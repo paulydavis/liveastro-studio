@@ -223,6 +223,7 @@ Camera control, native live stacking, mount control, guiding, plate solving, dir
 - Monitors a folder containing a changing stack image (FITS from Siril livestack, or PNG/JPG/TIFF).
 - Display updates automatically; linear FITS is auto-stretched to look correct.
 - OBS captures the broadcast window cleanly.
+- **Validated end-to-end on YouTube:** a real session streamed live to YouTube via OBS, with the broadcast window as the primary scene — overlay legible at YouTube's 1080p compression, image updates visible to viewers.
 - Snapshots recorded per stack update; session manifest written.
 - Generates a usable 45 s 1920×1080 H.264 MP4 evolution video at session end.
 - Works with both frequent (20 s subs) and slow (600 s subs) update cadences.
