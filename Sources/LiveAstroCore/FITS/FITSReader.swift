@@ -3,8 +3,10 @@ import Foundation
 public enum FITSReader {
 
     public static func readHeader(_ data: Data) throws -> FITSHeader {
-        guard data.count >= 6, String(data: data.prefix(6), encoding: .ascii) == "SIMPLE" else {
-            if data.count < 2880 { throw data.prefix(6).elementsEqual("SIMPLE".utf8) ? FITSError.truncatedHeader : FITSError.notFITS }
+        if data.count < 6 {
+            throw FITSError.truncatedHeader
+        }
+        guard String(data: data.prefix(6), encoding: .ascii) == "SIMPLE" else {
             throw FITSError.notFITS
         }
         var cards: [String: String] = [:]
@@ -72,25 +74,31 @@ public enum FITSReader {
             case 8:
                 for i in 0..<n { px[i] = Float(physical(Double(buf[i])) / 255.0) }
             case 16:
-                let p = buf.bindMemory(to: Int16.self)
-                for i in 0..<n { px[i] = Float(physical(Double(Int16(bigEndian: p[i]))) / 65535.0) }
+                for i in 0..<n {
+                    let raw = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<Int16>.size, as: Int16.self)
+                    px[i] = Float(physical(Double(Int16(bigEndian: raw))) / 65535.0)
+                }
             case 32:
-                let p = buf.bindMemory(to: Int32.self)
-                for i in 0..<n { px[i] = Float(physical(Double(Int32(bigEndian: p[i]))) / 4294967295.0) }
+                for i in 0..<n {
+                    let raw = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<Int32>.size, as: Int32.self)
+                    px[i] = Float(physical(Double(Int32(bigEndian: raw))) / 4294967295.0)
+                }
             case -32:
-                let p = buf.bindMemory(to: UInt32.self)
-                for i in 0..<n { px[i] = Float(physical(Double(Float(bitPattern: UInt32(bigEndian: p[i]))))) }
+                for i in 0..<n {
+                    let raw = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<UInt32>.size, as: UInt32.self)
+                    px[i] = Float(physical(Double(Float(bitPattern: UInt32(bigEndian: raw)))))
+                }
             case -64:
-                let p = buf.bindMemory(to: UInt64.self)
-                for i in 0..<n { px[i] = Float(physical(Double(bitPattern: UInt64(bigEndian: p[i])))) }
+                for i in 0..<n {
+                    let raw = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<UInt64>.size, as: UInt64.self)
+                    px[i] = Float(physical(Double(bitPattern: UInt64(bigEndian: raw))))
+                }
             default:
                 preconditionFailure("validated in readHeader")
             }
         }
-        // Clamp only integer types; float types preserve their values
-        if [8, 16, 32].contains(h.bitpix) {
-            for i in 0..<n { px[i] = min(max(px[i], 0), 1) }
-        }
+        // Clamp all pixel values to normalized 0…1 range (FITSImage contract)
+        for i in 0..<n { px[i] = min(max(px[i], 0), 1) }
 
         if h.bottomUp {
             let plane = h.width * h.height

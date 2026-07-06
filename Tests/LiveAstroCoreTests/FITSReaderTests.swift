@@ -26,19 +26,22 @@ final class FITSReaderTests: XCTestCase {
     }
 
     func testFloat32RoundTripRGB() throws {
-        let px = [Float](repeating: 0.25, count: 2 * 2 * 3)
-        let data = FITSWriter.float32(width: 2, height: 2, channels: 3, pixels: px)
+        let px = (0..<12).map { Float($0) / 11.0 }
+        let data = FITSWriter.float32(width: 2, height: 2, channels: 3, pixels: Array(px))
         let img = try FITSReader.read(data)
         XCTAssertEqual(img.channels, 3)
         XCTAssertEqual(img.pixels.count, 12)
+        for (a, b) in zip(img.pixels, px) { XCTAssertEqual(a, b, accuracy: 1e-6) }
     }
 
     func testBottomUpRowsAreFlipped() throws {
-        // 2x2, values row-major top-down: [0,1, 2,3]. Written bottom-up they are stored [2,3, 0,1].
+        // 2x2, values row-major top-down: [0.1, 0.4, 0.6, 0.9]. Written bottom-up they are stored [0.6, 0.9, 0.1, 0.4].
+        let px: [Float] = [0.1, 0.4, 0.6, 0.9]
         let data = FITSWriter.float32(width: 2, height: 2, channels: 1,
-                                      pixels: [0, 1, 2, 3], bottomUp: true)
+                                      pixels: px, bottomUp: true)
         let img = try FITSReader.read(data)
-        XCTAssertEqual(img.pixels, [0, 1, 2, 3]) // reader restores top-down
+        // reader restores top-down
+        for (a, b) in zip(img.pixels, px) { XCTAssertEqual(a, b, accuracy: 1e-6) }
     }
 
     func testInt16WithBZeroNormalizes() throws {
@@ -71,7 +74,10 @@ final class FITSReaderTests: XCTestCase {
         let data = FITSWriter.float32(width: 100, height: 100, channels: 1, pixels: px)
         let h = try FITSReader.readHeader(data)
         XCTAssertEqual(h.minimumFileSize, h.headerBytes + 100 * 100 * 4)
-        XCTAssertThrowsError(try FITSReader.read(data.prefix(h.minimumFileSize - 1)))
+        let truncated = h.minimumFileSize - 1
+        XCTAssertThrowsError(try FITSReader.read(data.prefix(truncated))) {
+            XCTAssertEqual($0 as? FITSError, .truncatedData(expected: h.minimumFileSize, actual: truncated))
+        }
     }
 }
 
