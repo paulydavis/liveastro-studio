@@ -71,6 +71,24 @@ final class AppModel {
         }
     }
 
+    func regenerateReplay(sessionDirectory: URL) {
+        guard !isRunning && !isGeneratingReplay else { return }
+        isGeneratingReplay = true
+        log.append("Regenerating replay for \(sessionDirectory.lastPathComponent)…")
+        Task.detached { [weak self] in
+            do {
+                let url = try ReplayService.regenerate(sessionDirectory: sessionDirectory)
+                await MainActor.run {
+                    self?.replayURL = url
+                    self?.log.append("Replay ready: \(url.lastPathComponent)")
+                }
+            } catch {
+                await MainActor.run { self?.errorMessage = "Regenerate failed: \(error)" }
+            }
+            await MainActor.run { self?.isGeneratingReplay = false }
+        }
+    }
+
     func endSession() {
         guard let p = pipeline else { return }
         guard !isGeneratingReplay else { return }

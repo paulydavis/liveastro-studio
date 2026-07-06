@@ -39,6 +39,10 @@ struct ControlView: View {
                             .buttonStyle(.borderedProminent)
                     }
                 }
+                if !model.isRunning {
+                    Button("Regenerate Replay…") { pickSessionDirectory() }
+                        .disabled(model.isGeneratingReplay)
+                }
                 if model.isGeneratingReplay { ProgressView("Rendering replay…") }
                 if let url = model.replayURL {
                     Button("Reveal Replay in Finder") {
@@ -69,5 +73,23 @@ struct ControlView: View {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK { model.watchFolder = panel.url }
+    }
+
+    private func pickSessionDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Choose Session Directory"
+        panel.message = "Select a past session folder containing manifest.json"
+        let liveAstro = FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("LiveAstro", isDirectory: true)
+        if FileManager.default.fileExists(atPath: liveAstro.path) {
+            panel.directoryURL = liveAstro
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            model.regenerateReplay(sessionDirectory: url)
+        }
     }
 }

@@ -71,23 +71,11 @@ public final class SessionPipeline {
             consumeTask = nil
         }
         try session.endSession()
-        guard let dir = session.sessionDirectory, let manifest = session.manifest else {
+        guard let dir = session.sessionDirectory else {
             throw SessionError.notRunning
         }
-        let snapshots = manifest.snapshots
-        let urls = snapshots.map { dir.appendingPathComponent($0.snapshotFile) }
-        let outputURL = dir.appendingPathComponent("replay.mp4")
-        guard !urls.isEmpty else { return outputURL } // empty session: no replay to render
-        let picked = try FrameSelector.selectSnapshots(urls: urls, maxKeyframes: maxKeyframes)
-        let keyframes = picked.map { i in
-            ReplayKeyframe(
-                imageURL: urls[i],
-                caption: "\(manifest.targetName) — " + IntegrationFormat.caption(
-                    seconds: snapshots[i].estimatedIntegrationSeconds,
-                    frames: snapshots[i].index,
-                    subSeconds: manifest.subExposureSeconds))
-        }
-        try ReplayGenerator(settings: replaySettings).render(keyframes: keyframes, to: outputURL)
-        return outputURL
+        return try ReplayService.regenerate(sessionDirectory: dir,
+                                            replaySettings: replaySettings,
+                                            maxKeyframes: maxKeyframes)
     }
 }
