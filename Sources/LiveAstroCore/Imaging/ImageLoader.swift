@@ -37,7 +37,7 @@ public enum ImageLoader {
         }
         let w = cg.width, h = cg.height
         var rgba = [UInt8](repeating: 0, count: w * h * 4)
-        let space = cg.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
         guard let ctx = CGContext(data: &rgba, width: w, height: h, bitsPerComponent: 8,
                                   bytesPerRow: w * 4, space: space,
                                   bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {

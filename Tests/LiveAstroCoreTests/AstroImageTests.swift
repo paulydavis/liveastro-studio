@@ -23,4 +23,9 @@ final class AstroImageTests: XCTestCase {
                              pixels: [0.0, 0.1, 0.2, 0.9, 1.0], sourceIsLinear: true)
         XCTAssertEqual(img.stats[0].median, 0.2, accuracy: 1e-6)
     }
+    func testMedianEvenLength() {
+        let img = AstroImage(width: 4, height: 1, channels: 1,
+                             pixels: [0.0, 0.2, 0.8, 1.0], sourceIsLinear: true)
+        XCTAssertEqual(img.stats[0].median, 0.5, accuracy: 1e-6)
+    }
 }

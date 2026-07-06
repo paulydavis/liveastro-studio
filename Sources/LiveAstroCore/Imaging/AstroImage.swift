@@ -32,7 +32,7 @@ public struct AstroImage {
     /// Stats over a stride-sampled subset (≤ 262144 samples) — full sort of a 24MP plane is wasteful.
     static func computeStats(_ slice: ArraySlice<Float>) -> ChannelStats {
         let n = slice.count
-        let stride = max(1, n / 262_144)
+        let stride = max(1, (n + 262_143) / 262_144)
         var samples: [Float] = []
         samples.reserveCapacity(n / stride + 1)
         var i = slice.startIndex
@@ -41,7 +41,10 @@ public struct AstroImage {
         let mean = samples.reduce(0.0) { $0 + Double($1) } / count
         let variance = samples.reduce(0.0) { $0 + pow(Double($1) - mean, 2) } / count
         samples.sort()
-        let median = Double(samples[samples.count / 2])
+        let mid = samples.count / 2
+        let median = samples.count % 2 == 0
+            ? (Double(samples[mid - 1]) + Double(samples[mid])) / 2
+            : Double(samples[mid])
         return ChannelStats(mean: mean, median: median, stddev: variance.squareRoot())
     }
 }
