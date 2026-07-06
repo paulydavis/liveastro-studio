@@ -1,8 +1,6 @@
 import Foundation
 import CoreGraphics
 
-public enum PipelineError: Error { case renderFailed }
-
 /// Glue: watcher → loader → stretch → broadcast callback + snapshot + manifest (spec §5.1).
 /// UI-free so the end-to-end test and the app share the same wiring.
 public final class SessionPipeline {
@@ -16,6 +14,7 @@ public final class SessionPipeline {
     private let maxKeyframes: Int
     private var recorder: SnapshotRecorder?
     private var consumeTask: Task<Void, Never>?
+    private let consumeDone = DispatchSemaphore(value: 0)
 
     public init(watchFolder: URL, profile: SessionProfile, rootDirectory: URL,
                 replaySettings: ReplaySettings = .init(), maxKeyframes: Int = 45) {
@@ -30,11 +29,16 @@ public final class SessionPipeline {
         let dir = try session.startSession(profile: profile)
         recorder = SnapshotRecorder(sessionDirectory: dir)
         try watcher.start()
+        let done = consumeDone
         consumeTask = Task.detached(priority: .userInitiated) { [weak self] in
-            guard let stream = self?.watcher.updates else { return }
+            guard let stream = self?.watcher.updates else {
+                done.signal()
+                return
+            }
             for await update in stream {
                 self?.handle(update)
             }
+            done.signal()
         }
     }
 
@@ -59,9 +63,13 @@ public final class SessionPipeline {
     }
 
     /// Ends the session and renders replay.mp4. Synchronous — call off the main thread.
+    /// Drains any in-flight handle() calls before finalizing the manifest.
     public func end() throws -> URL {
         watcher.stop()
-        consumeTask?.cancel()
+        if consumeTask != nil {
+            _ = consumeDone.wait(timeout: .now() + 10)
+            consumeTask = nil
+        }
         try session.endSession()
         guard let dir = session.sessionDirectory, let manifest = session.manifest else {
             throw SessionError.notRunning
