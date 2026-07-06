@@ -63,11 +63,63 @@ final class ReplayGeneratorTests: XCTestCase {
             keyframes: [], to: tmp.appendingPathComponent("x.mp4")))
     }
 
+    func testColorChannelsNotSwapped() throws {
+        let url = tmp.appendingPathComponent("red.png")
+        try writePNG(to: url, r: 1.0, g: 0.0, b: 0.0, width: 320, height: 180)
+
+        var settings = ReplaySettings()
+        settings.duration = 1; settings.fps = 10
+        settings.width = 320; settings.height = 180; settings.crossfade = 0.2
+        let out = tmp.appendingPathComponent("red-replay.mp4")
+        try ReplayGenerator(settings: settings).render(
+            keyframes: [ReplayKeyframe(imageURL: url, caption: "Red")],
+            to: out)
+
+        let asset = AVURLAsset(url: out)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        // Sample near frame 5 (middle of clip) to stay away from the caption margin.
+        let sampleTime = CMTime(value: 5, timescale: 10)
+        let cgImage = try gen.copyCGImage(at: sampleTime, actualTime: nil)
+
+        // Draw a centered 64×64 crop (well away from caption at bottom-left) into an
+        // RGBA8 sRGB context so we can read raw pixel values.
+        let sampleW = 64, sampleH = 64
+        let cropX = (cgImage.width - sampleW) / 2
+        let cropY = (cgImage.height - sampleH) / 2
+        let cropRect = CGRect(x: cropX, y: cropY, width: sampleW, height: sampleH)
+        let cropped = cgImage.cropping(to: cropRect)!
+
+        var pixelData = [UInt8](repeating: 0, count: sampleW * sampleH * 4)
+        let sampleCtx = CGContext(data: &pixelData,
+                                  width: sampleW, height: sampleH,
+                                  bitsPerComponent: 8,
+                                  bytesPerRow: sampleW * 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        sampleCtx.draw(cropped, in: CGRect(x: 0, y: 0, width: sampleW, height: sampleH))
+
+        var sumR: Double = 0, sumB: Double = 0
+        let pixelCount = sampleW * sampleH
+        for i in 0..<pixelCount {
+            sumR += Double(pixelData[i * 4 + 0])
+            sumB += Double(pixelData[i * 4 + 2])
+        }
+        let meanR = sumR / Double(pixelCount)
+        let meanB = sumB / Double(pixelCount)
+        XCTAssertGreaterThan(meanR, meanB * 3.0,
+            "Mean red (\(meanR)) should be > 3× mean blue (\(meanB)); channels may be swapped")
+    }
+
     private func writePNG(to url: URL, gray: Double, width: Int, height: Int) throws {
+        try writePNG(to: url, r: gray, g: gray, b: gray, width: width, height: height)
+    }
+
+    private func writePNG(to url: URL, r: Double, g: Double, b: Double, width: Int, height: Int) throws {
         let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
                             bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                             bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
-        ctx.setFillColor(CGColor(red: gray, green: gray, blue: gray, alpha: 1))
+        ctx.setFillColor(CGColor(red: r, green: g, blue: b, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
         let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!
         CGImageDestinationAddImage(dest, ctx.makeImage()!, nil)

@@ -86,7 +86,12 @@ public final class ReplayGenerator {
             let caption = blend < 0.5 ? keyframes[i].caption : keyframes[j].caption
             let buffer = try makeFrame(base: images[i], next: images[j],
                                        blend: blend, caption: caption, pool: adaptor.pixelBufferPool)
-            while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.005) }
+            while !input.isReadyForMoreMediaData {
+                guard writer.status == .writing else {
+                    throw ReplayError.writerFailed(writer.error?.localizedDescription ?? "writer status \(writer.status.rawValue)")
+                }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
             adaptor.append(buffer, withPresentationTime:
                 CMTime(value: CMTimeValue(f), timescale: CMTimeScale(settings.fps)))
         }
@@ -118,7 +123,7 @@ public final class ReplayGenerator {
                                   bitsPerComponent: 8,
                                   bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
                                   space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue) else {
+                                  bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue) else {
             throw ReplayError.writerFailed("frame context")
         }
         let canvas = CGSize(width: settings.width, height: settings.height)
