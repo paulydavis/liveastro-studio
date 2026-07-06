@@ -217,6 +217,7 @@ Manifest schema (per original brief):
 
 - **Integration-time correction at session end** (§5.5): not implemented; manifest JSON is hand-editable as a workaround. Revisit in v1.1.
 - **Folder-disappearance banner** (§7): watcher silently pauses and auto-resumes via its poll fallback; no UI feedback yet. Revisit in v1.1.
+- **AutoStretch background neutralization toggle**: real-data testing (2026-07-06) showed raw OSC data is green-dominant without white balance; the acquired-data import script neutralizes channel medians before stretch. If Siril livestack output proves unbalanced in the field, AutoStretch needs the same optional step. Revisit in v1.1.
 - **Crash-resume offer on relaunch** (§7): manifest is crash-safe (atomic per snapshot); the relaunch flow is post-MVP.
 
 ## 9. Non-Goals for v1
