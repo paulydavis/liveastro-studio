@@ -20,6 +20,7 @@ final class AppModel {
     var latestImage: CGImage?
     var latestRecord: SnapshotRecord?
     var sessionStart: Date?
+    var sessionEnd: Date?
     var log: [String] = []
     var replayURL: URL?
     var isGeneratingReplay = false
@@ -42,6 +43,7 @@ final class AppModel {
     }
 
     func startSession() {
+        guard !isRunning else { return }
         guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return }
         let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("LiveAstro", isDirectory: true)
@@ -61,6 +63,7 @@ final class AppModel {
             pipeline = p
             isRunning = true
             sessionStart = Date()
+            sessionEnd = nil
             replayURL = nil
             log.append("Session started — watching \(folder.path)")
         } catch {
@@ -86,6 +89,7 @@ final class AppModel {
                 self?.isRunning = false
                 self?.isGeneratingReplay = false
                 self?.pipeline = nil
+                self?.sessionEnd = Date()
             }
         }
     }

@@ -57,7 +57,8 @@ struct BroadcastView: View {
 
     private var elapsedLine: String {
         guard let start = model.sessionStart else { return "" }
-        let s = Int(Date().timeIntervalSince(start))
+        let ref = model.sessionEnd ?? Date()
+        let s = Int(ref.timeIntervalSince(start))
         return String(format: "%02d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
     }
 }
