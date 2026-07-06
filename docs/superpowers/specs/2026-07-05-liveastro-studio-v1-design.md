@@ -114,7 +114,7 @@ Owns:
   - Telescope · Camera
   - Location/Bortle (optional)
   - Session elapsed time
-- 16:9 1920×1080 only in v1. (9:16 vertical: deferred.)
+- Broadcast content is a 16:9 composition rendered proportionally at any window size (default 1280×720, minimum 640×360); OBS captures the window at its current size, and users on large displays can size it to 1920×1080 or full screen for maximum capture resolution. Note: this superseded the original fixed-1920×1080 decision on 2026-07-06 after laptop-screen testing. (9:16 vertical: deferred.)
 
 ### 5.7 SnapshotRecorder
 

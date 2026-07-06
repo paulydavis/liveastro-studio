@@ -24,9 +24,11 @@ struct LiveAstroApp: App {
         Window("LiveAstro Broadcast", id: "broadcast") {
             BroadcastView()
                 .environment(model)
-                .frame(width: 1920, height: 1080)
+                .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                .frame(minWidth: 640, minHeight: 360)
+                .background(Color.black)   // letterbox any non-16:9 window slack in black
         }
         .windowStyle(.hiddenTitleBar)
-        .windowResizability(.contentSize)
+        .defaultSize(width: 1280, height: 720)
     }
 }
