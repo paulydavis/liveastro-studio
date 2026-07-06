@@ -213,6 +213,12 @@ Manifest schema (per original brief):
 - **ReplayGenerator:** integration test rendering a tiny (few-frame, low-res) MP4; assert file validity via AVAsset.
 - **End-to-end:** scripted fake "Siril" writing FITS files into a temp folder; assert display updates, snapshots, manifest, and replay generation.
 
+## 8.5 Explicitly Deferred from v1 (decided 2026-07-05 during implementation)
+
+- **Integration-time correction at session end** (§5.5): not implemented; manifest JSON is hand-editable as a workaround. Revisit in v1.1.
+- **Folder-disappearance banner** (§7): watcher silently pauses and auto-resumes via its poll fallback; no UI feedback yet. Revisit in v1.1.
+- **Crash-resume offer on relaunch** (§7): manifest is crash-safe (atomic per snapshot); the relaunch flow is post-MVP.
+
 ## 9. Non-Goals for v1
 
 Camera control, native live stacking, mount control, guiding, plate solving, direct YouTube/Twitch upload, OBS plugin/WebSocket/Browser Source, AI narration, automatic target recognition, star counting, vertical formats, XISF.
