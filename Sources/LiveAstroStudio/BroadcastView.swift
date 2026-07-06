@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import LiveAstroCore
 
 /// The OBS-captured scene: dark, non-interactive, never blanks (spec §5.6).
@@ -19,6 +20,7 @@ struct BroadcastView: View {
                 overlay(scale: scale)
             }
             .ignoresSafeArea()
+            .background(BroadcastWindowConfigurator())
         }
     }
 
@@ -64,4 +66,23 @@ struct BroadcastView: View {
         let s = Int(ref.timeIntervalSince(start))
         return String(format: "%02d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
     }
+}
+
+/// Gives the hidden-titlebar broadcast window a real window-server title so
+/// OBS/ScreenCaptureKit list it, while keeping the chrome invisible.
+struct BroadcastWindowConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            guard let window = view.window else { return }
+            window.title = "LiveAstro Broadcast"
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            if !window.styleMask.contains(.titled) {
+                window.styleMask.insert(.titled)
+            }
+        }
+        return view
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
