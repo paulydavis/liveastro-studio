@@ -41,7 +41,8 @@ final class ImageLoaderTests: XCTestCase {
                             bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                             bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
         let g = CGFloat(gray) / 255.0
-        ctx.setFillColor(CGColor(red: g, green: g, blue: g, alpha: 1))
+        ctx.setFillColor(CGColor(colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                 components: [g, g, g, 1])!)
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
         let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!
         CGImageDestinationAddImage(dest, ctx.makeImage()!, nil)
