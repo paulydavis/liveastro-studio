@@ -23,6 +23,8 @@ public final class SessionManager {
     public static func sessionId(date: Date, targetName: String) -> String {
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd"
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = Calendar(identifier: .gregorian)
         var slug = targetName.lowercased().unicodeScalars
             .filter { CharacterSet.alphanumerics.contains($0) }
             .reduce(into: "") { $0.unicodeScalars.append($1) }

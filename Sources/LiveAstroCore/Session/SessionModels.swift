@@ -60,20 +60,23 @@ public struct SessionManifest: Codable, Equatable {
 }
 
 public enum ManifestCoding {
+    private static let isoWithFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
     public static func encoder() -> JSONEncoder {
         let e = JSONEncoder()
         e.keyEncodingStrategy = .convertToSnakeCase
         e.dateEncodingStrategy = .custom { date, encoder in
             var container = encoder.singleValueContainer()
-            // Encode as ISO8601 with microsecond precision for full roundtrip fidelity
-            let timeInterval = date.timeIntervalSinceReferenceDate
-            let fractional = timeInterval.truncatingRemainder(dividingBy: 1)
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-            formatter.timeZone = TimeZone(abbreviation: "UTC")
-            let base = formatter.string(from: date)
-            let fractionalStr = String(format: "%.6f", fractional).dropFirst() // drop the "0"
-            try container.encode("\(base)\(fractionalStr)Z")
+            try container.encode(Self.isoWithFractional.string(from: date))
         }
         e.outputFormatting = [.prettyPrinted, .sortedKeys]
         return e
@@ -84,27 +87,12 @@ public enum ManifestCoding {
         d.dateDecodingStrategy = .custom { decoder in
             let container = try decoder.singleValueContainer()
             let string = try container.decode(String.self)
-            let trimmed = string.trimmingCharacters(in: CharacterSet(charactersIn: "Z"))
-            let parts = trimmed.split(separator: ".", maxSplits: 1)
-
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-            formatter.timeZone = TimeZone(abbreviation: "UTC")
-
-            guard let baseDate = formatter.date(from: String(parts[0])) else {
-                throw DecodingError.dataCorrupted(.init(
-                    codingPath: container.codingPath,
-                    debugDescription: "Invalid ISO8601 date: \(string)"))
+            if let date = Self.isoWithFractional.date(from: string) ?? Self.isoPlain.date(from: string) {
+                return date
             }
-
-            var result = baseDate
-            if parts.count > 1 {
-                let fractionalStr = "0." + parts[1]
-                if let fractional = Double(fractionalStr) {
-                    result = baseDate.addingTimeInterval(fractional)
-                }
-            }
-            return result
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: container.codingPath,
+                debugDescription: "unparseable ISO8601 date: \(string)"))
         }
         return d
     }

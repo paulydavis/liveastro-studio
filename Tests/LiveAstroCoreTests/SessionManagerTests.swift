@@ -38,7 +38,11 @@ final class SessionManagerTests: XCTestCase {
     func testRecordSnapshotAppendsAndPersists() throws {
         let mgr = SessionManager(rootDirectory: tmp)
         let dir = try mgr.startSession(profile: profile)
-        let rec = SnapshotRecord(index: 1, timestamp: Date(), sourceFile: "live_stack.fit",
+        // Use an ISO8601-formatted date string to ensure millisecond-precision round-trip through encoding/decoding
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let timestamp = iso.date(from: "2026-07-05T21:30:45.123Z")!
+        let rec = SnapshotRecord(index: 1, timestamp: timestamp, sourceFile: "live_stack.fit",
                                  snapshotFile: "snapshots/0001.png",
                                  estimatedIntegrationSeconds: 120, width: 100, height: 80,
                                  mean: 0.1, median: 0.08, stddev: 0.02)
@@ -74,5 +78,65 @@ final class SessionManagerTests: XCTestCase {
                        "2h 14m · 402 × 20s")
         XCTAssertEqual(IntegrationFormat.caption(seconds: 870, frames: 12, subSeconds: 72.5),
                        "14m 30s · 12 × 72.5s")
+    }
+
+    func testManifestCodingDecodesOffsetAndFractionalDates() throws {
+        // Test offset-style date (no fractional seconds)
+        let offsetDateStr = "2026-07-05T22:15:00-05:00"
+        let offsetFormatter = ISO8601DateFormatter()
+        offsetFormatter.formatOptions = [.withInternetDateTime]
+        let expectedOffsetDate = offsetFormatter.date(from: offsetDateStr)!
+
+        // Test fractional date (with microseconds)
+        let fractionalDateStr = "2026-07-05T03:15:00.123456Z"
+        let fractionalFormatter = ISO8601DateFormatter()
+        fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let expectedFractionalDate = fractionalFormatter.date(from: fractionalDateStr)!
+
+        // Build minimal manifest JSON with each date format
+        let manifestWithOffset = """
+        {
+          "session_id": "test-session",
+          "target_name": "NGC 6888",
+          "start_time": "\(offsetDateStr)",
+          "end_time": null,
+          "sub_exposure_seconds": 120,
+          "bortle": 7,
+          "location_label": "Test",
+          "telescope": "120 APO",
+          "camera": "ASI2600MC",
+          "mount": "AM5N",
+          "filter": "Dual-band",
+          "notes": "",
+          "snapshots": []
+        }
+        """
+
+        let manifestWithFractional = """
+        {
+          "session_id": "test-session",
+          "target_name": "NGC 6888",
+          "start_time": "\(fractionalDateStr)",
+          "end_time": null,
+          "sub_exposure_seconds": 120,
+          "bortle": 7,
+          "location_label": "Test",
+          "telescope": "120 APO",
+          "camera": "ASI2600MC",
+          "mount": "AM5N",
+          "filter": "Dual-band",
+          "notes": "",
+          "snapshots": []
+        }
+        """
+
+        // Verify both decode successfully
+        let decodedOffset = try ManifestCoding.decoder()
+            .decode(SessionManifest.self, from: manifestWithOffset.data(using: .utf8)!)
+        XCTAssertEqual(decodedOffset.startTime, expectedOffsetDate)
+
+        let decodedFractional = try ManifestCoding.decoder()
+            .decode(SessionManifest.self, from: manifestWithFractional.data(using: .utf8)!)
+        XCTAssertEqual(decodedFractional.startTime, expectedFractionalDate)
     }
 }
