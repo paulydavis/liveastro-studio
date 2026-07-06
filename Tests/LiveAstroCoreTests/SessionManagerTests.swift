@@ -80,6 +80,40 @@ final class SessionManagerTests: XCTestCase {
                        "14m 30s · 12 × 72.5s")
     }
 
+    func testSessionDirCollisionUniquifiesAndPreservesFirst() throws {
+        // Use a fixed date so both starts produce the same base session id.
+        let date = ISO8601DateFormatter().date(from: "2026-07-05T22:15:00Z")!
+
+        // First session: start and end.
+        let mgr1 = SessionManager(rootDirectory: tmp)
+        let dir1 = try mgr1.startSession(profile: profile, at: date)
+        try mgr1.endSession()
+
+        // Capture the first manifest before the second session is created.
+        let manifest1Data = try Data(contentsOf: dir1.appendingPathComponent("manifest.json"))
+        let manifest1 = try ManifestCoding.decoder().decode(SessionManifest.self, from: manifest1Data)
+
+        // Second session with same profile + date (reuses same manager or a new one on same root).
+        let mgr2 = SessionManager(rootDirectory: tmp)
+        let dir2 = try mgr2.startSession(profile: profile, at: date)
+
+        // The two directories must differ.
+        XCTAssertNotEqual(dir1.lastPathComponent, dir2.lastPathComponent,
+                          "second session must get a unique directory")
+
+        // The second directory's manifest sessionId must match its directory name.
+        let manifest2Data = try Data(contentsOf: dir2.appendingPathComponent("manifest.json"))
+        let manifest2 = try ManifestCoding.decoder().decode(SessionManifest.self, from: manifest2Data)
+        XCTAssertEqual(manifest2.sessionId, dir2.lastPathComponent,
+                       "manifest sessionId must match directory name")
+
+        // The first session's manifest.json must still be intact and decodable with its original id.
+        let manifest1Again = try ManifestCoding.decoder().decode(SessionManifest.self, from:
+            Data(contentsOf: dir1.appendingPathComponent("manifest.json")))
+        XCTAssertEqual(manifest1Again.sessionId, manifest1.sessionId,
+                       "first session manifest must be untouched")
+    }
+
     func testManifestCodingDecodesOffsetAndFractionalDates() throws {
         // Test offset-style date (no fractional seconds)
         let offsetDateStr = "2026-07-05T22:15:00-05:00"

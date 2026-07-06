@@ -73,6 +73,7 @@ final class AppModel {
 
     func endSession() {
         guard let p = pipeline else { return }
+        guard !isGeneratingReplay else { return }
         isGeneratingReplay = true
         log.append("Ending session — generating replay…")
         Task.detached { [weak self] in

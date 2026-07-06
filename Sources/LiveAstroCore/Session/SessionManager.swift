@@ -35,7 +35,14 @@ public final class SessionManager {
     @discardableResult
     public func startSession(profile: SessionProfile, at date: Date = .init()) throws -> URL {
         guard state != .running else { throw SessionError.alreadyRunning }
-        let id = Self.sessionId(date: date, targetName: profile.targetName)
+        let baseId = Self.sessionId(date: date, targetName: profile.targetName)
+        var id = baseId
+        var suffix = 1
+        while FileManager.default.fileExists(
+            atPath: rootDirectory.appendingPathComponent(id, isDirectory: true).path) {
+            suffix += 1
+            id = "\(baseId)-\(suffix)"
+        }
         let dir = rootDirectory.appendingPathComponent(id, isDirectory: true)
         try FileManager.default.createDirectory(
             at: dir.appendingPathComponent("snapshots"), withIntermediateDirectories: true)

@@ -45,8 +45,13 @@ public final class ReplayGenerator {
         try? FileManager.default.removeItem(at: outputURL)
 
         let images: [CGImage] = try keyframes.map {
+            let opts: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: max(settings.width, settings.height),
+            ]
             guard let src = CGImageSourceCreateWithURL($0.imageURL as CFURL, nil),
-                  let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+                  let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else {
                 throw ReplayError.decodeFailed($0.imageURL.lastPathComponent)
             }
             return cg
@@ -57,6 +62,11 @@ public final class ReplayGenerator {
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: settings.width,
             AVVideoHeightKey: settings.height,
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            ],
         ])
         input.expectsMediaDataInRealTime = false
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
@@ -92,8 +102,11 @@ public final class ReplayGenerator {
                 }
                 Thread.sleep(forTimeInterval: 0.005)
             }
-            adaptor.append(buffer, withPresentationTime:
+            let appended = adaptor.append(buffer, withPresentationTime:
                 CMTime(value: CMTimeValue(f), timescale: CMTimeScale(settings.fps)))
+            if !appended {
+                throw ReplayError.writerFailed(writer.error?.localizedDescription ?? "pixel buffer append failed at frame \(f)")
+            }
         }
 
         input.markAsFinished()
