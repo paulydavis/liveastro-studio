@@ -1,2 +1,2 @@
 import LiveAstroCore
-print("LiveAstro Studio scaffold — core \(LiveAstroCore.version)")
+print("LiveAstro Studio — GUI arrives in Task 11")
