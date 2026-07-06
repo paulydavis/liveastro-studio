@@ -1,0 +1,47 @@
+import XCTest
+@testable import LiveAstroCore
+
+final class FrameSelectorTests: XCTestCase {
+
+    func testSmallCountReturnsAll() {
+        XCTAssertEqual(FrameSelector.logSpacedIndices(count: 5, maxKeyframes: 10), [0, 1, 2, 3, 4])
+    }
+
+    func testAlwaysIncludesFirstAndLast() {
+        let idx = FrameSelector.logSpacedIndices(count: 1000, maxKeyframes: 30)
+        XCTAssertEqual(idx.first, 0)
+        XCTAssertEqual(idx.last, 999)
+        XCTAssertLessThanOrEqual(idx.count, 31)
+    }
+
+    func testEarlyBias() {
+        let idx = FrameSelector.logSpacedIndices(count: 1000, maxKeyframes: 30)
+        let firstHalf = idx.filter { $0 < 500 }.count
+        let secondHalf = idx.filter { $0 >= 500 }.count
+        XCTAssertGreaterThan(firstHalf, secondHalf,
+                             "log spacing must sample the early session more densely")
+    }
+
+    func testSortedUnique() {
+        let idx = FrameSelector.logSpacedIndices(count: 100, maxKeyframes: 50)
+        XCTAssertEqual(idx, Array(Set(idx)).sorted())
+    }
+
+    func testDedupeDropsNearIdenticalButKeepsEnds() {
+        // difference: everything identical except index 0 vs anything.
+        let picked = FrameSelector.select(count: 100, maxKeyframes: 20,
+                                          difference: { a, b in (a == 0 || b == 0) ? 1.0 : 0.0 })
+        XCTAssertEqual(picked.first, 0)
+        XCTAssertEqual(picked.last, 99, "final frame survives even when visually identical")
+        XCTAssertLessThanOrEqual(picked.count, 3, "middle duplicates removed")
+    }
+
+    func testThumbnailDifference() {
+        let a = AstroImage(width: 128, height: 128, channels: 1,
+                           pixels: [Float](repeating: 0.2, count: 128 * 128), sourceIsLinear: false)
+        let b = AstroImage(width: 128, height: 128, channels: 1,
+                           pixels: [Float](repeating: 0.8, count: 128 * 128), sourceIsLinear: false)
+        XCTAssertEqual(FrameSelector.thumbnailDifference(a, a), 0, accuracy: 1e-6)
+        XCTAssertEqual(FrameSelector.thumbnailDifference(a, b), 0.6, accuracy: 0.01)
+    }
+}
