@@ -1,0 +1,71 @@
+import Foundation
+
+public enum SessionError: Error, Equatable {
+    case notRunning
+    case alreadyRunning
+}
+
+public final class SessionManager {
+    public enum State: Equatable { case idle, running, ended }
+
+    public private(set) var state: State = .idle
+    public private(set) var manifest: SessionManifest?
+    public private(set) var sessionDirectory: URL?
+    private let rootDirectory: URL
+
+    public init(rootDirectory: URL) { self.rootDirectory = rootDirectory }
+
+    public var acceptedCount: Int { manifest?.snapshots.count ?? 0 }
+    public var estimatedIntegrationSeconds: Double {
+        Double(acceptedCount) * (manifest?.subExposureSeconds ?? 0)
+    }
+
+    public static func sessionId(date: Date, targetName: String) -> String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        var slug = targetName.lowercased().unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .reduce(into: "") { $0.unicodeScalars.append($1) }
+        if slug.isEmpty { slug = "session" }
+        return "\(fmt.string(from: date))-\(String(slug.prefix(24)))"
+    }
+
+    @discardableResult
+    public func startSession(profile: SessionProfile, at date: Date = .init()) throws -> URL {
+        guard state != .running else { throw SessionError.alreadyRunning }
+        let id = Self.sessionId(date: date, targetName: profile.targetName)
+        let dir = rootDirectory.appendingPathComponent(id, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("snapshots"), withIntermediateDirectories: true)
+        manifest = SessionManifest(
+            sessionId: id, targetName: profile.targetName, startTime: date, endTime: nil,
+            subExposureSeconds: profile.subExposureSeconds, bortle: profile.bortle,
+            locationLabel: profile.locationLabel, telescope: profile.telescope,
+            camera: profile.camera, mount: profile.mount, filter: profile.filter,
+            notes: profile.notes, snapshots: [])
+        sessionDirectory = dir
+        state = .running
+        try persist()
+        return dir
+    }
+
+    public func recordSnapshot(_ record: SnapshotRecord) throws {
+        guard state == .running, manifest != nil else { throw SessionError.notRunning }
+        manifest!.snapshots.append(record)
+        try persist()
+    }
+
+    public func endSession(at date: Date = .init()) throws {
+        guard state == .running, manifest != nil else { throw SessionError.notRunning }
+        manifest!.endTime = date
+        state = .ended
+        try persist()
+    }
+
+    /// Atomic write: temp file + rename via Data(.atomic). Crash loses at most the in-flight update (spec §7).
+    private func persist() throws {
+        guard let dir = sessionDirectory, let m = manifest else { return }
+        let data = try ManifestCoding.encoder().encode(m)
+        try data.write(to: dir.appendingPathComponent("manifest.json"), options: .atomic)
+    }
+}
