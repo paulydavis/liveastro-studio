@@ -22,9 +22,12 @@ swift run LiveAstroStudio
 
 1. Choose the folder Siril's livestack writes into.
 2. Fill in the session profile (target, scope, camera, sub length…).
-3. Open the Broadcast Window; in OBS add a **Window Capture** for "LiveAstro Broadcast".
-4. Start Session. Stream from OBS as usual.
-5. End Session → `~/Documents/LiveAstro/<session>/replay.mp4`.
+3. The **File name starts with** field defaults to `live_stack` — this matches Siril's
+   `live_stack.fit` output and ignores raw sub-exposures that land in the same folder.
+   Clear the field (or leave it blank) when pointing at a folder of arbitrary display-ready images.
+4. Open the Broadcast Window; in OBS add a **Window Capture** for "LiveAstro Broadcast".
+5. Start Session. Stream from OBS as usual.
+6. End Session → `~/Documents/LiveAstro/<session>/replay.mp4`.
 
 ## Demo without a telescope
 

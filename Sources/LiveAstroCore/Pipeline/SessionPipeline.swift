@@ -17,8 +17,9 @@ public final class SessionPipeline {
     private let consumeDone = DispatchSemaphore(value: 0)
 
     public init(watchFolder: URL, profile: SessionProfile, rootDirectory: URL,
-                replaySettings: ReplaySettings = .init(), maxKeyframes: Int = 45) {
-        self.watcher = StackFileWatcher(folder: watchFolder)
+                replaySettings: ReplaySettings = .init(), maxKeyframes: Int = 45,
+                fileNamePrefix: String? = nil) {
+        self.watcher = StackFileWatcher(folder: watchFolder, fileNamePrefix: fileNamePrefix)
         self.profile = profile
         self.session = SessionManager(rootDirectory: rootDirectory)
         self.replaySettings = replaySettings

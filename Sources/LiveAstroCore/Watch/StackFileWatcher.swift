@@ -26,10 +26,14 @@ public final class StackFileWatcher {
     private var lastSeenSize: [String: Int] = [:]
     private var lastEmittedDigest: [String: String] = [:]
 
-    public init(folder: URL, quietPeriod: TimeInterval = 0.5, pollInterval: TimeInterval = 2.0) {
+    private let fileNamePrefix: String?
+
+    public init(folder: URL, quietPeriod: TimeInterval = 0.5, pollInterval: TimeInterval = 2.0,
+                fileNamePrefix: String? = nil) {
         self.folder = folder
         self.quietPeriod = quietPeriod
         self.pollInterval = pollInterval
+        self.fileNamePrefix = fileNamePrefix
         var cont: AsyncStream<StackUpdate>.Continuation!
         self.updates = AsyncStream { cont = $0 }
         self.continuation = cont
@@ -74,6 +78,8 @@ public final class StackFileWatcher {
         guard let names = try? fm.contentsOfDirectory(atPath: folder.path) else { return }
         for name in names {
             guard !name.hasPrefix("."), !name.lowercased().hasSuffix(".tmp") else { continue }
+            if let prefix = fileNamePrefix, !prefix.isEmpty,
+               !name.lowercased().hasPrefix(prefix.lowercased()) { continue }
             let ext = (name as NSString).pathExtension.lowercased()
             let isFITS = ImageLoader.fitsExtensions.contains(ext)
             guard isFITS || ImageLoader.bitmapExtensions.contains(ext) else { continue }

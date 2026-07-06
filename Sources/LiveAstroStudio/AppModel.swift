@@ -15,6 +15,7 @@ final class AppModel {
     var subExposureText = "60"
     var notes = ""
 
+    var fileNamePrefix = "live_stack"
     var watchFolder: URL?
     var isRunning = false
     var latestImage: CGImage?
@@ -47,7 +48,8 @@ final class AppModel {
         guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return }
         let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("LiveAstro", isDirectory: true)
-        let p = SessionPipeline(watchFolder: folder, profile: profile, rootDirectory: root)
+        let p = SessionPipeline(watchFolder: folder, profile: profile, rootDirectory: root,
+                               fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
         p.onUpdate = { [weak self] image, record in
             Task { @MainActor in
                 self?.latestImage = image

@@ -90,6 +90,20 @@ final class StackFileWatcherTests: XCTestCase {
         XCTAssertTrue(got, "changed content must emit a second update")
     }
 
+    func testFileNamePrefixFilter() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.3, fileNamePrefix: "live_stack")
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.4).write(to: tmp.appendingPathComponent("Light_NGC6888_001.fit"))  // raw sub — must be ignored
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))          // stack — must emit
+        let got = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(got)
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        let items = await collector.items
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].url.lastPathComponent, "live_stack.fit")
+    }
+
     func testIgnoresTempAndHiddenFiles() async throws {
         watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.3)
         let collector = collect(watcher)

@@ -15,6 +15,8 @@ struct ControlView: View {
                     Spacer()
                     Button("Choose…") { pickFolder() }.disabled(model.isRunning)
                 }
+                TextField("File name starts with (empty = any)", text: $model.fileNamePrefix)
+                    .disabled(model.isRunning)
             }
             Section("Session Profile") {
                 TextField("Target name", text: $model.targetName)
