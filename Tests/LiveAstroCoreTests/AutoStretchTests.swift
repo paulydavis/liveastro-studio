@@ -47,4 +47,42 @@ final class AutoStretchTests: XCTestCase {
         XCTAssertEqual(cg?.width, 4)
         XCTAssertEqual(cg?.height, 2)
     }
+
+    func testNeutralizeBackgroundMatchesChannelMediansToGreen() {
+        // 4x4 RGB, green-dominant background: R median 0.02, G median 0.10, B median 0.04
+        let plane = 16
+        var px = [Float](repeating: 0, count: plane * 3)
+        for i in 0..<plane { px[i] = 0.02; px[plane + i] = 0.10; px[2 * plane + i] = 0.04 }
+        // one "star" pixel per channel so data isn't perfectly uniform
+        px[0] = 0.9; px[plane] = 0.95; px[2 * plane] = 0.85
+        let img = AstroImage(width: 4, height: 4, channels: 3, pixels: px, sourceIsLinear: true)
+        let out = AutoStretch.neutralizeBackground(img)
+        func median(_ c: Int) -> Float {
+            var s = Array(out.pixels[c * plane..<(c + 1) * plane]); s.sort(); return s[plane / 2]
+        }
+        XCTAssertEqual(median(0), median(1), accuracy: 1e-4)
+        XCTAssertEqual(median(2), median(1), accuracy: 1e-4)
+        // green channel untouched
+        XCTAssertEqual(out.pixels[plane + 5], 0.10, accuracy: 1e-6)
+        // scaling clamps to [0,1]
+        XCTAssertLessThanOrEqual(out.pixels.max()!, 1.0)
+    }
+
+    func testNeutralizeBackgroundGrayscalePassthrough() {
+        let img = AstroImage(width: 2, height: 2, channels: 1,
+                             pixels: [0.1, 0.2, 0.3, 0.4], sourceIsLinear: true)
+        let out = AutoStretch.neutralizeBackground(img)
+        XCTAssertEqual(out.pixels, img.pixels)
+    }
+
+    func testNeutralizeBackgroundZeroMedianChannelUnscaled() {
+        // R median 0 → channel must be left unscaled (no divide-by-zero blowup)
+        let plane = 16
+        var px = [Float](repeating: 0, count: plane * 3)
+        for i in 0..<plane { px[plane + i] = 0.10; px[2 * plane + i] = 0.05 }
+        px[0] = 0.5
+        let img = AstroImage(width: 4, height: 4, channels: 3, pixels: px, sourceIsLinear: true)
+        let out = AutoStretch.neutralizeBackground(img)
+        XCTAssertEqual(out.pixels[0], 0.5, accuracy: 1e-6)
+    }
 }

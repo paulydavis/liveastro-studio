@@ -217,7 +217,8 @@ Manifest schema (per original brief):
 
 - **Integration-time correction at session end** (§5.5): not implemented; manifest JSON is hand-editable as a workaround. Revisit in v1.1.
 - **Folder-disappearance banner** (§7): watcher silently pauses and auto-resumes via its poll fallback; no UI feedback yet. Revisit in v1.1.
-- **AutoStretch background neutralization toggle**: real-data testing (2026-07-06) showed raw OSC data is green-dominant without white balance; the acquired-data import script neutralizes channel medians before stretch. If Siril livestack output proves unbalanced in the field, AutoStretch needs the same optional step. Revisit in v1.1.
+- **AutoStretch background neutralization toggle** — ~~Deferred from v1.~~ **Done in v1.1 (2026-07-07):** `AutoStretch.neutralizeBackground` scales R and B channel medians to match G before the midtone-transfer-function stretch; surfaced as a "Neutralize background (OSC white balance)" toggle in the Control window, default OFF; the toggle is disabled while a session is running and its value is captured at session start.
+- **FrameSelector replay cloud gate** — **Shipped in v1.1 (2026-07-07):** `FrameSelector.qualityGate` is always-on during `ReplayService.regenerate`; any snapshot whose linear background median deviates more than 50% from the rolling median of the last five accepted frames' medians is dropped; first and last snapshots are always kept; filtering runs before log-spaced keyframe selection so cloud passes do not corrupt the evolution video.
 - **Crash-resume offer on relaunch** (§7): manifest is crash-safe (atomic per snapshot); the relaunch flow is post-MVP.
 
 ## 9. Non-Goals for v1

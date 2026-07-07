@@ -57,6 +57,27 @@ public enum FrameSelector {
         }
     }
 
+    /// Quality-regression gate (spec §8.5 v1.1): drop snapshots whose linear background
+    /// median deviates sharply from the recent trend — the signature of a passing cloud.
+    /// Baseline = median of the last `baselineWindow` *accepted* medians, so a multi-frame
+    /// cloud band cannot drag the baseline up. First and last frames are always kept.
+    public static func qualityGate(medians: [Double],
+                                   deviationThreshold: Double = 0.5,
+                                   baselineWindow: Int = 5) -> [Int] {
+        guard medians.count > 2 else { return Array(medians.indices) }
+        var kept: [Int] = [0]
+        for i in 1..<(medians.count - 1) {
+            let window = kept.suffix(baselineWindow).map { medians[$0] }
+            let sorted = window.sorted()
+            let baseline = sorted[sorted.count / 2]
+            guard baseline > 1e-12 else { kept.append(i); continue }
+            let deviation = abs(medians[i] - baseline) / baseline
+            if deviation <= deviationThreshold { kept.append(i) }
+        }
+        kept.append(medians.count - 1)
+        return kept
+    }
+
     static func grayThumbnail(_ img: AstroImage, size: Int = 64) -> [Float] {
         let plane = img.width * img.height
         var out = [Float](repeating: 0, count: size * size)

@@ -50,6 +50,33 @@ public enum AutoStretch {
                           pixels: out, sourceIsLinear: false)
     }
 
+    /// Multiplicative background neutralization for OSC stacks (spec §8.5 v1.1).
+    /// Scales each non-green channel so its median matches the green channel's median.
+    /// Raw OSC sensors are green-dominant; this is the white-balance step Siril applies
+    /// during processing. Channel 1 is treated as the reference (G in RGB).
+    public static func neutralizeBackground(_ image: AstroImage) -> AstroImage {
+        guard image.channels == 3 else { return image }
+        let plane = image.width * image.height
+        func channelMedian(_ c: Int) -> Double {
+            var s = Array(image.pixels[c * plane..<(c + 1) * plane])
+            s.sort()
+            let mid = s.count / 2
+            return s.count % 2 == 0 ? Double(s[mid - 1] + s[mid]) / 2 : Double(s[mid])
+        }
+        let refMedian = channelMedian(1)
+        var out = image.pixels
+        for c in [0, 2] {
+            let med = channelMedian(c)
+            guard med > 1e-9 else { continue }
+            let scale = Float(refMedian / med)
+            for i in (c * plane)..<((c + 1) * plane) {
+                out[i] = min(max(out[i] * scale, 0), 1)
+            }
+        }
+        return AstroImage(width: image.width, height: image.height, channels: image.channels,
+                          pixels: out, sourceIsLinear: image.sourceIsLinear)
+    }
+
     /// Pack planar float image into an 8-bit CGImage (gray or RGBX).
     public static func makeCGImage(_ image: AstroImage) -> CGImage? {
         let w = image.width, h = image.height, plane = w * h

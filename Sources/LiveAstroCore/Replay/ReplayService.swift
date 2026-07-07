@@ -13,14 +13,16 @@ public enum ReplayService {
         let outputURL = sessionDirectory.appendingPathComponent("replay.mp4")
         let snapshots = manifest.snapshots
         guard !snapshots.isEmpty else { return outputURL }
-        let urls = snapshots.map { sessionDirectory.appendingPathComponent($0.snapshotFile) }
+        let gated = FrameSelector.qualityGate(medians: snapshots.map(\.median))
+        let survivors = gated.map { snapshots[$0] }
+        let urls = survivors.map { sessionDirectory.appendingPathComponent($0.snapshotFile) }
         let picked = try FrameSelector.selectSnapshots(urls: urls, maxKeyframes: maxKeyframes)
         let keyframes = picked.map { i in
             ReplayKeyframe(
                 imageURL: urls[i],
                 caption: "\(manifest.targetName) — " + IntegrationFormat.caption(
-                    seconds: snapshots[i].estimatedIntegrationSeconds,
-                    frames: snapshots[i].index,
+                    seconds: survivors[i].estimatedIntegrationSeconds,
+                    frames: survivors[i].index,
                     subSeconds: manifest.subExposureSeconds))
         }
         try ReplayGenerator(settings: replaySettings).render(keyframes: keyframes, to: outputURL)
