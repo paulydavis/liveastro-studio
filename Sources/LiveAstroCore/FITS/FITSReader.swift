@@ -55,7 +55,7 @@ public enum FITSReader {
         let bzero = cards["BZERO"].flatMap(Double.init) ?? 0
         let bottomUp = (cards["ROWORDER"] ?? "BOTTOM-UP").uppercased() != "TOP-DOWN"
         return FITSHeader(bitpix: bitpix, dims: dims, bscale: bscale, bzero: bzero,
-                          bottomUp: bottomUp, headerBytes: headerBytes!)
+                          bottomUp: bottomUp, headerBytes: headerBytes!, keywords: cards)
     }
 
     public static func read(_ data: Data) throws -> FITSImage {

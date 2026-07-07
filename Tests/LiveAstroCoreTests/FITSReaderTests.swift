@@ -79,6 +79,27 @@ final class FITSReaderTests: XCTestCase {
             XCTAssertEqual($0 as? FITSError, .truncatedData(expected: h.minimumFileSize, actual: truncated))
         }
     }
+
+    func testHeaderKeywordsCaptured() throws {
+        var header = ""
+        func card(_ s: String) { header += s.padding(toLength: 80, withPad: " ", startingAt: 0) }
+        card("SIMPLE  =                    T")
+        card("BITPIX  =                   16")
+        card("NAXIS   =                    2")
+        card("NAXIS1  =                    4")
+        card("NAXIS2  =                    2")
+        card("BZERO   =                32768")
+        card("BAYERPAT= 'GRBG    '")
+        card("DATE-OBS= '2026-07-06T22:04:40.123'")
+        card("END")
+        var data = header.data(using: .ascii)!
+        data.append(Data(repeating: 0x20, count: 2880 - data.count % 2880))
+        data.append(Data(repeating: 0, count: 16))
+        let h = try FITSReader.readHeader(data)
+        XCTAssertEqual(h.bayerPattern, "GRBG")
+        XCTAssertEqual(h.dateObs, "2026-07-06T22:04:40.123")
+        XCTAssertEqual(h.keywords["BITPIX"], "16")
+    }
 }
 
 /// Builds raw FITS headers for edge-case tests (FITSWriter covers the happy path).
