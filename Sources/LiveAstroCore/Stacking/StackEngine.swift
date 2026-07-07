@@ -21,6 +21,7 @@ public final class StackEngine {
     private var accumulator: StackAccumulator?
     private var referenceStars: [Star] = []
     private var referenceSize: (w: Int, h: Int)?
+    private var referenceChannels: Int?
     public private(set) var acceptedCount = 0
     public private(set) var rejectedCount = 0
 
@@ -34,6 +35,7 @@ public final class StackEngine {
         accumulator = nil
         referenceStars = []
         referenceSize = nil
+        referenceChannels = nil
     }
 
     public func currentStack() -> AstroImage? { accumulator?.mean() }
@@ -70,6 +72,7 @@ public final class StackEngine {
             accumulator = acc
             referenceStars = stars
             referenceSize = (raw.width, raw.height)
+            referenceChannels = rgb.channels
             acceptedCount += 1
             return .becameReference
         }
@@ -86,6 +89,10 @@ public final class StackEngine {
             return .rejected(.noTransform)
         }
         let rgb = displayRGB(frame)
+        guard rgb.channels == referenceChannels else {
+            rejectedCount += 1
+            return .rejected(.dimensionMismatch)
+        }
         let (warped, mask) = Warp.apply(rgb, transform: half.liftedToFullResolution())
         accumulator!.add(warped, mask: mask)
         acceptedCount += 1
