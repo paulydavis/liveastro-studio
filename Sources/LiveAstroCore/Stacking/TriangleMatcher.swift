@@ -40,6 +40,8 @@ public enum TriangleMatcher {
                                        maxTriangleStars: Int = 20,
                                        invariantTolerance: Double = 0.02,
                                        minVotes: Int = 2) -> [(source: Int, target: Int)] {
+        precondition(maxTriangleStars < 4096,
+                     "vote key encoding requires maxTriangleStars < 4096")
         let ts = triangles(source, maxStars: maxTriangleStars)
         let tt = triangles(target, maxStars: maxTriangleStars)
         guard !ts.isEmpty, !tt.isEmpty else { return [] }
