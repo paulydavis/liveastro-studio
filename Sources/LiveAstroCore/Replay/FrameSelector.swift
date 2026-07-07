@@ -68,7 +68,7 @@ public enum FrameSelector {
         var kept: [Int] = [0]
         for i in 1..<(medians.count - 1) {
             let window = kept.suffix(baselineWindow).map { medians[$0] }
-            var sorted = window.sorted()
+            let sorted = window.sorted()
             let baseline = sorted[sorted.count / 2]
             guard baseline > 1e-12 else { kept.append(i); continue }
             let deviation = abs(medians[i] - baseline) / baseline
