@@ -803,7 +803,7 @@ public enum TransformSolver {
 - Test: `Tests/LiveAstroCoreTests/WarpTests.swift`
 
 **Interfaces:**
-- Produces: `Warp.apply(_ image: AstroImage, transform: SimilarityTransform) -> (image: AstroImage, mask: [Float])` — output pixel `(x,y)` sampled from `transform.inverse().apply(x,y)`; `mask` is `width·height` floats in [0,1] (bilinear coverage; 0 outside the source footprint). Multi-channel supported.
+- Produces: `Warp.apply(_ image: AstroImage, transform: SimilarityTransform) -> (image: AstroImage, mask: [Float])` — output pixel `(x,y)` sampled from `transform.inverse().apply(x,y)`; `mask` is `width·height` floats — binary source-in-bounds indicator (1 where all bilinear taps are inside the source, 0 otherwise; the ~1 px partially-covered rim is deliberately dropped). Multi-channel supported.
 - Consumes: `SimilarityTransform` from Task 4.
 
 - [ ] **Step 1: Write failing tests**

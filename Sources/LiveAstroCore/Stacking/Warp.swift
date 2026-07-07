@@ -1,7 +1,10 @@
 import Foundation
 
-/// Inverse-mapped bilinear warp with coverage mask (spec §4.2). The mask lets the
-/// accumulator weight partial-overlap edges correctly instead of averaging in zeros.
+/// Inverse-mapped bilinear warp with a binary source-in-bounds mask (spec §4.2).
+/// mask[i] is 1 where every bilinear tap lands inside the source, 0 otherwise;
+/// the ~1 px partially-covered rim is deliberately dropped rather than given
+/// fractional weight — conservative edges beat partially-sampled ones. The mask
+/// lets the accumulator skip uncovered pixels instead of averaging in zeros.
 public enum Warp {
     public static func apply(_ image: AstroImage,
                              transform: SimilarityTransform) -> (image: AstroImage, mask: [Float]) {
