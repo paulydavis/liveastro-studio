@@ -44,4 +44,40 @@ final class FrameSelectorTests: XCTestCase {
         XCTAssertEqual(FrameSelector.thumbnailDifference(a, a), 0, accuracy: 1e-6)
         XCTAssertEqual(FrameSelector.thumbnailDifference(a, b), 0.6, accuracy: 0.01)
     }
+
+    func testQualityGateSkipsCloudSpike() {
+        // Slowly drifting background with a cloud spike at index 5 (0.02 → 0.06 = +200%)
+        let medians = [0.020, 0.020, 0.019, 0.019, 0.018, 0.060, 0.018, 0.018, 0.017, 0.017]
+        let kept = FrameSelector.qualityGate(medians: medians)
+        XCTAssertFalse(kept.contains(5))
+        XCTAssertEqual(kept.first, 0)
+        XCTAssertEqual(kept.last, medians.count - 1)
+        XCTAssertEqual(kept.count, medians.count - 1)
+    }
+
+    func testQualityGateCleanSequenceUntouched() {
+        // Normal stack: background drifts slowly downward as noise integrates out
+        let medians = (0..<20).map { 0.030 - Double($0) * 0.0005 }
+        XCTAssertEqual(FrameSelector.qualityGate(medians: medians), Array(0..<20))
+    }
+
+    func testQualityGateAlwaysKeepsFirstAndLast() {
+        // Final frame is itself a spike — kept anyway (it's the session's payoff frame)
+        let medians = [0.020, 0.020, 0.020, 0.020, 0.020, 0.080]
+        let kept = FrameSelector.qualityGate(medians: medians)
+        XCTAssertEqual(kept.last, 5)
+    }
+
+    func testQualityGateShortSequences() {
+        XCTAssertEqual(FrameSelector.qualityGate(medians: []), [])
+        XCTAssertEqual(FrameSelector.qualityGate(medians: [0.5]), [0])
+        XCTAssertEqual(FrameSelector.qualityGate(medians: [0.5, 5.0]), [0, 1])
+    }
+
+    func testQualityGateRecoversAfterCloudBand() {
+        // Multi-frame cloud band: indices 4...6 all spiked; baseline must not absorb them
+        let medians = [0.020, 0.020, 0.020, 0.020, 0.055, 0.060, 0.058, 0.020, 0.020, 0.020]
+        let kept = FrameSelector.qualityGate(medians: medians)
+        XCTAssertEqual(kept, [0, 1, 2, 3, 7, 8, 9])
+    }
 }
