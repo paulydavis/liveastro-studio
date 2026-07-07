@@ -12,18 +12,20 @@ public final class SessionPipeline {
     private let profile: SessionProfile
     private let replaySettings: ReplaySettings
     private let maxKeyframes: Int
+    private let neutralizeBackground: Bool
     private var recorder: SnapshotRecorder?
     private var consumeTask: Task<Void, Never>?
     private let consumeDone = DispatchSemaphore(value: 0)
 
     public init(watchFolder: URL, profile: SessionProfile, rootDirectory: URL,
                 replaySettings: ReplaySettings = .init(), maxKeyframes: Int = 45,
-                fileNamePrefix: String? = nil) {
+                fileNamePrefix: String? = nil, neutralizeBackground: Bool = false) {
         self.watcher = StackFileWatcher(folder: watchFolder, fileNamePrefix: fileNamePrefix)
         self.profile = profile
         self.session = SessionManager(rootDirectory: rootDirectory)
         self.replaySettings = replaySettings
         self.maxKeyframes = maxKeyframes
+        self.neutralizeBackground = neutralizeBackground
     }
 
     public func start() throws {
@@ -46,7 +48,8 @@ public final class SessionPipeline {
     private func handle(_ update: StackUpdate) {
         do {
             let linear = try ImageLoader.load(url: update.url)
-            let display = linear.sourceIsLinear ? AutoStretch.stretch(linear) : linear
+            let balanced = neutralizeBackground ? AutoStretch.neutralizeBackground(linear) : linear
+            let display = balanced.sourceIsLinear ? AutoStretch.stretch(balanced) : balanced
             guard let cg = AutoStretch.makeCGImage(display) else {
                 throw ImageLoaderError.decodeFailed("CGImage packing")
             }

@@ -16,6 +16,7 @@ final class AppModel {
     var notes = ""
 
     var fileNamePrefix = "live_stack"
+    var neutralizeBackground = false
     var watchFolder: URL?
     var isRunning = false
     var latestImage: CGImage?
@@ -49,7 +50,8 @@ final class AppModel {
         let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("LiveAstro", isDirectory: true)
         let p = SessionPipeline(watchFolder: folder, profile: profile, rootDirectory: root,
-                               fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
+                               fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
+                               neutralizeBackground: neutralizeBackground)
         p.onUpdate = { [weak self] image, record in
             Task { @MainActor in
                 self?.latestImage = image

@@ -17,6 +17,8 @@ struct ControlView: View {
                 }
                 TextField("File name starts with (empty = any)", text: $model.fileNamePrefix)
                     .disabled(model.isRunning)
+                Toggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground)
+                    .disabled(model.isRunning)
             }
             Section("Session Profile") {
                 TextField("Target name", text: $model.targetName)
