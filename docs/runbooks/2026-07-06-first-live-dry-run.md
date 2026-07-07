@@ -8,6 +8,28 @@
 
 Known-good facts from today's recon: Seestar SMB share is always-on in Station Mode (no app setting) — guest, share name `EMMC Images`, host `seestar.local` (was 192.168.1.28; may change after power cycle). RTSP port 4554 only opens while the camera is active.
 
+## Hard-won gotchas (learned live on 2026-07-06 — read before every session)
+
+1. **Siril CWD bug:** before arming livestacking, run `cd /full/path/to/watch/folder` in
+   Siril's command line (or navigate there in its file browser). A restarted Siril
+   restores the working directory in the header bar but not the *process* CWD, and then
+   rejects every file with "File not supported for live stacking". Full analysis:
+   `docs/upstream/siril-livestack-cwd-bug.md`.
+2. **Siril 1.4.4 writes numbered revisions** — `live_stack_00001.fit`, `_00002.fit`, … —
+   not a single rewritten `live_stack.fit`. LiveAstro's default filter `live_stack`
+   matches both forms and excludes `r_live_stack_*` registered frames; leave it alone.
+3. **Delivery into the watch folder must be a fast local `cp`** (stage the slow SMB pull
+   outside first — `seestar_relay.sh` now does this). Direct SMB copies give Siril
+   truncated FITS; rsync's temp+rename is invisible to it; `mv` is rejected.
+4. **Order when (re)starting livestack:** stop livestack → wipe/prepare the folder →
+   arm livestack → seed the first sub. Deleting `live_stack_00001.fit` while armed
+   breaks the sequence numbering and stalls stacking.
+5. **Reference frame matters:** the first sub seeds registration. If it was fog/cloud,
+   stacking accepts nothing afterward — wipe and reseed with a clean recent sub
+   (relay's `marker` argument skips the bad early files).
+6. **Siril hangs on quit mid-livestack.** Stop livestacking first; if it beachballs,
+   `kill -9` it — the numbered outputs already on disk are safe.
+
 ---
 
 ## Phase 0 — Daylight prep (any time before dark)
@@ -46,15 +68,15 @@ ls ~/seestar_mnt/MyWorks/          # find tonight's exact folder name
 ~/Desktop/liveastro-studio/Scripts/seestar_relay.sh \
     ~/seestar_mnt/MyWorks/"NGC 7000_sub" ~/Desktop/livestack_live
 ```
-(If `seestar.local` doesn't resolve, get the IP from the app's RTSP Get dialog and use it in place of the hostname.)
+(If `seestar.local` doesn't resolve, get the IP from the app's RTSP Get dialog and use it in place of the hostname. To skip earlier bad subs, pass a 4th arg: the last filename to ignore.)
 
 - [ ] Relay counter starts climbing within one sub cadence
 
 Siril:
-- [ ] Open Siril → hamburger menu → **Livestacking**
-- [ ] Watch folder: `~/Desktop/livestack_live`
+- [ ] Open Siril → **command line at the bottom** → `cd /Users/<you>/Desktop/livestack_live` (gotcha #1 — do this every launch)
+- [ ] Hamburger menu → **Livestacking**
 - [ ] **Debayer ON** (subs are GRBG OSC), registration on → Start
-- [ ] Confirm `live_stack.fit` appears in `~/Desktop/livestack_live` after 1–2 subs
+- [ ] Confirm numbered `live_stack_00001.fit` appears in `~/Desktop/livestack_live` after 1–2 subs (gotcha #2)
 
 Terminal 2 — LiveAstro:
 ```
@@ -105,8 +127,10 @@ Scene additions (build once, reuse):
 |---|---|
 | SMB mount refuses | Use IP instead of seestar.local; power-cycle Seestar re-joins Station Mode |
 | Relay copies nothing | Check exact folder name (`ls ~/seestar_mnt/MyWorks/`) — target name in app sets it |
+| Siril rejects every file: "File not supported for live stacking" | Gotcha #1 — `cd` to the watch folder in Siril's command line, restart livestack |
 | Siril livestack won't start / errors | Fall back: skip Siril; LiveAstro can't stack, so stream RTSP + camera only; after the session run `Scripts/build_session_from_subs.py` (edit SRC/OUT paths) for the replay |
-| live_stack.fit appears but LiveAstro silent | Check filter field says `live_stack`; check control-window log for skip errors |
+| live_stack files appear but LiveAstro silent | Check filter field says `live_stack`; check control-window log for skip errors |
+| Stack count stops climbing after folder cleanup | Gotcha #4 — stop livestack, wipe folder, re-arm, reseed (never delete revisions while armed) |
 | RTSP won't connect in OBS | Get the address again while actively imaging (port closes when idle) |
 | Stream stutters | OBS Settings → Output → lower bitrate to 4500 Kbps; house upload may be modest |
 | Clouds win completely | Everything above minus sky: it's still a full rig rehearsal, and fakesiril can stand in |

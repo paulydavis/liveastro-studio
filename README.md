@@ -22,9 +22,16 @@ swift run LiveAstroStudio
 
 1. Choose the folder Siril's livestack writes into.
 2. Fill in the session profile (target, scope, camera, sub length…). For OSC cameras, enable **Neutralize background (OSC white balance)** to scale R and B channel medians to G before stretching — useful when your live-stack output looks green-dominant. The toggle is off by default and locks once a session starts.
-3. The **File name starts with** field defaults to `live_stack` — this matches Siril's
-   `live_stack.fit` output and ignores raw sub-exposures that land in the same folder.
+3. The **File name starts with** field defaults to `live_stack` — this matches both
+   Siril's classic in-place `live_stack.fit` and the numbered `live_stack_00001.fit`
+   revisions Siril 1.4+ writes, while ignoring raw sub-exposures and `r_live_stack_*`
+   registered frames that land in the same folder.
    Clear the field (or leave it blank) when pointing at a folder of arbitrary display-ready images.
+
+> **Siril tip:** after launching Siril, run `cd /path/to/your/watch/folder` in its
+> command line before starting livestacking. A freshly launched Siril otherwise
+> rejects every file with "File not supported for live stacking" (stat against the
+> wrong process CWD — see `docs/upstream/siril-livestack-cwd-bug.md`).
 4. Open the Broadcast Window; in OBS add a **Window Capture** for "LiveAstro Broadcast".
 5. Start Session. Stream from OBS as usual.
 6. End Session → `~/Documents/LiveAstro/<session>/replay.mp4`. The replay cloud gate automatically drops frames whose background brightness deviates more than 50% from the recent accepted-frame baseline before keyframe selection — first and last frames are always kept, so passing clouds do not corrupt the evolution video.
