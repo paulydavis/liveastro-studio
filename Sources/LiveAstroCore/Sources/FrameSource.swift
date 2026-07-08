@@ -14,3 +14,11 @@ public struct RawFrame {
         self.timestamp = timestamp; self.sourceName = sourceName
     }
 }
+
+/// A source of raw frames; implementations include folder import and live watch (spec §4.1).
+public protocol FrameSource: AnyObject {
+    /// Emits raw frames as available; finishes when the source ends (import) or stop() is called.
+    var frames: AsyncStream<RawFrame> { get }
+    func start() throws
+    func stop()
+}
