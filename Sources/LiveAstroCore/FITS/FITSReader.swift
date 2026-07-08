@@ -58,7 +58,10 @@ public enum FITSReader {
                           bottomUp: bottomUp, headerBytes: headerBytes!, keywords: cards)
     }
 
-    public static func read(_ data: Data) throws -> FITSImage {
+    /// `normalizeRowOrder`: true (default) flips bottom-up files to top-down for
+    /// display consumers; false returns pixels exactly as stored — required by CFA
+    /// consumers (debayering a flipped mosaic shifts the Bayer phase and swaps R/B).
+    public static func read(_ data: Data, normalizeRowOrder: Bool = true) throws -> FITSImage {
         let h = try readHeader(data)
         guard data.count >= h.minimumFileSize else {
             throw FITSError.truncatedData(expected: h.minimumFileSize, actual: data.count)
@@ -100,7 +103,7 @@ public enum FITSReader {
         // Clamp all pixel values to normalized 0…1 range (FITSImage contract)
         for i in 0..<n { px[i] = min(max(px[i], 0), 1) }
 
-        if h.bottomUp {
+        if h.bottomUp && normalizeRowOrder {
             let plane = h.width * h.height
             for c in 0..<h.channels {
                 for row in 0..<(h.height / 2) {

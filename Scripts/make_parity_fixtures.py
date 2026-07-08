@@ -92,11 +92,12 @@ def write_fixture(path: Path, crop_f32: np.ndarray, hdr: fits.Header) -> int:
     return size
 
 
-def superpixel_lum(data: np.ndarray) -> np.ndarray:
-    """4-pixel average superpixel luminance in STORED (bottom-up) order.
+def superpixel_lum(data: np.ndarray, bottom_up: bool = True) -> np.ndarray:
+    """4-pixel superpixel luminance in DISPLAY orientation (StackEngine parity).
 
-    Formula: (G1 + R + B + G2) / 4  — identical to StackEngine's CFA average.
-    No row flip applied; see module docstring for why this matches Swift behavior.
+    Superpixels are built from STORED-order CFA — (G1 + R + B + G2) / 4, identical
+    to StackEngine's CFA average — then rows are flipped when the source is
+    bottom-up, exactly like StackEngine's srcRow = hh-1-j display flip.
     """
     g1 = data[0::2, 0::2]  # GRBG: G at even-row, even-col
     r  = data[0::2, 1::2]  # R  at even-row, odd-col
@@ -104,7 +105,8 @@ def superpixel_lum(data: np.ndarray) -> np.ndarray:
     g2 = data[1::2, 1::2]  # G  at odd-row,  odd-col
     h = min(g1.shape[0], r.shape[0], b.shape[0], g2.shape[0])
     w = min(g1.shape[1], r.shape[1], b.shape[1], g2.shape[1])
-    return (g1[:h, :w] + r[:h, :w] + b[:h, :w] + g2[:h, :w]) / 4.0
+    lum = (g1[:h, :w] + r[:h, :w] + b[:h, :w] + g2[:h, :w]) / 4.0
+    return lum[::-1] if bottom_up else lum
 
 
 def extract_transform(tf) -> tuple[float, float, float, float]:
@@ -172,7 +174,7 @@ def main() -> None:
     json_path = OUT_DIR / "parity_expected.json"
     json_path.write_text(json.dumps(expected, indent=2))
     print(f"  wrote {json_path.name}")
-    print("\nOrientation: STORED (bottom-up) — matches StackEngine double-flip for no-ROWORDER files.")
+    print("\nOrientation: DISPLAY (top-down) — matches StackEngine flip for bottom-up sources.")
 
 
 if __name__ == "__main__":

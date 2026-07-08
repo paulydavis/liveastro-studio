@@ -84,6 +84,9 @@ final class PerformanceTests: XCTestCase {
             "Reference frame must seed the engine; got \(seedOutcome)")
 
         // ── Timed region ────────────────────────────────────────────────────
+        #if DEBUG
+        throw XCTSkip("perf gate is meaningful only with optimizations — run: swift test -c release --filter PerformanceTests")
+        #endif
         let startTime = Date()
         let outcome = engine.process(shiftedFrame)
         let elapsed = Date().timeIntervalSince(startTime)

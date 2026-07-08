@@ -9,11 +9,7 @@ import XCTest
 // Orientation note
 // ----------------
 // The fixture files have no ROWORDER header, so FITSReader.read() defaults
-// to bottomUp = true and flips the pixel rows to top-down on load.
-// FolderFrameSource.loadRawFrame() stores these already-flipped pixels in
 // RawFrame.image, keeping RawFrame.bottomUp = true.  StackEngine's luminance
-// loop uses  srcRow = hh − 1 − j  (when bottomUp), which re-flips them back
-// to stored (bottom-up) order.  Net effect: double flip = identity.  The
 // luminance seen by StarDetector is therefore in STORED (bottom-up) order,
 // matching the orientation in parity_expected.json.
 // ---------------------------------------------------------------------------
@@ -33,8 +29,8 @@ final class ParityTests: XCTestCase {
     // MARK: – Helpers
 
     /// Build the same half-res superpixel luminance StackEngine builds.
-    /// When bottomUp is true the row-read order is reversed, so the net
-    /// effect for files loaded via loadRawFrame (which already flipped) is
+    /// When bottomUp is true the row-read order is reversed — mirroring
+    /// StackEngine's display-orientation flip over stored-order frames.
     /// stored (bottom-up) order — identical to the Python fixture script.
     private func buildLuminance(frame: RawFrame) -> ([Float], Int, Int) {
         let raw = frame.image

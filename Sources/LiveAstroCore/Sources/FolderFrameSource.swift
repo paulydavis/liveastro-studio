@@ -87,7 +87,7 @@ public final class FolderFrameSource: FrameSource {
         let bottomUp = header.bottomUp
         let dateObs = header.dateObs
 
-        let fitsImage = try FITSReader.read(data)
+        let fitsImage = try FITSReader.read(data, normalizeRowOrder: false)
         let image = AstroImage(width: fitsImage.width, height: fitsImage.height,
                                channels: fitsImage.channels, pixels: fitsImage.pixels,
                                sourceIsLinear: true)

@@ -54,4 +54,50 @@ final class FolderFrameSourceTests: XCTestCase {
         source.stop()
         XCTAssertEqual(got?.sourceName, "Light_live_001.fit")
     }
+
+    /// Regression: a BOTTOM-UP GRBG file must reach the engine in STORED row order —
+    /// FITSReader's display flip would shift the Bayer phase and swap R/B (the
+    /// 2026-07-06 "cyan nebula" bug class). Pins loadRawFrame to raw stored bytes.
+    func testLoadRawFrameKeepsBottomUpStoredOrder() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // Hand-craft a 4x4 16-bit FITS: ROWORDER=BOTTOM-UP, BAYERPAT=GRBG.
+        // Stored pixel value = row index (0,1,2,3) so any flip is detectable.
+        var header = ""
+        func card(_ c: String) { header += c.padding(toLength: 80, withPad: " ", startingAt: 0) }
+        card("SIMPLE  =                    T")
+        card("BITPIX  =                   16")
+        card("NAXIS   =                    2")
+        card("NAXIS1  =                    4")
+        card("NAXIS2  =                    4")
+        card("BZERO   =                32768")
+        card("BSCALE  =                    1")
+        card("ROWORDER= 'BOTTOM-UP'")
+        card("BAYERPAT= 'GRBG    '")
+        card("END")
+        var data = header.padding(toLength: 2880, withPad: " ", startingAt: 0).data(using: .ascii)!
+        for row in 0..<4 {
+            for _ in 0..<4 {
+                // physical value row*8192 -> stored int16 = row*8192 - 32768, big-endian
+                let stored = Int16(row * 8192 - 32768)
+                var be = UInt16(bitPattern: stored).bigEndian
+                withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
+            }
+        }
+        data.append(Data(repeating: 0, count: 2880 - 32))
+        let url = dir.appendingPathComponent("bottomup.fit")
+        try data.write(to: url)
+
+        let frame = try FolderFrameSource.loadRawFrame(url: url)
+        XCTAssertTrue(frame.bottomUp)
+        XCTAssertEqual(frame.bayerPattern, .grbg)
+        // STORED order: row 0 must hold the smallest value, row 3 the largest.
+        let px = frame.image.pixels
+        XCTAssertLessThan(px[0], px[3 * 4])
+        XCTAssertEqual(px[0], 0.0, accuracy: 1e-4)                    // row 0 as stored
+        XCTAssertEqual(px[3 * 4], Float(3 * 8192) / 65535, accuracy: 1e-4) // row 3 as stored
+    }
 }
