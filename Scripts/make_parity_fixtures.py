@@ -8,16 +8,14 @@ of expected transform values.
 
 Orientation notes
 -----------------
-FITSReader.read() flips pixel rows when ROWORDER is absent (defaults BOTTOM-UP).
-FolderFrameSource.loadRawFrame() stores the already-flipped (top-down) pixels in
-RawFrame.image, but leaves RawFrame.bottomUp = True.  StackEngine's luminance loop
-then re-flips via  srcRow = hh - 1 - j  (when bottomUp is True), undoing the first
-flip.  Net result for real files with no ROWORDER header: StackEngine luminance is
-in STORED (bottom-up) order.
+FolderFrameSource.loadRawFrame() reads pixels in STORED order (FITSReader.read
+with normalizeRowOrder: false — debayering a flipped CFA shifts the Bayer phase).
+StackEngine builds its registration luminance in DISPLAY orientation: superpixels
+from the stored-order CFA, rows flipped via srcRow = hh - 1 - j when bottomUp.
 
-This script therefore builds superpixel luminance WITHOUT any additional row flip,
-matching the double-flip → identity that StackEngine applies.  The orientation of
-the expected transform coordinates is STORED (bottom-up).
+This script mirrors that exactly: superpixel_lum() flips rows for bottom-up
+sources (ROWORDER absent defaults to BOTTOM-UP). The expected transform
+coordinates are therefore in DISPLAY (top-down) orientation.
 """
 
 import json
@@ -141,10 +139,10 @@ def main() -> None:
     if size_a > limit or size_b > limit:
         sys.exit(f"ERROR: fixture exceeds 3 MB — a={size_a}, b={size_b}")
 
-    # Build superpixel luminance in STORED order (matches StackEngine)
+    # Build superpixel luminance in DISPLAY orientation (StackEngine parity) (matches StackEngine)
     lum_a = superpixel_lum(crop_a)
     lum_b = superpixel_lum(crop_b)
-    print(f"Luminance shape: {lum_a.shape} (STORED/bottom-up orientation)")
+    print(f"Luminance shape: {lum_a.shape} (DISPLAY/top-down orientation)")
 
     print("Running astroalign.find_transform(A → B)…")
     try:

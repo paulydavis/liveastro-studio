@@ -72,6 +72,9 @@ final class PerformanceTests: XCTestCase {
     /// The reference frame seeds the engine, then we time one process() call on
     /// a copy shifted by (5, 3) pixels.  Wall-clock limit: 10 seconds.
     func testProcess26MPPerformanceGate() throws {
+        #if DEBUG
+        throw XCTSkip("perf gate is meaningful only with optimizations — run: swift test -c release --filter PerformanceTests")
+        #endif
         let width = 6248, height = 4176   // even dimensions, GRBG-safe
 
         // Build reference and shifted frames (outside the timed region).
@@ -84,9 +87,6 @@ final class PerformanceTests: XCTestCase {
             "Reference frame must seed the engine; got \(seedOutcome)")
 
         // ── Timed region ────────────────────────────────────────────────────
-        #if DEBUG
-        throw XCTSkip("perf gate is meaningful only with optimizations — run: swift test -c release --filter PerformanceTests")
-        #endif
         let startTime = Date()
         let outcome = engine.process(shiftedFrame)
         let elapsed = Date().timeIntervalSince(startTime)
