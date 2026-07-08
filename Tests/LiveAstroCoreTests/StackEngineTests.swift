@@ -74,6 +74,18 @@ final class StackEngineTests: XCTestCase {
         XCTAssertEqual(engine.process(small), .rejected(.dimensionMismatch))
     }
 
+    /// Regression (F2b): a degenerate 1×N frame used to crash star detection instead
+    /// of being rejected up front.
+    func testDegenerateFrameRejectedWithoutCrash() {
+        let engine = StackEngine()
+        let img = AstroImage(width: 1, height: 8, channels: 1,
+                             pixels: [Float](repeating: 0.5, count: 8), sourceIsLinear: true)
+        let frame = RawFrame(image: img, bayerPattern: nil, bottomUp: false,
+                             timestamp: Date(timeIntervalSince1970: 0), sourceName: "thin.fit")
+        XCTAssertEqual(engine.process(frame), .rejected(.dimensionMismatch))
+        XCTAssertEqual(engine.rejectedCount, 1)
+    }
+
     func testBottomUpFrameFlipped() {
         // Same field delivered bottom-up must land at flipped y in the stack
         let engine = StackEngine()

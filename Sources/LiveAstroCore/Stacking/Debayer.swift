@@ -3,6 +3,8 @@ import Foundation
 public enum BayerPattern: String {
     case grbg = "GRBG"
     case rggb = "RGGB"
+    case bggr = "BGGR"
+    case gbrg = "GBRG"
 
     public init?(headerValue: String?) {
         guard let v = headerValue?.trimmingCharacters(in: .whitespaces).uppercased(),
@@ -15,6 +17,8 @@ public enum BayerPattern: String {
         switch self {
         case .grbg: return (row % 2 == 0) ? (col % 2 == 0 ? 1 : 0) : (col % 2 == 0 ? 2 : 1)
         case .rggb: return (row % 2 == 0) ? (col % 2 == 0 ? 0 : 1) : (col % 2 == 0 ? 1 : 2)
+        case .bggr: return (row % 2 == 0) ? (col % 2 == 0 ? 2 : 1) : (col % 2 == 0 ? 1 : 0)
+        case .gbrg: return (row % 2 == 0) ? (col % 2 == 0 ? 1 : 2) : (col % 2 == 0 ? 0 : 1)
         }
     }
 }

@@ -64,6 +64,14 @@ public enum TransformSolver {
         guard best.count >= minMatches,
               let refined = fit(source: source, target: target, pairs: best[...])
         else { return nil }
+        // The refined least-squares fit can drift off the consensus set — re-validate:
+        // it must still explain >= minMatches of the original pairs within tolerance.
+        guard inliers(refined, source: source, target: target,
+                      pairs: pairs, tolerance: inlierTolerance).count >= minMatches
+        else { return nil }
+        // Sanity bound: frames come from the same optical train during one session, so
+        // true scale is ~1. A refined scale outside [0.5, 2.0] is a degenerate/false fit.
+        guard refined.scale >= 0.5, refined.scale <= 2.0 else { return nil }
         return refined
     }
 }

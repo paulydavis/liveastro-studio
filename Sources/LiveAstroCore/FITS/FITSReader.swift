@@ -54,6 +54,18 @@ public enum FITSReader {
             dims.append(c)
         }
         guard dims[0] > 0, dims[1] > 0 else { throw FITSError.malformedHeader("non-positive dimensions") }
+        // Sanity: reject implausible axes and any pixel-count/byte-size that would
+        // overflow Int (dataBytes/minimumFileSize compute dims.reduce(1,*) * |BITPIX|/8
+        // with trapping arithmetic — validate here with checked multiplies instead).
+        guard dims.allSatisfy({ $0 <= 100_000 }) else {
+            throw FITSError.malformedHeader("implausible dimensions")
+        }
+        var totalBytes = abs(bitpix) / 8
+        for d in dims {
+            let (product, overflow) = totalBytes.multipliedReportingOverflow(by: d)
+            guard !overflow else { throw FITSError.malformedHeader("implausible dimensions") }
+            totalBytes = product
+        }
         let bscale = cards["BSCALE"].flatMap(Double.init) ?? 1
         let bzero = cards["BZERO"].flatMap(Double.init) ?? 0
         let bottomUp = (cards["ROWORDER"] ?? "BOTTOM-UP").uppercased() != "TOP-DOWN"
@@ -134,8 +146,10 @@ public enum FITSReader {
                 preconditionFailure("validated in readHeader")
             }
         }
-        // Clamp all pixel values to normalized 0…1 range (FITSImage contract)
-        for i in 0..<n { px[i] = min(max(px[i], 0), 1) }
+        // Clamp all pixel values to normalized 0…1 range (FITSImage contract).
+        // Swift's min/max do NOT clamp NaN (comparisons with NaN are false), so
+        // non-finite samples (NaN/±Inf from BITPIX -32/-64 data) map to 0 explicitly.
+        for i in 0..<n { px[i] = px[i].isFinite ? min(max(px[i], 0), 1) : 0 }
 
         if h.bottomUp && normalizeRowOrder {
             let plane = h.width * h.height

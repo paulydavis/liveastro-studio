@@ -129,7 +129,8 @@ public final class FolderFrameSource: FrameSource {
                     }
                     return true
                 }
-                .sorted()
+                // Numeric-aware order so Light_2 precedes Light_10 (capture sequence order).
+                .sorted { $0.compare($1, options: [.numeric, .caseInsensitive]) == .orderedAscending }
                 .map { folder.appendingPathComponent($0) }
         }
     }

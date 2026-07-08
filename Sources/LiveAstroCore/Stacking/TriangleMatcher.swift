@@ -27,7 +27,9 @@ public enum TriangleMatcher {
                     let (l1, l2, l3) = (sides[0].0, sides[1].0, sides[2].0)
                     guard l1 > 4 else { continue }                    // degenerate / same blob
                     let inv = (l2 / l1, l3 / l2)
-                    guard inv.0 < 20, inv.1 < 20 else { continue }    // near-collinear
+                    // Reject needle-like triangles (extreme side ratios) whose
+                    // invariants are noise-dominated.
+                    guard inv.0 < 20, inv.1 < 20 else { continue }
                     out.append(Triangle(vertices: (sides[0].1, sides[1].1, sides[2].1),
                                         invariant: inv))
                 }

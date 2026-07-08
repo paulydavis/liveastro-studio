@@ -27,6 +27,24 @@ final class FolderFrameSourceTests: XCTestCase {
         XCTAssertEqual(names, ["Light_A_001.fit", "Light_B_002.fit"])
     }
 
+    /// Regression (F6): plain lexicographic sort put Light_10 before Light_2;
+    /// import order must be numeric-aware (capture sequence order).
+    func testImportOnceSortsNumerically() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        _ = try writeFITS(dir, name: "Light_2.fit", value: 0.2)
+        _ = try writeFITS(dir, name: "Light_10.fit", value: 0.3)
+        _ = try writeFITS(dir, name: "Light_1.fit", value: 0.1)
+
+        let source = FolderFrameSource(folder: dir, mode: .importOnce, fileNamePrefix: "Light_")
+        try source.start()
+        var names: [String] = []
+        for await frame in source.frames { names.append(frame.sourceName) }
+        XCTAssertEqual(names, ["Light_1.fit", "Light_2.fit", "Light_10.fit"])
+    }
+
     func testLoadRawFrameKeepsStoredOrderAndMetadata() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

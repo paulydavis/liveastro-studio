@@ -48,6 +48,10 @@ public final class StackFileWatcher {
         let src = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: folderFD, eventMask: [.write, .extend], queue: queue)
         src.setEventHandler { [weak self] in self?.scheduleScan() }
+        // Apple's DispatchSource contract: the watched fd must stay open until the
+        // source's cancellation handler runs — closing it earlier races the kqueue.
+        let fd = folderFD
+        src.setCancelHandler { close(fd) }
         src.resume()
         source = src
 
@@ -60,9 +64,10 @@ public final class StackFileWatcher {
     }
 
     public func stop() {
+        // The fd is closed by the source's cancel handler, never here (see start()).
         source?.cancel(); source = nil
         pollTimer?.cancel(); pollTimer = nil
-        if folderFD >= 0 { close(folderFD); folderFD = -1 }
+        folderFD = -1
         continuation.finish()
     }
 

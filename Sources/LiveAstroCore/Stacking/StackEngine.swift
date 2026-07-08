@@ -57,6 +57,12 @@ public final class StackEngine {
     public func process(_ frame: RawFrame) -> StackOutcome {
         lock.lock(); defer { lock.unlock() }
         let raw = frame.image
+        // Degenerate frames (a half-res luminance needs at least a 2×2 source) would
+        // crash star detection / superpixel binning — reject before any luminance work.
+        guard raw.width >= 2, raw.height >= 2 else {
+            rejectedCount += 1
+            return .rejected(.dimensionMismatch)
+        }
         if let size = referenceSize, size != (raw.width, raw.height) {
             rejectedCount += 1
             return .rejected(.dimensionMismatch)

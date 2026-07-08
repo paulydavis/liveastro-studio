@@ -80,6 +80,42 @@ final class FITSReaderTests: XCTestCase {
         }
     }
 
+    /// Regression (F1): Swift's min/max do not clamp NaN, so non-finite float samples
+    /// used to survive the 0…1 clamp and poison downstream stacking arithmetic.
+    func testNonFiniteFloat32SamplesClampToZero() throws {
+        var data = FITSTestBuilder.header(cards: [
+            ("SIMPLE", "T"), ("BITPIX", "-32"), ("NAXIS", "2"),
+            ("NAXIS1", "4"), ("NAXIS2", "1"),
+        ])
+        for v: Float in [.nan, .infinity, 0.5, -0.25] {
+            var be = v.bitPattern.bigEndian
+            withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
+        }
+        data.append(Data(repeating: 0, count: 2880 - 16)) // pad data block
+        let img = try FITSReader.read(data)
+        for v in img.pixels {
+            XCTAssertTrue(v.isFinite, "output must contain only finite values")
+            XCTAssertGreaterThanOrEqual(v, 0)
+            XCTAssertLessThanOrEqual(v, 1)
+        }
+        XCTAssertEqual(img.pixels[0], 0)                          // NaN → 0
+        XCTAssertEqual(img.pixels[1], 0)                          // +Inf → 0
+        XCTAssertEqual(img.pixels[2], 0.5, accuracy: 1e-6)        // finite passes through
+        XCTAssertEqual(img.pixels[3], 0)                          // negative clamps to 0
+    }
+
+    /// Regression (F3): astronomically large NAXIS values used to trap on overflow in
+    /// dataBytes/minimumFileSize instead of throwing.
+    func testImplausibleDimensionsThrowInsteadOfTrapping() {
+        let data = FITSTestBuilder.header(cards: [
+            ("SIMPLE", "T"), ("BITPIX", "16"), ("NAXIS", "2"),
+            ("NAXIS1", "4000000000"), ("NAXIS2", "4000000000"),
+        ])
+        XCTAssertThrowsError(try FITSReader.readHeader(data)) {
+            XCTAssertEqual($0 as? FITSError, .malformedHeader("implausible dimensions"))
+        }
+    }
+
     func testHeaderKeywordsCaptured() throws {
         var header = ""
         func card(_ s: String) { header += s.padding(toLength: 80, withPad: " ", startingAt: 0) }

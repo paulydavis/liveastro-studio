@@ -51,4 +51,12 @@ final class StarDetectorTests: XCTestCase {
         let field = [Float](repeating: 0.05, count: 256 * 256)
         XCTAssertEqual(StarDetector.detect(luminance: field, width: 256, height: 256).count, 0)
     }
+
+    /// Regression (F2a): zero-dimension input used to trap on `vals[vals.count / 2]`
+    /// with an empty per-cell sample list.
+    func testZeroDimensionInputReturnsEmpty() {
+        XCTAssertEqual(StarDetector.detect(luminance: [], width: 0, height: 4), [])
+        XCTAssertEqual(StarDetector.detect(luminance: [], width: 4, height: 0), [])
+        XCTAssertEqual(StarDetector.detect(luminance: [], width: 0, height: 0), [])
+    }
 }

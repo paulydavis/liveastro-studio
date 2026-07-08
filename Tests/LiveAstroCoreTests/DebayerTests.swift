@@ -5,6 +5,8 @@ final class DebayerTests: XCTestCase {
     func testPatternParse() {
         XCTAssertEqual(BayerPattern(headerValue: " grbg "), .grbg)
         XCTAssertEqual(BayerPattern(headerValue: "RGGB"), .rggb)
+        XCTAssertEqual(BayerPattern(headerValue: "BGGR"), .bggr)
+        XCTAssertEqual(BayerPattern(headerValue: " gbrg "), .gbrg)
         XCTAssertNil(BayerPattern(headerValue: "XTRANS"))
         XCTAssertNil(BayerPattern(headerValue: nil))
     }
@@ -31,6 +33,42 @@ final class DebayerTests: XCTestCase {
                                                    pixels: px, sourceIsLinear: true), pattern: .grbg)
         let plane = 16
         // Every output pixel of each channel equals that channel's constant
+        for i in 0..<plane {
+            XCTAssertEqual(rgb.pixels[i], 0.8, accuracy: 1e-5)             // R
+            XCTAssertEqual(rgb.pixels[plane + i], 0.4, accuracy: 1e-5)     // G
+            XCTAssertEqual(rgb.pixels[2 * plane + i], 0.2, accuracy: 1e-5) // B
+        }
+    }
+
+    /// Regression (F4): BGGR support. Rows: [B G B G], [G R G R], ...
+    func testBGGRSiteValuesPreserved() {
+        var px = [Float](repeating: 0, count: 16)
+        for y in 0..<4 { for x in 0..<4 {
+            let isB = (y % 2 == 0 && x % 2 == 0)
+            let isR = (y % 2 == 1 && x % 2 == 1)
+            px[y * 4 + x] = isR ? 0.8 : (isB ? 0.2 : 0.4)
+        }}
+        let rgb = Debayer.bilinear(cfa: AstroImage(width: 4, height: 4, channels: 1,
+                                                   pixels: px, sourceIsLinear: true), pattern: .bggr)
+        let plane = 16
+        for i in 0..<plane {
+            XCTAssertEqual(rgb.pixels[i], 0.8, accuracy: 1e-5)             // R
+            XCTAssertEqual(rgb.pixels[plane + i], 0.4, accuracy: 1e-5)     // G
+            XCTAssertEqual(rgb.pixels[2 * plane + i], 0.2, accuracy: 1e-5) // B
+        }
+    }
+
+    /// Regression (F4): GBRG support. Rows: [G B G B], [R G R G], ...
+    func testGBRGSiteValuesPreserved() {
+        var px = [Float](repeating: 0, count: 16)
+        for y in 0..<4 { for x in 0..<4 {
+            let isB = (y % 2 == 0 && x % 2 == 1)
+            let isR = (y % 2 == 1 && x % 2 == 0)
+            px[y * 4 + x] = isR ? 0.8 : (isB ? 0.2 : 0.4)
+        }}
+        let rgb = Debayer.bilinear(cfa: AstroImage(width: 4, height: 4, channels: 1,
+                                                   pixels: px, sourceIsLinear: true), pattern: .gbrg)
+        let plane = 16
         for i in 0..<plane {
             XCTAssertEqual(rgb.pixels[i], 0.8, accuracy: 1e-5)             // R
             XCTAssertEqual(rgb.pixels[plane + i], 0.4, accuracy: 1e-5)     // G

@@ -12,6 +12,7 @@ public enum StarDetector {
     public static func detect(luminance: [Float], width: Int, height: Int,
                               maxStars: Int = 60, sigmaThreshold: Double = 5.0) -> [Star] {
         precondition(luminance.count == width * height)
+        guard width >= 1, height >= 1 else { return [] }
         let cell = 32
         let gw = max(1, (width + cell - 1) / cell), gh = max(1, (height + cell - 1) / cell)
         var bgGrid = [Float](repeating: 0, count: gw * gh)
@@ -24,6 +25,12 @@ public enum StarDetector {
                     for x in (gx * cell)..<min((gx + 1) * cell, width) {
                         vals.append(luminance[y * width + x])
                     }
+                }
+                guard !vals.isEmpty else {
+                    // Degenerate cell (zero-area input region): flat background, sigma floor.
+                    bgGrid[gy * gw + gx] = 0
+                    sigGrid[gy * gw + gx] = 1e-6
+                    continue
                 }
                 vals.sort()
                 let med = vals[vals.count / 2]
