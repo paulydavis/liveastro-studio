@@ -5,6 +5,9 @@ struct ControlView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
 
+    private let logDisplayCap = 200
+    private let logMinHeight: CGFloat = 120
+
     var body: some View {
         @Bindable var model = model
         Form {
@@ -76,50 +79,47 @@ struct ControlView: View {
             Section("Log") {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(model.log.suffix(200).enumerated()), id: \.offset) {
+                        ForEach(Array(model.log.suffix(logDisplayCap).enumerated()), id: \.offset) {
                             Text($0.element).font(.system(.caption, design: .monospaced))
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading)
-                }.frame(minHeight: 120)
+                }.frame(minHeight: logMinHeight)
             }
         }
         .formStyle(.grouped)
         .padding(.bottom, 8)
-        .alert("LiveAstro", isPresented: .constant(model.errorMessage != nil)) {
+        .alert("LiveAstro", isPresented: $model.isShowingError) {
             Button("OK") { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
     }
 
-    private func pickFolder() {
+    private func makeDirectoryPanel(title: String? = nil, message: String? = nil) -> NSOpenPanel {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
+        if let title { panel.title = title }
+        if let message { panel.message = message }
+        return panel
+    }
+
+    private func pickFolder() {
+        let panel = makeDirectoryPanel()
         if panel.runModal() == .OK { model.watchFolder = panel.url }
     }
 
     private func pickImportFolder() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.title = "Choose Subs Folder"
-        panel.message = "Select a folder containing raw FITS subs to import"
+        let panel = makeDirectoryPanel(title: "Choose Subs Folder",
+                                       message: "Select a folder containing raw FITS subs to import")
         if panel.runModal() == .OK, let url = panel.url {
             model.importSubs(from: url)
         }
     }
 
     private func pickSessionDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.title = "Choose Session Directory"
-        panel.message = "Select a past session folder containing manifest.json"
-        let liveAstro = FileManager.default
-            .urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("LiveAstro", isDirectory: true)
+        let panel = makeDirectoryPanel(title: "Choose Session Directory",
+                                       message: "Select a past session folder containing manifest.json")
+        let liveAstro = model.liveAstroRoot
         if FileManager.default.fileExists(atPath: liveAstro.path) {
             panel.directoryURL = liveAstro
         }

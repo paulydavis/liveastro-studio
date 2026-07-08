@@ -1,14 +1,6 @@
 import SwiftUI
 import LiveAstroCore
 
-/// Minimal thread-safe counter for pipeline callbacks that fire off the main actor.
-private final class AtomicCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var count = 0
-    func increment() { lock.lock(); count += 1; lock.unlock() }
-    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
-}
-
 @Observable
 @MainActor
 final class AppModel {
@@ -52,6 +44,8 @@ final class AppModel {
     }
     var isRunning = false
     var isImporting = false
+    /// Accepted frames this session; updated only in .nativeStack mode
+    /// (watcher mode reads 0 — use latestRecord?.index instead).
     var acceptedCount = 0
     var rejectedCount = 0
     var latestImage: CGImage?
@@ -63,7 +57,21 @@ final class AppModel {
     var isGeneratingReplay = false
     var errorMessage: String?
 
+    /// Drives the error alert; dismissal (setting false) clears errorMessage.
+    /// Setting true directly is a no-op — present errors via errorMessage.
+    var isShowingError: Bool {
+        get { errorMessage != nil }
+        set { if !newValue { errorMessage = nil } }
+    }
+
     private var pipeline: SessionPipeline?
+
+    /// Root for all session output; every session/import directory lives under here.
+    static let sessionRootName = "LiveAstro"
+    var liveAstroRoot: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(Self.sessionRootName, isDirectory: true)
+    }
 
     var profile: SessionProfile {
         SessionProfile(targetName: targetName, telescope: telescope, camera: camera,
@@ -79,12 +87,14 @@ final class AppModel {
                                          subSeconds: profile.subExposureSeconds)
     }
 
+    /// Starts a live session watching `watchFolder`.
+    /// Not unit-testable: needs FileManager, a live pipeline, and a real watch
+    /// folder — the end-to-end test covers this path.
     func startSession() {
         guard !isRunning else { return }
         guard !isImporting else { errorMessage = "Finish the import before starting a session."; return }
         guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return }
-        let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("LiveAstro", isDirectory: true)
+        let root = liveAstroRoot
 
         let p: SessionPipeline
         switch sourceMode {
@@ -103,22 +113,11 @@ final class AppModel {
         acceptedCount = 0
         rejectedCount = 0
 
-        p.onUpdate = { [weak self] image, record in
-            Task { @MainActor in
-                self?.latestImage = image
-                self?.latestRecord = record
-                if self?.sourceMode == .nativeStack { self?.acceptedCount += 1 }
-                self?.log.append("✓ update \(record.index) — \(record.snapshotFile)")
-            }
-        }
-        p.onRejected = { [weak self] reason, name in
-            Task { @MainActor in
-                self?.rejectedCount += 1
-                self?.log.append("✗ rejected \(name): \(reason)")
-            }
-        }
-        p.onLog = { [weak self] message in
-            Task { @MainActor in self?.log.append("⚠ \(message)") }
+        // Watcher mode has no per-frame accept count (see acceptedCount doc).
+        if sourceMode == .nativeStack {
+            wireCallbacks(to: p, onAccepted: { [weak self] in self?.acceptedCount += 1 })
+        } else {
+            wireCallbacks(to: p)
         }
         do {
             try p.start()
@@ -133,6 +132,34 @@ final class AppModel {
         }
     }
 
+    /// Wires the pipeline callbacks shared by live sessions and imports.
+    /// `onAnyFrame` runs synchronously on the pipeline's callback thread for
+    /// every produced frame (accepted or rejected); `onAccepted` runs on the
+    /// main actor alongside the model updates for each accepted frame.
+    private func wireCallbacks(to pipeline: SessionPipeline,
+                               onAccepted: (@MainActor () -> Void)? = nil,
+                               onAnyFrame: (() -> Void)? = nil) {
+        pipeline.onUpdate = { [weak self] image, record in
+            onAnyFrame?()
+            Task { @MainActor in
+                self?.latestImage = image
+                self?.latestRecord = record
+                onAccepted?()
+                self?.log.append("✓ update \(record.index) — \(record.snapshotFile)")
+            }
+        }
+        pipeline.onRejected = { [weak self] reason, name in
+            onAnyFrame?()
+            Task { @MainActor in
+                self?.rejectedCount += 1
+                self?.log.append("✗ rejected \(name): \(reason)")
+            }
+        }
+        pipeline.onLog = { [weak self] message in
+            Task { @MainActor in self?.log.append("⚠ \(message)") }
+        }
+    }
+
     /// Reseeds the stacking engine reference frame (native mode only).
     func reseedReference() {
         guard isRunning && sourceMode == .nativeStack && !isGeneratingReplay else { return }
@@ -142,50 +169,32 @@ final class AppModel {
 
     /// Imports raw FITS subs from `folder` as a one-shot batch.
     /// Runs start()+end() off the main thread; end() drains the finite import stream.
+    /// Not unit-testable: needs a detached task and a real folder; the
+    /// zero-match path is covered via noMatchMessage(prefix:).
     func importSubs(from folder: URL) {
         guard !isRunning else { errorMessage = "End the session before importing."; return }
         guard !isImporting else { return }
-        let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("LiveAstro", isDirectory: true)
         let source = FolderFrameSource(folder: folder, mode: .importOnce,
                                         fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
         let engine = StackEngine()
         let importPipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
-                                              rootDirectory: root, neutralizeBackground: neutralizeBackground)
+                                              rootDirectory: liveAstroRoot,
+                                              neutralizeBackground: neutralizeBackground)
         // Counts every frame the source produced (accepted or rejected); it stays at zero
         // only when nothing in the folder matched the prefix at all. The pipeline callbacks
         // fire synchronously on the consume task, which end() drains before returning.
         let matchedFrames = AtomicCounter()
-        importPipeline.onUpdate = { [weak self] image, record in
-            matchedFrames.increment()
-            Task { @MainActor in
-                self?.latestImage = image
-                self?.latestRecord = record
-                self?.log.append("✓ update \(record.index) — \(record.snapshotFile)")
-            }
-        }
-        importPipeline.onRejected = { [weak self] reason, name in
-            matchedFrames.increment()
-            Task { @MainActor in self?.log.append("✗ rejected \(name): \(reason)") }
-        }
-        importPipeline.onLog = { [weak self] message in
-            Task { @MainActor in self?.log.append("⚠ \(message)") }
-        }
+        wireCallbacks(to: importPipeline, onAnyFrame: { matchedFrames.increment() })
         isImporting = true
         log.append("Importing subs from \(folder.path)…")
         let prefix = fileNamePrefix
         Task.detached { [weak self] in
-            func zeroMatchMessage() -> String {
-                prefix.isEmpty
-                    ? "No .fit files found in the chosen folder."
-                    : "No .fit files matching prefix '\(prefix)' in the chosen folder."
-            }
             do {
                 try importPipeline.start()
                 let url = try importPipeline.end()
                 await MainActor.run {
                     if matchedFrames.value == 0 {
-                        self?.errorMessage = zeroMatchMessage()
+                        self?.errorMessage = AppModel.noMatchMessage(prefix: prefix)
                     } else {
                         self?.replayURL = url
                         self?.log.append("Import complete. Replay: \(url.path)")
@@ -197,12 +206,19 @@ final class AppModel {
                     // A zero-match import may also surface as a downstream failure
                     // (nothing to render) — prefer the actionable message.
                     self?.errorMessage = matchedFrames.value == 0
-                        ? zeroMatchMessage()
+                        ? AppModel.noMatchMessage(prefix: prefix)
                         : "Import failed: \(error)"
                     self?.isImporting = false
                 }
             }
         }
+    }
+
+    /// User-facing message for an import that matched zero files.
+    private nonisolated static func noMatchMessage(prefix: String) -> String {
+        prefix.isEmpty
+            ? "No .fit files found in the chosen folder."
+            : "No .fit files matching prefix '\(prefix)' in the chosen folder."
     }
 
     func regenerateReplay(sessionDirectory: URL) {
