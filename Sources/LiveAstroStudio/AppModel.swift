@@ -1,6 +1,14 @@
 import SwiftUI
 import LiveAstroCore
 
+/// Minimal thread-safe counter for pipeline callbacks that fire off the main actor.
+private final class AtomicCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.lock(); count += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+}
+
 @Observable
 @MainActor
 final class AppModel {
@@ -8,6 +16,15 @@ final class AppModel {
     enum SourceMode: String, CaseIterable {
         case stackerOutput = "Stacker output (Siril)"
         case nativeStack   = "Raw subs (native stacking)"
+
+        /// Typical capture filename prefix for the mode (Siril writes live_stack_*,
+        /// capture software writes Light_*).
+        var defaultFileNamePrefix: String {
+            switch self {
+            case .stackerOutput: return "live_stack"
+            case .nativeStack:   return "Light_"
+            }
+        }
     }
 
     // Session profile draft (bound to the control form)
@@ -21,10 +38,18 @@ final class AppModel {
     var subExposureText = "60"
     var notes = ""
 
-    var fileNamePrefix = "live_stack"
+    var fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
     var neutralizeBackground = false
     var watchFolder: URL?
-    var sourceMode: SourceMode = .stackerOutput
+    var sourceMode: SourceMode = .stackerOutput {
+        didSet {
+            // Swap the prefix default with the mode, but never clobber a user-edited value.
+            guard sourceMode != oldValue else { return }
+            if fileNamePrefix == oldValue.defaultFileNamePrefix {
+                fileNamePrefix = sourceMode.defaultFileNamePrefix
+            }
+        }
+    }
     var isRunning = false
     var isImporting = false
     var acceptedCount = 0
@@ -127,7 +152,12 @@ final class AppModel {
         let engine = StackEngine()
         let importPipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
                                               rootDirectory: root, neutralizeBackground: neutralizeBackground)
+        // Counts every frame the source produced (accepted or rejected); it stays at zero
+        // only when nothing in the folder matched the prefix at all. The pipeline callbacks
+        // fire synchronously on the consume task, which end() drains before returning.
+        let matchedFrames = AtomicCounter()
         importPipeline.onUpdate = { [weak self] image, record in
+            matchedFrames.increment()
             Task { @MainActor in
                 self?.latestImage = image
                 self?.latestRecord = record
@@ -135,6 +165,7 @@ final class AppModel {
             }
         }
         importPipeline.onRejected = { [weak self] reason, name in
+            matchedFrames.increment()
             Task { @MainActor in self?.log.append("✗ rejected \(name): \(reason)") }
         }
         importPipeline.onLog = { [weak self] message in
@@ -142,18 +173,32 @@ final class AppModel {
         }
         isImporting = true
         log.append("Importing subs from \(folder.path)…")
+        let prefix = fileNamePrefix
         Task.detached { [weak self] in
+            func zeroMatchMessage() -> String {
+                prefix.isEmpty
+                    ? "No .fit files found in the chosen folder."
+                    : "No .fit files matching prefix '\(prefix)' in the chosen folder."
+            }
             do {
                 try importPipeline.start()
                 let url = try importPipeline.end()
                 await MainActor.run {
-                    self?.replayURL = url
-                    self?.log.append("Import complete. Replay: \(url.path)")
+                    if matchedFrames.value == 0 {
+                        self?.errorMessage = zeroMatchMessage()
+                    } else {
+                        self?.replayURL = url
+                        self?.log.append("Import complete. Replay: \(url.path)")
+                    }
                     self?.isImporting = false
                 }
             } catch {
                 await MainActor.run {
-                    self?.errorMessage = "Import failed: \(error)"
+                    // A zero-match import may also surface as a downstream failure
+                    // (nothing to render) — prefer the actionable message.
+                    self?.errorMessage = matchedFrames.value == 0
+                        ? zeroMatchMessage()
+                        : "Import failed: \(error)"
                     self?.isImporting = false
                 }
             }

@@ -48,8 +48,9 @@ There are two entry points:
    (the folder that your capture software writes to, e.g. `~/Documents/lights/`).
 3. Fill in the session profile and click **Start Session**.
    The engine imports each file in chronological order: bilinear debayer → star
-   registration → incremental mean stack.  A progress bar shows accepted / rejected
-   counts.  The session lands in `~/Documents/LiveAstro/<date-target>/` like any
+   registration → incremental mean stack.  An indeterminate spinner is shown while
+   the import runs; accepted and rejected frames are listed in the session log.
+   The session lands in `~/Documents/LiveAstro/<date-target>/` like any
    other session — including `replay.mp4` and `master.fit`.
 
 **Live raw-subs (watch folder as subs arrive)**

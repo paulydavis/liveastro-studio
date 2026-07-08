@@ -46,17 +46,22 @@ FrameSource (protocol)                     StackEngine
 ### 4.1 FrameSource protocol (`Sources/LiveAstroCore/Sources/FrameSource.swift`)
 
 ```swift
-public protocol FrameSource {
-    /// Emits raw (pre-debayer) frames as they become available, then finishes.
+public protocol FrameSource: AnyObject {
+    /// Emits raw (pre-debayer) frames as they become available; finishes when the
+    /// source ends (import) or stop() is called.
     var frames: AsyncStream<RawFrame> { get }
+    /// True when the stream ends on its own (finite import); false for live sources.
+    /// Drives SessionPipeline.end() drain semantics: finite sources are drained to
+    /// completion, live sources are stopped first and then drained with a timeout.
+    var isFinite: Bool { get }
     func start() throws
     func stop()
 }
 public struct RawFrame {
-    public let image: AstroImage      // 1-channel, linear, as stored
-    public let bayerPattern: String?  // from FITS BAYERPAT (nil = mono)
-    public let rowOrder: ROWORDERValue
-    public let timestamp: Date        // DATE-OBS or file mtime
+    public let image: AstroImage          // 1-channel CFA or mono, stored row order
+    public let bayerPattern: BayerPattern?  // from FITS BAYERPAT (nil = mono)
+    public let bottomUp: Bool             // FITS ROWORDER
+    public let timestamp: Date            // DATE-OBS or file mtime
     public let sourceName: String
 }
 ```

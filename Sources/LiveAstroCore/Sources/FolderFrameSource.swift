@@ -1,68 +1,68 @@
 import Foundation
 
 /// Reads raw frames from a folder, either as a one-shot import or by watching for new files.
+///
+/// Import mode is PULL-based: one file is loaded per consumer pull (`AsyncStream(unfolding:)`),
+/// so peak memory stays O(1) frames regardless of folder size. Live mode remains push-based
+/// from the file watcher (frame cadence is ~20s, so buffering is not a concern).
 public final class FolderFrameSource: FrameSource {
 
     public enum Mode { case importOnce, live }
 
     public let frames: AsyncStream<RawFrame>
     public var isFinite: Bool { mode == .importOnce }
-    private var continuation: AsyncStream<RawFrame>.Continuation!
+    /// Live mode only; nil in import mode (which uses the pull-based cursor instead).
+    private var continuation: AsyncStream<RawFrame>.Continuation?
 
     private let folder: URL
     private let mode: Mode
     private let fileNamePrefix: String?
 
-    private var importTask: Task<Void, Never>?
+    private let importCursor: ImportCursor?
+    private var liveTask: Task<Void, Never>?
     private var watcher: StackFileWatcher?
 
     public init(folder: URL, mode: Mode, fileNamePrefix: String? = nil) {
         self.folder = folder
         self.mode = mode
         self.fileNamePrefix = fileNamePrefix
-        var cont: AsyncStream<RawFrame>.Continuation!
-        self.frames = AsyncStream { cont = $0 }
-        self.continuation = cont
+
+        switch mode {
+        case .importOnce:
+            let cursor = ImportCursor(folder: folder, fileNamePrefix: fileNamePrefix)
+            self.importCursor = cursor
+            self.continuation = nil
+            // One file is read per pull; unreadable files are skipped without buffering.
+            self.frames = AsyncStream(unfolding: {
+                while !Task.isCancelled {
+                    guard let url = cursor.next() else { return nil }
+                    if let frame = try? FolderFrameSource.loadRawFrame(url: url) {
+                        return frame
+                    }
+                }
+                return nil
+            })
+
+        case .live:
+            self.importCursor = nil
+            var cont: AsyncStream<RawFrame>.Continuation!
+            self.frames = AsyncStream { cont = $0 }
+            self.continuation = cont
+        }
     }
 
     public func start() throws {
         switch mode {
         case .importOnce:
-            let folder = self.folder
-            let fileNamePrefix = self.fileNamePrefix
-            let continuation = self.continuation!
-            importTask = Task.detached {
-                let fm = FileManager.default
-                guard let names = try? fm.contentsOfDirectory(atPath: folder.path) else {
-                    continuation.finish()
-                    return
-                }
-                let sorted = names
-                    .filter { name in
-                        let ext = (name as NSString).pathExtension.lowercased()
-                        guard ImageLoader.fitsExtensions.contains(ext) else { return false }
-                        if let p = fileNamePrefix, !p.isEmpty {
-                            return name.lowercased().hasPrefix(p.lowercased())
-                        }
-                        return true
-                    }
-                    .sorted()
-                for name in sorted {
-            guard !Task.isCancelled else { break }
-                    let url = folder.appendingPathComponent(name)
-                    if let frame = try? FolderFrameSource.loadRawFrame(url: url) {
-                        continuation.yield(frame)
-                    }
-                }
-                continuation.finish()
-            }
+            // Pull-based: just snapshot the sorted file list; loading happens per pull.
+            importCursor?.snapshotIfNeeded()
 
         case .live:
             let w = StackFileWatcher(folder: folder, fileNamePrefix: fileNamePrefix)
             self.watcher = w
             try w.start()
             let continuation = self.continuation!
-            importTask = Task.detached {
+            liveTask = Task.detached {
                 for await update in w.updates {
                     if let frame = try? FolderFrameSource.loadRawFrame(url: update.url) {
                         continuation.yield(frame)
@@ -74,9 +74,64 @@ public final class FolderFrameSource: FrameSource {
     }
 
     public func stop() {
+        importCursor?.stop()
         watcher?.stop()
-        importTask?.cancel()
-        continuation.finish()
+        liveTask?.cancel()
+        continuation?.finish()
+    }
+
+    /// Lazily-advanced sorted file list for import mode. Thread-safe: pulls come from the
+    /// consumer's task, stop() may come from another thread.
+    private final class ImportCursor: @unchecked Sendable {
+        private let lock = NSLock()
+        private let folder: URL
+        private let fileNamePrefix: String?
+        private var files: [URL]?   // nil until first snapshot
+        private var index = 0
+        private var stopped = false
+
+        init(folder: URL, fileNamePrefix: String?) {
+            self.folder = folder
+            self.fileNamePrefix = fileNamePrefix
+        }
+
+        func snapshotIfNeeded() {
+            lock.lock(); defer { lock.unlock() }
+            snapshotLocked()
+        }
+
+        func stop() {
+            lock.lock(); defer { lock.unlock() }
+            stopped = true
+        }
+
+        /// Next file to load, or nil at end of list / after stop().
+        func next() -> URL? {
+            lock.lock(); defer { lock.unlock() }
+            guard !stopped else { return nil }
+            snapshotLocked()
+            guard let files, index < files.count else { return nil }
+            let url = files[index]
+            index += 1
+            return url
+        }
+
+        private func snapshotLocked() {
+            guard files == nil else { return }
+            let fm = FileManager.default
+            let names = (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
+            files = names
+                .filter { name in
+                    let ext = (name as NSString).pathExtension.lowercased()
+                    guard ImageLoader.fitsExtensions.contains(ext) else { return false }
+                    if let p = fileNamePrefix, !p.isEmpty {
+                        return name.lowercased().hasPrefix(p.lowercased())
+                    }
+                    return true
+                }
+                .sorted()
+                .map { folder.appendingPathComponent($0) }
+        }
     }
 
     /// Shared FITS → RawFrame loader (also used by tests).

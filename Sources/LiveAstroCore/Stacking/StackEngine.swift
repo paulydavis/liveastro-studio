@@ -18,6 +18,10 @@ public final class StackEngine {
     private let seedMinStars: Int
     private let minMatches: Int
     private let inlierTolerance: Double
+    /// Serializes process()/reseed()/currentStack()/stackFrameCount: reseed() runs on the
+    /// main thread while process() runs on the pipeline's consume task. A reseed issued
+    /// mid-frame applies before the NEXT frame (the intended UX).
+    private let lock = NSLock()
     private var accumulator: StackAccumulator?
     private var referenceStars: [Star] = []
     private var referenceSize: (w: Int, h: Int)?
@@ -32,18 +36,26 @@ public final class StackEngine {
     }
 
     public func reseed() {
+        lock.lock(); defer { lock.unlock() }
         accumulator = nil
         referenceStars = []
         referenceSize = nil
         referenceChannels = nil
     }
 
-    public func currentStack() -> AstroImage? { accumulator?.mean() }
+    public func currentStack() -> AstroImage? {
+        lock.lock(); defer { lock.unlock() }
+        return accumulator?.mean()
+    }
 
     /// Frames in the CURRENT stack (resets on reseed, unlike acceptedCount).
-    public var stackFrameCount: Int { accumulator?.frameCount ?? 0 }
+    public var stackFrameCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return accumulator?.frameCount ?? 0
+    }
 
     public func process(_ frame: RawFrame) -> StackOutcome {
+        lock.lock(); defer { lock.unlock() }
         let raw = frame.image
         if let size = referenceSize, size != (raw.width, raw.height) {
             rejectedCount += 1
