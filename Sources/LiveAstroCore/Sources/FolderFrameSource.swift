@@ -47,6 +47,7 @@ public final class FolderFrameSource: FrameSource {
                     }
                     .sorted()
                 for name in sorted {
+            guard !Task.isCancelled else { break }
                     let url = folder.appendingPathComponent(name)
                     if let frame = try? FolderFrameSource.loadRawFrame(url: url) {
                         continuation.yield(frame)

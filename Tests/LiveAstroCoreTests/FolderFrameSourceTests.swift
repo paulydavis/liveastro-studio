@@ -47,6 +47,7 @@ final class FolderFrameSourceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
         try source.start()
+        try await Task.sleep(nanoseconds: 10_000_000)   // let the kqueue source arm
         _ = try writeFITS(dir, name: "Light_live_001.fit", value: 0.3)
         var got: RawFrame?
         for await frame in source.frames { got = frame; break }
