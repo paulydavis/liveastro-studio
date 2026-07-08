@@ -29,10 +29,17 @@ public struct AstroImage {
         }
     }
 
+    /// Stride that caps statistical samples at `maxSamples` (256K default) so stats
+    /// stay O(1) on huge frames. Ceiling division: any count above the cap gets
+    /// stride ≥ 2, keeping the sample count at or below the cap.
+    static func sampleStride(count: Int, maxSamples: Int = 262_144) -> Int {
+        max(1, (count + maxSamples - 1) / maxSamples)
+    }
+
     /// Stats over a stride-sampled subset (≤ 262144 samples) — full sort of a 24MP plane is wasteful.
     static func computeStats(_ slice: ArraySlice<Float>) -> ChannelStats {
         let n = slice.count
-        let stride = max(1, (n + 262_143) / 262_144)
+        let stride = Self.sampleStride(count: n)
         var samples: [Float] = []
         samples.reserveCapacity(n / stride + 1)
         var i = slice.startIndex

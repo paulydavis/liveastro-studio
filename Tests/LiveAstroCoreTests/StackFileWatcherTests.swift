@@ -40,6 +40,11 @@ final class StackFileWatcherTests: XCTestCase {
         }
     }
 
+    func testStartThrowsForNonexistentFolder() {
+        let w = StackFileWatcher(folder: URL(fileURLWithPath: "/nonexistent-\(UUID())"))
+        XCTAssertThrowsError(try w.start())
+    }
+
     func testEmitsOnCompleteFITSWrite() async throws {
         watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.5)
         let collector = collect(watcher)

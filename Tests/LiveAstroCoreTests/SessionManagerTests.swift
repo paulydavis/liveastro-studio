@@ -73,6 +73,28 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertThrowsError(try mgr.recordSnapshot(rec))
     }
 
+    func testRecordAfterEndThrows() throws {
+        let mgr = SessionManager(rootDirectory: tmp)
+        _ = try mgr.startSession(profile: profile)
+        try mgr.endSession()
+        let rec = SnapshotRecord(index: 1, timestamp: Date(), sourceFile: "a", snapshotFile: "b",
+                                 estimatedIntegrationSeconds: 0, width: 1, height: 1,
+                                 mean: 0, median: 0, stddev: 0)
+        XCTAssertThrowsError(try mgr.recordSnapshot(rec)) {
+            XCTAssertEqual($0 as? SessionError, .notRunning)
+        }
+    }
+
+    func testEndedManagerCanStartNewSession() throws {
+        let mgr = SessionManager(rootDirectory: tmp)
+        let dir1 = try mgr.startSession(profile: profile)
+        try mgr.endSession()
+        // Reuse across sessions is intentional (watcher-mode reuse in startSession).
+        let dir2 = try mgr.startSession(profile: profile)
+        XCTAssertEqual(mgr.state, .running)
+        XCTAssertNotEqual(dir1, dir2)
+    }
+
     func testCaptionFormat() {
         XCTAssertEqual(IntegrationFormat.caption(seconds: 8040, frames: 402, subSeconds: 20),
                        "2h 14m · 402 × 20s")

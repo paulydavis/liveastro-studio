@@ -1,9 +1,23 @@
 import Foundation
 
+/// A matched star correspondence: index into the source star list paired with
+/// its counterpart in the target (reference) star list.
+public struct StarPair: Equatable {
+    public let source: Int
+    public let target: Int
+    public init(source: Int, target: Int) {
+        self.source = source
+        self.target = target
+    }
+}
+
 /// Triangle-invariant star matching (spec §4.2). Clean-room implementation of the
 /// classic method: triangles are similarity-invariant, so matching side-ratio
 /// signatures across images yields vertex correspondences without initial alignment.
 public enum TriangleMatcher {
+
+    // key = src * stride + dst; requires maxTriangleStars < stride
+    static let voteKeyStride = 4096
     struct Triangle {
         let vertices: (Int, Int, Int)   // star indices ordered by opposite-side rank:
                                         // .0 opposite shortest, .2 opposite longest
@@ -41,13 +55,13 @@ public enum TriangleMatcher {
     public static func correspondences(source: [Star], target: [Star],
                                        maxTriangleStars: Int = 20,
                                        invariantTolerance: Double = 0.02,
-                                       minVotes: Int = 2) -> [(source: Int, target: Int)] {
-        precondition(maxTriangleStars < 4096,
-                     "vote key encoding requires maxTriangleStars < 4096")
+                                       minVotes: Int = 2) -> [StarPair] {
+        precondition(maxTriangleStars < Self.voteKeyStride,
+                     "vote key encoding requires maxTriangleStars < voteKeyStride")
         let ts = triangles(source, maxStars: maxTriangleStars)
         let tt = triangles(target, maxStars: maxTriangleStars)
         guard !ts.isEmpty, !tt.isEmpty else { return [] }
-        var votes: [Int: Int] = [:]   // key = srcIdx * 4096 + dstIdx
+        var votes: [Int: Int] = [:]   // key = srcIdx * voteKeyStride + dstIdx
         for a in ts {
             for b in tt {
                 let r1 = abs(a.invariant.0 - b.invariant.0) / max(a.invariant.0, 1e-9)
@@ -56,7 +70,7 @@ public enum TriangleMatcher {
                 for (sv, tv) in [(a.vertices.0, b.vertices.0),
                                  (a.vertices.1, b.vertices.1),
                                  (a.vertices.2, b.vertices.2)] {
-                    votes[sv * 4096 + tv, default: 0] += 1
+                    votes[sv * Self.voteKeyStride + tv, default: 0] += 1
                 }
             }
         }
@@ -64,12 +78,12 @@ public enum TriangleMatcher {
         let ranked = votes.filter { $0.value >= minVotes }
             .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
         var usedS = Set<Int>(), usedT = Set<Int>()
-        var out: [(source: Int, target: Int)] = []
+        var out: [StarPair] = []
         for (key, _) in ranked {
-            let s = key / 4096, t = key % 4096
+            let s = key / Self.voteKeyStride, t = key % Self.voteKeyStride
             guard !usedS.contains(s), !usedT.contains(t) else { continue }
             usedS.insert(s); usedT.insert(t)
-            out.append((source: s, target: t))
+            out.append(StarPair(source: s, target: t))
         }
         return out
     }

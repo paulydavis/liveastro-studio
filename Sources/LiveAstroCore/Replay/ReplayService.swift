@@ -6,7 +6,7 @@ public enum ReplayService {
     @discardableResult
     public static func regenerate(sessionDirectory: URL,
                                   replaySettings: ReplaySettings = .init(),
-                                  maxKeyframes: Int = 45) throws -> URL {
+                                  maxKeyframes: Int = FrameSelector.defaultMaxKeyframes) throws -> URL {
         let manifestURL = sessionDirectory.appendingPathComponent("manifest.json")
         let manifest = try ManifestCoding.decoder()
             .decode(SessionManifest.self, from: Data(contentsOf: manifestURL))

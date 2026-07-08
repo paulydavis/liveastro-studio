@@ -63,6 +63,17 @@ final class ReplayGeneratorTests: XCTestCase {
             keyframes: [], to: tmp.appendingPathComponent("x.mp4")))
     }
 
+    func testNonexistentKeyframeImageThrowsDecodeFailed() {
+        let missing = tmp.appendingPathComponent("missing.png")
+        XCTAssertThrowsError(try ReplayGenerator().render(
+            keyframes: [ReplayKeyframe(imageURL: missing, caption: "x")],
+            to: tmp.appendingPathComponent("y.mp4"))) {
+            guard case ReplayError.decodeFailed = $0 else {
+                return XCTFail("expected decodeFailed, got \($0)")
+            }
+        }
+    }
+
     func testColorChannelsNotSwapped() throws {
         let url = tmp.appendingPathComponent("red.png")
         try writePNG(to: url, r: 1.0, g: 0.0, b: 0.0, width: 320, height: 180)

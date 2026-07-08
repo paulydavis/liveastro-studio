@@ -16,6 +16,9 @@ public final class SnapshotRecorder {
                      estimatedIntegrationSeconds: Double) throws -> SnapshotRecord {
         let name = String(format: "snapshots/%04d.png", index)
         let url = sessionDirectory.appendingPathComponent(name)
+        // Destination creation is nil only for malformed URLs/UTIs; the session
+        // directory itself is guaranteed by SessionManager. A missing snapshots/
+        // subdirectory surfaces later as a Finalize failure.
         guard let dest = CGImageDestinationCreateWithURL(
             url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
             throw SnapshotError.encodeFailed
@@ -23,6 +26,7 @@ public final class SnapshotRecorder {
         CGImageDestinationAddImage(dest, cgImage, nil)
         guard CGImageDestinationFinalize(dest) else { throw SnapshotError.encodeFailed }
 
+        // AstroImage.init computes stats for every channel; stats.count == channels >= 1.
         let stats = linear.stats[0]
         return SnapshotRecord(index: index, timestamp: timestamp, sourceFile: sourceFile,
                               snapshotFile: name,

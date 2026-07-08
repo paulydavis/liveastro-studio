@@ -48,6 +48,14 @@ final class AutoStretchTests: XCTestCase {
         XCTAssertEqual(cg?.height, 2)
     }
 
+    func testMakeCGImageMono() {
+        let img = AstroImage(width: 4, height: 4, channels: 1,
+                             pixels: [Float](repeating: 0.5, count: 16), sourceIsLinear: false)
+        let cg = AutoStretch.makeCGImage(img)
+        XCTAssertEqual(cg?.width, 4)
+        XCTAssertEqual(cg?.height, 4)
+    }
+
     func testNeutralizeBackgroundMatchesChannelMediansToGreen() {
         // 4x4 RGB, green-dominant background: R median 0.02, G median 0.10, B median 0.04
         let plane = 16
@@ -66,6 +74,8 @@ final class AutoStretchTests: XCTestCase {
         XCTAssertEqual(out.pixels[plane + 5], 0.10, accuracy: 1e-6)
         // scaling clamps to [0,1]
         XCTAssertLessThanOrEqual(out.pixels.max()!, 1.0)
+        // neutralization is a white-balance step, not a stretch — linearity is preserved
+        XCTAssertTrue(out.sourceIsLinear)
     }
 
     func testNeutralizeBackgroundGrayscalePassthrough() {

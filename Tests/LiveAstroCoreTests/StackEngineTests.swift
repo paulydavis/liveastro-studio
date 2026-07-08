@@ -86,6 +86,77 @@ final class StackEngineTests: XCTestCase {
         XCTAssertEqual(engine.rejectedCount, 1)
     }
 
+    /// K4: a mono frame (no bayerPattern) after a CFA reference registers fine but
+    /// carries 1 channel against the debayered 3-channel accumulator — must reject.
+    func testChannelMismatchRejected() {
+        let engine = StackEngine()
+        XCTAssertEqual(engine.process(cfaFrame(stars: field)), .becameReference)
+        let mono = cfaFrame(stars: field)
+        let frame = RawFrame(image: mono.image, bayerPattern: nil, bottomUp: false,
+                             timestamp: mono.timestamp, sourceName: "mono.fit")
+        XCTAssertEqual(engine.process(frame), .rejected(.dimensionMismatch))
+        XCTAssertEqual(engine.rejectedCount, 1)
+    }
+
+    func testStacksRotatedFrame() {
+        let engine = StackEngine()
+        XCTAssertEqual(engine.process(cfaFrame(stars: field)), .becameReference)
+        // Same synthesizer, star positions rotated ~2° about the image center.
+        let theta = 2.0 * Double.pi / 180
+        let (c, s) = (cos(theta), sin(theta))
+        let rotated = field.map { p -> (x: Double, y: Double) in
+            let dx = p.x - 256, dy = p.y - 256
+            return (x: 256 + dx * c - dy * s, y: 256 + dx * s + dy * c)
+        }
+        XCTAssertEqual(engine.process(cfaFrame(stars: rotated)), .stacked(frameCount: 2))
+        // Stack keeps stars at REFERENCE positions (mirrors testStacksTranslatedFrame).
+        let stack = engine.currentStack()!
+        let plane = stack.width * stack.height
+        let lum = { (x: Int, y: Int) -> Float in
+            (0..<stack.channels).reduce(Float(0)) { $0 + stack.pixels[$1 * plane + y * stack.width + x] }
+        }
+        XCTAssertGreaterThan(lum(60, 80), lum(65, 78))
+        XCTAssertGreaterThan(lum(60, 80), 0.5)
+    }
+
+    /// BGGR CFA starfield with a colored background (B > G > R per mosaic site) so a
+    /// channel-mapping regression (e.g. R/B swap) shows up in the stacked medians.
+    func bggrFrame(width: Int = 512, height: Int = 512,
+                   stars: [(x: Double, y: Double)], amp: Float = 0.8,
+                   name: String = "bggr.fit") -> RawFrame {
+        var px = [Float](repeating: 0, count: width * height)
+        for y in 0..<height {
+            for x in 0..<width {
+                px[y * width + x] = y % 2 == 0
+                    ? (x % 2 == 0 ? 0.09 : 0.05)   // B G
+                    : (x % 2 == 0 ? 0.05 : 0.02)   // G R
+            }
+        }
+        for s in stars {
+            for y in max(0, Int(s.y) - 8)...min(height - 1, Int(s.y) + 8) {
+                for x in max(0, Int(s.x) - 8)...min(width - 1, Int(s.x) + 8) {
+                    let dx = Double(x) - s.x, dy = Double(y) - s.y
+                    px[y * width + x] += amp * Float(exp(-(dx * dx + dy * dy) / (2 * 3.0 * 3.0)))
+                }
+            }
+        }
+        let img = AstroImage(width: width, height: height, channels: 1, pixels: px, sourceIsLinear: true)
+        return RawFrame(image: img, bayerPattern: .bggr, bottomUp: false,
+                        timestamp: Date(timeIntervalSince1970: 0), sourceName: name)
+    }
+
+    func testBGGRStacksThroughEngine() {
+        let engine = StackEngine()
+        XCTAssertEqual(engine.process(bggrFrame(stars: field)), .becameReference)
+        let shifted = field.map { (x: $0.x + 4.6, y: $0.y - 2.2) }
+        XCTAssertEqual(engine.process(bggrFrame(stars: shifted)), .stacked(frameCount: 2))
+        let stack = engine.currentStack()!
+        XCTAssertEqual(stack.channels, 3)
+        // BGGR background paints B sites brightest and R sites darkest.
+        XCTAssertGreaterThan(stack.stats[2].median, stack.stats[1].median)
+        XCTAssertGreaterThan(stack.stats[1].median, stack.stats[0].median)
+    }
+
     func testBottomUpFrameFlipped() {
         // Same field delivered bottom-up must land at flipped y in the stack
         let engine = StackEngine()

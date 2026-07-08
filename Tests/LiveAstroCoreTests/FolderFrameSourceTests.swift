@@ -45,6 +45,27 @@ final class FolderFrameSourceTests: XCTestCase {
         XCTAssertEqual(names, ["Light_1.fit", "Light_2.fit", "Light_10.fit"])
     }
 
+    func testStopMidImportEndsStreamWithoutYieldingAllFiles() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for i in 1...6 {
+            _ = try writeFITS(dir, name: "Light_\(i).fit", value: Float(i) / 10)
+        }
+
+        let source = FolderFrameSource(folder: dir, mode: .importOnce, fileNamePrefix: "Light_")
+        try source.start()
+        var consumed = 0
+        for await _ in source.frames {
+            consumed += 1
+            if consumed == 1 { source.stop() }
+        }
+        // Pull-based cursor: stop() must end the stream promptly. At most one frame
+        // already in flight may still arrive, but never the whole folder.
+        XCTAssertLessThan(consumed, 6, "stop() mid-import must not drain all files")
+    }
+
     func testLoadRawFrameKeepsStoredOrderAndMetadata() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

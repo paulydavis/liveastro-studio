@@ -26,4 +26,17 @@ final class SnapshotRecorderTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: path))
         XCTAssertNotNil(try? ImageLoader.load(url: tmp.appendingPathComponent(rec.snapshotFile)))
     }
+
+    func testSaveThrowsWhenSnapshotsSubdirectoryMissing() throws {
+        let bare = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rec-bare-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: bare, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: bare) }
+        let img = AstroImage(width: 8, height: 6, channels: 1,
+                             pixels: [Float](repeating: 0.1, count: 48), sourceIsLinear: true)
+        let cg = AutoStretch.makeCGImage(AutoStretch.stretch(img))!
+        XCTAssertThrowsError(try SnapshotRecorder(sessionDirectory: bare).save(
+            cgImage: cg, linear: img, sourceFile: "live_stack.fit",
+            index: 1, timestamp: Date(), estimatedIntegrationSeconds: 60))
+    }
 }

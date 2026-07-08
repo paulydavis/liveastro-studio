@@ -24,7 +24,8 @@ public final class SessionPipeline {
 
     /// Watcher mode: monitors a folder for new Siril stacks and processes each update.
     public init(watchFolder: URL, profile: SessionProfile, rootDirectory: URL,
-                replaySettings: ReplaySettings = .init(), maxKeyframes: Int = 45,
+                replaySettings: ReplaySettings = .init(),
+                maxKeyframes: Int = FrameSelector.defaultMaxKeyframes,
                 fileNamePrefix: String? = nil, neutralizeBackground: Bool = false) {
         self.watcher = StackFileWatcher(folder: watchFolder, fileNamePrefix: fileNamePrefix)
         self.source = nil
@@ -40,7 +41,8 @@ public final class SessionPipeline {
     /// and records each accepted frame as a snapshot.
     public init(nativeSource: FrameSource, engine: StackEngine, profile: SessionProfile,
                 rootDirectory: URL, replaySettings: ReplaySettings = .init(),
-                maxKeyframes: Int = 45, neutralizeBackground: Bool = false) {
+                maxKeyframes: Int = FrameSelector.defaultMaxKeyframes,
+                neutralizeBackground: Bool = false) {
         self.watcher = nil
         self.source = nativeSource
         self.engine = engine
@@ -85,22 +87,31 @@ public final class SessionPipeline {
         }
     }
 
+    /// Shared display pipeline: optional background neutralization, then stretch
+    /// if still linear, then pack to CGImage.
+    private func displayCGImage(from linear: AstroImage) throws -> CGImage {
+        let balanced = neutralizeBackground ? AutoStretch.neutralizeBackground(linear) : linear
+        let display = balanced.sourceIsLinear ? AutoStretch.stretch(balanced) : balanced
+        guard let cg = AutoStretch.makeCGImage(display) else {
+            throw ImageLoaderError.decodeFailed("CGImage packing")
+        }
+        return cg
+    }
+
     /// Processes one raw frame through the stack engine (native mode).
     private func handleNative(_ frame: RawFrame, engine: StackEngine) {
         let outcome = engine.process(frame)
         switch outcome {
         case .becameReference, .stacked:
             guard let mean = engine.currentStack() else { return }
+            guard let recorder else {
+                onLog?("recorder missing — frame dropped (\(frame.sourceName))")
+                return
+            }
             do {
-                // Display pipeline mirrors handle(): optional background neutralization,
-                // then stretch if still linear, then pack to CGImage.
-                let balanced = neutralizeBackground ? AutoStretch.neutralizeBackground(mean) : mean
-                let display = balanced.sourceIsLinear ? AutoStretch.stretch(balanced) : balanced
-                guard let cg = AutoStretch.makeCGImage(display) else {
-                    throw ImageLoaderError.decodeFailed("CGImage packing")
-                }
+                let cg = try displayCGImage(from: mean)
                 // Pass the raw un-neutralized mean as linear: stats stay raw for v1.1 cloud gate.
-                let record = try recorder!.save(
+                let record = try recorder.save(
                     cgImage: cg, linear: mean, sourceFile: frame.sourceName,
                     index: engine.acceptedCount, timestamp: frame.timestamp,
                     estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
@@ -116,15 +127,15 @@ public final class SessionPipeline {
     }
 
     private func handle(_ update: StackUpdate) {
+        guard let recorder else {
+            onLog?("recorder missing — frame dropped (\(update.url.lastPathComponent))")
+            return
+        }
         do {
             let linear = try ImageLoader.load(url: update.url)
-            let balanced = neutralizeBackground ? AutoStretch.neutralizeBackground(linear) : linear
-            let display = balanced.sourceIsLinear ? AutoStretch.stretch(balanced) : balanced
-            guard let cg = AutoStretch.makeCGImage(display) else {
-                throw ImageLoaderError.decodeFailed("CGImage packing")
-            }
+            let cg = try displayCGImage(from: linear)
             let index = session.acceptedCount + 1
-            let record = try recorder!.save(
+            let record = try recorder.save(
                 cgImage: cg, linear: linear, sourceFile: update.url.lastPathComponent,
                 index: index, timestamp: Date(),
                 estimatedIntegrationSeconds: Double(index) * profile.subExposureSeconds)
@@ -143,7 +154,7 @@ public final class SessionPipeline {
     /// In watcher mode, stops the watcher first so the stream terminates, then drains.
     public func end() throws -> URL {
         if source != nil {
-            if source?.isFinite == true {
+            if source?.isFinite ?? false {
                 // Import: the stream ends on its own; drain it completely (a long import
                 // takes as long as it takes — end() runs off the main thread).
                 if consumeTask != nil {

@@ -5,7 +5,7 @@ public enum FITSReader {
     // FITS format constants (FITS Standard 4.0 §3.1): headers are a sequence of
     // 2880-byte blocks, each holding 36 card images of 80 ASCII characters —
     // sizes inherited from 80-column punch cards and 1970s tape blocking.
-    static let blockSize = 2880
+    public static let blockSize = 2880
     static let cardSize = 80
     static let cardsPerBlock = blockSize / cardSize   // 36
 
@@ -112,35 +112,35 @@ public enum FITSReader {
         guard data.count >= h.minimumFileSize else {
             throw FITSError.truncatedData(expected: h.minimumFileSize, actual: data.count)
         }
-        let raw = data.subdata(in: h.headerBytes..<(h.headerBytes + h.dataBytes))
+        let pixelBytes = data.subdata(in: h.headerBytes..<(h.headerBytes + h.dataBytes))
         let n = h.dims.reduce(1, *)
         var px = [Float](repeating: 0, count: n)
 
         func physical(_ v: Double) -> Double { h.bzero + h.bscale * v }
 
-        raw.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+        pixelBytes.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
             switch h.bitpix {
             case 8:
                 for i in 0..<n { px[i] = Float(physical(Double(buf[i])) / 255.0) }
             case 16:
                 for i in 0..<n {
-                    let raw = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<Int16>.size, as: Int16.self)
-                    px[i] = Float(physical(Double(Int16(bigEndian: raw))) / 65535.0)
+                    let word16 = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<Int16>.size, as: Int16.self)
+                    px[i] = Float(physical(Double(Int16(bigEndian: word16))) / 65535.0)
                 }
             case 32:
                 for i in 0..<n {
-                    let raw = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<Int32>.size, as: Int32.self)
-                    px[i] = Float(physical(Double(Int32(bigEndian: raw))) / 4294967295.0)
+                    let word32 = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<Int32>.size, as: Int32.self)
+                    px[i] = Float(physical(Double(Int32(bigEndian: word32))) / 4294967295.0)
                 }
             case -32:
                 for i in 0..<n {
-                    let raw = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<UInt32>.size, as: UInt32.self)
-                    px[i] = Float(physical(Double(Float(bitPattern: UInt32(bigEndian: raw)))))
+                    let bits32 = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<UInt32>.size, as: UInt32.self)
+                    px[i] = Float(physical(Double(Float(bitPattern: UInt32(bigEndian: bits32)))))
                 }
             case -64:
                 for i in 0..<n {
-                    let raw = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<UInt64>.size, as: UInt64.self)
-                    px[i] = Float(physical(Double(bitPattern: UInt64(bigEndian: raw))))
+                    let bits64 = buf.loadUnaligned(fromByteOffset: i * MemoryLayout<UInt64>.size, as: UInt64.self)
+                    px[i] = Float(physical(Double(bitPattern: UInt64(bigEndian: bits64))))
                 }
             default:
                 preconditionFailure("validated in readHeader")

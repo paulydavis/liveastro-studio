@@ -5,6 +5,8 @@ import ImageIO
 import AppKit // NSAttributedString text drawing only — no UI
 
 public struct ReplaySettings {
+    // 45 s coincides with FrameSelector.defaultMaxKeyframes but is an
+    // independent knob (seconds of video, not a frame count).
     public var duration: Double = 45
     public var fps: Int = 30
     public var width: Int = 1920
@@ -96,6 +98,8 @@ public final class ReplayGenerator {
             let caption = blend < 0.5 ? keyframes[i].caption : keyframes[j].caption
             let buffer = try makeFrame(base: images[i], next: images[j],
                                        blend: blend, caption: caption, pool: adaptor.pixelBufferPool)
+            // Encoder back-pressure spin: when/why the encoder stalls is unspecified
+            // by AVFoundation, so this loop can't be exercised deterministically.
             while !input.isReadyForMoreMediaData {
                 guard writer.status == .writing else {
                     throw ReplayError.writerFailed(writer.error?.localizedDescription ?? "writer status \(writer.status.rawValue)")
@@ -110,6 +114,8 @@ public final class ReplayGenerator {
         }
 
         input.markAsFinished()
+        // AVFoundation contract: finishWriting completes asynchronously; block until
+        // its callback so the file is fully written before we return.
         let sema = DispatchSemaphore(value: 0)
         writer.finishWriting { sema.signal() }
         sema.wait()
@@ -127,6 +133,7 @@ public final class ReplayGenerator {
                                 [kCVPixelBufferCGBitmapContextCompatibilityKey: true] as CFDictionary,
                                 &pixelBuffer)
         }
+        // Both pool and direct allocation failing happens only under memory pressure.
         guard let buffer = pixelBuffer else { throw ReplayError.writerFailed("pixel buffer") }
 
         CVPixelBufferLockBaseAddress(buffer, [])

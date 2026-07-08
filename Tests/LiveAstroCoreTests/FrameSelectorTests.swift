@@ -74,6 +74,13 @@ final class FrameSelectorTests: XCTestCase {
         XCTAssertEqual(FrameSelector.qualityGate(medians: [0.5, 5.0]), [0, 1])
     }
 
+    func testQualityGateNearZeroBaselineKeepsAll() {
+        // All-dark session: baseline below the meaningful-median floor must keep
+        // every frame rather than divide by ~0 and reject everything.
+        let medians = [Double](repeating: 1e-15, count: 8)
+        XCTAssertEqual(FrameSelector.qualityGate(medians: medians), Array(0..<8))
+    }
+
     func testQualityGateRecoversAfterCloudBand() {
         // Multi-frame cloud band: indices 4...6 all spiked; baseline must not absorb them
         let medians = [0.020, 0.020, 0.020, 0.020, 0.055, 0.060, 0.058, 0.020, 0.020, 0.020]

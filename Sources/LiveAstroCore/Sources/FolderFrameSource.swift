@@ -46,6 +46,7 @@ public final class FolderFrameSource: FrameSource {
         case .live:
             self.importCursor = nil
             var cont: AsyncStream<RawFrame>.Continuation!
+            // AsyncStream's init runs this closure synchronously; cont is non-nil here.
             self.frames = AsyncStream { cont = $0 }
             self.continuation = cont
         }
@@ -68,6 +69,9 @@ public final class FolderFrameSource: FrameSource {
                         continuation.yield(frame)
                     }
                 }
+                // Normally unreachable: the watcher stream only ends via stop(),
+                // which finishes the continuation itself. Kept as a backstop so
+                // consumers never hang on a dead stream.
                 continuation.finish()
             }
         }
@@ -96,29 +100,30 @@ public final class FolderFrameSource: FrameSource {
         }
 
         func snapshotIfNeeded() {
-            lock.lock(); defer { lock.unlock() }
-            snapshotLocked()
+            lock.withLock { snapshotLocked() }
         }
 
         func stop() {
-            lock.lock(); defer { lock.unlock() }
-            stopped = true
+            lock.withLock { stopped = true }
         }
 
         /// Next file to load, or nil at end of list / after stop().
         func next() -> URL? {
-            lock.lock(); defer { lock.unlock() }
-            guard !stopped else { return nil }
-            snapshotLocked()
-            guard let files, index < files.count else { return nil }
-            let url = files[index]
-            index += 1
-            return url
+            lock.withLock {
+                guard !stopped else { return nil }
+                snapshotLocked()
+                guard let files, index < files.count else { return nil }
+                let url = files[index]
+                index += 1
+                return url
+            }
         }
 
         private func snapshotLocked() {
             guard files == nil else { return }
             let fm = FileManager.default
+            // An unreadable folder yields a silent empty import (stream ends with no
+            // frames); the folder's existence is validated upstream by the caller's UI.
             let names = (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
             files = names
                 .filter { name in
@@ -167,6 +172,8 @@ public final class FolderFrameSource: FrameSource {
                         timestamp: timestamp, sourceName: url.lastPathComponent)
     }
 
+    // Date() fallback covers the file vanishing between load and attribute read
+    // (a race we can't test deterministically); the timestamp is advisory-only.
     private static func modDate(url: URL) -> Date {
         (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
             ?? Date()

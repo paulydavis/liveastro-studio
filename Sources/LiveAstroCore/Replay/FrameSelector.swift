@@ -4,6 +4,10 @@ import Foundation
 /// Improvement is dramatic early and slow late, so sampling is logarithmic over index.
 public enum FrameSelector {
 
+    /// Default keyframe budget for a replay: enough to show stack evolution
+    /// without bloating the render.
+    public static let defaultMaxKeyframes = 45
+
     public static func logSpacedIndices(count: Int, maxKeyframes: Int) -> [Int] {
         guard count > 0 else { return [] }
         guard count > maxKeyframes else { return Array(0..<count) }
@@ -41,7 +45,8 @@ public enum FrameSelector {
     }
 
     /// Pipeline convenience: load snapshot PNGs, memoize thumbnails, select.
-    public static func selectSnapshots(urls: [URL], maxKeyframes: Int = 45) throws -> [Int] {
+    public static func selectSnapshots(urls: [URL],
+                                       maxKeyframes: Int = defaultMaxKeyframes) throws -> [Int] {
         var thumbs: [Int: [Float]] = [:]
         func thumb(_ i: Int) throws -> [Float] {
             if let t = thumbs[i] { return t }
@@ -50,6 +55,7 @@ public enum FrameSelector {
             return t
         }
         return select(count: urls.count, maxKeyframes: maxKeyframes) { i, j in
+            // Load failure → treat as maximally different so neither frame is silently dropped.
             guard let a = try? thumb(i), let b = try? thumb(j) else { return 1.0 }
             var sum = 0.0
             for k in 0..<a.count { sum += abs(Double(a[k]) - Double(b[k])) }
@@ -65,12 +71,15 @@ public enum FrameSelector {
                                    deviationThreshold: Double = 0.5,
                                    baselineWindow: Int = 5) -> [Int] {
         guard medians.count > 2 else { return Array(medians.indices) }
+        // Below this the baseline is numerically meaningless (all-dark frames);
+        // relative deviation would explode, so keep everything instead.
+        let minimumMeaningfulMedian = 1e-12
         var kept: [Int] = [0]
         for i in 1..<(medians.count - 1) {
             let window = kept.suffix(baselineWindow).map { medians[$0] }
             let sorted = window.sorted()
             let baseline = sorted[sorted.count / 2]
-            guard baseline > 1e-12 else { kept.append(i); continue }
+            guard baseline > minimumMeaningfulMedian else { kept.append(i); continue }
             let deviation = abs(medians[i] - baseline) / baseline
             if deviation <= deviationThreshold { kept.append(i) }
         }
@@ -78,7 +87,7 @@ public enum FrameSelector {
         return kept
     }
 
-    static func grayThumbnail(_ img: AstroImage, size: Int = 64) -> [Float] {
+    private static func grayThumbnail(_ img: AstroImage, size: Int = 64) -> [Float] {
         let plane = img.width * img.height
         var out = [Float](repeating: 0, count: size * size)
         for ty in 0..<size {

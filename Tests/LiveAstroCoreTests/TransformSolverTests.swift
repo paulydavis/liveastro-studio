@@ -4,13 +4,13 @@ import XCTest
 final class TransformSolverTests: XCTestCase {
     let truth = SimilarityTransform(scale: 1.003, rotation: 0.021, tx: 8.4, ty: -3.9)
 
-    func makePairs(n: Int, outliers: Int = 0) -> (src: [Star], dst: [Star], pairs: [(source: Int, target: Int)]) {
+    func makePairs(n: Int, outliers: Int = 0) -> (src: [Star], dst: [Star], pairs: [StarPair]) {
         var seed: UInt64 = 42
         func rand() -> Double {
             seed = seed &* 6364136223846793005 &+ 1442695040888963407
             return Double(seed >> 33) / Double(UInt32.max)
         }
-        var src: [Star] = [], dst: [Star] = [], pairs: [(source: Int, target: Int)] = []
+        var src: [Star] = [], dst: [Star] = [], pairs: [StarPair] = []
         for i in 0..<n {
             let x = rand() * 900, y = rand() * 500
             src.append(Star(x: x, y: y, flux: 1))
@@ -18,7 +18,7 @@ final class TransformSolverTests: XCTestCase {
             let isOutlier = i < outliers
             dst.append(Star(x: q.x + (isOutlier ? 80 + rand() * 50 : (rand() - 0.5) * 0.6),
                             y: q.y + (isOutlier ? -60 - rand() * 40 : (rand() - 0.5) * 0.6), flux: 1))
-            pairs.append((source: i, target: i))
+            pairs.append(StarPair(source: i, target: i))
         }
         return (src, dst, pairs)
     }

@@ -4,7 +4,7 @@ import Foundation
 public enum TransformSolver {
     /// Closed-form least-squares similarity fit (Umeyama) over the given pair indices.
     static func fit(source: [Star], target: [Star],
-                    pairs: ArraySlice<(source: Int, target: Int)>) -> SimilarityTransform? {
+                    pairs: ArraySlice<StarPair>) -> SimilarityTransform? {
         let n = Double(pairs.count)
         guard pairs.count >= 2 else { return nil }
         var pcx = 0.0, pcy = 0.0, qcx = 0.0, qcy = 0.0
@@ -32,7 +32,7 @@ public enum TransformSolver {
     }
 
     static func inliers(_ t: SimilarityTransform, source: [Star], target: [Star],
-                        pairs: [(source: Int, target: Int)], tolerance: Double) -> [(source: Int, target: Int)] {
+                        pairs: [StarPair], tolerance: Double) -> [StarPair] {
         pairs.filter { pr in
             let q = t.apply(x: source[pr.source].x, y: source[pr.source].y)
             let dx = q.x - target[pr.target].x, dy = q.y - target[pr.target].y
@@ -41,16 +41,17 @@ public enum TransformSolver {
     }
 
     public static func solve(source: [Star], target: [Star],
-                             pairs: [(source: Int, target: Int)],
+                             pairs: [StarPair],
                              minMatches: Int = 8, inlierTolerance: Double = 2.0,
                              iterations: Int = 500, seed: UInt64 = 0x5EED) -> SimilarityTransform? {
         guard pairs.count >= minMatches else { return nil }
         var rng = seed
         func randIndex(_ bound: Int) -> Int {
+            // Knuth 64-bit LCG (MMIX multiplier/addend)
             rng = rng &* 6364136223846793005 &+ 1442695040888963407
             return Int(rng >> 33) % bound
         }
-        var best: [(source: Int, target: Int)] = []
+        var best: [StarPair] = []
         for _ in 0..<iterations {
             let i = randIndex(pairs.count)
             var j = randIndex(pairs.count)

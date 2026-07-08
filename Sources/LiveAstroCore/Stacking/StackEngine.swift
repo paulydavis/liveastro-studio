@@ -26,9 +26,14 @@ public final class StackEngine {
     private var referenceStars: [Star] = []
     private var referenceSize: (w: Int, h: Int)?
     private var referenceChannels: Int?
+    /// Session-total accepted frames; deliberately NOT reset by reseed()
+    /// (per-stack progress is stackFrameCount).
     public private(set) var acceptedCount = 0
+    /// Session-total rejected frames; deliberately NOT reset by reseed().
     public private(set) var rejectedCount = 0
 
+    /// seedMinStars: must comfortably exceed minMatches (8); 15 gives
+    /// C(15,3)=455 triangles for reliable initial matching.
     public init(seedMinStars: Int = 15, minMatches: Int = 8, inlierTolerance: Double = 2.0) {
         self.seedMinStars = seedMinStars
         self.minMatches = minMatches
@@ -36,26 +41,28 @@ public final class StackEngine {
     }
 
     public func reseed() {
-        lock.lock(); defer { lock.unlock() }
-        accumulator = nil
-        referenceStars = []
-        referenceSize = nil
-        referenceChannels = nil
+        lock.withLock {
+            accumulator = nil
+            referenceStars = []
+            referenceSize = nil
+            referenceChannels = nil
+        }
     }
 
     public func currentStack() -> AstroImage? {
-        lock.lock(); defer { lock.unlock() }
-        return accumulator?.mean()
+        lock.withLock { accumulator?.mean() }
     }
 
     /// Frames in the CURRENT stack (resets on reseed, unlike acceptedCount).
     public var stackFrameCount: Int {
-        lock.lock(); defer { lock.unlock() }
-        return accumulator?.frameCount ?? 0
+        lock.withLock { accumulator?.frameCount ?? 0 }
     }
 
     public func process(_ frame: RawFrame) -> StackOutcome {
-        lock.lock(); defer { lock.unlock() }
+        lock.withLock { processLocked(frame) }
+    }
+
+    private func processLocked(_ frame: RawFrame) -> StackOutcome {
         let raw = frame.image
         // Degenerate frames (a half-res luminance needs at least a 2×2 source) would
         // crash star detection / superpixel binning — reject before any luminance work.
@@ -67,19 +74,7 @@ public final class StackEngine {
             rejectedCount += 1
             return .rejected(.dimensionMismatch)
         }
-        // Half-res superpixel luminance in DISPLAY orientation (flip rows if bottom-up).
-        let hw = raw.width / 2, hh = raw.height / 2
-        var lum = [Float](repeating: 0, count: hw * hh)
-        raw.pixels.withUnsafeBufferPointer { p in
-            for j in 0..<hh {
-                let srcRow = frame.bottomUp ? (hh - 1 - j) : j
-                for i in 0..<hw {
-                    let r0 = 2 * srcRow * raw.width + 2 * i
-                    let r1 = r0 + raw.width
-                    lum[j * hw + i] = (p[r0] + p[r0 + 1] + p[r1] + p[r1 + 1]) / 4
-                }
-            }
-        }
+        let (lum, hw, hh) = Self.halfResLuminance(frame: frame)
         let stars = StarDetector.detect(luminance: lum, width: hw, height: hh)
 
         if referenceSize == nil {
@@ -98,6 +93,8 @@ public final class StackEngine {
             return .becameReference
         }
 
+        // 3 = TriangleMatcher minimum (one triangle); RANSAC's minMatches is
+        // enforced later by TransformSolver.
         guard stars.count >= 3 else {
             rejectedCount += 1
             return .rejected(.insufficientStars(found: stars.count))
@@ -114,13 +111,41 @@ public final class StackEngine {
             rejectedCount += 1
             return .rejected(.dimensionMismatch)
         }
+        // Invariant: referenceSize != nil (checked above) implies the accumulator was
+        // created when the reference seeded. Guard rather than trap so a violated
+        // invariant degrades to a rejection instead of crashing the session.
+        guard let accumulator else {
+            rejectedCount += 1
+            return .rejected(.noTransform)
+        }
         let (warped, mask) = Warp.apply(rgb, transform: half.liftedToFullResolution())
-        accumulator!.add(warped, mask: mask)
+        accumulator.add(warped, mask: mask)
         acceptedCount += 1
-        return .stacked(frameCount: accumulator!.frameCount)
+        return .stacked(frameCount: accumulator.frameCount)
+    }
+
+    /// Half-res superpixel luminance in DISPLAY orientation (flip rows if bottom-up).
+    /// Internal so parity tests exercise the exact production binning.
+    static func halfResLuminance(frame: RawFrame) -> (lum: [Float], width: Int, height: Int) {
+        let raw = frame.image
+        let hw = raw.width / 2, hh = raw.height / 2
+        var lum = [Float](repeating: 0, count: hw * hh)
+        raw.pixels.withUnsafeBufferPointer { p in
+            for j in 0..<hh {
+                let srcRow = frame.bottomUp ? (hh - 1 - j) : j
+                for i in 0..<hw {
+                    let r0 = 2 * srcRow * raw.width + 2 * i
+                    let r1 = r0 + raw.width
+                    lum[j * hw + i] = (p[r0] + p[r0 + 1] + p[r1] + p[r1 + 1]) / 4
+                }
+            }
+        }
+        return (lum, hw, hh)
     }
 
     /// Debayer in stored order (never flip the CFA), then flip rows to top-down display.
+    /// RawFrame contract: bayerPattern != nil implies channels == 1 (a violated
+    /// contract traps in Debayer.bilinear rather than silently mis-rendering).
     private func displayRGB(_ frame: RawFrame) -> AstroImage {
         var rgb: AstroImage
         if let pattern = frame.bayerPattern, frame.image.channels == 1 {

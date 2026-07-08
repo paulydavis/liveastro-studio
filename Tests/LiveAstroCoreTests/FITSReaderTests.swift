@@ -136,20 +136,6 @@ final class FITSReaderTests: XCTestCase {
         XCTAssertEqual(h.dateObs, "2026-07-06T22:04:40.123")
         XCTAssertEqual(h.keywords["BITPIX"], "16")
     }
-}
-
-/// Builds raw FITS headers for edge-case tests (FITSWriter covers the happy path).
-enum FITSTestBuilder {
-    static func card(_ key: String, _ value: String) -> String {
-        let k = key.padding(toLength: 8, withPad: " ", startingAt: 0)
-        return "\(k)= \(value)".padding(toLength: 80, withPad: " ", startingAt: 0)
-    }
-    static func header(cards: [(String, String)]) -> Data {
-        var s = cards.map { card($0.0, $0.1) }.joined()
-        s += "END".padding(toLength: 80, withPad: " ", startingAt: 0)
-        while s.count % 2880 != 0 { s += String(repeating: " ", count: 80) }
-        return s.data(using: .ascii)!
-    }
 
     /// FITS standard: '/' inside a quoted string is NOT a comment delimiter,
     /// and a quote inside a string is escaped by doubling.
@@ -174,5 +160,19 @@ enum FITSTestBuilder {
         XCTAssertEqual(h.keywords["OBSERVER"], "O'HARA")
         XCTAssertEqual(h.keywords["OBJECT"], "M 101 / Pinwheel")
         XCTAssertEqual(h.keywords["EXPTIME"], "30.0")
+    }
+}
+
+/// Builds raw FITS headers for edge-case tests (FITSWriter covers the happy path).
+enum FITSTestBuilder {
+    static func card(_ key: String, _ value: String) -> String {
+        let k = key.padding(toLength: 8, withPad: " ", startingAt: 0)
+        return "\(k)= \(value)".padding(toLength: 80, withPad: " ", startingAt: 0)
+    }
+    static func header(cards: [(String, String)]) -> Data {
+        var s = cards.map { card($0.0, $0.1) }.joined()
+        s += "END".padding(toLength: 80, withPad: " ", startingAt: 0)
+        while s.count % 2880 != 0 { s += String(repeating: " ", count: 80) }
+        return s.data(using: .ascii)!
     }
 }

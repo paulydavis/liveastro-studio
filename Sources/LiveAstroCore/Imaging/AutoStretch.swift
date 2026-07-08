@@ -18,7 +18,7 @@ public enum AutoStretch {
                                shadowsClipping: Double = -2.8) -> AstroImage {
         let plane = image.width * image.height
         // Combined luminance sample (mean across channels), stride-sampled.
-        let stride = max(1, plane / 262_144)
+        let stride = AstroImage.sampleStride(count: plane)
         var sample: [Float] = []
         sample.reserveCapacity(plane / stride + 1)
         var i = 0
@@ -32,6 +32,7 @@ public enum AutoStretch {
         let median = Double(sample[sample.count / 2])
         var deviations = sample.map { abs(Double($0) - median) }
         deviations.sort()
+        // 1.4826 = 1 / Φ⁻¹(0.75): MAD→σ consistency factor for Gaussian data
         let madn_raw = 1.4826 * deviations[deviations.count / 2]
         // When all samples are nearly identical (madn ≈ 0), use median as fallback to preserve channel ratios
         let madn = madn_raw > 1e-10 ? madn_raw : max(median, 1e-10)
@@ -78,6 +79,8 @@ public enum AutoStretch {
     }
 
     /// Pack planar float image into an 8-bit CGImage (gray or RGBX).
+    /// CGContext creation / makeImage() only fail under memory pressure;
+    /// the nil propagates to the caller rather than trapping.
     public static func makeCGImage(_ image: AstroImage) -> CGImage? {
         let w = image.width, h = image.height, plane = w * h
         if image.channels == 1 {

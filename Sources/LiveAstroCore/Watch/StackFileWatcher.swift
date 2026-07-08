@@ -28,6 +28,8 @@ public final class StackFileWatcher {
 
     private let fileNamePrefix: String?
 
+    private static let maxHeaderBlocks = 32  // generous ceiling; real headers are 1-10 blocks
+
     public init(folder: URL, quietPeriod: TimeInterval = 0.5, pollInterval: TimeInterval = 2.0,
                 fileNamePrefix: String? = nil) {
         self.folder = folder
@@ -47,6 +49,8 @@ public final class StackFileWatcher {
         }
         let src = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: folderFD, eventMask: [.write, .extend], queue: queue)
+        // Kernel events can't be injected in tests; the poll fallback below
+        // exercises the same scheduleScan/scan path.
         src.setEventHandler { [weak self] in self?.scheduleScan() }
         // Apple's DispatchSource contract: the watched fd must stay open until the
         // source's cancellation handler runs — closing it earlier races the kqueue.
@@ -80,6 +84,8 @@ public final class StackFileWatcher {
 
     private func scan() {
         let fm = FileManager.default
+        // Folder unmount/delete mid-run degrades to silent idle; exercising this
+        // requires OS-level volume teardown, so it stays untested.
         guard let names = try? fm.contentsOfDirectory(atPath: folder.path) else { return }
         for name in names {
             guard !name.hasPrefix("."), !name.lowercased().hasSuffix(".tmp") else { continue }
@@ -98,7 +104,7 @@ public final class StackFileWatcher {
 
             if isFITS {
                 // Bulletproof completeness: header declares exact expected data length (spec §5.2).
-                guard let head = try? readHead(url: url, bytes: 32 * 2880),
+                guard let head = try? readHead(url: url, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
                       let header = try? FITSReader.readHeader(head),
                       size >= header.minimumFileSize else { continue }
             } else {
@@ -106,7 +112,7 @@ public final class StackFileWatcher {
                 guard previousSize == size else { continue }
             }
 
-            let digest = contentDigest(url: url, size: size)
+            guard let digest = contentDigest(url: url, size: size) else { continue }
             guard lastEmittedDigest[name] != digest else { continue }
             lastEmittedDigest[name] = digest
             continuation.yield(StackUpdate(url: url, fileSize: size))
@@ -116,12 +122,16 @@ public final class StackFileWatcher {
     private func readHead(url: URL, bytes: Int) throws -> Data {
         let fh = try FileHandle(forReadingFrom: url)
         defer { try? fh.close() }
+        // FileHandle.read returning nil is a framework-level anomaly; the empty-Data
+        // fallback yields a truncated-header skip in scan(), which is safe.
         return try fh.read(upToCount: bytes) ?? Data()
     }
 
     /// Cheap content identity: SHA256 over size + first/last 64 KB.
-    private func contentDigest(url: URL, size: Int) -> String {
-        guard let fh = try? FileHandle(forReadingFrom: url) else { return UUID().uuidString }
+    /// Returns nil when the file cannot be opened — the caller must skip the file
+    /// rather than emit (a random digest would defeat dedupe and yield repeats).
+    private func contentDigest(url: URL, size: Int) -> String? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? fh.close() }
         var hasher = SHA256()
         hasher.update(data: Data("\(size)".utf8))

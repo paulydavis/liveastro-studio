@@ -20,20 +20,27 @@ public final class SessionManager {
         Double(acceptedCount) * (manifest?.subExposureSeconds ?? 0)
     }
 
-    public static func sessionId(date: Date, targetName: String) -> String {
+    // Fixed format/locale/calendar make this formatter immutable after setup,
+    // so a single shared instance is safe to reuse.
+    private static let sessionIdDateFormatter: DateFormatter = {
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd"
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.calendar = Calendar(identifier: .gregorian)
+        return fmt
+    }()
+
+    public static func sessionId(date: Date, targetName: String) -> String {
         var slug = targetName.lowercased().unicodeScalars
             .filter { CharacterSet.alphanumerics.contains($0) }
             .reduce(into: "") { $0.unicodeScalars.append($1) }
         if slug.isEmpty { slug = "session" }
-        return "\(fmt.string(from: date))-\(String(slug.prefix(24)))"
+        return "\(Self.sessionIdDateFormatter.string(from: date))-\(String(slug.prefix(24)))"
     }
 
     @discardableResult
     public func startSession(profile: SessionProfile, at date: Date = .init()) throws -> URL {
+        // Intentional: an ended manager may start a fresh session (watcher-mode reuse).
         guard state != .running else { throw SessionError.alreadyRunning }
         let baseId = Self.sessionId(date: date, targetName: profile.targetName)
         var id = baseId

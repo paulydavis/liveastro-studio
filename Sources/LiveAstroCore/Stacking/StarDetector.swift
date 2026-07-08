@@ -13,6 +13,7 @@ public enum StarDetector {
                               maxStars: Int = 60, sigmaThreshold: Double = 5.0) -> [Star] {
         precondition(luminance.count == width * height)
         guard width >= 1, height >= 1 else { return [] }
+        // Star blobs (5-10 px) ≪ cell, so each cell's median stays an unbiased sky estimate.
         let cell = 32
         let gw = max(1, (width + cell - 1) / cell), gh = max(1, (height + cell - 1) / cell)
         var bgGrid = [Float](repeating: 0, count: gw * gh)
@@ -37,6 +38,7 @@ public enum StarDetector {
                 var dev = vals.map { abs($0 - med) }
                 dev.sort()
                 bgGrid[gy * gw + gx] = med
+                // 1.4826 = 1 / Φ⁻¹(0.75): MAD→σ consistency factor for Gaussian data
                 sigGrid[gy * gw + gx] = max(1.4826 * dev[dev.count / 2], 1e-6)
             }
         }
@@ -63,6 +65,8 @@ public enum StarDetector {
 
         var visited = [Bool](repeating: false, count: width * height)
         var stars: [Star] = []
+        // minArea 3 excludes hot pixels and 2-px noise (too small to centroid);
+        // maxArea 400 rejects smeared cosmic rays, nebula patches, and dust donuts.
         let minArea = 3, maxArea = 400
         for start in 0..<mask.count where mask[start] && !visited[start] {
             var stack = [start]

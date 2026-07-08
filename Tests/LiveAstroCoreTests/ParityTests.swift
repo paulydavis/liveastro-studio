@@ -29,25 +29,11 @@ final class ParityTests: XCTestCase {
 
     // MARK: – Helpers
 
-    /// Build the same half-res superpixel luminance StackEngine builds.
-    /// When bottomUp is true the row-read order is reversed — mirroring
-    /// StackEngine's display-orientation flip over stored-order frames.
-    /// display orientation — identical to the Python fixture script.
+    /// Exactly the production half-res superpixel luminance (via @testable):
+    /// parity against astroalign is only meaningful over the same binning and
+    /// display-orientation flip StackEngine registers on.
     private func buildLuminance(frame: RawFrame) -> ([Float], Int, Int) {
-        let raw = frame.image
-        let hw = raw.width / 2, hh = raw.height / 2
-        var lum = [Float](repeating: 0, count: hw * hh)
-        raw.pixels.withUnsafeBufferPointer { p in
-            for j in 0..<hh {
-                let srcRow = frame.bottomUp ? (hh - 1 - j) : j
-                for i in 0..<hw {
-                    let r0 = 2 * srcRow * raw.width + 2 * i
-                    let r1 = r0 + raw.width
-                    lum[j * hw + i] = (p[r0] + p[r0 + 1] + p[r1] + p[r1 + 1]) / 4
-                }
-            }
-        }
-        return (lum, hw, hh)
+        StackEngine.halfResLuminance(frame: frame)
     }
 
     /// Load the parity_expected.json from the test bundle.
