@@ -71,7 +71,7 @@ final class PerformanceTests: XCTestCase {
     ///
     /// The reference frame seeds the engine, then we time one process() call on
     /// a copy shifted by (5, 3) pixels.  Wall-clock limit: 10 seconds.
-    func testProcess26MPPerformanceGate() {
+    func testProcess26MPPerformanceGate() throws {
         let width = 6248, height = 4176   // even dimensions, GRBG-safe
 
         // Build reference and shifted frames (outside the timed region).
