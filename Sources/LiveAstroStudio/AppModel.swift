@@ -110,7 +110,7 @@ final class AppModel {
 
     /// Reseeds the stacking engine reference frame (native mode only).
     func reseedReference() {
-        guard isRunning && sourceMode == .nativeStack else { return }
+        guard isRunning && sourceMode == .nativeStack && !isGeneratingReplay else { return }
         pipeline?.reseed()
         log.append("reference reseeded")
     }
