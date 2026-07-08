@@ -104,6 +104,11 @@ final class AppModel {
 
     private var pipeline: SessionPipeline?
 
+    /// The fire-and-forget OBS bring-up task (connect + retry + startStream).
+    /// Stored so session teardown can cancel it before OBS finishes launching —
+    /// otherwise a late connect could start a stream the operator already ended.
+    private var obsBringUpTask: Task<Void, Never>?
+
     init() {
         // Route OBS diagnostics into the session log. onLog fires on the main
         // actor (OBSController is @MainActor), so appending is safe.
@@ -182,7 +187,7 @@ final class AppModel {
             replayURL = nil
             log.append("Session started — watching \(folder.path)")
             startSceneAutomation()
-            Task { await bringUpOBS() }
+            obsBringUpTask = Task { await bringUpOBS() }
         } catch {
             errorMessage = "Start failed: \(error.localizedDescription)"
         }
@@ -305,6 +310,11 @@ final class AppModel {
         // deferred until AFTER the pipeline end/replay flow below.
         stopSceneAutomation()
 
+        // Cancel any in-flight OBS bring-up so a late connect (OBS still
+        // launching) can't start a stream after we've asked it to stop below.
+        obsBringUpTask?.cancel()
+        obsBringUpTask = nil
+
         Task.detached { [weak self] in
             do {
                 let url = try p.end()
@@ -348,8 +358,10 @@ final class AppModel {
             launchOBS()
             // Retry connect every 2 s until success or a 20 s budget elapses.
             let deadline = Date().addingTimeInterval(20)
-            while !connected && Date() < deadline {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            while !connected && Date() < deadline && !Task.isCancelled && isRunning {
+                // Cancellation-aware sleep: a cancel throws here, which we treat
+                // as "stop retrying" — return out of bring-up entirely.
+                do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
                 if obs.state == .disconnected {
                     connected = await obs.connect(host: obsHost, port: obsPort,
                                                  password: obsPassword.isEmpty ? nil : obsPassword)
@@ -363,6 +375,10 @@ final class AppModel {
             log.append("OBS: not connected — continuing session without OBS")
             return
         }
+
+        // A connection that completes after the session ended (or after cancel)
+        // must not start a broadcast the operator already stopped.
+        guard isRunning, !Task.isCancelled else { return }
 
         await obs.startStream()
         if obsRecord { await obs.setRecording(true) }
