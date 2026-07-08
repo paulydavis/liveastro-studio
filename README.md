@@ -36,6 +36,75 @@ swift run LiveAstroStudio
 5. Start Session. Stream from OBS as usual.
 6. End Session → `~/Documents/LiveAstro/<session>/replay.mp4`. The replay cloud gate automatically drops frames whose background brightness deviates more than 50% from the recent accepted-frame baseline before keyframe selection — first and last frames are always kept, so passing clouds do not corrupt the evolution video.
 
+## OBS automation
+
+LiveAstro can drive OBS over the obs-websocket 5.x protocol so you never have to
+touch OBS during a session — it launches OBS, connects, starts the stream, and
+switches scenes based on whether stacking is making progress.
+
+**One-time OBS setup**
+
+1. In OBS, open **Tools → WebSocket Server Settings**.
+2. Check **Enable WebSocket server** (default port **4455**).
+3. Either turn off **Enable Authentication**, or set a password and copy it into
+   the Control window's OBS **Password** field.
+
+**Control window — OBS section**
+
+- **Status line** — a colored dot + text (`disconnected` / `connecting…` /
+  `connected` / `streaming`), plus a red **REC** indicator while OBS is recording.
+- **Connect / Disconnect** — connect manually with the current host/port/password.
+- **Host / Port / Password** — connection settings; locked while connected.
+- **Auto-launch OBS on session start** — when on (default), starting a session
+  that can't reach OBS launches OBS (in the background, without stealing focus)
+  and retries the connection for up to 20 s.
+- **Scene picker + ↻** — pick the live program scene; ↻ refreshes the scene list
+  from OBS.
+- **Record while streaming** — also start OBS recording when the stream comes up.
+- **Scene automation (scope on stall)** with **Stack scene** / **Scope scene**
+  pickers — see below.
+
+**What happens on Start / End Session**
+
+- **Start Session** connects to OBS (auto-launching if needed), starts the stream,
+  optionally starts recording, and switches to the Stack scene. Every OBS step is
+  best-effort: if any of it fails, the failure is logged and the astronomy session
+  continues regardless — **OBS never blocks the session.**
+- **Scene automation:** while a session runs with automation on, a stall detector
+  (seeded from your sub-exposure length) watches for stacking to stall. On a stall
+  it switches OBS to the **Scope scene** once; when frames resume it switches back
+  to the **Stack scene** once. If you change the program scene by hand, automation
+  detects the override and pauses until the next stall/resume boundary.
+- **End Session** runs the replay generation first, then — and only then — stops
+  the OBS stream and recording. This is the **only** place the stream is stopped:
+  quitting or force-quitting the app deliberately leaves the OBS stream alive so a
+  crash or accidental quit never kills your broadcast.
+
+**Manual validation checklist**
+
+Run through these against a live OBS before relying on the automation:
+
+- [ ] **Auth** — with a WebSocket password set, Connect succeeds; with a wrong
+      password it fails and logs an auth error (session still starts).
+- [ ] **Cold auto-launch** — with OBS quit and Auto-launch on, Start Session
+      launches OBS (in the background) and connects within ~20 s.
+- [ ] **Stream toggle** — Start Session turns OBS's stream indicator on; End
+      Session turns it off.
+- [ ] **Scene automation via stall** — with automation on and Stack/Scope scenes
+      chosen, stop feeding frames (or pause `fakesiril`); after the stall threshold
+      OBS switches to the Scope scene, and resuming frames switches back to Stack.
+- [ ] **Accidental quit leaves stream alive** — while streaming, force-quit
+      LiveAstro; OBS keeps streaming (only End Session stops it).
+
+**Real-connection smoke test**
+
+`Scripts/obs_smoke.swift` is a headless program that connects to a live OBS on
+`localhost:4455`, prints the state, scene list, and OBS version, then starts and
+stops the stream. It is run **manually** (it connects to real OBS and starts a
+real stream, so never run it during a live broadcast). The password is passed as
+the first argument; the build+run command is documented in a comment at the top
+of the script.
+
 ## Native stacking
 
 LiveAstro v2 can stack raw sub-exposures itself — no external live-stacker required.
