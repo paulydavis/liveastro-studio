@@ -225,6 +225,11 @@ Manifest schema (per original brief):
 
 Camera control, native live stacking, mount control, guiding, plate solving, direct YouTube/Twitch upload, OBS plugin/WebSocket/Browser Source, AI narration, automatic target recognition, star counting, vertical formats, XISF.
 
+> **v2 annotation (2026-07-07):** Native live stacking is no longer a non-goal for the product.
+> It was implemented in v2 as a first-class feature (see
+> `docs/superpowers/specs/2026-07-07-liveastro-v2-native-stacking-design.md`).
+> The v1 non-goal remains accurate — this was deferred until v2, not never-built.
+
 ## 10. Definition of Done (MVP)
 
 - Runs on macOS 14+.

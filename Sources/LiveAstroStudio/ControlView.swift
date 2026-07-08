@@ -9,16 +9,26 @@ struct ControlView: View {
         @Bindable var model = model
         Form {
             Section("Watch Folder") {
+                Picker("Source", selection: $model.sourceMode) {
+                    ForEach(AppModel.SourceMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(model.isRunning || model.isImporting)
+
                 HStack {
                     Text(model.watchFolder?.path ?? "none selected")
                         .lineLimit(1).truncationMode(.middle)
                     Spacer()
-                    Button("Choose…") { pickFolder() }.disabled(model.isRunning)
+                    Button("Choose…") { pickFolder() }
+                        .disabled(model.isRunning || model.isImporting)
                 }
-                TextField("File name starts with (empty = any)", text: $model.fileNamePrefix)
-                    .disabled(model.isRunning)
+                TextField("File prefix (empty = any; e.g. Light_ for native subs)",
+                          text: $model.fileNamePrefix)
+                    .disabled(model.isRunning || model.isImporting)
                 Toggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground)
-                    .disabled(model.isRunning)
+                    .disabled(model.isRunning || model.isImporting)
             }
             Section("Session Profile") {
                 TextField("Target name", text: $model.targetName)
@@ -41,8 +51,17 @@ struct ControlView: View {
                     } else {
                         Button("Start Session") { model.startSession() }
                             .buttonStyle(.borderedProminent)
+                            .disabled(model.isImporting)
                     }
                 }
+                if model.isRunning && model.sourceMode == .nativeStack {
+                    Text("accepted \(model.acceptedCount) · rejected \(model.rejectedCount)")
+                        .font(.system(.caption, design: .monospaced))
+                    Button("Reseed Reference") { model.reseedReference() }
+                }
+                Button("Import Subs…") { pickImportFolder() }
+                    .disabled(model.isRunning || model.isImporting)
+                if model.isImporting { ProgressView("Importing subs…") }
                 if !model.isRunning {
                     Button("Regenerate Replay…") { pickSessionDirectory() }
                         .disabled(model.isGeneratingReplay)
@@ -77,6 +96,18 @@ struct ControlView: View {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK { model.watchFolder = panel.url }
+    }
+
+    private func pickImportFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Choose Subs Folder"
+        panel.message = "Select a folder containing raw FITS subs to import"
+        if panel.runModal() == .OK, let url = panel.url {
+            model.importSubs(from: url)
+        }
     }
 
     private func pickSessionDirectory() {

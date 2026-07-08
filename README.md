@@ -36,6 +36,59 @@ swift run LiveAstroStudio
 5. Start Session. Stream from OBS as usual.
 6. End Session → `~/Documents/LiveAstro/<session>/replay.mp4`. The replay cloud gate automatically drops frames whose background brightness deviates more than 50% from the recent accepted-frame baseline before keyframe selection — first and last frames are always kept, so passing clouds do not corrupt the evolution video.
 
+## Native stacking
+
+LiveAstro v2 can stack raw sub-exposures itself — no external live-stacker required.
+There are two entry points:
+
+**Import Subs… (batch import from acquired files)**
+
+1. In the Control window, set the source mode to **Raw subs folder (native stacking)**.
+2. Click **Import Subs…** and choose the folder containing your `.fit` files
+   (the folder that your capture software writes to, e.g. `~/Documents/lights/`).
+3. Fill in the session profile and click **Start Session**.
+   The engine imports each file in chronological order: bilinear debayer → star
+   registration → incremental mean stack.  An indeterminate spinner is shown while
+   the import runs; accepted and rejected frames are listed in the session log.
+   The session lands in `~/Documents/LiveAstro/<date-target>/` like any
+   other session — including `replay.mp4` and `master.fit`.
+
+**Live raw-subs (watch folder as subs arrive)**
+
+1. Set source mode to **Raw subs folder (native stacking)**.
+2. Point the watch folder at the folder your capture software writes subs into
+   (Seestar SMB share, ASIAIR, or a local capture path).
+3. Start Session — each new sub is stacked as it arrives.
+4. Use **Reseed Reference** to discard the current reference frame and restart
+   alignment from the next accepted sub (useful after a long gap, fog clearing,
+   or a meridian flip that changes field rotation significantly).
+
+**Stacker output folder (Siril / external stacker)**
+
+This is the original v1 mode.  Set source mode to **Stacker output folder (Siril)**
+and point at the folder Siril writes its `live_stack.fit` into.  All v1 behavior
+is unchanged.
+
+**master.fit output**
+
+At the end of every native-stack session, `master.fit` is written into the session
+directory alongside `replay.mp4`.  It is a 32-bit float RGB FITS file in TOP-DOWN
+row order, suitable for further processing in PixInsight or Siril.
+
+**Validation results (NGC 6888, 2026-07-07)**
+
+120 × 20 s subs (40 min) imported headless against Paul's Siril 1000-sub master:
+
+| Channel | LiveAstro r | Siril master baseline (16-sub prototype) | Delta |
+|---------|-------------|------------------------------------------|-------|
+| R       | **0.9490**  | 0.87                                     | +0.079 |
+| G       | **0.9522**  | 0.94                                     | +0.012 |
+| B       | **0.9466**  | 0.83                                     | +0.117 |
+
+All 120 subs accepted, 0 rejected.  Import time: ~350 s on Apple Silicon (M-class).
+Correlation measured by `Scripts/compare_to_master.py` (astroalign luminance
+registration, full registered frame Pearson r).
+
 ## Demo without a telescope
 
 ```bash
@@ -48,7 +101,12 @@ Point the watch folder at `/tmp/fakestack`.
 ## Development
 
 ```bash
-swift test   # full suite, no hardware needed
+swift test                                          # full suite, no hardware needed
+swift test -c release --filter PerformanceTests     # 26 MP perf gate (< 10 s per frame)
 ```
 
-Design spec: `docs/superpowers/specs/2026-07-05-liveastro-studio-v1-design.md`
+Design specs:
+- v1: `docs/superpowers/specs/2026-07-05-liveastro-studio-v1-design.md`
+- v2 native stacking: `docs/superpowers/specs/2026-07-07-liveastro-v2-native-stacking-design.md`
+
+Validation comparison script: `Scripts/compare_to_master.py`
