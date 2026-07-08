@@ -13,6 +13,7 @@ public final class SessionPipeline {
 
     private let watcher: StackFileWatcher?
     private var source: FrameSource?
+    private var sourceIsFinite = true
     private var engine: StackEngine?
     private let profile: SessionProfile
     private let replaySettings: ReplaySettings
@@ -38,11 +39,16 @@ public final class SessionPipeline {
 
     /// Native stacking mode: pulls raw frames from a FrameSource, stacks them with StackEngine,
     /// and records each accepted frame as a snapshot.
+    /// `sourceIsFinite`: true for import (stream ends on its own — end() drains it fully,
+    /// however long that takes); false for live sources (end() stops the source first,
+    /// then drains briefly — mirroring watcher-mode semantics).
     public init(nativeSource: FrameSource, engine: StackEngine, profile: SessionProfile,
                 rootDirectory: URL, replaySettings: ReplaySettings = .init(),
-                maxKeyframes: Int = 45, neutralizeBackground: Bool = false) {
+                maxKeyframes: Int = 45, neutralizeBackground: Bool = false,
+                sourceIsFinite: Bool = true) {
         self.watcher = nil
         self.source = nativeSource
+        self.sourceIsFinite = sourceIsFinite
         self.engine = engine
         self.profile = profile
         self.session = SessionManager(rootDirectory: rootDirectory)
@@ -143,13 +149,22 @@ public final class SessionPipeline {
     /// In watcher mode, stops the watcher first so the stream terminates, then drains.
     public func end() throws -> URL {
         if source != nil {
-            // Native mode: the import stream ends naturally; wait for the consume task to drain it.
-            // Stop the source only afterward as cleanup (idempotent for importOnce).
-            if consumeTask != nil {
-                _ = consumeDone.wait(timeout: .now() + 30)
-                consumeTask = nil
+            if sourceIsFinite {
+                // Import: the stream ends on its own; drain it completely (a long import
+                // takes as long as it takes — end() runs off the main thread).
+                if consumeTask != nil {
+                    consumeDone.wait()
+                    consumeTask = nil
+                }
+                source?.stop()
+            } else {
+                // Live source: the stream never ends by itself — stop it first, then drain.
+                source?.stop()
+                if consumeTask != nil {
+                    _ = consumeDone.wait(timeout: .now() + 10)
+                    consumeTask = nil
+                }
             }
-            source?.stop()
         } else {
             // Watcher mode: stop the watcher to terminate the updates stream, then drain.
             watcher?.stop()
