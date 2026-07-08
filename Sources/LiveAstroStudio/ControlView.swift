@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import LiveAstroCore
 
 struct ControlView: View {
     @Environment(AppModel.self) private var model
@@ -76,6 +77,9 @@ struct ControlView: View {
                     }
                 }
             }
+            // Observes the OBSController (Combine ObservableObject) so its
+            // @Published state/scene/record changes re-render this section.
+            OBSSection(model: model)
             Section("Log") {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {
@@ -125,6 +129,124 @@ struct ControlView: View {
         }
         if panel.runModal() == .OK, let url = panel.url {
             model.regenerateReplay(sessionDirectory: url)
+        }
+    }
+}
+
+/// OBS controls, split out so it can `@ObservedObject` the controller.
+///
+/// `OBSController` is a Combine `ObservableObject` (not `@Observable`), held as a
+/// plain `let` on the `@Observable` AppModel — so its `@Published` state/scene/
+/// record changes would NOT drive a re-render if we only read them through the
+/// model. Observing it directly here restores reactivity. Config fields
+/// (host/port/password/toggles) are `@Observable` AppModel props, bound via
+/// `@Bindable`.
+private struct OBSSection: View {
+    @Bindable var model: AppModel
+    @ObservedObject private var obs: OBSController
+
+    init(model: AppModel) {
+        self.model = model
+        self.obs = model.obs
+    }
+
+    /// True once the controller is connected (any non-disconnected state).
+    private var connected: Bool { obs.state != .disconnected }
+
+    /// Short human label + status dot color for the current OBS state.
+    private var status: (text: String, color: Color) {
+        switch obs.state {
+        case .disconnected: return ("disconnected", .secondary)
+        case .connecting:   return ("connecting…", .orange)
+        case .connected:    return ("connected", .green)
+        case .streaming:    return ("streaming", .green)
+        }
+    }
+
+    /// Two-way binding for the program-scene Picker: reads OBS's current program
+    /// scene, writes go through `setScene` (operator override).
+    private var sceneSelection: Binding<String?> {
+        Binding(
+            get: { obs.currentScene },
+            set: { newValue in
+                guard let name = newValue else { return }
+                Task { await obs.setScene(name) }
+            }
+        )
+    }
+
+    var body: some View {
+        Section("OBS") {
+            // Status line: ● state text, plus a REC dot when recording.
+            HStack(spacing: 6) {
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 8))
+                    .foregroundStyle(status.color)
+                Text(status.text)
+                    .font(.system(.caption, design: .monospaced))
+                if obs.isRecording {
+                    Spacer()
+                    Image(systemName: "record.circle").foregroundStyle(.red)
+                    Text("REC").font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.red)
+                }
+                Spacer()
+                if connected {
+                    Button("Disconnect") { obs.disconnect() }
+                } else {
+                    Button("Connect") { connectOBS() }
+                }
+            }
+
+            // Connection config — locked while connected.
+            TextField("Host", text: $model.obsHost)
+                .disabled(connected)
+            TextField("Port", value: $model.obsPort, format: .number.grouping(.never))
+                .disabled(connected)
+            SecureField("Password (empty if auth off)", text: $model.obsPassword)
+                .disabled(connected)
+            Toggle("Auto-launch OBS on session start", isOn: $model.obsAutoLaunch)
+
+            // Scene selection, fed by the controller's live scene list.
+            HStack {
+                Picker("Scene", selection: sceneSelection) {
+                    Text("—").tag(String?.none)
+                    ForEach(obs.sceneNames, id: \.self) { name in
+                        Text(name).tag(String?.some(name))
+                    }
+                }
+                Button {
+                    Task { await obs.refreshScenes() }
+                } label: { Image(systemName: "arrow.clockwise") }
+                .help("Refresh scene list")
+                .disabled(!connected)
+            }
+
+            Toggle("Record while streaming", isOn: $model.obsRecord)
+
+            // Scene automation: switch to the scope scene on a stall, back to the
+            // stack scene on resume.
+            Toggle("Scene automation (scope on stall)", isOn: $model.sceneAutomationOn)
+            Picker("Stack scene", selection: $model.stackSceneName) {
+                Text("—").tag("")
+                ForEach(obs.sceneNames, id: \.self) { Text($0).tag($0) }
+            }
+            .disabled(!model.sceneAutomationOn)
+            Picker("Scope scene", selection: $model.scopeSceneName) {
+                Text("—").tag("")
+                ForEach(obs.sceneNames, id: \.self) { Text($0).tag($0) }
+            }
+            .disabled(!model.sceneAutomationOn)
+        }
+    }
+
+    /// Connect using the form's host/port/password and refresh the scene list.
+    private func connectOBS() {
+        Task {
+            let ok = await obs.connect(
+                host: model.obsHost, port: model.obsPort,
+                password: model.obsPassword.isEmpty ? nil : model.obsPassword)
+            if ok { await obs.refreshScenes() }
         }
     }
 }
