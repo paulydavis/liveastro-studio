@@ -18,7 +18,11 @@ public enum FITSWriter {
         if channels == 3 { cards.append(card("NAXIS3", "3")) }
         cards.append(card("ROWORDER", bottomUp ? "'BOTTOM-UP'" : "'TOP-DOWN'"))
         var s = cards.joined() + "END".padding(toLength: 80, withPad: " ", startingAt: 0)
-        while s.count % 2880 != 0 { s += String(repeating: " ", count: 80) }
+        // Pad the header with spaces to a 2880-byte block boundary (FITS §3.1).
+        // Exact-remainder form: terminates for ANY length, unlike stepping in
+        // 80-byte chunks, which would spin forever if a card ever weren't 80 bytes.
+        let headerPad = (2880 - s.count % 2880) % 2880
+        s += String(repeating: " ", count: headerPad)
         var data = s.data(using: .ascii)!
 
         let plane = width * height
@@ -31,7 +35,9 @@ public enum FITSWriter {
                 }
             }
         }
-        while data.count % 2880 != 0 { data.append(0) }
+        // Zero-pad the data section to a block boundary, in one append.
+        let dataPad = (2880 - data.count % 2880) % 2880
+        data.append(Data(repeating: 0, count: dataPad))
         return data
     }
 }
