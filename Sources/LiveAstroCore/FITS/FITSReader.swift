@@ -25,11 +25,7 @@ public enum FITSReader {
                 let idx8 = card.index(card.startIndex, offsetBy: 8)
                 if card[idx8...].hasPrefix("= ") {
                     let raw = String(card[card.index(idx8, offsetBy: 2)...])
-                    let value = raw.split(separator: "/", maxSplits: 1)[0]
-                        .trimmingCharacters(in: .whitespaces)
-                        .trimmingCharacters(in: CharacterSet(charactersIn: "'"))
-                        .trimmingCharacters(in: .whitespaces)
-                    cards[key] = value
+                    cards[key] = Self.parseCardValue(raw)
                 }
             }
             block += 1
@@ -61,6 +57,37 @@ public enum FITSReader {
     /// `normalizeRowOrder`: true (default) flips bottom-up files to top-down for
     /// display consumers; false returns pixels exactly as stored — required by CFA
     /// consumers (debayering a flipped mosaic shifts the Bayer phase and swaps R/B).
+
+    /// Parse a FITS card value field (the bytes after "= "), per the standard:
+    /// a '/' starts a comment only OUTSIDE quoted strings, and a quote inside
+    /// a string is escaped by doubling ('O''HARA' means O'HARA).
+    static func parseCardValue(_ raw: String) -> String {
+        let trimmed = raw.drop(while: { $0 == " " })
+        if trimmed.first == "'" {
+            var value = ""
+            var i = trimmed.index(after: trimmed.startIndex)
+            while i < trimmed.endIndex {
+                let ch = trimmed[i]
+                if ch == "'" {
+                    let next = trimmed.index(after: i)
+                    if next < trimmed.endIndex, trimmed[next] == "'" {
+                        value.append("'")          // escaped quote
+                        i = trimmed.index(after: next)
+                        continue
+                    }
+                    break                          // closing quote
+                }
+                value.append(ch)
+                i = trimmed.index(after: i)
+            }
+            // FITS pads string values with trailing spaces inside the quotes
+            return value.trimmingCharacters(in: .whitespaces)
+        }
+        // Unquoted: strip comment at the first '/', then trim
+        let beforeComment = trimmed.prefix(while: { $0 != "/" })
+        return beforeComment.trimmingCharacters(in: .whitespaces)
+    }
+
     public static func read(_ data: Data, normalizeRowOrder: Bool = true) throws -> FITSImage {
         let h = try readHeader(data)
         guard data.count >= h.minimumFileSize else {

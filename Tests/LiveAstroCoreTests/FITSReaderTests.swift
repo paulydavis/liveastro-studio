@@ -114,4 +114,29 @@ enum FITSTestBuilder {
         while s.count % 2880 != 0 { s += String(repeating: " ", count: 80) }
         return s.data(using: .ascii)!
     }
+
+    /// FITS standard: '/' inside a quoted string is NOT a comment delimiter,
+    /// and a quote inside a string is escaped by doubling.
+    func testQuotedValuesWithSlashesAndEscapes() throws {
+        var header = ""
+        func card(_ c: String) { header += c.padding(toLength: 80, withPad: " ", startingAt: 0) }
+        card("SIMPLE  =                    T")
+        card("BITPIX  =                   16")
+        card("NAXIS   =                    2")
+        card("NAXIS1  =                    4")
+        card("NAXIS2  =                    2")
+        card("FILTER  = 'Ha/OIII '           / dual-band filter")
+        card("OBSERVER= 'O''HARA'")
+        card("OBJECT  = 'M 101 / Pinwheel'")
+        card("EXPTIME =                 30.0 / seconds")
+        card("END")
+        var data = header.data(using: .ascii)!
+        data.append(Data(repeating: 0x20, count: 2880 - data.count % 2880))
+        data.append(Data(repeating: 0, count: 16))
+        let h = try FITSReader.readHeader(data)
+        XCTAssertEqual(h.keywords["FILTER"], "Ha/OIII")
+        XCTAssertEqual(h.keywords["OBSERVER"], "O'HARA")
+        XCTAssertEqual(h.keywords["OBJECT"], "M 101 / Pinwheel")
+        XCTAssertEqual(h.keywords["EXPTIME"], "30.0")
+    }
 }
