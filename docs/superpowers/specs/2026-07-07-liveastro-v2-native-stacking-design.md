@@ -1,6 +1,6 @@
 # LiveAstro Studio v2 — Native Stacking Design
 
-**Date:** 2026-07-07 · **Status:** draft for review
+**Date:** 2026-07-07 · **Status:** implemented (2026-07-07)
 
 ## 1. Goal
 
