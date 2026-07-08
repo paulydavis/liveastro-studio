@@ -11,6 +11,7 @@ let package = Package(
         .target(name: "LiveAstroCore"),
         .executableTarget(name: "LiveAstroStudio", dependencies: ["LiveAstroCore"]),
         .executableTarget(name: "fakesiril", dependencies: ["LiveAstroCore"]),
-        .testTarget(name: "LiveAstroCoreTests", dependencies: ["LiveAstroCore"]),
+        .testTarget(name: "LiveAstroCoreTests", dependencies: ["LiveAstroCore"],
+                    resources: [.copy("Fixtures")]),
     ]
 )
