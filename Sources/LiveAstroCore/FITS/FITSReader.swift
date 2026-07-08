@@ -2,6 +2,13 @@ import Foundation
 
 public enum FITSReader {
 
+    // FITS format constants (FITS Standard 4.0 §3.1): headers are a sequence of
+    // 2880-byte blocks, each holding 36 card images of 80 ASCII characters —
+    // sizes inherited from 80-column punch cards and 1970s tape blocking.
+    static let blockSize = 2880
+    static let cardSize = 80
+    static let cardsPerBlock = blockSize / cardSize   // 36
+
     public static func readHeader(_ data: Data) throws -> FITSHeader {
         if data.count < 6 {
             throw FITSError.truncatedHeader
@@ -13,15 +20,15 @@ public enum FITSReader {
         var headerBytes: Int?
         var block = 0
         while headerBytes == nil {
-            let base = block * 2880
-            guard base + 2880 <= data.count else { throw FITSError.truncatedHeader }
-            for i in 0..<36 {
-                let start = base + i * 80
-                guard let card = String(data: data.subdata(in: start..<(start + 80)), encoding: .ascii) else {
+            let base = block * Self.blockSize
+            guard base + Self.blockSize <= data.count else { throw FITSError.truncatedHeader }
+            for i in 0..<Self.cardsPerBlock {
+                let start = base + i * Self.cardSize
+                guard let card = String(data: data.subdata(in: start..<(start + Self.cardSize)), encoding: .ascii) else {
                     throw FITSError.malformedHeader("non-ASCII card at byte \(start)")
                 }
                 let key = String(card.prefix(8)).trimmingCharacters(in: .whitespaces)
-                if key == "END" { headerBytes = base + 2880; break }
+                if key == "END" { headerBytes = base + Self.blockSize; break }
                 let idx8 = card.index(card.startIndex, offsetBy: 8)
                 if card[idx8...].hasPrefix("= ") {
                     let raw = String(card[card.index(idx8, offsetBy: 2)...])
