@@ -19,6 +19,8 @@ public struct RawFrame {
 public protocol FrameSource: AnyObject {
     /// Emits raw frames as available; finishes when the source ends (import) or stop() is called.
     var frames: AsyncStream<RawFrame> { get }
+    /// True when the stream ends on its own (finite import); false for live sources.
+    var isFinite: Bool { get }
     func start() throws
     func stop()
 }

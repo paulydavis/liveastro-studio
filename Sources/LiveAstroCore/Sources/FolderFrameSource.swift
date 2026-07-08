@@ -6,6 +6,7 @@ public final class FolderFrameSource: FrameSource {
     public enum Mode { case importOnce, live }
 
     public let frames: AsyncStream<RawFrame>
+    public var isFinite: Bool { mode == .importOnce }
     private var continuation: AsyncStream<RawFrame>.Continuation!
 
     private let folder: URL

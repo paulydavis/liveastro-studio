@@ -40,6 +40,9 @@ public final class StackEngine {
 
     public func currentStack() -> AstroImage? { accumulator?.mean() }
 
+    /// Frames in the CURRENT stack (resets on reseed, unlike acceptedCount).
+    public var stackFrameCount: Int { accumulator?.frameCount ?? 0 }
+
     public func process(_ frame: RawFrame) -> StackOutcome {
         let raw = frame.image
         if let size = referenceSize, size != (raw.width, raw.height) {

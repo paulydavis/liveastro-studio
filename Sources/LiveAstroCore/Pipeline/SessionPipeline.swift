@@ -13,7 +13,6 @@ public final class SessionPipeline {
 
     private let watcher: StackFileWatcher?
     private var source: FrameSource?
-    private var sourceIsFinite = true
     private var engine: StackEngine?
     private let profile: SessionProfile
     private let replaySettings: ReplaySettings
@@ -39,16 +38,11 @@ public final class SessionPipeline {
 
     /// Native stacking mode: pulls raw frames from a FrameSource, stacks them with StackEngine,
     /// and records each accepted frame as a snapshot.
-    /// `sourceIsFinite`: true for import (stream ends on its own — end() drains it fully,
-    /// however long that takes); false for live sources (end() stops the source first,
-    /// then drains briefly — mirroring watcher-mode semantics).
     public init(nativeSource: FrameSource, engine: StackEngine, profile: SessionProfile,
                 rootDirectory: URL, replaySettings: ReplaySettings = .init(),
-                maxKeyframes: Int = 45, neutralizeBackground: Bool = false,
-                sourceIsFinite: Bool = true) {
+                maxKeyframes: Int = 45, neutralizeBackground: Bool = false) {
         self.watcher = nil
         self.source = nativeSource
-        self.sourceIsFinite = sourceIsFinite
         self.engine = engine
         self.profile = profile
         self.session = SessionManager(rootDirectory: rootDirectory)
@@ -109,7 +103,7 @@ public final class SessionPipeline {
                 let record = try recorder!.save(
                     cgImage: cg, linear: mean, sourceFile: frame.sourceName,
                     index: engine.acceptedCount, timestamp: frame.timestamp,
-                    estimatedIntegrationSeconds: Double(engine.acceptedCount) * profile.subExposureSeconds)
+                    estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
                 try session.recordSnapshot(record)
                 onUpdate?(cg, record)
             } catch {
@@ -149,7 +143,7 @@ public final class SessionPipeline {
     /// In watcher mode, stops the watcher first so the stream terminates, then drains.
     public func end() throws -> URL {
         if source != nil {
-            if sourceIsFinite {
+            if source?.isFinite == true {
                 // Import: the stream ends on its own; drain it completely (a long import
                 // takes as long as it takes — end() runs off the main thread).
                 if consumeTask != nil {
