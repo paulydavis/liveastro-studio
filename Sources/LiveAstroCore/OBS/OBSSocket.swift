@@ -44,14 +44,25 @@ public protocol OBSSocket: AnyObject {
 public final class URLSessionOBSSocket: OBSSocket {
 
     private var task: URLSessionWebSocketTask?
+    private var session: URLSession?
+    private let openDelegate = OpenDelegate()
 
     public init() {}
 
     public func connect(url: URL) async throws {
-        let session = URLSession(configuration: .default)
+        // URLSessionWebSocketTask.resume() returns immediately without waiting for
+        // the WebSocket upgrade to complete. Sending/receiving before the socket is
+        // actually open races the handshake and fails with ENOTCONN (POSIX 57).
+        // Await the delegate's didOpenWithProtocol (success) / didCompleteWithError
+        // (failure) so connect() only returns once the connection is truly live.
+        let session = URLSession(configuration: .default, delegate: openDelegate, delegateQueue: nil)
+        self.session = session
         let t = session.webSocketTask(with: url)
         task = t
-        t.resume()
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            openDelegate.awaitOpen(cont)
+            t.resume()
+        }
     }
 
     public func send(_ text: String) async throws {
@@ -79,6 +90,46 @@ public final class URLSessionOBSSocket: OBSSocket {
     public func close() {
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
+        session?.invalidateAndCancel()   // release the delegate-retaining session
+        session = nil
+    }
+}
+
+// MARK: - Open delegate
+
+/// Bridges URLSessionWebSocketTask's open/failure callbacks to the async
+/// `connect()`. Resumes the pending continuation exactly once: on
+/// didOpenWithProtocol (success) or didCompleteWithError (failure).
+private final class OpenDelegate: NSObject, URLSessionWebSocketDelegate {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var settled = false
+
+    func awaitOpen(_ cont: CheckedContinuation<Void, Error>) {
+        lock.lock(); defer { lock.unlock() }
+        continuation = cont
+    }
+
+    private func resume(_ result: Result<Void, Error>) {
+        lock.lock()
+        guard !settled, let cont = continuation else { lock.unlock(); return }
+        settled = true
+        continuation = nil
+        lock.unlock()
+        cont.resume(with: result)
+    }
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
+                    didOpenWithProtocol proto: String?) {
+        resume(.success(()))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didCompleteWithError error: Error?) {
+        // Fires for connection failures (refused/unreachable) before an open,
+        // and for normal closes after. Only the pre-open case still has a
+        // pending continuation; post-open completions are a no-op here.
+        resume(.failure(error ?? OBSSocketError.notConnected))
     }
 }
 
