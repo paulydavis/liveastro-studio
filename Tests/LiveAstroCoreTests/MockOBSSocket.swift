@@ -1,0 +1,168 @@
+import Foundation
+@testable import LiveAstroCore
+
+// MARK: - MockOBSSocket
+
+/// A fully scripted, in-process OBSSocket double for unit tests.
+///
+/// ## Inbound frames (server → client)
+/// Call `enqueueInbound(_:)` to push frames that `receive()` will return in
+/// FIFO order. `receive()` suspends (does not busy-spin) until a frame is
+/// available, using a `CheckedContinuation`. This means tests can enqueue
+/// frames before OR after `receive()` is called:
+///
+/// ```swift
+/// mock.enqueueInbound("""{"op":0,"d":{...}}""")   // before
+/// let frame = try await mock.receive()             // pops immediately
+/// ```
+///
+/// or (using a Task to supply the frame concurrently):
+///
+/// ```swift
+/// let task = Task { mock.enqueueInbound("...") }
+/// let frame = try await mock.receive()             // suspends, then wakes
+/// await task.value
+/// ```
+///
+/// ## Outbound frames (client → server)
+/// `send(_:)` appends the text to `sentFrames` in call order.
+///
+/// ## Reply hook (keyed to last-sent frame)
+/// Before calling `send`, install a handler with `replyToLastSent(_:)`. After
+/// `send` records the outbound frame, the hook fires and `enqueueInbound` is
+/// called with its return value. This models a synchronous server echo/reply:
+///
+/// ```swift
+/// mock.replyToLastSent { sent in return makeResponse(for: sent) }
+/// try await mock.send(myRequest)   // records in sentFrames, enqueues reply
+/// let reply = try await mock.receive()
+/// ```
+///
+/// ## "Finished" / error injection
+/// Call `finishWithError(_:)` to make the next (or current) pending `receive()`
+/// throw the supplied error. Call `finish()` to throw `CancellationError`.
+///
+/// ## Thread safety
+/// All state is guarded by a simple actor (`InboundQueue`). Safe to call from
+/// concurrent tasks in tests.
+final class MockOBSSocket: OBSSocket {
+
+    // MARK: - Public state (test-readable)
+
+    /// All frames passed to `send(_:)`, in order.
+    private(set) var sentFrames: [String] = []
+
+    // MARK: - Private
+
+    private let queue = InboundQueue()
+
+    /// Optional hook: fired synchronously inside `send(_:)` after recording
+    /// the outbound frame. Returns a frame to inject as the next inbound, or
+    /// `nil` to inject nothing.
+    private var replyHook: ((String) -> String?)?
+
+    // MARK: - OBSSocket
+
+    func connect(url: URL) async throws {
+        // No-op for the mock; tests drive the handshake by enqueueing frames.
+    }
+
+    func send(_ text: String) async throws {
+        sentFrames.append(text)
+        if let hook = replyHook, let reply = hook(text) {
+            await queue.enqueue(reply)
+        }
+    }
+
+    func receive() async throws -> String {
+        return try await queue.dequeue()
+    }
+
+    func close() {
+        Task { await queue.finish(throwing: CancellationError()) }
+    }
+
+    // MARK: - Test-control API
+
+    /// Enqueue a text frame that the next `receive()` call will return.
+    func enqueueInbound(_ text: String) {
+        Task { await queue.enqueue(text) }
+    }
+
+    /// Install a hook that fires after each `send(_:)`. The closure receives
+    /// the just-sent frame and may return a reply frame to inject as inbound.
+    /// Pass `nil` to clear the hook.
+    func replyToLastSent(_ hook: ((String) -> String?)?) {
+        replyHook = hook
+    }
+
+    /// Make the next (or pending) `receive()` throw `error`.
+    func finishWithError(_ error: Error) {
+        Task { await queue.finish(throwing: error) }
+    }
+
+    /// Make the next (or pending) `receive()` throw `CancellationError`.
+    func finish() {
+        Task { await queue.finish(throwing: CancellationError()) }
+    }
+}
+
+// MARK: - InboundQueue actor
+
+/// An async FIFO queue backed by continuations.
+///
+/// Frames enqueued before `dequeue()` is called are buffered.
+/// A single pending `dequeue()` awaits a continuation that is resumed by the
+/// next `enqueue(_:)` or `finish(throwing:)`.
+private actor InboundQueue {
+
+    // Buffered frames not yet consumed by a `dequeue()`.
+    private var buffer: [String] = []
+
+    // At most one suspended `dequeue()` waits at a time (single-consumer).
+    private var pending: CheckedContinuation<String, Error>?
+
+    // Sticky terminal error — once set, all future dequeues throw immediately.
+    private var terminalError: Error?
+
+    func enqueue(_ text: String) {
+        if let continuation = pending {
+            // A dequeue() is already waiting — resume it directly.
+            pending = nil
+            continuation.resume(returning: text)
+        } else {
+            buffer.append(text)
+        }
+    }
+
+    func finish(throwing error: Error) {
+        terminalError = error
+        if let continuation = pending {
+            pending = nil
+            continuation.resume(throwing: error)
+        }
+        // Future dequeue() calls will throw via the terminalError path.
+    }
+
+    func dequeue() async throws -> String {
+        // Throw immediately if already finished.
+        if let err = terminalError { throw err }
+
+        // Return buffered frame if available.
+        if !buffer.isEmpty { return buffer.removeFirst() }
+
+        // Otherwise suspend until enqueue or finish.
+        return try await withCheckedThrowingContinuation { continuation in
+            // Check again inside the actor to avoid a TOCTOU race on buffer.
+            if let err = self.terminalError {
+                continuation.resume(throwing: err)
+                return
+            }
+            if !self.buffer.isEmpty {
+                continuation.resume(returning: self.buffer.removeFirst())
+                return
+            }
+            self.pending = continuation
+        }
+    }
+}
