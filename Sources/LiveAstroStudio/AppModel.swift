@@ -383,12 +383,18 @@ final class AppModel {
         fileNamePrefix = "Light_"
         neutralizeBackground = true
         targetName = found.target
-        subExposureText = String(format: "%g", found.subExposure ?? 10)
-        // app-managed relay dir
+        // Relay exactly this session's exposure (10/20/30/60s), and give each
+        // exposure its own relay folder so a restart at a different length never
+        // mixes into one stack. Fall back to any-exposure if it can't be parsed.
+        let exp = found.subExposure
+        subExposureText = String(format: "%g", exp ?? 10)
+        let expToken = exp.map { String(format: "%.1f", $0) }        // e.g. "30.0"; nil if unknown
+        let glob = expToken.map { "Light_*_\($0)s_*.fit" } ?? "Light_*.fit"
         let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
         let relayDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))", isDirectory: true)
-        let relay = SeestarRelay(source: found.subDir, destination: relayDir)
+            .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))\(expToken.map { "-\($0)s" } ?? "")",
+                                    isDirectory: true)
+        let relay = SeestarRelay(source: found.subDir, destination: relayDir, glob: glob)
         relay.onLog = { [weak self] msg in
             Task { @MainActor in self?.log.append(msg) }
         }

@@ -26,9 +26,17 @@ public enum SeestarDetector {
         }
         guard let best = candidates.max(by: { $0.mod < $1.mod }) else { return nil }
         let target = String(best.url.lastPathComponent.dropLast("_sub".count))
-        let sample = ((try? fm.contentsOfDirectory(atPath: best.url.path)) ?? []).first { $0.hasSuffix(".fit") }
+        // Parse the exposure from the NEWEST .fit so a folder that ended up with
+        // mixed exposures (e.g. a 30s → 20s restart) reports the current length.
+        let fits = ((try? fm.contentsOfDirectory(at: best.url, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+            .filter { $0.pathExtension.lowercased() == "fit" }
+        let newest = fits.max { a, b in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            return da < db
+        }
         return Found(subDir: best.url, target: target,
-                     subExposure: sample.flatMap(parseExposure(fromFilename:)))
+                     subExposure: newest.map { $0.lastPathComponent }.flatMap(parseExposure(fromFilename:)))
     }
 
     /// Parse "..._10.0s_..." → 10.0
