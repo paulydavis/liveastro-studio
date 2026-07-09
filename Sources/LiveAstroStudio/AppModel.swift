@@ -117,6 +117,12 @@ final class AppModel {
             MainActor.assumeIsolated { self?.log.append("OBS: \(message)") }
         }
         loadSettings()
+
+        // Save settings when the app is about to terminate.
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.saveSettings() }
+        }
     }
 
     // MARK: - Settings persistence
