@@ -33,6 +33,7 @@ final class AppModel {
 
     var fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
     var neutralizeBackground = false
+    var calibration = CalibrationStore.load(.standard)
     var watchFolder: URL?
     var sourceMode: SourceMode = .stackerOutput {
         didSet {
@@ -157,8 +158,14 @@ final class AppModel {
             let source = FolderFrameSource(folder: folder, mode: .live,
                                             fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
             let engine = StackEngine()
+            let (calibrator, calWarnings) = CalibrationLoader.makeCalibrator(
+                dark: calibration.darkPath.map { URL(fileURLWithPath: $0) },
+                flat: calibration.flatPath.map { URL(fileURLWithPath: $0) })
+            calWarnings.forEach { log.append("⚠ \($0)") }
+            CalibrationStore.save(calibration, to: .standard)
             p = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
-                               rootDirectory: root, neutralizeBackground: neutralizeBackground)
+                               rootDirectory: root, neutralizeBackground: neutralizeBackground,
+                               calibrator: calibrator)
         }
 
         acceptedCount = 0
@@ -238,9 +245,15 @@ final class AppModel {
         let source = FolderFrameSource(folder: folder, mode: .importOnce,
                                         fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
         let engine = StackEngine()
+        let (importCalibrator, importCalWarnings) = CalibrationLoader.makeCalibrator(
+            dark: calibration.darkPath.map { URL(fileURLWithPath: $0) },
+            flat: calibration.flatPath.map { URL(fileURLWithPath: $0) })
+        importCalWarnings.forEach { log.append("⚠ \($0)") }
+        CalibrationStore.save(calibration, to: .standard)
         let importPipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
                                               rootDirectory: liveAstroRoot,
-                                              neutralizeBackground: neutralizeBackground)
+                                              neutralizeBackground: neutralizeBackground,
+                                              calibrator: importCalibrator)
         // Counts every frame the source produced (accepted or rejected); it stays at zero
         // only when nothing in the folder matched the prefix at all. The pipeline callbacks
         // fire synchronously on the consume task, which end() drains before returning.
