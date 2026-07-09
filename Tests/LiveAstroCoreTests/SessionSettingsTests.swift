@@ -27,4 +27,34 @@ final class SessionSettingsTests: XCTestCase {
         d.set(Data([0x00, 0x01]), forKey: "sessionSettings.v1")
         XCTAssertEqual(SessionSettingsStore.load(d), SessionSettings.defaults)
     }
+
+    func testRejectionDefaults() {
+        let d = SessionSettings.defaults
+        XCTAssertTrue(d.rejectionEnabled)
+        XCTAssertEqual(d.rejectionStrength, .medium)
+    }
+
+    func testRejectionRoundTrips() {
+        let dd = defaults()
+        var s = SessionSettings.defaults
+        s.rejectionEnabled = false; s.rejectionStrength = .high
+        SessionSettingsStore.save(s, to: dd)
+        XCTAssertEqual(SessionSettingsStore.load(dd), s)
+    }
+
+    func testOldBlobWithoutRejectionKeysDecodesToDefaults() throws {
+        // an older SessionSettings JSON (no rejection keys) must decode with rejection
+        // defaults rather than failing the whole load and wiping other settings.
+        let dd = defaults()
+        let json = """
+        {"sourceModeRaw":"Raw subs (native stacking)","watchFolderPath":null,
+         "filePrefix":"Light_","neutralizeBackground":true,"subExposureSeconds":10,
+         "targetName":"M8","calibration":{"darkPath":null,"flatPath":null,"biasPath":null}}
+        """
+        dd.set(Data(json.utf8), forKey: "sessionSettings.v1")
+        let loaded = SessionSettingsStore.load(dd)
+        XCTAssertEqual(loaded.targetName, "M8")            // old fields preserved
+        XCTAssertTrue(loaded.rejectionEnabled)              // new fields defaulted
+        XCTAssertEqual(loaded.rejectionStrength, .medium)
+    }
 }
