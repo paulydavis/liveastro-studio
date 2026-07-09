@@ -108,6 +108,7 @@ final class AppModel {
     private var lastAutomationScene: String?
 
     private var pipeline: SessionPipeline?
+    private var seestarRelay: SeestarRelay?
 
     /// The fire-and-forget OBS bring-up task (connect + retry + startStream).
     /// Stored so session teardown can cancel it before OBS finishes launching —
@@ -122,10 +123,13 @@ final class AppModel {
         }
         loadSettings()
 
-        // Save settings when the app is about to terminate.
+        // Save settings and stop the Seestar relay when the app is about to terminate.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.saveSettings() }
+            MainActor.assumeIsolated {
+                self?.seestarRelay?.stop()
+                self?.saveSettings()
+            }
         }
     }
 
@@ -353,12 +357,41 @@ final class AppModel {
         }
     }
 
+    func startSeestarLive() {
+        guard let found = SeestarDetector.detect() else {
+            errorMessage = "No Seestar share found. Mount it first: Finder → Go → Connect to Server → the Seestar's smb:// address, then try again."
+            return
+        }
+        // configure
+        sourceMode = .nativeStack
+        fileNamePrefix = "Light_"
+        neutralizeBackground = true
+        targetName = found.target
+        subExposureText = String(format: "%g", found.subExposure ?? 10)
+        // app-managed relay dir
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
+        let relayDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))", isDirectory: true)
+        let relay = SeestarRelay(source: found.subDir, destination: relayDir)
+        relay.onLog = { [weak self] in self?.log.append($0) }
+        do { try relay.start() } catch { errorMessage = "Relay failed to start: \(error)"; return }
+        seestarRelay = relay
+        watchFolder = relayDir
+        saveSettings()
+        startSession()             // existing native-start path (uses watchFolder + sourceMode)
+        selectedTab = .live
+    }
+
     func endSession() {
         saveSettings()
         guard let p = pipeline else { return }
         guard !isGeneratingReplay else { return }
         isGeneratingReplay = true
         log.append("Ending session — generating replay…")
+
+        // Stop the Seestar relay (if any) immediately — before the pipeline drains.
+        seestarRelay?.stop()
+        seestarRelay = nil
 
         // Scene automation stops immediately; the OBS stream/record stop is
         // deferred until AFTER the pipeline end/replay flow below.

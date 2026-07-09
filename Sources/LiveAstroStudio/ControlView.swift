@@ -83,6 +83,11 @@ struct ControlView: View {
                             .disabled(model.isImporting)
                     }
                     Spacer()
+                    Button {
+                        model.startSeestarLive()
+                    } label: { Label("Seestar Live", systemImage: "dot.radiowaves.left.and.right") }
+                    .help("Auto-detect the mounted Seestar folder, start relaying its 10s subs, and begin native stacking — one tap.")
+                    .disabled(model.isRunning)
                     Button("Import Subs…") { pickImportFolder() }
                         .disabled(model.isRunning || model.isImporting)
                 }
