@@ -39,6 +39,7 @@ struct ControlView: View {
                             .disabled(model.isRunning || model.isImporting)
                             .help("Apply a per-channel background neutralization pass after stacking to correct OSC white balance drift.")
                         Toggle("Reject outliers (σ-clip)", isOn: $model.rejectionEnabled)
+                            .disabled(model.isRunning || model.isImporting)
                             .help("Drop satellite / plane / cosmic-ray streaks by clamping pixels that deviate from the per-pixel stack statistics (winsorized κ-σ). On by default.")
                         if model.rejectionEnabled {
                             Picker("Strength", selection: $model.rejectionStrength) {
@@ -47,6 +48,7 @@ struct ControlView: View {
                                 Text("High").tag(RejectionStrength.high)
                             }
                             .pickerStyle(.segmented)
+                            .disabled(model.isRunning || model.isImporting)
                             .help("Higher = safer (rejects less); lower = more aggressive. Medium (κ=3) is the validated default.")
                         }
                     }
