@@ -9,7 +9,8 @@ let package = Package(
     ],
     targets: [
         .target(name: "LiveAstroCore"),
-        .executableTarget(name: "LiveAstroStudio", dependencies: ["LiveAstroCore"]),
+        .executableTarget(name: "LiveAstroStudio", dependencies: ["LiveAstroCore"],
+                          resources: [.process("Resources")]),
         .executableTarget(name: "fakesiril", dependencies: ["LiveAstroCore"]),
         .testTarget(name: "LiveAstroCoreTests", dependencies: ["LiveAstroCore"],
                     resources: [.copy("Fixtures")]),

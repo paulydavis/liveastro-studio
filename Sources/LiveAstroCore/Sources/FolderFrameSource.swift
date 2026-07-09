@@ -11,6 +11,7 @@ public final class FolderFrameSource: FrameSource {
 
     public let frames: AsyncStream<RawFrame>
     public var isFinite: Bool { mode == .importOnce }
+    public let totalCount: Int?
     /// Live mode only; nil in import mode (which uses the pull-based cursor instead).
     private var continuation: AsyncStream<RawFrame>.Continuation?
 
@@ -30,7 +31,10 @@ public final class FolderFrameSource: FrameSource {
         switch mode {
         case .importOnce:
             let cursor = ImportCursor(folder: folder, fileNamePrefix: fileNamePrefix)
+            // Snapshot eagerly so totalCount is available before start() is called.
+            cursor.snapshotIfNeeded()
             self.importCursor = cursor
+            self.totalCount = cursor.fileCount
             self.continuation = nil
             // One file is read per pull; unreadable files are skipped without buffering.
             self.frames = AsyncStream(unfolding: {
@@ -45,6 +49,7 @@ public final class FolderFrameSource: FrameSource {
 
         case .live:
             self.importCursor = nil
+            self.totalCount = nil
             var cont: AsyncStream<RawFrame>.Continuation!
             // AsyncStream's init runs this closure synchronously; cont is non-nil here.
             self.frames = AsyncStream { cont = $0 }
@@ -101,6 +106,11 @@ public final class FolderFrameSource: FrameSource {
 
         func snapshotIfNeeded() {
             lock.withLock { snapshotLocked() }
+        }
+
+        /// Number of files in the snapshot; 0 before snapshotIfNeeded() is called.
+        var fileCount: Int {
+            lock.withLock { files?.count ?? 0 }
         }
 
         func stop() {

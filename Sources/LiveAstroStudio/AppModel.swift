@@ -6,6 +6,10 @@ import LiveAstroCore
 @MainActor
 final class AppModel {
 
+    enum MainTab: String, CaseIterable { case live = "Live", setup = "Setup", help = "Help" }
+    var selectedTab: MainTab = .setup
+    var isDetached = false
+
     enum SourceMode: String, CaseIterable {
         case stackerOutput = "Stacker output (Siril)"
         case nativeStack   = "Raw subs (native stacking)"
@@ -103,7 +107,11 @@ final class AppModel {
     /// CurrentProgramSceneChanged can tell "us" from "the operator".
     private var lastAutomationScene: String?
 
+    var importProcessed = 0
+    var importTotal = 0
     private var pipeline: SessionPipeline?
+    private var importPipeline: SessionPipeline?
+    private var seestarRelay: SeestarRelay?
 
     /// The fire-and-forget OBS bring-up task (connect + retry + startStream).
     /// Stored so session teardown can cancel it before OBS finishes launching —
@@ -116,6 +124,42 @@ final class AppModel {
         obs.onLog = { [weak self] message in
             MainActor.assumeIsolated { self?.log.append("OBS: \(message)") }
         }
+        loadSettings()
+
+        // Save settings and stop the Seestar relay when the app is about to terminate.
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.seestarRelay?.stop()
+                self?.saveSettings()
+            }
+        }
+    }
+
+    // MARK: - Settings persistence
+
+    private func currentSettings() -> SessionSettings {
+        SessionSettings(
+            sourceModeRaw: sourceMode.rawValue,
+            watchFolderPath: watchFolder?.path,
+            filePrefix: fileNamePrefix,
+            neutralizeBackground: neutralizeBackground,
+            subExposureSeconds: Double(subExposureText) ?? 60,
+            targetName: targetName,
+            calibration: calibration)
+    }
+
+    func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
+
+    func loadSettings() {
+        let s = SessionSettingsStore.load(.standard)
+        sourceMode = SourceMode(rawValue: s.sourceModeRaw) ?? .stackerOutput
+        watchFolder = s.watchFolderPath.map { URL(fileURLWithPath: $0) }
+        fileNamePrefix = s.filePrefix
+        neutralizeBackground = s.neutralizeBackground
+        subExposureText = String(format: "%g", s.subExposureSeconds)
+        targetName = s.targetName
+        calibration = s.calibration
     }
 
     /// Root for all session output; every session/import directory lives under here.
@@ -143,6 +187,7 @@ final class AppModel {
     /// Not unit-testable: needs FileManager, a live pipeline, and a real watch
     /// folder — the end-to-end test covers this path.
     func startSession() {
+        saveSettings()
         guard !isRunning else { return }
         guard !isImporting else { errorMessage = "Finish the import before starting a session."; return }
         guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return }
@@ -189,6 +234,7 @@ final class AppModel {
             try p.start()
             pipeline = p
             isRunning = true
+            selectedTab = .live
             sessionStart = Date()
             sessionEnd = nil
             replayURL = nil
@@ -240,6 +286,7 @@ final class AppModel {
     /// Not unit-testable: needs a detached task and a real folder; the
     /// zero-match path is covered via noMatchMessage(prefix:).
     func importSubs(from folder: URL) {
+        saveSettings()
         guard !isRunning else { errorMessage = "End the session before importing."; return }
         guard !isImporting else { return }
         let source = FolderFrameSource(folder: folder, mode: .importOnce,
@@ -254,11 +301,22 @@ final class AppModel {
                                               rootDirectory: liveAstroRoot,
                                               neutralizeBackground: neutralizeBackground,
                                               calibrator: importCalibrator)
+        importPipeline.onImportProgress = { [weak self] processed, total, accepted, rejected in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self?.importProcessed = processed; self?.importTotal = total
+                    self?.acceptedCount = accepted; self?.rejectedCount = rejected
+                }
+            }
+        }
+        self.importPipeline = importPipeline
         // Counts every frame the source produced (accepted or rejected); it stays at zero
         // only when nothing in the folder matched the prefix at all. The pipeline callbacks
         // fire synchronously on the consume task, which end() drains before returning.
         let matchedFrames = AtomicCounter()
         wireCallbacks(to: importPipeline, onAnyFrame: { matchedFrames.increment() })
+        importProcessed = 0
+        importTotal = 0
         isImporting = true
         log.append("Importing subs from \(folder.path)…")
         let prefix = fileNamePrefix
@@ -288,6 +346,8 @@ final class AppModel {
         }
     }
 
+    func cancelImport() { importPipeline?.cancelImport() }
+
     /// User-facing message for an import that matched zero files.
     private nonisolated static func noMatchMessage(prefix: String) -> String {
         prefix.isEmpty
@@ -313,11 +373,47 @@ final class AppModel {
         }
     }
 
+    func startSeestarLive() {
+        guard let found = SeestarDetector.detect() else {
+            errorMessage = "No Seestar share found. Mount it first: Finder → Go → Connect to Server → the Seestar's smb:// address, then try again."
+            return
+        }
+        // configure
+        sourceMode = .nativeStack
+        fileNamePrefix = "Light_"
+        neutralizeBackground = true
+        targetName = found.target
+        subExposureText = String(format: "%g", found.subExposure ?? 10)
+        // app-managed relay dir
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
+        let relayDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))", isDirectory: true)
+        let relay = SeestarRelay(source: found.subDir, destination: relayDir)
+        relay.onLog = { [weak self] msg in
+            Task { @MainActor in self?.log.append(msg) }
+        }
+        do { try relay.start() } catch { errorMessage = "Relay failed to start: \(error)"; return }
+        seestarRelay = relay
+        watchFolder = relayDir
+        saveSettings()
+        startSession()             // existing native-start path (uses watchFolder + sourceMode)
+        if !isRunning {                       // startSession failed (e.g. pipeline start threw)
+            seestarRelay?.stop(); seestarRelay = nil
+            return
+        }
+        selectedTab = .live
+    }
+
     func endSession() {
+        saveSettings()
         guard let p = pipeline else { return }
         guard !isGeneratingReplay else { return }
         isGeneratingReplay = true
         log.append("Ending session — generating replay…")
+
+        // Stop the Seestar relay (if any) immediately — before the pipeline drains.
+        seestarRelay?.stop()
+        seestarRelay = nil
 
         // Scene automation stops immediately; the OBS stream/record stop is
         // deferred until AFTER the pipeline end/replay flow below.

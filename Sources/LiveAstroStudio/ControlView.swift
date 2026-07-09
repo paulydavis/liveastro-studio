@@ -4,57 +4,80 @@ import LiveAstroCore
 
 struct ControlView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.openWindow) private var openWindow
 
     private let logDisplayCap = 200
     private let logMinHeight: CGFloat = 120
 
     var body: some View {
         @Bindable var model = model
-        Form {
-            Section("Watch Folder") {
-                Picker("Source", selection: $model.sourceMode) {
-                    ForEach(AppModel.SourceMode.allCases, id: \.self) { mode in
-                        Text(mode.rawValue).tag(mode)
+        VStack(spacing: 0) {
+            ScrollView {
+                Form {
+                    Section("Watch Folder") {
+                        Picker("Source", selection: $model.sourceMode) {
+                            ForEach(AppModel.SourceMode.allCases, id: \.self) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .disabled(model.isRunning || model.isImporting)
+                        .help("Seestar Live displays Siril's live_stack.fit directly; Raw subs stacks individual exposures natively using LiveAstro's built-in stacker.")
+
+                        HStack {
+                            Text(model.watchFolder?.path ?? "none selected")
+                                .lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            Button("Choose…") { pickFolder() }
+                                .disabled(model.isRunning || model.isImporting)
+                                .help("Choose the folder to watch for incoming FITS subs or the Seestar relay folder.")
+                        }
+                        TextField("File prefix (empty = any; e.g. Light_ for native subs)",
+                                  text: $model.fileNamePrefix)
+                            .disabled(model.isRunning || model.isImporting)
+                            .help("Only process files whose name starts with this prefix; leave empty to accept all FITS files in the watch folder.")
+                        Toggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground)
+                            .disabled(model.isRunning || model.isImporting)
+                            .help("Apply a per-channel background neutralization pass after stacking to correct OSC white balance drift.")
+                    }
+                    if model.sourceMode == .nativeStack {
+                        Section("Calibration") {
+                            CalibrationSection(selection: $model.calibration,
+                                               onLog: { model.log.append($0) })
+                        }
+                    }
+                    Section("Session Profile") {
+                        TextField("Target name", text: $model.targetName)
+                        TextField("Telescope", text: $model.telescope)
+                        TextField("Camera", text: $model.camera)
+                        TextField("Mount", text: $model.mount)
+                        TextField("Filter", text: $model.filter)
+                        TextField("Location", text: $model.locationLabel)
+                        TextField("Bortle (1–9)", text: $model.bortleText)
+                        TextField("Sub-exposure seconds", text: $model.subExposureText)
+                            .help("Individual sub-exposure length in seconds; recorded in the session manifest and used for dark-frame matching.")
+                        TextField("Notes", text: $model.notes)
+                    }
+                    // Observes the OBSController (Combine ObservableObject) so its
+                    // @Published state/scene/record changes re-render this section.
+                    OBSSection(model: model)
+                    Section("Log") {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(Array(model.log.suffix(logDisplayCap).enumerated()), id: \.offset) {
+                                    Text($0.element).font(.system(.caption, design: .monospaced))
+                                }
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }.frame(minHeight: logMinHeight)
                     }
                 }
-                .pickerStyle(.segmented)
-                .disabled(model.isRunning || model.isImporting)
+                .formStyle(.grouped)
+            }
 
+            Divider()
+
+            // Fixed footer — always visible regardless of scroll position.
+            VStack(spacing: 8) {
                 HStack {
-                    Text(model.watchFolder?.path ?? "none selected")
-                        .lineLimit(1).truncationMode(.middle)
-                    Spacer()
-                    Button("Choose…") { pickFolder() }
-                        .disabled(model.isRunning || model.isImporting)
-                }
-                TextField("File prefix (empty = any; e.g. Light_ for native subs)",
-                          text: $model.fileNamePrefix)
-                    .disabled(model.isRunning || model.isImporting)
-                Toggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground)
-                    .disabled(model.isRunning || model.isImporting)
-            }
-            if model.sourceMode == .nativeStack {
-                Section("Calibration") {
-                    CalibrationSection(selection: $model.calibration,
-                                       onLog: { model.log.append($0) })
-                }
-            }
-            Section("Session Profile") {
-                TextField("Target name", text: $model.targetName)
-                TextField("Telescope", text: $model.telescope)
-                TextField("Camera", text: $model.camera)
-                TextField("Mount", text: $model.mount)
-                TextField("Filter", text: $model.filter)
-                TextField("Location", text: $model.locationLabel)
-                TextField("Bortle (1–9)", text: $model.bortleText)
-                TextField("Sub-exposure seconds", text: $model.subExposureText)
-                TextField("Notes", text: $model.notes)
-            }
-            Section {
-                HStack {
-                    Button("Open Broadcast Window") { openWindow(id: "broadcast") }
-                    Spacer()
                     if model.isRunning {
                         Button("End Session", role: .destructive) { model.endSession() }
                             .disabled(model.isGeneratingReplay)
@@ -63,41 +86,54 @@ struct ControlView: View {
                             .buttonStyle(.borderedProminent)
                             .disabled(model.isImporting)
                     }
+                    Spacer()
+                    Button {
+                        model.startSeestarLive()
+                    } label: { Label("Seestar Live", systemImage: "dot.radiowaves.left.and.right") }
+                    .help("Auto-detect the mounted Seestar folder, start relaying its 10s subs, and begin native stacking — one tap.")
+                    .disabled(model.isRunning)
+                    Button("Import Subs…") { pickImportFolder() }
+                        .disabled(model.isRunning || model.isImporting)
+                        .help("Select a folder of previously captured FITS subs to stack offline, with progress tracking and Cancel support.")
                 }
                 if model.isRunning && model.sourceMode == .nativeStack {
-                    Text("accepted \(model.acceptedCount) · rejected \(model.rejectedCount)")
-                        .font(.system(.caption, design: .monospaced))
-                    Button("Reseed Reference") { model.reseedReference() }
-                }
-                Button("Import Subs…") { pickImportFolder() }
-                    .disabled(model.isRunning || model.isImporting)
-                if model.isImporting { ProgressView("Importing subs…") }
-                if !model.isRunning {
-                    Button("Regenerate Replay…") { pickSessionDirectory() }
-                        .disabled(model.isGeneratingReplay)
-                }
-                if model.isGeneratingReplay { ProgressView("Rendering replay…") }
-                if let url = model.replayURL {
-                    Button("Reveal Replay in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                    HStack {
+                        Text("accepted \(model.acceptedCount) · rejected \(model.rejectedCount)")
+                            .font(.system(.caption, design: .monospaced))
+                        Spacer()
+                        Button("Reseed Reference") { model.reseedReference() }
+                            .help("Replace the alignment reference frame with the latest accepted sub so subsequent subs align to it.")
                     }
                 }
-            }
-            // Observes the OBSController (Combine ObservableObject) so its
-            // @Published state/scene/record changes re-render this section.
-            OBSSection(model: model)
-            Section("Log") {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(model.log.suffix(logDisplayCap).enumerated()), id: \.offset) {
-                            Text($0.element).font(.system(.caption, design: .monospaced))
+                if model.isImporting {
+                    VStack(spacing: 4) {
+                        ProgressView(value: Double(model.importProcessed),
+                                     total: Double(max(model.importTotal, 1)))
+                        HStack {
+                            Text("\(model.importProcessed) / \(model.importTotal)")
+                            Spacer()
+                            Text("✓ \(model.acceptedCount)  ✗ \(model.rejectedCount)").foregroundStyle(.secondary)
+                            Button("Cancel", role: .cancel) { model.cancelImport() }
+                        }.font(.caption)
+                    }.padding(.horizontal)
+                }
+                if !model.isRunning {
+                    HStack {
+                        Button("Regenerate Replay…") { pickSessionDirectory() }
+                            .disabled(model.isGeneratingReplay)
+                        if let url = model.replayURL {
+                            Spacer()
+                            Button("Reveal Replay in Finder") {
+                                NSWorkspace.shared.activateFileViewerSelecting([url])
+                            }
                         }
-                    }.frame(maxWidth: .infinity, alignment: .leading)
-                }.frame(minHeight: logMinHeight)
+                    }
+                }
+                if model.isGeneratingReplay { ProgressView("Rendering replay…") }
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
         }
-        .formStyle(.grouped)
-        .padding(.bottom, 8)
         .alert("LiveAstro", isPresented: $model.isShowingError) {
             Button("OK") { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
@@ -207,10 +243,13 @@ private struct OBSSection: View {
             // Connection config — locked while connected.
             TextField("Host", text: $model.obsHost)
                 .disabled(connected)
+                .help("Hostname or IP address of the machine running OBS (use 127.0.0.1 when OBS is on the same Mac).")
             TextField("Port", value: $model.obsPort, format: .number.grouping(.never))
                 .disabled(connected)
+                .help("OBS WebSocket server port — default is 4455; change only if you customised it in OBS → Tools → WebSocket Server Settings.")
             SecureField("Password (empty if auth off)", text: $model.obsPassword)
                 .disabled(connected)
+                .help("OBS WebSocket password — copy it from OBS → Tools → WebSocket Server Settings → Show Connect Info (it regenerates each time OBS restarts with auto-generate on).")
             Toggle("Auto-launch OBS on session start", isOn: $model.obsAutoLaunch)
 
             // Scene selection, fed by the controller's live scene list.

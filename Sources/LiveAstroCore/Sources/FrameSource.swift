@@ -21,6 +21,8 @@ public protocol FrameSource: AnyObject {
     var frames: AsyncStream<RawFrame> { get }
     /// True when the stream ends on its own (finite import); false for live sources.
     var isFinite: Bool { get }
+    /// Total frames known up front (finite import); nil for live sources.
+    var totalCount: Int? { get }
     func start() throws
     func stop()
 }

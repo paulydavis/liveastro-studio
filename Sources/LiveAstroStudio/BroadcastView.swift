@@ -18,6 +18,7 @@ private enum BroadcastLayout {
 /// The OBS-captured scene: dark, non-interactive, never blanks (spec §5.6).
 struct BroadcastView: View {
     @Environment(AppModel.self) private var model
+    var configuresWindow: Bool = true
 
     var body: some View {
         GeometryReader { geo in
@@ -33,7 +34,7 @@ struct BroadcastView: View {
                 overlay(scale: scale)
             }
             .ignoresSafeArea()
-            .background(BroadcastWindowConfigurator())
+            .background(configuresWindow ? AnyView(BroadcastWindowConfigurator()) : AnyView(EmptyView()))
         }
     }
 

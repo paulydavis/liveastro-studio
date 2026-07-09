@@ -23,12 +23,15 @@ struct CalibrationSection: View {
                            kind: MasterKind, needsBias: Bool) -> some View {
         HStack {
             Text(label).frame(width: 44, alignment: .leading)
+                .help("\(label) calibration frame — applied to every light sub before stacking.")
             Text(path.wrappedValue.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "None")
                 .foregroundStyle(path.wrappedValue == nil ? .secondary : .primary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer()
             Button("Use file…") { pickFile(path) }
+                .help("Point to a pre-built master \(label.lowercased()) FITS file.")
             Button("Build…") { pickFolderAndBuild(path, label: label, kind: kind, needsBias: needsBias) }
+                .help("Choose a folder of raw \(label.lowercased()) frames and build a master by median-combining them.")
             if path.wrappedValue != nil { Button("Clear") { path.wrappedValue = nil } }
         }
     }

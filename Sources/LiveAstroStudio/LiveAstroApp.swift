@@ -5,7 +5,7 @@ private enum AppLayout {
     static let broadcastAspect: CGFloat = 16.0 / 9.0
     static let broadcastDefaultSize = CGSize(width: 1280, height: 720)
     static let broadcastMinSize = CGSize(width: 640, height: 360)
-    static let controlDefaultSize = CGSize(width: 460, height: 640)
+    static let mainDefaultSize = CGSize(width: 900, height: 720)
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -23,10 +23,10 @@ struct LiveAstroApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("LiveAstro Control") {
-            ControlView().environment(model)
+        WindowGroup("LiveAstro") {
+            MainView().environment(model)
         }
-        .defaultSize(AppLayout.controlDefaultSize)
+        .defaultSize(AppLayout.mainDefaultSize)
 
         Window("LiveAstro Broadcast", id: "broadcast") {
             BroadcastView()
@@ -35,6 +35,7 @@ struct LiveAstroApp: App {
                 .frame(minWidth: AppLayout.broadcastMinSize.width,
                        minHeight: AppLayout.broadcastMinSize.height)
                 .background(Color.black)   // letterbox any non-16:9 window slack in black
+                .onDisappear { model.isDetached = false }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(AppLayout.broadcastDefaultSize)
