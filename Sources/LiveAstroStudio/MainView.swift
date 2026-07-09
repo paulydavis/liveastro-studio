@@ -21,7 +21,7 @@ struct MainView: View {
             }.padding(8)
             Divider()
             switch model.selectedTab {
-            case .live:  model.isDetached ? AnyView(detachedPlaceholder) : AnyView(BroadcastView())
+            case .live:  model.isDetached ? AnyView(detachedPlaceholder) : AnyView(BroadcastView(configuresWindow: false))
             case .setup: AnyView(ControlView())
             case .help:  AnyView(HelpView())
             }

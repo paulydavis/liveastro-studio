@@ -4,7 +4,6 @@ import LiveAstroCore
 
 struct ControlView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.openWindow) private var openWindow
 
     private let logDisplayCap = 200
     private let logMinHeight: CGFloat = 120

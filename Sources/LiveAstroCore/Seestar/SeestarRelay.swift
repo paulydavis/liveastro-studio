@@ -35,7 +35,9 @@ public final class SeestarRelay {
     @discardableResult
     func copyOnce() throws -> Int {
         let fm = FileManager.default
-        let names = (try? fm.contentsOfDirectory(atPath: source.path)) ?? []
+        let names: [String]
+        do { names = try fm.contentsOfDirectory(atPath: source.path) }
+        catch { onLog?("source unreachable: \(source.path)"); return 0 }
         let stage = try fm.url(for: .itemReplacementDirectory, in: .userDomainMask,
                                appropriateFor: destination, create: true)
         defer { try? fm.removeItem(at: stage) }

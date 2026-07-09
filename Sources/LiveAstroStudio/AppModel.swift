@@ -389,12 +389,18 @@ final class AppModel {
         let relayDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))", isDirectory: true)
         let relay = SeestarRelay(source: found.subDir, destination: relayDir)
-        relay.onLog = { [weak self] in self?.log.append($0) }
+        relay.onLog = { [weak self] msg in
+            Task { @MainActor in self?.log.append(msg) }
+        }
         do { try relay.start() } catch { errorMessage = "Relay failed to start: \(error)"; return }
         seestarRelay = relay
         watchFolder = relayDir
         saveSettings()
         startSession()             // existing native-start path (uses watchFolder + sourceMode)
+        if !isRunning {                       // startSession failed (e.g. pipeline start threw)
+            seestarRelay?.stop(); seestarRelay = nil
+            return
+        }
         selectedTab = .live
     }
 
