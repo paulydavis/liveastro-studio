@@ -22,6 +22,7 @@ struct ControlView: View {
                         }
                         .pickerStyle(.segmented)
                         .disabled(model.isRunning || model.isImporting)
+                        .help("Seestar Live displays Siril's live_stack.fit directly; Raw subs stacks individual exposures natively using LiveAstro's built-in stacker.")
 
                         HStack {
                             Text(model.watchFolder?.path ?? "none selected")
@@ -29,12 +30,15 @@ struct ControlView: View {
                             Spacer()
                             Button("Choose…") { pickFolder() }
                                 .disabled(model.isRunning || model.isImporting)
+                                .help("Choose the folder to watch for incoming FITS subs or the Seestar relay folder.")
                         }
                         TextField("File prefix (empty = any; e.g. Light_ for native subs)",
                                   text: $model.fileNamePrefix)
                             .disabled(model.isRunning || model.isImporting)
+                            .help("Only process files whose name starts with this prefix; leave empty to accept all FITS files in the watch folder.")
                         Toggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground)
                             .disabled(model.isRunning || model.isImporting)
+                            .help("Apply a per-channel background neutralization pass after stacking to correct OSC white balance drift.")
                     }
                     if model.sourceMode == .nativeStack {
                         Section("Calibration") {
@@ -51,6 +55,7 @@ struct ControlView: View {
                         TextField("Location", text: $model.locationLabel)
                         TextField("Bortle (1–9)", text: $model.bortleText)
                         TextField("Sub-exposure seconds", text: $model.subExposureText)
+                            .help("Individual sub-exposure length in seconds; recorded in the session manifest and used for dark-frame matching.")
                         TextField("Notes", text: $model.notes)
                     }
                     // Observes the OBSController (Combine ObservableObject) so its
@@ -90,6 +95,7 @@ struct ControlView: View {
                     .disabled(model.isRunning)
                     Button("Import Subs…") { pickImportFolder() }
                         .disabled(model.isRunning || model.isImporting)
+                        .help("Select a folder of previously captured FITS subs to stack offline, with progress tracking and Cancel support.")
                 }
                 if model.isRunning && model.sourceMode == .nativeStack {
                     HStack {
@@ -97,6 +103,7 @@ struct ControlView: View {
                             .font(.system(.caption, design: .monospaced))
                         Spacer()
                         Button("Reseed Reference") { model.reseedReference() }
+                            .help("Replace the alignment reference frame with the latest accepted sub so subsequent subs align to it.")
                     }
                 }
                 if model.isImporting {
@@ -237,10 +244,13 @@ private struct OBSSection: View {
             // Connection config — locked while connected.
             TextField("Host", text: $model.obsHost)
                 .disabled(connected)
+                .help("Hostname or IP address of the machine running OBS (use 127.0.0.1 when OBS is on the same Mac).")
             TextField("Port", value: $model.obsPort, format: .number.grouping(.never))
                 .disabled(connected)
+                .help("OBS WebSocket server port — default is 4455; change only if you customised it in OBS → Tools → WebSocket Server Settings.")
             SecureField("Password (empty if auth off)", text: $model.obsPassword)
                 .disabled(connected)
+                .help("OBS WebSocket password — copy it from OBS → Tools → WebSocket Server Settings → Show Connect Info (it regenerates each time OBS restarts with auto-generate on).")
             Toggle("Auto-launch OBS on session start", isOn: $model.obsAutoLaunch)
 
             // Scene selection, fed by the controller's live scene list.

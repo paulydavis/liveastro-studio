@@ -36,8 +36,3 @@ struct MainView: View {
         }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Color.black)
     }
 }
-
-// Stub — fleshed out in Task 9.
-struct HelpView: View {
-    var body: some View { Text("Help") }
-}
