@@ -34,6 +34,12 @@ struct ControlView: View {
                 Toggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground)
                     .disabled(model.isRunning || model.isImporting)
             }
+            if model.sourceMode == .nativeStack {
+                Section("Calibration") {
+                    CalibrationSection(selection: $model.calibration,
+                                       onLog: { model.log.append($0) })
+                }
+            }
             Section("Session Profile") {
                 TextField("Target name", text: $model.targetName)
                 TextField("Telescope", text: $model.telescope)

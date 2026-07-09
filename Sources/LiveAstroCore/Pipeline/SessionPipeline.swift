@@ -18,6 +18,7 @@ public final class SessionPipeline {
     private let replaySettings: ReplaySettings
     private let maxKeyframes: Int
     private let neutralizeBackground: Bool
+    private let calibrator: Calibrator?
     private var recorder: SnapshotRecorder?
     private var consumeTask: Task<Void, Never>?
     private let consumeDone = DispatchSemaphore(value: 0)
@@ -35,6 +36,7 @@ public final class SessionPipeline {
         self.replaySettings = replaySettings
         self.maxKeyframes = maxKeyframes
         self.neutralizeBackground = neutralizeBackground
+        self.calibrator = nil
     }
 
     /// Native stacking mode: pulls raw frames from a FrameSource, stacks them with StackEngine,
@@ -42,7 +44,7 @@ public final class SessionPipeline {
     public init(nativeSource: FrameSource, engine: StackEngine, profile: SessionProfile,
                 rootDirectory: URL, replaySettings: ReplaySettings = .init(),
                 maxKeyframes: Int = FrameSelector.defaultMaxKeyframes,
-                neutralizeBackground: Bool = false) {
+                neutralizeBackground: Bool = false, calibrator: Calibrator? = nil) {
         self.watcher = nil
         self.source = nativeSource
         self.engine = engine
@@ -51,6 +53,7 @@ public final class SessionPipeline {
         self.replaySettings = replaySettings
         self.maxKeyframes = maxKeyframes
         self.neutralizeBackground = neutralizeBackground
+        self.calibrator = calibrator
     }
 
     /// Reseeds the stacking engine, discarding the current reference frame (native mode only).
@@ -62,6 +65,7 @@ public final class SessionPipeline {
 
         if let src = source, let eng = engine {
             // Native stacking mode
+            calibrator?.onLog = { [weak self] in self?.onLog?($0) }
             try src.start()
             let done = consumeDone
             consumeTask = Task.detached(priority: .userInitiated) { [weak self] in
@@ -101,7 +105,8 @@ public final class SessionPipeline {
     }
 
     /// Processes one raw frame through the stack engine (native mode).
-    private func handleNative(_ frame: RawFrame, engine: StackEngine) {
+    private func handleNative(_ rawFrame: RawFrame, engine: StackEngine) {
+        let frame = calibrator?.apply(rawFrame) ?? rawFrame
         let outcome = engine.process(frame)
         switch outcome {
         case .becameReference, .stacked:
