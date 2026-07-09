@@ -67,4 +67,20 @@ public enum MasterBuilder {
         let mid = v.count / 2
         return v.count % 2 == 0 ? (v[mid - 1] + v[mid]) / 2 : v[mid]
     }
+
+    /// Save a master as Float32 top-down FITS (ROWORDER = TOP-DOWN).
+    public static func save(_ master: AstroImage, to url: URL) throws {
+        let data = FITSWriter.float32(width: master.width, height: master.height,
+                                      channels: master.channels, pixels: master.pixels,
+                                      bottomUp: false)
+        try data.write(to: url)
+    }
+
+    /// Load a pre-built master as a canonical top-down AstroImage.
+    public static func load(_ url: URL) throws -> AstroImage {
+        let data = try Data(contentsOf: url)
+        let img = try FITSReader.read(data, normalizeRowOrder: true)
+        return AstroImage(width: img.width, height: img.height, channels: img.channels,
+                          pixels: img.pixels, sourceIsLinear: true)
+    }
 }
