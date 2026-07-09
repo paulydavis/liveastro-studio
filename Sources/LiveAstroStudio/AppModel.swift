@@ -107,7 +107,10 @@ final class AppModel {
     /// CurrentProgramSceneChanged can tell "us" from "the operator".
     private var lastAutomationScene: String?
 
+    var importProcessed = 0
+    var importTotal = 0
     private var pipeline: SessionPipeline?
+    private var importPipeline: SessionPipeline?
     private var seestarRelay: SeestarRelay?
 
     /// The fire-and-forget OBS bring-up task (connect + retry + startStream).
@@ -298,11 +301,22 @@ final class AppModel {
                                               rootDirectory: liveAstroRoot,
                                               neutralizeBackground: neutralizeBackground,
                                               calibrator: importCalibrator)
+        importPipeline.onImportProgress = { [weak self] processed, total, accepted, rejected in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self?.importProcessed = processed; self?.importTotal = total
+                    self?.acceptedCount = accepted; self?.rejectedCount = rejected
+                }
+            }
+        }
+        self.importPipeline = importPipeline
         // Counts every frame the source produced (accepted or rejected); it stays at zero
         // only when nothing in the folder matched the prefix at all. The pipeline callbacks
         // fire synchronously on the consume task, which end() drains before returning.
         let matchedFrames = AtomicCounter()
         wireCallbacks(to: importPipeline, onAnyFrame: { matchedFrames.increment() })
+        importProcessed = 0
+        importTotal = 0
         isImporting = true
         log.append("Importing subs from \(folder.path)…")
         let prefix = fileNamePrefix
@@ -331,6 +345,8 @@ final class AppModel {
             }
         }
     }
+
+    func cancelImport() { importPipeline?.cancelImport() }
 
     /// User-facing message for an import that matched zero files.
     private nonisolated static func noMatchMessage(prefix: String) -> String {

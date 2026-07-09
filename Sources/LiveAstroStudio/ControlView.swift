@@ -99,7 +99,18 @@ struct ControlView: View {
                         Button("Reseed Reference") { model.reseedReference() }
                     }
                 }
-                if model.isImporting { ProgressView("Importing subs…") }
+                if model.isImporting {
+                    VStack(spacing: 4) {
+                        ProgressView(value: Double(model.importProcessed),
+                                     total: Double(max(model.importTotal, 1)))
+                        HStack {
+                            Text("\(model.importProcessed) / \(model.importTotal)")
+                            Spacer()
+                            Text("✓ \(model.acceptedCount)  ✗ \(model.rejectedCount)").foregroundStyle(.secondary)
+                            Button("Cancel", role: .cancel) { model.cancelImport() }
+                        }.font(.caption)
+                    }.padding(.horizontal)
+                }
                 if !model.isRunning {
                     HStack {
                         Button("Regenerate Replay…") { pickSessionDirectory() }
