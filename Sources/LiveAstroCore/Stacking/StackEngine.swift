@@ -18,6 +18,7 @@ public final class StackEngine {
     private let seedMinStars: Int
     private let minMatches: Int
     private let inlierTolerance: Double
+    private let rejection: RejectionMethod
     /// Serializes process()/reseed()/currentStack()/stackFrameCount: reseed() runs on the
     /// main thread while process() runs on the pipeline's consume task. A reseed issued
     /// mid-frame applies before the NEXT frame (the intended UX).
@@ -34,10 +35,12 @@ public final class StackEngine {
 
     /// seedMinStars: must comfortably exceed minMatches (8); 15 gives
     /// C(15,3)=455 triangles for reliable initial matching.
-    public init(seedMinStars: Int = 15, minMatches: Int = 8, inlierTolerance: Double = 2.0) {
+    public init(seedMinStars: Int = 15, minMatches: Int = 8, inlierTolerance: Double = 2.0,
+                rejection: RejectionMethod = NoRejection()) {
         self.seedMinStars = seedMinStars
         self.minMatches = minMatches
         self.inlierTolerance = inlierTolerance
+        self.rejection = rejection
     }
 
     public func reseed() {
@@ -46,6 +49,7 @@ public final class StackEngine {
             referenceStars = []
             referenceSize = nil
             referenceChannels = nil
+            rejection.reset()
         }
     }
 
@@ -83,8 +87,10 @@ public final class StackEngine {
                 return .rejected(.insufficientStars(found: stars.count))
             }
             let rgb = displayRGB(frame)
+            let ones = [Float](repeating: 1, count: rgb.width * rgb.height)
+            let seed = rejection.apply(rgb, mask: ones)
             let acc = StackAccumulator(width: rgb.width, height: rgb.height, channels: rgb.channels)
-            acc.add(rgb, mask: [Float](repeating: 1, count: rgb.width * rgb.height))
+            acc.add(seed, mask: ones)
             accumulator = acc
             referenceStars = stars
             referenceSize = (raw.width, raw.height)
@@ -119,7 +125,8 @@ public final class StackEngine {
             return .rejected(.noTransform)
         }
         let (warped, mask) = Warp.apply(rgb, transform: half.liftedToFullResolution())
-        accumulator.add(warped, mask: mask)
+        let cleaned = rejection.apply(warped, mask: mask)
+        accumulator.add(cleaned, mask: mask)
         acceptedCount += 1
         return .stacked(frameCount: accumulator.frameCount)
     }
