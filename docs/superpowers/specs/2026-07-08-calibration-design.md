@@ -63,45 +63,48 @@ Sources/LiveAstroStudio/
   AppModel / persistence            (remembered master paths in UserDefaults)
 ```
 
-### 4.1 MasterKind & MasterFrame
+### 4.1 MasterKind & canonical orientation
 
 ```swift
 public enum MasterKind { case dark, flat, bias }
-
-/// A master calibration frame in SENSOR (stored) row order — the same order as
-/// the raw lights it calibrates. `bottomUp` records that order so the Calibrator
-/// can align it to each incoming light.
-public struct MasterFrame {
-    public let image: AstroImage    // 1-channel CFA (or mono), sensor order
-    public let bottomUp: Bool
-    public init(image: AstroImage, bottomUp: Bool)
-}
 ```
+
+Masters are **canonical top-down** `AstroImage`s. Every master — built from raw
+folders or loaded from a pre-built file — is read with `normalizeRowOrder: true`,
+so a bottom-up source is flipped to top-down at read and all masters share one
+orientation. Row-order alignment is therefore a property of the *incoming light*,
+not the master: when a light arrives bottom-up (its native stored order), the
+`Calibrator` vertically flips the master once to align photosites. This is why
+no `bottomUp` field is needed on the master — there is only one master
+orientation. (Sensor-order masters were rejected: `FITSWriter` couples flip and
+`ROWORDER` label, so a sensor-order master cannot round-trip through save/reload
+faithfully.)
 
 ### 4.2 MasterBuilder
 
 ```swift
 public enum MasterBuilder {
-    /// Mean-combine FITS frames into a master, in sensor (stored) order.
+    /// Mean-combine FITS frames into a canonical top-down master.
     /// - For .flat: subtracts `bias` per-frame when provided, then normalizes
-    ///   the mean to median 1 after clamping to ≥ epsilon.
+    ///   the mean to median 1 after clamping to ≥ flatFloor.
     /// - O(1) memory: running Double sum ÷ count; frames are not retained.
     /// - Throws if `fitsURLs` is empty or every frame mismatches the first
     ///   frame's dimensions.
     public static func combine(fitsURLs: [URL], kind: MasterKind,
-                               bias: AstroImage?) throws -> MasterFrame
+                               bias: AstroImage?) throws -> AstroImage
 
-    /// Save a built master as Float32 FITS. Records its row order in the header.
-    public static func save(_ master: MasterFrame, to url: URL) throws
+    /// Save a built master as Float32 top-down FITS (ROWORDER = TOP-DOWN).
+    public static func save(_ master: AstroImage, to url: URL) throws
 
-    /// Load a pre-built master file (sensor order + ROWORDER-derived bottomUp).
-    public static func load(_ url: URL) throws -> MasterFrame
+    /// Load a pre-built master file as a canonical top-down AstroImage
+    /// (read with normalizeRowOrder: true, so a bottom-up file is flipped in).
+    public static func load(_ url: URL) throws -> AstroImage
 }
 ```
 
-- **Row order:** frames are read with `normalizeRowOrder: false` (sensor order,
-  never flipped) so masters match the CFA order the stacker consumes. The frame's
-  `bottomUp` comes from the FITS `ROWORDER` header, exactly as `RawFrame.bottomUp`.
+- **Row order:** frames are read with `normalizeRowOrder: true` → canonical
+  top-down (§4.1). `save` writes `FITSWriter.float32(..., bottomUp: false)`;
+  `load` reads `normalizeRowOrder: true`; the round trip is exact.
 - **Accumulation:** a `[Double]` running sum guards against precision loss over
   100+ frames; divide by count for the mean.
 - **Flat normalization:** after (optional) bias subtraction and mean, clamp each
@@ -117,7 +120,8 @@ public enum MasterBuilder {
 
 ```swift
 public final class Calibrator {
-    public init(dark: MasterFrame?, flat: MasterFrame?)
+    /// dark and flat are canonical top-down masters (§4.1).
+    public init(dark: AstroImage?, flat: AstroImage?)
 
     /// Calibrate one raw frame's CFA. Returns the frame unchanged when no
     /// masters apply. Never throws — a mismatched master is skipped (logged
@@ -132,12 +136,16 @@ public final class Calibrator {
   clamp [0,1]; if `!out.isFinite` → 0 (NaN-poisoning guard). `flatNorm` pixels
   are re-clamped ≥ `flatFloor` at apply time too, in case a *pre-built* external
   flat contains zeros the build clamp never saw.
-- **Orientation (the #1 correctness risk):** calibration is a per-pixel op, so a
-  master and the light must share row order. On the first `apply`, each master
-  whose `bottomUp` differs from the frame's is flipped once and the aligned copy
-  cached (all frames in a session share `bottomUp`, so this happens at most once
-  per master). A **bottom-up regression test** pins this, mirroring the CFA R/B
-  discipline already in the codebase.
+- **Orientation (the #1 correctness risk):** calibration is a per-pixel op, so
+  the master and the light must address the same photosite. Masters are canonical
+  top-down; a light in its native stored order may be bottom-up. When
+  `frame.bottomUp` is true, the Calibrator uses a **vertically flipped** copy of
+  each master (cached on first use, since every frame in a session shares
+  `bottomUp`); when false, it uses the master as-is. The subtraction/division runs
+  in the light's stored order and the returned `RawFrame` preserves the light's
+  orientation and `bottomUp`, so the engine still debayers the light's native CFA
+  phase (the master is never debayered). A **bottom-up regression test** pins
+  photosite alignment, mirroring the CFA R/B discipline already in the codebase.
 - **Dimension mismatch:** a master whose dims differ from the frame's is dropped
   for that frame (logged once), and the remaining masters still apply. The frame
   is never rejected on calibration grounds.
@@ -213,8 +221,9 @@ trip preserves pixels and row order.
 **Calibrator** — exact `(L−D)/F` on synthetic data (a dark that removes a known
 pedestal; a flat that removes a known gradient); identity passthrough with no
 masters; dimension-mismatch skip leaves the frame otherwise intact; flat-zero
-clamp (no NaN/Inf); non-finite input → 0; **row-order alignment** (a bottom-up
-master applied to a top-down light lines up pixel-for-pixel).
+clamp (no NaN/Inf); non-finite input → 0; **row-order alignment** (a canonical
+top-down master applied to a bottom-up light lines up photosite-for-photosite via
+the vertical flip).
 
 **SessionPipeline integration** — native e2e: a `FrameSource` emitting frames
 with a known additive pedestal + a matching master dark → the accumulated
@@ -236,7 +245,7 @@ drizzle. Winsorized κ-σ rejection is a separate, already-specced pillar.
 
 | Risk | Mitigation |
 |---|---|
-| Row-order mismatch between master and light (silent vertical flip → garbage calibration) | Calibrator aligns masters to each frame's `bottomUp`; bottom-up regression test pins it |
+| Row-order mismatch between master and light (silent vertical flip → garbage calibration) | Canonical top-down masters; Calibrator flips to the light's `bottomUp` when needed; bottom-up regression test pins photosite alignment; master never debayered so Bayer phase is preserved |
 | Precision loss mean-combining 100+ frames | `Double` running-sum accumulator |
 | Pre-built external flat with zero pixels | `flatFloor` clamp at both build and apply |
 | Long build blocking the UI | off-main-thread combine with progress; masters persist so build is one-time |
