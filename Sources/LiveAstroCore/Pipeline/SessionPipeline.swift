@@ -1,6 +1,13 @@
 import Foundation
 import CoreGraphics
 
+/// Simple atomic boolean flag backed by NSLock (Foundation only).
+final class NSLock_Flag {
+    private let lock = NSLock(); private var value = false
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func set() { lock.lock(); value = true; lock.unlock() }
+}
+
 /// Glue: watcher → loader → stretch → broadcast callback + snapshot + manifest (spec §5.1).
 /// Also supports native stacking mode: FrameSource → StackEngine → snapshot + manifest.
 /// UI-free so the end-to-end test and the app share the same wiring.
@@ -10,6 +17,11 @@ public final class SessionPipeline {
     public var onLog: ((String) -> Void)?
     /// Called for every frame the stack engine rejects (native mode only).
     public var onRejected: ((RejectionReason, String) -> Void)?
+    /// Called after each frame is processed (native import mode only).
+    public var onImportProgress: ((_ processed: Int, _ total: Int,
+                                   _ accepted: Int, _ rejected: Int) -> Void)?
+    private let cancelled = NSLock_Flag()
+    private var processedCount = 0
 
     private let watcher: StackFileWatcher?
     private var source: FrameSource?
@@ -59,6 +71,10 @@ public final class SessionPipeline {
     /// Reseeds the stacking engine, discarding the current reference frame (native mode only).
     public func reseed() { engine?.reseed() }
 
+    /// Cancel an in-progress import: stops feeding new frames; end() finalizes
+    /// whatever completed into a valid master.fit + replay (not a hard abort).
+    public func cancelImport() { cancelled.set(); source?.stop() }
+
     public func start() throws {
         let dir = try session.startSession(profile: profile)
         recorder = SnapshotRecorder(sessionDirectory: dir)
@@ -106,8 +122,10 @@ public final class SessionPipeline {
 
     /// Processes one raw frame through the stack engine (native mode).
     private func handleNative(_ rawFrame: RawFrame, engine: StackEngine) {
+        if cancelled.isSet { return }
         let frame = calibrator?.apply(rawFrame) ?? rawFrame
         let outcome = engine.process(frame)
+        processedCount += 1
         switch outcome {
         case .becameReference, .stacked:
             guard let mean = engine.currentStack() else { return }
@@ -130,6 +148,9 @@ public final class SessionPipeline {
         case .rejected(let reason):
             onRejected?(reason, frame.sourceName)
             onLog?("Rejected \(frame.sourceName): \(reason)")
+        }
+        if let total = source?.totalCount {
+            onImportProgress?(processedCount, total, engine.acceptedCount, engine.rejectedCount)
         }
     }
 
