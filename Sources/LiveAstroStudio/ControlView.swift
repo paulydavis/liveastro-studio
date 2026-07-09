@@ -38,6 +38,17 @@ struct ControlView: View {
                         Toggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground)
                             .disabled(model.isRunning || model.isImporting)
                             .help("Apply a per-channel background neutralization pass after stacking to correct OSC white balance drift.")
+                        Toggle("Reject outliers (σ-clip)", isOn: $model.rejectionEnabled)
+                            .help("Drop satellite / plane / cosmic-ray streaks by clamping pixels that deviate from the per-pixel stack statistics (winsorized κ-σ). On by default.")
+                        if model.rejectionEnabled {
+                            Picker("Strength", selection: $model.rejectionStrength) {
+                                Text("Low").tag(RejectionStrength.low)
+                                Text("Medium").tag(RejectionStrength.medium)
+                                Text("High").tag(RejectionStrength.high)
+                            }
+                            .pickerStyle(.segmented)
+                            .help("Higher = safer (rejects less); lower = more aggressive. Medium (κ=3) is the validated default.")
+                        }
                     }
                     if model.sourceMode == .nativeStack {
                         Section("Calibration") {
