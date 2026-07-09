@@ -37,7 +37,8 @@ public enum MasterBuilder {
                 continue    // dimension mismatch → skip
             }
             // For flats, subtract bias per-frame when its dimensions match.
-            if kind == .flat, let bias, bias.pixels.count == sum.count {
+            if kind == .flat, let bias,
+               bias.width == refW && bias.height == refH && bias.channels == refC {
                 for i in 0..<sum.count { sum[i] += Double(img.pixels[i]) - Double(bias.pixels[i]) }
             } else {
                 for i in 0..<sum.count { sum[i] += Double(img.pixels[i]) }
@@ -47,17 +48,28 @@ public enum MasterBuilder {
 
         guard count > 0 else { throw BuildError.noValidFrames }
 
-        var mean = sum.map { Float($0 / Double(count)) }
+        let mean = sum.map { Float($0 / Double(count)) }
+        let raw = AstroImage(width: refW, height: refH, channels: refC,
+                             pixels: mean, sourceIsLinear: true)
 
         if kind == .flat {
-            for i in 0..<mean.count where mean[i] < flatFloor { mean[i] = flatFloor }
-            let med = median(of: mean)
-            let divisor = med < flatFloor ? flatFloor : med
-            for i in 0..<mean.count { mean[i] /= divisor }
+            return normalizedFlat(raw)
         }
 
-        return AstroImage(width: refW, height: refH, channels: refC,
-                          pixels: mean, sourceIsLinear: true)
+        return raw
+    }
+
+    /// Clamp a flat to ≥ flatFloor and normalize it to median 1 (a dimensionless
+    /// multiplier). Idempotent: an already-normalized flat (median 1) is unchanged.
+    /// Applied to every flat — built in-app or loaded from an external file — so a
+    /// non-normalized external master flat still divides correctly.
+    public static func normalizedFlat(_ image: AstroImage) -> AstroImage {
+        var pixels = image.pixels
+        for i in 0..<pixels.count where pixels[i] < flatFloor { pixels[i] = flatFloor }
+        let med = median(of: pixels)
+        for i in 0..<pixels.count { pixels[i] /= med }
+        return AstroImage(width: image.width, height: image.height, channels: image.channels,
+                          pixels: pixels, sourceIsLinear: true)
     }
 
     /// Exact median via full sort of a copy (one-time build; correctness over speed).

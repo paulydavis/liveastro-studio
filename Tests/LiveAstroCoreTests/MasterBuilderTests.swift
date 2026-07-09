@@ -73,6 +73,26 @@ final class MasterBuilderTests: XCTestCase {
         for (a, b) in zip(loaded.pixels, master.pixels) { XCTAssertEqual(a, b, accuracy: 1e-5) }
     }
 
+    func testNormalizedFlatMakesMedianOne() throws {
+        // pixels [1, 2, 3, 4] → median = (2+3)/2 = 2.5 → normalized [0.4, 0.8, 1.2, 1.6]
+        let input = AstroImage(width: 2, height: 2, channels: 1,
+                               pixels: [1.0, 2.0, 3.0, 4.0], sourceIsLinear: true)
+        let normed = MasterBuilder.normalizedFlat(input)
+        let expected: [Float] = [0.4, 0.8, 1.2, 1.6]
+        for (got, exp) in zip(normed.pixels, expected) {
+            XCTAssertEqual(got, exp, accuracy: 1e-5)
+        }
+        // median of normalized result must be 1.0
+        let sorted = normed.pixels.sorted()
+        let med = (sorted[1] + sorted[2]) / 2
+        XCTAssertEqual(med, 1.0, accuracy: 1e-5)
+        // idempotence: normalizing again leaves pixels unchanged
+        let normed2 = MasterBuilder.normalizedFlat(normed)
+        for (a, b) in zip(normed2.pixels, normed.pixels) {
+            XCTAssertEqual(a, b, accuracy: 1e-5)
+        }
+    }
+
     func testLoadFlipsBottomUpFileToTopDown() throws {
         let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
         // A bottom-up file written with FITSWriter(bottomUp: true) stores the input flipped to disk;

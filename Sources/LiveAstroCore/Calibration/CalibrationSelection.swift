@@ -46,7 +46,7 @@ public enum CalibrationLoader {
             catch { warnings.append("Could not load master \(label): \(url.lastPathComponent)"); return nil }
         }
         let d = loadMaster(dark, "dark")
-        let f = loadMaster(flat, "flat")
+        let f = loadMaster(flat, "flat").map { MasterBuilder.normalizedFlat($0) }
         guard d != nil || f != nil else { return (nil, warnings) }
         return (Calibrator(dark: d, flat: f), warnings)
     }

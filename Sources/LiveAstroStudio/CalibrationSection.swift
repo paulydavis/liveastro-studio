@@ -9,14 +9,12 @@ struct CalibrationSection: View {
     var onLog: (String) -> Void
 
     var body: some View {
-        GroupBox("Calibration") {
-            VStack(alignment: .leading, spacing: 6) {
-                masterRow("Dark", path: $selection.darkPath, kind: .dark, needsBias: false)
-                masterRow("Flat", path: $selection.flatPath, kind: .flat, needsBias: true)
-                masterRow("Bias", path: $selection.biasPath, kind: .bias, needsBias: false)
-                Text("Bias is used to clean flats; it is not applied to lights directly.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }.padding(6)
+        VStack(alignment: .leading, spacing: 6) {
+            masterRow("Dark", path: $selection.darkPath, kind: .dark, needsBias: false)
+            masterRow("Flat", path: $selection.flatPath, kind: .flat, needsBias: true)
+            masterRow("Bias", path: $selection.biasPath, kind: .bias, needsBias: false)
+            Text("Bias is used to clean flats; it is not applied to lights directly.")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
