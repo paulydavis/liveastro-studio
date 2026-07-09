@@ -73,13 +73,14 @@ public enum MasterBuilder {
         let data = FITSWriter.float32(width: master.width, height: master.height,
                                       channels: master.channels, pixels: master.pixels,
                                       bottomUp: false)
-        try data.write(to: url)
+        try data.write(to: url, options: .atomic)
     }
 
     /// Load a pre-built master as a canonical top-down AstroImage.
     public static func load(_ url: URL) throws -> AstroImage {
         let data = try Data(contentsOf: url)
         let img = try FITSReader.read(data, normalizeRowOrder: true)
+        // Master frames are always linear calibration data (dark/flat/bias), never raw Bayer.
         return AstroImage(width: img.width, height: img.height, channels: img.channels,
                           pixels: img.pixels, sourceIsLinear: true)
     }

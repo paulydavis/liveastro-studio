@@ -75,13 +75,14 @@ final class MasterBuilderTests: XCTestCase {
 
     func testLoadFlipsBottomUpFileToTopDown() throws {
         let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
-        // A bottom-up file with rows [r0=A, r1=B]; loaded top-down must be [B, A].
+        // A bottom-up file written with FITSWriter(bottomUp: true) stores the input flipped to disk;
+        // load(normalizeRowOrder: true) flips it back, so the round-trip yields the original top-down input [0.9, 0.1].
         let url = dir.appendingPathComponent("bu.fit")
         try FITSWriter.float32(width: 1, height: 2, channels: 1,
                                pixels: [0.9, 0.1], bottomUp: true).write(to: url)
         let loaded = try MasterBuilder.load(url)
-        // FITSWriter(bottomUp:true) stores the input flipped; read normalizeRowOrder:true
-        // yields the input back in top-down. Just assert it round-trips the logical image.
         XCTAssertEqual(loaded.pixels.count, 2)
+        XCTAssertEqual(loaded.pixels[0], Float(0.9), accuracy: 1e-5)
+        XCTAssertEqual(loaded.pixels[1], Float(0.1), accuracy: 1e-5)
     }
 }
