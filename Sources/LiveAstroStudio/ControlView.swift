@@ -11,50 +11,69 @@ struct ControlView: View {
 
     var body: some View {
         @Bindable var model = model
-        Form {
-            Section("Watch Folder") {
-                Picker("Source", selection: $model.sourceMode) {
-                    ForEach(AppModel.SourceMode.allCases, id: \.self) { mode in
-                        Text(mode.rawValue).tag(mode)
+        VStack(spacing: 0) {
+            ScrollView {
+                Form {
+                    Section("Watch Folder") {
+                        Picker("Source", selection: $model.sourceMode) {
+                            ForEach(AppModel.SourceMode.allCases, id: \.self) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .disabled(model.isRunning || model.isImporting)
+
+                        HStack {
+                            Text(model.watchFolder?.path ?? "none selected")
+                                .lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            Button("Choose…") { pickFolder() }
+                                .disabled(model.isRunning || model.isImporting)
+                        }
+                        TextField("File prefix (empty = any; e.g. Light_ for native subs)",
+                                  text: $model.fileNamePrefix)
+                            .disabled(model.isRunning || model.isImporting)
+                        Toggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground)
+                            .disabled(model.isRunning || model.isImporting)
+                    }
+                    if model.sourceMode == .nativeStack {
+                        Section("Calibration") {
+                            CalibrationSection(selection: $model.calibration,
+                                               onLog: { model.log.append($0) })
+                        }
+                    }
+                    Section("Session Profile") {
+                        TextField("Target name", text: $model.targetName)
+                        TextField("Telescope", text: $model.telescope)
+                        TextField("Camera", text: $model.camera)
+                        TextField("Mount", text: $model.mount)
+                        TextField("Filter", text: $model.filter)
+                        TextField("Location", text: $model.locationLabel)
+                        TextField("Bortle (1–9)", text: $model.bortleText)
+                        TextField("Sub-exposure seconds", text: $model.subExposureText)
+                        TextField("Notes", text: $model.notes)
+                    }
+                    // Observes the OBSController (Combine ObservableObject) so its
+                    // @Published state/scene/record changes re-render this section.
+                    OBSSection(model: model)
+                    Section("Log") {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(Array(model.log.suffix(logDisplayCap).enumerated()), id: \.offset) {
+                                    Text($0.element).font(.system(.caption, design: .monospaced))
+                                }
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }.frame(minHeight: logMinHeight)
                     }
                 }
-                .pickerStyle(.segmented)
-                .disabled(model.isRunning || model.isImporting)
+                .formStyle(.grouped)
+            }
 
+            Divider()
+
+            // Fixed footer — always visible regardless of scroll position.
+            VStack(spacing: 8) {
                 HStack {
-                    Text(model.watchFolder?.path ?? "none selected")
-                        .lineLimit(1).truncationMode(.middle)
-                    Spacer()
-                    Button("Choose…") { pickFolder() }
-                        .disabled(model.isRunning || model.isImporting)
-                }
-                TextField("File prefix (empty = any; e.g. Light_ for native subs)",
-                          text: $model.fileNamePrefix)
-                    .disabled(model.isRunning || model.isImporting)
-                Toggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground)
-                    .disabled(model.isRunning || model.isImporting)
-            }
-            if model.sourceMode == .nativeStack {
-                Section("Calibration") {
-                    CalibrationSection(selection: $model.calibration,
-                                       onLog: { model.log.append($0) })
-                }
-            }
-            Section("Session Profile") {
-                TextField("Target name", text: $model.targetName)
-                TextField("Telescope", text: $model.telescope)
-                TextField("Camera", text: $model.camera)
-                TextField("Mount", text: $model.mount)
-                TextField("Filter", text: $model.filter)
-                TextField("Location", text: $model.locationLabel)
-                TextField("Bortle (1–9)", text: $model.bortleText)
-                TextField("Sub-exposure seconds", text: $model.subExposureText)
-                TextField("Notes", text: $model.notes)
-            }
-            Section {
-                HStack {
-                    Button("Open Broadcast Window") { openWindow(id: "broadcast") }
-                    Spacer()
                     if model.isRunning {
                         Button("End Session", role: .destructive) { model.endSession() }
                             .disabled(model.isGeneratingReplay)
@@ -63,41 +82,36 @@ struct ControlView: View {
                             .buttonStyle(.borderedProminent)
                             .disabled(model.isImporting)
                     }
+                    Spacer()
+                    Button("Import Subs…") { pickImportFolder() }
+                        .disabled(model.isRunning || model.isImporting)
                 }
                 if model.isRunning && model.sourceMode == .nativeStack {
-                    Text("accepted \(model.acceptedCount) · rejected \(model.rejectedCount)")
-                        .font(.system(.caption, design: .monospaced))
-                    Button("Reseed Reference") { model.reseedReference() }
-                }
-                Button("Import Subs…") { pickImportFolder() }
-                    .disabled(model.isRunning || model.isImporting)
-                if model.isImporting { ProgressView("Importing subs…") }
-                if !model.isRunning {
-                    Button("Regenerate Replay…") { pickSessionDirectory() }
-                        .disabled(model.isGeneratingReplay)
-                }
-                if model.isGeneratingReplay { ProgressView("Rendering replay…") }
-                if let url = model.replayURL {
-                    Button("Reveal Replay in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                    HStack {
+                        Text("accepted \(model.acceptedCount) · rejected \(model.rejectedCount)")
+                            .font(.system(.caption, design: .monospaced))
+                        Spacer()
+                        Button("Reseed Reference") { model.reseedReference() }
                     }
                 }
-            }
-            // Observes the OBSController (Combine ObservableObject) so its
-            // @Published state/scene/record changes re-render this section.
-            OBSSection(model: model)
-            Section("Log") {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(model.log.suffix(logDisplayCap).enumerated()), id: \.offset) {
-                            Text($0.element).font(.system(.caption, design: .monospaced))
+                if model.isImporting { ProgressView("Importing subs…") }
+                if !model.isRunning {
+                    HStack {
+                        Button("Regenerate Replay…") { pickSessionDirectory() }
+                            .disabled(model.isGeneratingReplay)
+                        if let url = model.replayURL {
+                            Spacer()
+                            Button("Reveal Replay in Finder") {
+                                NSWorkspace.shared.activateFileViewerSelecting([url])
+                            }
                         }
-                    }.frame(maxWidth: .infinity, alignment: .leading)
-                }.frame(minHeight: logMinHeight)
+                    }
+                }
+                if model.isGeneratingReplay { ProgressView("Rendering replay…") }
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
         }
-        .formStyle(.grouped)
-        .padding(.bottom, 8)
         .alert("LiveAstro", isPresented: $model.isShowingError) {
             Button("OK") { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }

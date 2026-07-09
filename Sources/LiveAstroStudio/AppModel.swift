@@ -6,6 +6,10 @@ import LiveAstroCore
 @MainActor
 final class AppModel {
 
+    enum MainTab: String, CaseIterable { case live = "Live", setup = "Setup", help = "Help" }
+    var selectedTab: MainTab = .setup
+    var isDetached = false
+
     enum SourceMode: String, CaseIterable {
         case stackerOutput = "Stacker output (Siril)"
         case nativeStack   = "Raw subs (native stacking)"
@@ -223,6 +227,7 @@ final class AppModel {
             try p.start()
             pipeline = p
             isRunning = true
+            selectedTab = .live
             sessionStart = Date()
             sessionEnd = nil
             replayURL = nil
