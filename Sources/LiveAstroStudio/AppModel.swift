@@ -116,6 +116,33 @@ final class AppModel {
         obs.onLog = { [weak self] message in
             MainActor.assumeIsolated { self?.log.append("OBS: \(message)") }
         }
+        loadSettings()
+    }
+
+    // MARK: - Settings persistence
+
+    private func currentSettings() -> SessionSettings {
+        SessionSettings(
+            sourceModeRaw: sourceMode.rawValue,
+            watchFolderPath: watchFolder?.path,
+            filePrefix: fileNamePrefix,
+            neutralizeBackground: neutralizeBackground,
+            subExposureSeconds: Double(subExposureText) ?? 60,
+            targetName: targetName,
+            calibration: calibration)
+    }
+
+    func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
+
+    func loadSettings() {
+        let s = SessionSettingsStore.load(.standard)
+        sourceMode = SourceMode(rawValue: s.sourceModeRaw) ?? .stackerOutput
+        watchFolder = s.watchFolderPath.map { URL(fileURLWithPath: $0) }
+        fileNamePrefix = s.filePrefix
+        neutralizeBackground = s.neutralizeBackground
+        subExposureText = String(format: "%g", s.subExposureSeconds)
+        targetName = s.targetName
+        calibration = s.calibration
     }
 
     /// Root for all session output; every session/import directory lives under here.
@@ -143,6 +170,7 @@ final class AppModel {
     /// Not unit-testable: needs FileManager, a live pipeline, and a real watch
     /// folder — the end-to-end test covers this path.
     func startSession() {
+        saveSettings()
         guard !isRunning else { return }
         guard !isImporting else { errorMessage = "Finish the import before starting a session."; return }
         guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return }
@@ -240,6 +268,7 @@ final class AppModel {
     /// Not unit-testable: needs a detached task and a real folder; the
     /// zero-match path is covered via noMatchMessage(prefix:).
     func importSubs(from folder: URL) {
+        saveSettings()
         guard !isRunning else { errorMessage = "End the session before importing."; return }
         guard !isImporting else { return }
         let source = FolderFrameSource(folder: folder, mode: .importOnce,
@@ -314,6 +343,7 @@ final class AppModel {
     }
 
     func endSession() {
+        saveSettings()
         guard let p = pipeline else { return }
         guard !isGeneratingReplay else { return }
         isGeneratingReplay = true
