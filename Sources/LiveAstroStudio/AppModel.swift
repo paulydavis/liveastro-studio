@@ -37,6 +37,8 @@ final class AppModel {
 
     var fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
     var neutralizeBackground = false
+    var rejectionEnabled = true
+    var rejectionStrength: RejectionStrength = .medium
     var calibration = CalibrationStore.load(.standard)
     var watchFolder: URL?
     var sourceMode: SourceMode = .stackerOutput {
@@ -146,7 +148,9 @@ final class AppModel {
             neutralizeBackground: neutralizeBackground,
             subExposureSeconds: Double(subExposureText) ?? 60,
             targetName: targetName,
-            calibration: calibration)
+            calibration: calibration,
+            rejectionEnabled: rejectionEnabled,
+            rejectionStrength: rejectionStrength)
     }
 
     func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
@@ -160,6 +164,15 @@ final class AppModel {
         subExposureText = String(format: "%g", s.subExposureSeconds)
         targetName = s.targetName
         calibration = s.calibration
+        rejectionEnabled = s.rejectionEnabled
+        rejectionStrength = s.rejectionStrength
+    }
+
+    private func makeStackEngine() -> StackEngine {
+        let rejection: RejectionMethod = rejectionEnabled
+            ? WinsorizedSigmaClip(kappa: rejectionStrength.kappa)
+            : NoRejection()
+        return StackEngine(rejection: rejection)
     }
 
     /// Root for all session output; every session/import directory lives under here.
@@ -202,7 +215,7 @@ final class AppModel {
         case .nativeStack:
             let source = FolderFrameSource(folder: folder, mode: .live,
                                             fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
-            let engine = StackEngine()
+            let engine = makeStackEngine()
             let (calibrator, calWarnings) = CalibrationLoader.makeCalibrator(
                 dark: calibration.darkPath.map { URL(fileURLWithPath: $0) },
                 flat: calibration.flatPath.map { URL(fileURLWithPath: $0) })
@@ -291,7 +304,7 @@ final class AppModel {
         guard !isImporting else { return }
         let source = FolderFrameSource(folder: folder, mode: .importOnce,
                                         fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
-        let engine = StackEngine()
+        let engine = makeStackEngine()
         let (importCalibrator, importCalWarnings) = CalibrationLoader.makeCalibrator(
             dark: calibration.darkPath.map { URL(fileURLWithPath: $0) },
             flat: calibration.flatPath.map { URL(fileURLWithPath: $0) })
