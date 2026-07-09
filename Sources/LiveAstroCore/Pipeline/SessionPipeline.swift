@@ -90,7 +90,9 @@ public final class SessionPipeline {
     /// Shared display pipeline: optional background neutralization, then stretch
     /// if still linear, then pack to CGImage.
     private func displayCGImage(from linear: AstroImage) throws -> CGImage {
-        let balanced = neutralizeBackground ? AutoStretch.neutralizeBackground(linear) : linear
+        let balanced = neutralizeBackground
+            ? AutoStretch.neutralizeBackground(AutoStretch.neutralizeBackgroundAdditive(linear))
+            : linear
         let display = balanced.sourceIsLinear ? AutoStretch.stretch(balanced) : balanced
         guard let cg = AutoStretch.makeCGImage(display) else {
             throw ImageLoaderError.decodeFailed("CGImage packing")

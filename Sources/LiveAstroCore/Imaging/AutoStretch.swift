@@ -78,6 +78,79 @@ public enum AutoStretch {
                           pixels: out, sourceIsLinear: image.sourceIsLinear)
     }
 
+    /// Additive background neutralization for OSC color casts.
+    /// Multiplicative BN corrects channel gain but leaves the additive skyglow
+    /// pedestal, so a green cast survives. This estimates each channel's sky
+    /// background from a tile grid and subtracts each channel down to the darkest
+    /// channel's level, removing the cast (validated on ASI2600 data).
+    ///
+    /// Robustness: the channel background is the LOW percentile of tile medians.
+    /// The darkest tiles are true sky, so bright nebula/stars can't skew the
+    /// estimate the way a whole-frame median would.
+    public static func neutralizeBackgroundAdditive(_ image: AstroImage,
+                                                    tilesPerAxis: Int = 48,
+                                                    backgroundPercentile: Double = 20) -> AstroImage {
+        guard image.channels == 3 else { return image }
+        let w = image.width, h = image.height, plane = w * h
+        let tiles = max(1, tilesPerAxis)
+
+        // Median of an arbitrary set of values (even-count → mean of the two middle).
+        func median(_ values: inout [Float]) -> Double {
+            values.sort()
+            let mid = values.count / 2
+            return values.count % 2 == 0 ? Double(values[mid - 1] + values[mid]) / 2
+                                         : Double(values[mid])
+        }
+
+        // Background estimate for one channel: low percentile of per-tile medians.
+        func channelBackground(_ c: Int) -> Double {
+            let base = c * plane
+            var tileMedians: [Double] = []
+            tileMedians.reserveCapacity(tiles * tiles)
+            for ty in 0..<tiles {
+                let y0 = ty * h / tiles
+                let y1 = (ty + 1) * h / tiles
+                for tx in 0..<tiles {
+                    let x0 = tx * w / tiles
+                    let x1 = (tx + 1) * w / tiles
+                    if y1 <= y0 || x1 <= x0 { continue }
+                    var vals: [Float] = []
+                    vals.reserveCapacity((y1 - y0) * (x1 - x0))
+                    for y in y0..<y1 {
+                        let row = base + y * w
+                        for x in x0..<x1 { vals.append(image.pixels[row + x]) }
+                    }
+                    tileMedians.append(median(&vals))
+                }
+            }
+            // Reachable only for a degenerate 0-area frame (every tile collapses
+            // to zero extent and is skipped above). Return a 0 background offset
+            // so such an image passes through unchanged rather than crashing on
+            // the empty-array percentile index below.
+            guard !tileMedians.isEmpty else { return 0 }
+            tileMedians.sort()
+            let p = min(max(backgroundPercentile, 0), 100) / 100
+            // Nearest-rank index into the sorted tile medians.
+            let idx = min(tileMedians.count - 1,
+                          max(0, Int((p * Double(tileMedians.count - 1)).rounded())))
+            return tileMedians[idx]
+        }
+
+        let bg = (0..<3).map { channelBackground($0) }
+        let floor = min(bg[0], min(bg[1], bg[2]))
+
+        var out = image.pixels
+        for c in 0..<3 {
+            let offset = Float(bg[c] - floor)
+            if offset <= 0 { continue }
+            for i in (c * plane)..<((c + 1) * plane) {
+                out[i] = min(max(out[i] - offset, 0), 1)
+            }
+        }
+        return AstroImage(width: w, height: h, channels: image.channels,
+                          pixels: out, sourceIsLinear: image.sourceIsLinear)
+    }
+
     /// Pack planar float image into an 8-bit CGImage (gray or RGBX).
     /// CGContext creation / makeImage() only fail under memory pressure;
     /// the nil propagates to the caller rather than trapping.

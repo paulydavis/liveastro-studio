@@ -95,4 +95,84 @@ final class AutoStretchTests: XCTestCase {
         let out = AutoStretch.neutralizeBackground(img)
         XCTAssertEqual(out.pixels[0], 0.5, accuracy: 1e-6)
     }
+
+    // MARK: - Additive background neutralization
+
+    /// Tile-based low-percentile background estimate, mirroring the logic under test,
+    /// so tests can assert channel backgrounds without reaching into private helpers.
+    private func tileBackground(_ image: AstroImage, channel c: Int,
+                                tilesPerAxis: Int = 48, percentile: Double = 20) -> Double {
+        let w = image.width, h = image.height, plane = w * h, base = c * plane
+        var tileMedians: [Double] = []
+        for ty in 0..<tilesPerAxis {
+            let y0 = ty * h / tilesPerAxis, y1 = (ty + 1) * h / tilesPerAxis
+            for tx in 0..<tilesPerAxis {
+                let x0 = tx * w / tilesPerAxis, x1 = (tx + 1) * w / tilesPerAxis
+                if y1 <= y0 || x1 <= x0 { continue }
+                var vals: [Float] = []
+                for y in y0..<y1 { for x in x0..<x1 { vals.append(image.pixels[base + y * w + x]) } }
+                vals.sort()
+                let mid = vals.count / 2
+                tileMedians.append(vals.count % 2 == 0 ? Double(vals[mid - 1] + vals[mid]) / 2
+                                                       : Double(vals[mid]))
+            }
+        }
+        tileMedians.sort()
+        let p = min(max(percentile, 0), 100) / 100
+        let idx = min(tileMedians.count - 1, max(0, Int((p * Double(tileMedians.count - 1)).rounded())))
+        return tileMedians[idx]
+    }
+
+    func testAdditiveBNAlignsChannelBackgrounds() {
+        // 96x96x3, flat per-channel offset + a few bright stars in one channel.
+        let w = 96, h = 96, plane = w * h
+        var px = [Float](repeating: 0, count: plane * 3)
+        for i in 0..<plane {
+            px[i] = 0.02             // R
+            px[plane + i] = 0.05     // G
+            px[2 * plane + i] = 0.03 // B
+        }
+        // Bright "star" pixels in the green channel (should survive, not be subtracted away).
+        let starIdx = [10 * w + 10, 50 * w + 40, 80 * w + 70]
+        for s in starIdx { px[plane + s] = 0.9 }
+        let img = AstroImage(width: w, height: h, channels: 3, pixels: px, sourceIsLinear: true)
+
+        let out = AutoStretch.neutralizeBackgroundAdditive(img)
+
+        let bgR = tileBackground(out, channel: 0)
+        let bgG = tileBackground(out, channel: 1)
+        let bgB = tileBackground(out, channel: 2)
+        XCTAssertEqual(bgR, bgG, accuracy: 1e-4)
+        XCTAssertEqual(bgG, bgB, accuracy: 1e-4)
+
+        // Star preserved: green was 0.9, offset removed is (0.05 - 0.02) = 0.03 → ~0.87.
+        XCTAssertEqual(out.pixels[plane + starIdx[0]], 0.87, accuracy: 1e-4)
+    }
+
+    func testAdditiveBNGrayscalePassthrough() {
+        let img = AstroImage(width: 2, height: 2, channels: 1,
+                             pixels: [0.1, 0.2, 0.3, 0.4], sourceIsLinear: true)
+        let out = AutoStretch.neutralizeBackgroundAdditive(img)
+        XCTAssertEqual(out.pixels, img.pixels)
+    }
+
+    func testAdditiveBNIgnoresBrightSignalInEstimate() {
+        // Dark 0.02 sky everywhere, but one bright QUADRANT (0.8) in green only.
+        let w = 96, h = 96, plane = w * h
+        var px = [Float](repeating: 0.02, count: plane * 3)
+        for y in 0..<(h / 2) {
+            for x in 0..<(w / 2) { px[plane + y * w + x] = 0.8 }
+        }
+        let img = AstroImage(width: w, height: h, channels: 3, pixels: px, sourceIsLinear: true)
+
+        // Low-percentile estimate must track the dark sky, not the bright quadrant.
+        XCTAssertEqual(tileBackground(img, channel: 1), 0.02, accuracy: 1e-4)
+
+        let out = AutoStretch.neutralizeBackgroundAdditive(img)
+        // Dark green sky stays ~aligned to the other channels' 0.02 (offset ~0).
+        let darkGreenIdx = plane + (h - 1) * w + (w - 1)
+        XCTAssertEqual(out.pixels[darkGreenIdx], 0.02, accuracy: 1e-4)
+        // Bright quadrant stays bright (not crushed).
+        XCTAssertEqual(out.pixels[plane + 0], 0.8, accuracy: 1e-4)
+    }
 }
