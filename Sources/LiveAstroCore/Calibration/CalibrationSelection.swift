@@ -1,7 +1,7 @@
 import Foundation
 
 /// Persistable choice of master files for calibration (last-used paths).
-public struct CalibrationSelection: Equatable {
+public struct CalibrationSelection: Codable, Equatable {
     public var darkPath: String?
     public var flatPath: String?
     public var biasPath: String?
