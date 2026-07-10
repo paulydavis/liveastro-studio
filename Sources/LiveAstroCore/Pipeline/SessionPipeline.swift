@@ -22,6 +22,7 @@ public final class SessionPipeline {
                                    _ accepted: Int, _ rejected: Int) -> Void)?
     private let cancelled = NSLock_Flag()
     private var processedCount = 0
+    private var sourceMetadata: SourceMetadata?
 
     private let watcher: StackFileWatcher?
     private var source: FrameSource?
@@ -123,6 +124,7 @@ public final class SessionPipeline {
     /// Processes one raw frame through the stack engine (native mode).
     private func handleNative(_ rawFrame: RawFrame, engine: StackEngine) {
         if cancelled.isSet { return }
+        if sourceMetadata == nil, let m = rawFrame.metadata { sourceMetadata = m }
         let frame = calibrator?.apply(rawFrame) ?? rawFrame
         let outcome = engine.process(frame)
         processedCount += 1
@@ -211,9 +213,19 @@ public final class SessionPipeline {
             throw SessionError.notRunning
         }
         // Native mode: write the final mean stack as master.fit (TOP-DOWN, FITSWriter default).
+        // Additive-only background neutralization (display path uses additive+multiplicative;
+        // the saved master gets additive-only so colour ratios stay physically calibratable).
         if let eng = engine, let master = eng.currentStack() {
-            let masterData = FITSWriter.float32(width: master.width, height: master.height,
-                                                channels: master.channels, pixels: master.pixels)
+            let balanced = neutralizeBackground
+                ? AutoStretch.neutralizeBackgroundAdditive(master)
+                : master
+            let totalExp = Double(eng.stackFrameCount) * profile.subExposureSeconds
+            let masterData = FITSWriter.float32(
+                width: balanced.width, height: balanced.height,
+                channels: balanced.channels, pixels: balanced.pixels,
+                metadata: sourceMetadata,
+                stackCount: eng.acceptedCount,
+                totalExposureSeconds: totalExp)
             try masterData.write(to: dir.appendingPathComponent("master.fit"))
         }
         return try ReplayService.regenerate(sessionDirectory: dir,
