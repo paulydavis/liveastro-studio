@@ -208,6 +208,7 @@ public final class SessionPipeline {
                 consumeTask = nil
             }
         }
+        if let meta = sourceMetadata { session.fillMissingMetadata(from: meta) }
         try session.endSession()
         guard let dir = session.sessionDirectory else {
             throw SessionError.notRunning

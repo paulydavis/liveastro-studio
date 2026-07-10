@@ -78,6 +78,15 @@ public final class SessionManager {
         try persist()
     }
 
+    /// Fill blank manifest metadata from the source header. User-entered values always win.
+    /// No-op if there is no active manifest.
+    public func fillMissingMetadata(from meta: SourceMetadata) {
+        guard manifest != nil else { return }
+        if manifest!.camera.isEmpty, let v = meta.instrument { manifest!.camera = v }
+        if manifest!.telescope.isEmpty, let v = meta.telescope { manifest!.telescope = v }
+        if manifest!.filter.isEmpty, let v = meta.filter { manifest!.filter = v }
+    }
+
     /// Atomic write: temp file + rename via Data(.atomic). Crash loses at most the in-flight update (spec §7).
     private func persist() throws {
         guard let dir = sessionDirectory, let m = manifest else { return }
