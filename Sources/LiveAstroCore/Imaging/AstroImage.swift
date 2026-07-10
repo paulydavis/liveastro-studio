@@ -54,4 +54,24 @@ public struct AstroImage {
             : Double(samples[mid])
         return ChannelStats(mean: mean, median: median, stddev: variance.squareRoot())
     }
+
+    /// Rectangular sub-region copy (per channel). `rect` bounds are inclusive
+    /// and must lie within the image.
+    public func cropped(to rect: CropRect) -> AstroImage {
+        precondition(rect.x0 >= 0 && rect.y0 >= 0 && rect.x1 < width && rect.y1 < height && rect.x0 <= rect.x1 && rect.y0 <= rect.y1)
+        let nw = rect.width, nh = rect.height
+        let srcPlane = width * height
+        let dstPlane = nw * nh
+        var out = [Float](repeating: 0, count: dstPlane * channels)
+        for c in 0..<channels {
+            for y in 0..<nh {
+                let srcRow = (rect.y0 + y) * width + rect.x0
+                let dstRow = c * dstPlane + y * nw
+                for x in 0..<nw {
+                    out[dstRow + x] = pixels[c * srcPlane + srcRow + x]
+                }
+            }
+        }
+        return AstroImage(width: nw, height: nh, channels: channels, pixels: out, sourceIsLinear: sourceIsLinear)
+    }
 }
