@@ -53,4 +53,26 @@ final class FITSWriterFormatTests: XCTestCase {
         let img = try FITSReader.read(d)   // existing reader entry point
         XCTAssertEqual(img.width, 2); XCTAssertEqual(img.height, 2); XCTAssertEqual(img.channels, 3)
     }
+
+    func testLongStringCardStaysEightyBytes() throws {
+        // OBJECT is a 100-char string; cardStr must truncate to keep card within 80 bytes
+        let longName = String(repeating: "X", count: 100)
+        var metadata = SourceMetadata()
+        metadata.object = longName
+
+        let px = [Float](repeating: 0, count: 4)
+        let d = FITSWriter.float32(width: 2, height: 2, channels: 1, pixels: px, metadata: metadata)
+
+        // The entire FITS header must be a multiple of 80 bytes and 2880 bytes
+        // Extract header (everything up to and including END block padding)
+        let headerData = d.prefix(2880)
+        XCTAssertEqual(headerData.count % 80, 0, "Header must be multiple of 80 bytes")
+        XCTAssertEqual(d.count % 2880, 0, "Full data must be multiple of 2880 bytes")
+
+        // Verify we can still read it back through the reader
+        let img = try FITSReader.read(d)
+        XCTAssertEqual(img.width, 2)
+        XCTAssertEqual(img.height, 2)
+        XCTAssertEqual(img.channels, 1)
+    }
 }

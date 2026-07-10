@@ -13,6 +13,7 @@ public enum FITSWriter {
 
         // Fixed-format numeric/logical card: value right-justified, ending at column 30.
         func card(_ key: String, _ value: String) -> String {
+            precondition(value.count <= 20, "FITS numeric card value too long: \(value)")
             let k = key.padding(toLength: 8, withPad: " ", startingAt: 0)
             let valField = String(repeating: " ", count: max(0, 20 - value.count)) + value  // cols 11-30
             return "\(k)= \(valField)".padding(toLength: 80, withPad: " ", startingAt: 0)
@@ -21,7 +22,8 @@ public enum FITSWriter {
         // padded to at least 8 chars inside the quotes (FITS §4.2.1).
         func cardStr(_ key: String, _ value: String) -> String {
             let k = key.padding(toLength: 8, withPad: " ", startingAt: 0)
-            let inner = value.count < 8 ? value.padding(toLength: 8, withPad: " ", startingAt: 0) : value
+            var inner = value.count < 8 ? value.padding(toLength: 8, withPad: " ", startingAt: 0) : value
+            inner = String(inner.prefix(68))   // keep the card within 80 bytes
             return "\(k)= '\(inner)'".padding(toLength: 80, withPad: " ", startingAt: 0)
         }
         // Format doubles without trailing noise: integer-valued → no decimals, else full.
