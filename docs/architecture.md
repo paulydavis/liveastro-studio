@@ -180,6 +180,43 @@ flowchart TB
     APP --> OBSSEC["OBS section: host/port/password, scene automation"]
 ```
 
+## Roadmap — planned pluggable processing (NOT yet implemented)
+
+The shipped pipeline stacks, rejects, crops, color-balances and exports. The
+next pillar adds **post-stack image processing** (denoise / deconvolution /
+background extraction) as a **pluggable backend** — the same pattern used for
+`RejectionMethod`. Nothing below exists in the codebase yet; it documents intent.
+
+```mermaid
+flowchart TB
+    MASTER["master.fit (cropped, balanced, header-complete)"] --> PROC["Processor (protocol)"]
+    PROC --> OUT["processed master + preview"]
+
+    subgraph Backends["Processor backends (user-selectable)"]
+        NONE["None (passthrough)"]
+        NATIVE["Native (classic NR: NLM / wavelet, Accelerate/Metal)"]
+        GRAX["GraXpert (free, CLI) — bg-extraction / denoising / deconv-obj / deconv-stellar"]
+        RCA["RC-Astro (paid, if standalone/CLI) — NoiseX / BlurX / StarX Terminator"]
+    end
+    PROC -.-> Backends
+
+    subgraph Where["Where it runs"]
+        IMPORT["Import / End-of-session: full processing on the master"]
+        LIVE["Live view (periodic, optional): background-extraction on the displayed stack"]
+    end
+    OUT -.-> Where
+```
+
+Notes: **GraXpert is the free default** (installed standalone, CLI verified:
+`GraXpert.app/Contents/MacOS/GraXpert -cli -cmd {background-extraction|denoising|deconv-obj|deconv-stellar}`);
+the app calls the user's own install (can't bundle). RC-Astro is an optional
+"use-what-you-own" backend where a standalone/CLI exists. A future **native**
+backend (ONNX→Core ML) removes the external dependency. Real-time viability
+differs by op: **background-extraction** is the live-view priority (slow-changing,
+biggest visual win); denoise is mostly handled for free by stacking; deconvolution
+is a final-polish step, not live. Parameter selection uses measured defaults + a
+user slider (a naive auto-metric over-denoises — validated experimentally).
+
 ## Key design decisions
 
 - **Zero external dependencies** — Apple system frameworks only, for a small,
