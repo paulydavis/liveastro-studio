@@ -57,6 +57,8 @@ final class NativePipelineTests: XCTestCase {
         // The subs use small sub-pixel offsets so crop-to-overlap may trim a few
         // edge pixels; assert a sensible positive width rather than an exact 256.
         let master = try FITSReader.read(Data(contentsOf: sessionDir.appendingPathComponent("master.fit")))
-        XCTAssertGreaterThan(master.width, 200)
+        // Crop-to-overlap trims ~2–3 px of ragged partial-coverage border from the subs' small drift offsets
+        XCTAssertEqual(master.width, 251)
+        XCTAssertEqual(master.height, 253)
     }
 }

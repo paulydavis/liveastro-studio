@@ -46,8 +46,8 @@ final class CropToOverlapPipelineTests: XCTestCase {
     // MARK: - Session Helpers
 
     /// Builds a native session over CFA subs that each have their star pattern
-    /// shifted by a per-frame translation. The shift is large enough (~20 px each
-    /// frame over 4 frames = 60 px total drift) so the covered intersection is
+    /// shifted by a per-frame translation. The shift is large enough (8 px each
+    /// frame over 4 inter-frame steps = 32 px total drift) so the covered intersection is
     /// well under the full frame, but small enough that registration still matches.
     private func makeDriftingSession() throws -> (URL, URL) {
         let sandbox = FileManager.default.temporaryDirectory
