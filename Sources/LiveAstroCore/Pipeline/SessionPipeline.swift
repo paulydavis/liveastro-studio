@@ -177,6 +177,24 @@ public final class SessionPipeline {
         }
     }
 
+    /// Crop the master to its covered region (a copy). Returns the image
+    /// unchanged when coverage is unavailable, the rect is nil, the rect is the
+    /// full frame, or the crop would remove more than ~40% of the area.
+    private func cropMaster(_ image: AstroImage, coverage: [Float]?) -> AstroImage {
+        guard let cov = coverage,
+              let rect = CoverageCrop.rect(coverage: cov, width: image.width, height: image.height)
+        else { return image }
+        if rect.x0 == 0 && rect.y0 == 0 && rect.x1 == image.width - 1 && rect.y1 == image.height - 1 {
+            return image   // full-frame rect: no-op
+        }
+        let croppedArea = rect.width * rect.height
+        guard croppedArea >= (image.width * image.height) * 6 / 10 else {
+            onLog?("Crop-to-overlap: rect \(rect.width)x\(rect.height) would remove >40% — keeping full frame")
+            return image
+        }
+        return image.cropped(to: rect)
+    }
+
     /// Ends the session and renders replay.mp4. Synchronous — call off the main thread.
     ///
     /// In native (importOnce) mode, drains any in-flight frame processing before finalizing.
@@ -214,9 +232,12 @@ public final class SessionPipeline {
             throw SessionError.notRunning
         }
         // Native mode: write the final mean stack as master.fit (TOP-DOWN, FITSWriter default).
-        // Additive-only background neutralization (display path uses additive+multiplicative;
-        // the saved master gets additive-only so colour ratios stay physically calibratable).
-        if let eng = engine, let master = eng.currentStack() {
+        // Crop to covered region first (Task 4), then additive-only background neutralization
+        // (display path uses additive+multiplicative; the saved master gets additive-only so
+        // colour ratios stay physically calibratable). Crop happens BEFORE balance so balance
+        // operates on the final spatial extent.
+        if let eng = engine, let master0 = eng.currentStack() {
+            let master = cropMaster(master0, coverage: eng.currentCoverage())   // crop BEFORE balance
             let balanced = neutralizeBackground
                 ? AutoStretch.neutralizeBackgroundAdditive(master)
                 : master
