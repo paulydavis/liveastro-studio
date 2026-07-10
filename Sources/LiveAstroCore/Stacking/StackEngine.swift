@@ -62,6 +62,11 @@ public final class StackEngine {
         lock.withLock { accumulator?.frameCount ?? 0 }
     }
 
+    /// The current per-pixel coverage map, or nil if there is no active stack.
+    public func currentCoverage() -> [Float]? {
+        lock.withLock { accumulator?.coverage() }
+    }
+
     public func process(_ frame: RawFrame) -> StackOutcome {
         lock.withLock { processLocked(frame) }
     }

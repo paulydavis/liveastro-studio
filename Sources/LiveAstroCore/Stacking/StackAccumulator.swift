@@ -34,4 +34,9 @@ public final class StackAccumulator {
         return AstroImage(width: width, height: height, channels: channels,
                           pixels: out, sourceIsLinear: true)
     }
+
+    /// Read-only per-pixel coverage (sum of applied mask values). With binary
+    /// Warp masks this is the number of frames covering each pixel. Returns a
+    /// copy; callers cannot mutate accumulator state.
+    public func coverage() -> [Float] { weight }
 }
