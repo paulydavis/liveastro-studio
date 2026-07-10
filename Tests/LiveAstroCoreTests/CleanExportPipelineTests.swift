@@ -134,16 +134,8 @@ final class CleanExportPipelineTests: XCTestCase {
         }
         // Write with BAYERPAT=RGGB so FolderFrameSource decodes a bayerPattern
         // and StackEngine debayers it into RGB channels.
-        var data = FITSWriter.float32(
-            width: W, height: H, channels: 1, pixels: px,
-            metadata: metadata
-        )
-        // Insert BAYERPAT card into header: FITSWriter doesn't expose bayerPattern,
-        // so we append it by prepending to the first block before END.
-        // Instead, write via the helper that includes bayerPattern.
-        _ = data  // suppress warning; overwrite below
-        data = writeCFAFITS(width: W, height: H, pixels: px, metadata: metadata,
-                            bayerPattern: "RGGB")
+        let data = writeCFAFITS(width: W, height: H, pixels: px, metadata: metadata,
+                                bayerPattern: "RGGB")
         try data.write(to: dir.appendingPathComponent(name))
     }
 

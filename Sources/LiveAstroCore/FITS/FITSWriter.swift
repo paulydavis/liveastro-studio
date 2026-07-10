@@ -20,16 +20,25 @@ public enum FITSWriter {
         }
         // Fixed-format string card: single-quoted, left-justified from column 11,
         // padded to at least 8 chars inside the quotes (FITS §4.2.1).
+        // Non-ASCII chars are stripped (FITS headers are ASCII-only by standard).
+        // Single-quotes inside the value are replaced with spaces (FITS fixed-format
+        // strings don't escape embedded quotes).
         func cardStr(_ key: String, _ value: String) -> String {
             let k = key.padding(toLength: 8, withPad: " ", startingAt: 0)
-            var inner = value.count < 8 ? value.padding(toLength: 8, withPad: " ", startingAt: 0) : value
-            inner = String(inner.prefix(68))   // keep the card within 80 bytes
+            // Sanitize: ASCII-only, no single-quotes
+            var ascii = String(value.unicodeScalars.filter { $0.isASCII })
+            ascii = ascii.replacingOccurrences(of: "'", with: " ")
+            // Pad to at least 8 chars; truncate to 68 chars (card body budget).
+            // Because the string is ASCII-only, Character count == byte count here.
+            var inner = ascii.count < 8 ? ascii.padding(toLength: 8, withPad: " ", startingAt: 0) : ascii
+            inner = String(inner.prefix(68))
             return "\(k)= '\(inner)'".padding(toLength: 80, withPad: " ", startingAt: 0)
         }
-        // Format doubles without trailing noise: integer-valued → no decimals, else full.
+        // Format doubles without trailing noise: integer-valued → no decimals, else
+        // 10 significant digits via %G (always ≤ ~17 chars, fits the 20-char limit).
         func trim(_ d: Double) -> String {
             if d == d.rounded() && abs(d) < 1e15 { return String(Int(d)) }
-            return String(d)
+            return String(format: "%.10G", d)
         }
         var cards = [card("SIMPLE", "T"), card("BITPIX", "-32"),
                      card("NAXIS", channels == 1 ? "2" : "3"),
