@@ -4,7 +4,10 @@ import Foundation
 public enum FITSWriter {
 
     public static func float32(width: Int, height: Int, channels: Int,
-                               pixels: [Float], bottomUp: Bool = false) -> Data {
+                               pixels: [Float], bottomUp: Bool = false,
+                               metadata: SourceMetadata? = nil,
+                               stackCount: Int? = nil,
+                               totalExposureSeconds: Double? = nil) -> Data {
         precondition(pixels.count == width * height * channels)
         precondition(channels == 1 || channels == 3)
 
@@ -21,11 +24,39 @@ public enum FITSWriter {
             let inner = value.count < 8 ? value.padding(toLength: 8, withPad: " ", startingAt: 0) : value
             return "\(k)= '\(inner)'".padding(toLength: 80, withPad: " ", startingAt: 0)
         }
+        // Format doubles without trailing noise: integer-valued → no decimals, else full.
+        func trim(_ d: Double) -> String {
+            if d == d.rounded() && abs(d) < 1e15 { return String(Int(d)) }
+            return String(d)
+        }
         var cards = [card("SIMPLE", "T"), card("BITPIX", "-32"),
                      card("NAXIS", channels == 1 ? "2" : "3"),
                      card("NAXIS1", "\(width)"), card("NAXIS2", "\(height)")]
         if channels == 3 { cards.append(card("NAXIS3", "3")) }
         cards.append(cardStr("ROWORDER", bottomUp ? "BOTTOM-UP" : "TOP-DOWN"))
+
+        // Emit propagated astronomical metadata
+        if let m = metadata {
+            if let v = m.object { cards.append(cardStr("OBJECT", v)) }
+            if let v = m.ra { cards.append(card("RA", trim(v))) }
+            if let v = m.dec { cards.append(card("DEC", trim(v))) }
+            if let v = m.focalLengthMM { cards.append(card("FOCALLEN", trim(v))) }
+            if let v = m.pixelSizeUM { cards.append(card("XPIXSZ", trim(v))); cards.append(card("YPIXSZ", trim(v))) }
+            if let v = m.instrument { cards.append(cardStr("INSTRUME", v)) }
+            if let v = m.telescope { cards.append(cardStr("TELESCOP", v)) }
+            if let v = m.filter { cards.append(cardStr("FILTER", v)) }
+            if let v = m.exposureSeconds { cards.append(card("EXPTIME", trim(v))) }
+            if let v = m.dateObs { cards.append(cardStr("DATE-OBS", v)) }
+            if let v = m.gain { cards.append(card("GAIN", trim(v))) }
+            if let v = m.ccdTempC { cards.append(card("CCD-TEMP", trim(v))) }
+            if let v = m.siteLat { cards.append(card("SITELAT", trim(v))) }
+            if let v = m.siteLon { cards.append(card("SITELONG", trim(v))) }
+        }
+        if let n = stackCount { cards.append(card("STACKCNT", "\(n)")) }
+        if let t = totalExposureSeconds { cards.append(card("TOTALEXP", trim(t))) }
+        cards.append("HISTORY Stacked by LiveAstro Studio".padding(toLength: 80, withPad: " ", startingAt: 0))
+        // Note: BAYERPAT intentionally omitted — the RGB master is already debayered.
+
         var s = cards.joined() + "END".padding(toLength: 80, withPad: " ", startingAt: 0)
         // Pad the header with spaces to a 2880-byte block boundary (FITS §3.1).
         // Exact-remainder form: terminates for ANY length, unlike stepping in
