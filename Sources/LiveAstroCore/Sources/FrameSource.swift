@@ -7,11 +7,13 @@ public struct RawFrame {
     public let bottomUp: Bool             // FITS ROWORDER
     public let timestamp: Date
     public let sourceName: String
+    public let metadata: SourceMetadata?
 
     public init(image: AstroImage, bayerPattern: BayerPattern?, bottomUp: Bool,
-                timestamp: Date, sourceName: String) {
+                timestamp: Date, sourceName: String, metadata: SourceMetadata? = nil) {
         self.image = image; self.bayerPattern = bayerPattern; self.bottomUp = bottomUp
         self.timestamp = timestamp; self.sourceName = sourceName
+        self.metadata = metadata
     }
 }
 

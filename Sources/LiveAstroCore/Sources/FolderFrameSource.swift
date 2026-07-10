@@ -157,6 +157,7 @@ public final class FolderFrameSource: FrameSource {
         let bayerPattern = BayerPattern(headerValue: header.bayerPattern)
         let bottomUp = header.bottomUp
         let dateObs = header.dateObs
+        let metadata = SourceMetadata(fitsKeywords: header.keywords)
 
         let fitsImage = try FITSReader.read(data, normalizeRowOrder: false)
         let image = AstroImage(width: fitsImage.width, height: fitsImage.height,
@@ -179,7 +180,8 @@ public final class FolderFrameSource: FrameSource {
         }
 
         return RawFrame(image: image, bayerPattern: bayerPattern, bottomUp: bottomUp,
-                        timestamp: timestamp, sourceName: url.lastPathComponent)
+                        timestamp: timestamp, sourceName: url.lastPathComponent,
+                        metadata: metadata)
     }
 
     // Date() fallback covers the file vanishing between load and attribute read
