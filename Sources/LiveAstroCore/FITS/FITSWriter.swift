@@ -8,15 +8,24 @@ public enum FITSWriter {
         precondition(pixels.count == width * height * channels)
         precondition(channels == 1 || channels == 3)
 
+        // Fixed-format numeric/logical card: value right-justified, ending at column 30.
         func card(_ key: String, _ value: String) -> String {
             let k = key.padding(toLength: 8, withPad: " ", startingAt: 0)
-            return "\(k)= \(value)".padding(toLength: 80, withPad: " ", startingAt: 0)
+            let valField = String(repeating: " ", count: max(0, 20 - value.count)) + value  // cols 11-30
+            return "\(k)= \(valField)".padding(toLength: 80, withPad: " ", startingAt: 0)
+        }
+        // Fixed-format string card: single-quoted, left-justified from column 11,
+        // padded to at least 8 chars inside the quotes (FITS §4.2.1).
+        func cardStr(_ key: String, _ value: String) -> String {
+            let k = key.padding(toLength: 8, withPad: " ", startingAt: 0)
+            let inner = value.count < 8 ? value.padding(toLength: 8, withPad: " ", startingAt: 0) : value
+            return "\(k)= '\(inner)'".padding(toLength: 80, withPad: " ", startingAt: 0)
         }
         var cards = [card("SIMPLE", "T"), card("BITPIX", "-32"),
                      card("NAXIS", channels == 1 ? "2" : "3"),
                      card("NAXIS1", "\(width)"), card("NAXIS2", "\(height)")]
         if channels == 3 { cards.append(card("NAXIS3", "3")) }
-        cards.append(card("ROWORDER", bottomUp ? "'BOTTOM-UP'" : "'TOP-DOWN'"))
+        cards.append(cardStr("ROWORDER", bottomUp ? "BOTTOM-UP" : "TOP-DOWN"))
         var s = cards.joined() + "END".padding(toLength: 80, withPad: " ", startingAt: 0)
         // Pad the header with spaces to a 2880-byte block boundary (FITS §3.1).
         // Exact-remainder form: terminates for ANY length, unlike stepping in
