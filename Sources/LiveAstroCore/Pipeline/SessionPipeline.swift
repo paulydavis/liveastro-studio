@@ -24,6 +24,15 @@ public final class SessionPipeline {
     private var processedCount = 0
     private var sourceMetadata: SourceMetadata?
 
+    private let adjLock = NSLock()
+    private var _displayAdjustments = DisplayAdjustments.neutral
+    /// Display-path adjustments. Read once per render; lock-guarded because the
+    /// frame loop and the live re-render access it from different threads.
+    public var displayAdjustments: DisplayAdjustments {
+        get { adjLock.lock(); defer { adjLock.unlock() }; return _displayAdjustments }
+        set { adjLock.lock(); _displayAdjustments = newValue; adjLock.unlock() }
+    }
+
     private let watcher: StackFileWatcher?
     private var source: FrameSource?
     private var engine: StackEngine?
@@ -111,14 +120,27 @@ public final class SessionPipeline {
     /// Shared display pipeline: optional background neutralization, then stretch
     /// if still linear, then pack to CGImage.
     private func displayCGImage(from linear: AstroImage) throws -> CGImage {
+        let adj = displayAdjustments                         // single locked read
         let balanced = neutralizeBackground
             ? AutoStretch.neutralizeBackground(AutoStretch.neutralizeBackgroundAdditive(linear))
             : linear
-        let display = balanced.sourceIsLinear ? AutoStretch.stretch(balanced) : balanced
+        let stretched = balanced.sourceIsLinear
+            ? AutoStretch.stretch(balanced, blackPoint: adj.blackPoint, midtoneStrength: adj.midtoneStrength)
+            : balanced
+        let display = AutoStretch.applySaturation(stretched, adj.saturation)
         guard let cg = AutoStretch.makeCGImage(display) else {
             throw ImageLoaderError.decodeFailed("CGImage packing")
         }
         return cg
+    }
+
+    /// Re-render the current stack with the given adjustments (live slider feedback).
+    /// Stores the adjustments so the next frame's snapshot matches, then renders
+    /// engine.currentStack(). nil when there is no stack yet.
+    public func renderCurrentDisplay(adjustments: DisplayAdjustments) -> CGImage? {
+        displayAdjustments = adjustments
+        guard let mean = engine?.currentStack() else { return nil }
+        return try? displayCGImage(from: mean)
     }
 
     /// Processes one raw frame through the stack engine (native mode).
