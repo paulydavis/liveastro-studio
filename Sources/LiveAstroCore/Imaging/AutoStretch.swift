@@ -15,7 +15,19 @@ public enum AutoStretch {
     /// Linked autostretch: statistics from the mean-of-channels sample, one transform for all channels.
     public static func stretch(_ image: AstroImage,
                                targetBackground: Double = 0.25,
-                               shadowsClipping: Double = -2.8) -> AstroImage {
+                               shadowsClipping: Double = -2.8,
+                               blackPoint: Double = 0,
+                               midtoneStrength: Double = 0) -> AstroImage {
+        // Black-point: gentle shadow clip on the LINEAR data. bp==0 → identity.
+        let bp = min(max(blackPoint, 0), 0.2)
+        let work: [Float]
+        if bp > 0 {
+            let inv = 1.0 - bp
+            work = image.pixels.map { Float(max(0, (Double($0) - bp) / inv)) }
+        } else {
+            work = image.pixels
+        }
+
         let plane = image.width * image.height
         // Combined luminance sample (mean across channels), stride-sampled.
         let stride = AstroImage.sampleStride(count: plane)
@@ -24,7 +36,7 @@ public enum AutoStretch {
         var i = 0
         while i < plane {
             var s: Float = 0
-            for c in 0..<image.channels { s += image.pixels[c * plane + i] }
+            for c in 0..<image.channels { s += work[c * plane + i] }
             sample.append(s / Float(image.channels))
             i += stride
         }
@@ -40,15 +52,38 @@ public enum AutoStretch {
         let shadow = min(max(median + shadowsClipping * madn, 0), 1)
         let denom = max(1 - shadow, 1e-9)
         let r = min(max((median - shadow) / denom, 1e-9), 1)
-        let midtone = mtf(r, targetBackground)
+        let strengthFactor = pow(2.0, -min(max(midtoneStrength, -1), 1))
+        let midtone = min(max(mtf(r, targetBackground) * strengthFactor, 1e-4), 1 - 1e-4)
 
         var out = [Float](repeating: 0, count: image.pixels.count)
         for idx in 0..<image.pixels.count {
-            let x = (Double(image.pixels[idx]) - shadow) / denom
+            let x = (Double(work[idx]) - shadow) / denom
             out[idx] = Float(mtf(min(max(x, 0), 1), midtone))
         }
         return AstroImage(width: image.width, height: image.height, channels: image.channels,
                           pixels: out, sourceIsLinear: false)
+    }
+
+    /// Luminance-preserving saturation on stretched, display-space [0,1] RGB.
+    /// factor 1 → identity, 0 → greyscale (each channel = luminance), 2 → doubled
+    /// chroma around luminance. Mono (channels != 3) is returned unchanged.
+    public static func applySaturation(_ image: AstroImage, _ factor: Double) -> AstroImage {
+        guard image.channels == 3 else { return image }
+        let f = min(max(factor, 0), 2)
+        if f == 1 { return image }
+        let plane = image.width * image.height
+        var out = image.pixels
+        for i in 0..<plane {
+            let r = Double(image.pixels[i])
+            let g = Double(image.pixels[plane + i])
+            let b = Double(image.pixels[2 * plane + i])
+            let L = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            out[i]             = Float(min(max(L + f * (r - L), 0), 1))
+            out[plane + i]     = Float(min(max(L + f * (g - L), 0), 1))
+            out[2 * plane + i] = Float(min(max(L + f * (b - L), 0), 1))
+        }
+        return AstroImage(width: image.width, height: image.height, channels: image.channels,
+                          pixels: out, sourceIsLinear: image.sourceIsLinear)
     }
 
     /// Multiplicative background neutralization for OSC stacks (spec §8.5 v1.1).
