@@ -37,6 +37,9 @@ public struct GraXpertProcessor: Processor {
         let c2 = try runner.run(executable: executable, arguments: dnArgs, log: log)
         guard c2 == 0 else { throw ProcessorError.stepFailed(cmd: "denoising", code: c2) }
 
-        guard fileManager.fileExists(atPath: outputURL.path) else { throw ProcessorError.noOutput }
+        let altOutput = outputURL.deletingPathExtension().appendingPathExtension("fits")
+        guard fileManager.fileExists(atPath: outputURL.path) || fileManager.fileExists(atPath: altOutput.path) else {
+            throw ProcessorError.noOutput
+        }
     }
 }

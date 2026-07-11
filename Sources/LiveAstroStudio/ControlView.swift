@@ -149,7 +149,7 @@ struct ControlView: View {
                         }
                     }
                 }
-                if model.processorBackend == .graxpert, let dir = model.lastSessionDirectory {
+                if model.processorBackend == .graxpert, model.sourceMode == .nativeStack, let dir = model.lastSessionDirectory {
                     Button(model.isProcessing ? "Processing…" : "Process master") {
                         model.processMaster(sessionDirectory: dir)
                     }

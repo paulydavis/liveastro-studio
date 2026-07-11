@@ -397,14 +397,18 @@ final class AppModel {
         guard processorBackend == .graxpert, let exe = GraXpertProcessor.defaultExecutable() else {
             errorMessage = "GraXpert not found — install it from graxpert.com"; return
         }
+        let master = sessionDirectory.appendingPathComponent("master.fit")
+        guard FileManager.default.fileExists(atPath: master.path) else {
+            errorMessage = "No master.fit in this session — post-processing needs a natively-stacked master (Raw subs mode)."
+            return
+        }
         isProcessing = true
         log.append("Processing master with GraXpert…")
         Task.detached { [weak self] in
             do {
-                let master = sessionDirectory.appendingPathComponent("master.fit")
                 let out = sessionDirectory.appendingPathComponent("master_processed.fit")
                 let proc = GraXpertProcessor(executable: exe)
-                try proc.process(masterURL: master, outputURL: out) { m in
+                try proc.process(masterURL: master, outputURL: out) { [weak self] m in
                     Task { @MainActor in self?.log.append(m) }
                 }
                 await MainActor.run {

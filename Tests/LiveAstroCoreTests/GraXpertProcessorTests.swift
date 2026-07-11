@@ -20,6 +20,25 @@ final class GraXpertProcessorTests: XCTestCase {
             return idx < exitCodes.count ? exitCodes[idx] : 0
         }
     }
+    // Fake runner that writes the .fits sibling of the denoise -output path,
+    // simulating GraXpert appending ".fits" to the requested output stem.
+    final class FitsExtFakeRunner: ProcessRunner {
+        var calls: [[String]] = []
+        var exitCodes: [Int32]
+        init(exitCodes: [Int32]) { self.exitCodes = exitCodes }
+        func run(executable: URL, arguments: [String], log: ((String)->Void)?) throws -> Int32 {
+            let idx = calls.count
+            calls.append(arguments)
+            // On the second call (denoising), write <output-stem>.fits instead of .fit
+            if idx == 1, let oi = arguments.firstIndex(of: "-output"), oi+1 < arguments.count {
+                let requestedURL = URL(fileURLWithPath: arguments[oi+1])
+                let fitsURL = requestedURL.deletingPathExtension().appendingPathExtension("fits")
+                FileManager.default.createFile(atPath: fitsURL.path, contents: Data("fake".utf8))
+            }
+            return idx < exitCodes.count ? exitCodes[idx] : 0
+        }
+    }
+
     private var tmp: URL!
     private var exeFile: URL!
     override func setUpWithError() throws {
@@ -73,6 +92,19 @@ final class GraXpertProcessorTests: XCTestCase {
                                               outputURL: tmp.appendingPathComponent("o.fit"), log: nil)) { err in
             XCTAssertEqual(err as? ProcessorError, .noOutput)
         }
+    }
+
+    func testAcceptsFitsExtensionOutput() throws {
+        // GraXpert writes master_processed.fits instead of the requested .fit —
+        // the processor should succeed rather than throw .noOutput.
+        let proc = GraXpertProcessor(executable: exeFile, runner: FitsExtFakeRunner(exitCodes: [0, 0]))
+        let master = tmp.appendingPathComponent("master.fit")
+        let out = tmp.appendingPathComponent("master_processed.fit")
+        // Should NOT throw — .fits sibling exists even though .fit does not.
+        XCTAssertNoThrow(try proc.process(masterURL: master, outputURL: out, log: nil))
+        // The .fit itself should not exist; the .fits sibling should.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: out.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: out.deletingPathExtension().appendingPathExtension("fits").path))
     }
 
     func testIsAvailableReflectsExecutableExistence() {
