@@ -66,6 +66,7 @@ final class AppModel {
     var replayURL: URL?
     var isGeneratingReplay = false
     var processorBackend: ProcessorBackend = .none
+    var displayAdjustments = DisplayAdjustments.neutral
     private(set) var lastSessionDirectory: URL?
     var errorMessage: String?
 
@@ -155,7 +156,8 @@ final class AppModel {
             calibration: calibration,
             rejectionEnabled: rejectionEnabled,
             rejectionStrength: rejectionStrength,
-            processorBackend: processorBackend)
+            processorBackend: processorBackend,
+            displayAdjustments: displayAdjustments)
     }
 
     func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
@@ -172,6 +174,28 @@ final class AppModel {
         rejectionEnabled = s.rejectionEnabled
         rejectionStrength = s.rejectionStrength
         processorBackend = s.processorBackend
+        displayAdjustments = s.displayAdjustments
+    }
+
+    private var lastAdjustmentRender = Date.distantPast
+
+    /// Called when a slider changes: persist, push adjustments to the pipeline so
+    /// the next frame's snapshot matches, and re-render the current stack off-main
+    /// (throttled to ~12 fps so dragging a 26MP stretch stays smooth).
+    func applyDisplayAdjustments() {
+        saveSettings()
+        guard let pipeline else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else { return }
+        lastAdjustmentRender = now
+        let adj = displayAdjustments
+        Task.detached { [weak self] in
+            let cg = pipeline.renderCurrentDisplay(adjustments: adj)
+            await MainActor.run {
+                guard let self, let cg else { return }
+                self.latestImage = cg
+            }
+        }
     }
 
     private func makeStackEngine() -> StackEngine {

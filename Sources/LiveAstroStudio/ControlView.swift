@@ -80,6 +80,34 @@ struct ControlView: View {
                     // Observes the OBSController (Combine ObservableObject) so its
                     // @Published state/scene/record changes re-render this section.
                     OBSSection(model: model)
+                    Section("Display Adjustments") {
+                        VStack(alignment: .leading) {
+                            Text("Black point")
+                            Slider(value: $model.displayAdjustments.blackPoint, in: 0...0.2) { editing in
+                                if !editing { model.applyDisplayAdjustments() }
+                            }
+                            .help("Darken the sky background. 0 = auto.")
+                        }
+                        VStack(alignment: .leading) {
+                            Text("Stretch strength")
+                            Slider(value: $model.displayAdjustments.midtoneStrength, in: -1...1) { editing in
+                                if !editing { model.applyDisplayAdjustments() }
+                            }
+                            .help("How aggressive the stretch is. 0 = auto.")
+                        }
+                        VStack(alignment: .leading) {
+                            Text("Saturation")
+                            Slider(value: $model.displayAdjustments.saturation, in: 0...2) { editing in
+                                if !editing { model.applyDisplayAdjustments() }
+                            }
+                            .help("Color intensity. 1 = unchanged.")
+                        }
+                        Button("Reset") {
+                            model.displayAdjustments = .neutral
+                            model.applyDisplayAdjustments()
+                        }
+                        .help("Back to the neutral auto-stretch look.")
+                    }
                     Section("Log") {
                         ScrollView {
                             VStack(alignment: .leading, spacing: 2) {
