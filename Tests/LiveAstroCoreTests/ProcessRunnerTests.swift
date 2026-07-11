@@ -19,6 +19,22 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertEqual(code, 1)
     }
 
+    // Prove multi-line output is captured through handler+drain (trailing lines not lost).
+    func testCapturesMultiLineOutput() throws {
+        let runner = FoundationProcessRunner()
+        var lines: [String] = []
+        let code = try runner.run(
+            executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "printf 'alpha\\nbeta\\ngamma\\n'"],
+            log: { lines.append($0) }
+        )
+        XCTAssertEqual(code, 0)
+        // Handler and drain timing is nondeterministic; assert on the union (each line present).
+        XCTAssertTrue(lines.contains("alpha"), "lines: \(lines)")
+        XCTAssertTrue(lines.contains("beta"), "lines: \(lines)")
+        XCTAssertTrue(lines.contains("gamma"), "lines: \(lines)")
+    }
+
     // A fake conforming type proves the protocol is injectable (used heavily in Task 3).
     private class FakeRunner: ProcessRunner {
         var recorded: [(URL, [String])] = []

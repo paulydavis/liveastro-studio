@@ -20,7 +20,8 @@ public struct FoundationProcessRunner: ProcessRunner {
         if let log {
             pipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
-                if !data.isEmpty, let s = String(data: data, encoding: .utf8) {
+                if !data.isEmpty {
+                    let s = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? "«non-UTF-8 output»"
                     s.split(separator: "\n").forEach { log(String($0)) }
                 }
             }
@@ -28,6 +29,14 @@ public struct FoundationProcessRunner: ProcessRunner {
         try process.run()
         process.waitUntilExit()
         pipe.fileHandleForReading.readabilityHandler = nil
+        // Drain any bytes the async handler didn't deliver (process has exited; no block risk).
+        if let log {
+            let tail = pipe.fileHandleForReading.readDataToEndOfFile()
+            if !tail.isEmpty {
+                let s = String(data: tail, encoding: .utf8) ?? String(data: tail, encoding: .isoLatin1) ?? "«non-UTF-8 output»"
+                s.split(separator: "\n").forEach { log(String($0)) }
+            }
+        }
         return process.terminationStatus
     }
 }
