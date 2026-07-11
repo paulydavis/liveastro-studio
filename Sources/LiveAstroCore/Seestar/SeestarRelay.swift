@@ -11,18 +11,23 @@ public final class SeestarRelay {
     private let pollSeconds: Double
     public var onLog: ((String) -> Void)?
     public private(set) var relayedCount = 0
+    private let sessionScoped: Bool
+    private var baseline: Set<String> = []
 
     private var timer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "seestar.relay")
 
     public init(source: URL, destination: URL,
-                glob: String = "Light_*_10.0s_*.fit", pollSeconds: Double = 5) {
+                glob: String = "Light_*_10.0s_*.fit", pollSeconds: Double = 5,
+                sessionScoped: Bool = true) {
         self.source = source; self.destination = destination
         self.glob = glob; self.pollSeconds = pollSeconds
+        self.sessionScoped = sessionScoped
     }
 
     public func start() throws {
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        queue.async { [weak self] in self?.snapshotBaseline() }
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: pollSeconds)
         t.setEventHandler { [weak self] in _ = try? self?.copyOnce() }
@@ -30,6 +35,19 @@ public final class SeestarRelay {
     }
 
     public func stop() { timer?.cancel(); timer = nil }
+
+    /// Snapshot the names already present in `source` (matching `glob`) so a
+    /// session-scoped relay copies ONLY frames that appear afterward. No-op when
+    /// `sessionScoped` is false. Source-unreachable → log + empty baseline
+    /// (fail-open: relay rather than silently drop a whole session).
+    func snapshotBaseline() {
+        guard sessionScoped else { return }
+        let fm = FileManager.default
+        let names: [String]
+        do { names = try fm.contentsOfDirectory(atPath: source.path) }
+        catch { onLog?("source unreachable (baseline): \(source.path)"); baseline = []; return }
+        baseline = Set(names.filter { Self.wildcardMatch($0, glob) })
+    }
 
     /// One relay pass: copy new matching files not yet in destination. Returns count copied.
     @discardableResult
@@ -43,6 +61,7 @@ public final class SeestarRelay {
         defer { try? fm.removeItem(at: stage) }
         var copied = 0
         for name in names.sorted() where Self.wildcardMatch(name, glob) {
+            if baseline.contains(name) { continue }
             let dst = destination.appendingPathComponent(name)
             if fm.fileExists(atPath: dst.path) { continue }
             let src = source.appendingPathComponent(name)

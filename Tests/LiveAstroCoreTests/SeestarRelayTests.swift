@@ -37,4 +37,40 @@ final class SeestarRelayTests: XCTestCase {
         XCTAssertEqual(try r.copyOnce(), 0)   // second pass skips existing
         XCTAssertEqual(r.relayedCount, 1)
     }
+
+    func testSnapshotBaselineExcludesBacklog() throws {
+        let src = try tmp(), dst = try tmp()
+        // 3 backlog subs present at "tap" time
+        try write(src, "Light_M 8_10.0s_LP_20260709-000001.fit")
+        try write(src, "Light_M 8_10.0s_LP_20260709-000002.fit")
+        try write(src, "Light_M 8_10.0s_LP_20260709-000003.fit")
+        let r = SeestarRelay(source: src, destination: dst)   // sessionScoped defaults true
+        r.snapshotBaseline()                                  // capture the 3 backlog names
+        // 2 new subs arrive after the tap
+        try write(src, "Light_M 8_10.0s_LP_20260711-010001.fit")
+        try write(src, "Light_M 8_10.0s_LP_20260711-010002.fit")
+        XCTAssertEqual(try r.copyOnce(), 2)                   // only the 2 new
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dst.appendingPathComponent("Light_M 8_10.0s_LP_20260711-010001.fit").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dst.appendingPathComponent("Light_M 8_10.0s_LP_20260709-000001.fit").path))
+    }
+
+    func testSessionScopedFalseCopiesAll() throws {
+        let src = try tmp(), dst = try tmp()
+        try write(src, "Light_M 8_10.0s_LP_20260709-000001.fit")
+        try write(src, "Light_M 8_10.0s_LP_20260709-000002.fit")
+        let r = SeestarRelay(source: src, destination: dst, sessionScoped: false)
+        r.snapshotBaseline()                                  // no-op when not session-scoped
+        try write(src, "Light_M 8_10.0s_LP_20260711-010001.fit")
+        XCTAssertEqual(try r.copyOnce(), 3)                   // baseline empty → copies all 3
+    }
+
+    func testBaselineStillHonorsGlob() throws {
+        let src = try tmp(), dst = try tmp()
+        try write(src, "Light_M 8_10.0s_LP_20260709-000001.fit")
+        let r = SeestarRelay(source: src, destination: dst)
+        r.snapshotBaseline()
+        try write(src, "Light_M 8_20.0s_LP_20260711-010001.fit")   // new but wrong exposure
+        try write(src, "Light_M 8_10.0s_LP_20260711-010002.fit")   // new and matches
+        XCTAssertEqual(try r.copyOnce(), 1)                        // only the matching new one
+    }
 }
