@@ -32,6 +32,14 @@ final class AutoStretchAdjustmentsTests: XCTestCase {
         let neutral = AutoStretch.stretch(img)
         let clipped = AutoStretch.stretch(img, blackPoint: 0.25)
         XCTAssertLessThanOrEqual(clipped.pixels.min()!, neutral.pixels.min()!)
+
+        // Integration: prove the clip flows through stretch into shadow/denom, not just
+        // that `work` is built. The ramp is i/15 per channel (n=16). With bp=0.25:
+        //   - pixel 0 (linear 0.0) is below bp → clipped to 0 → mtf(0, m) == 0 in output.
+        //   - pixel 15 (linear 1.0) is above bp → maps to > 0.
+        // Catches a regression where `work` is computed but the transform still reads image.pixels.
+        XCTAssertEqual(clipped.pixels[0], 0.0, accuracy: 1e-6)   // at/below bp → 0
+        XCTAssertGreaterThan(clipped.pixels[15], 0.0)            // above bp → > 0
     }
 
     func testMidtoneStrengthDirection() {

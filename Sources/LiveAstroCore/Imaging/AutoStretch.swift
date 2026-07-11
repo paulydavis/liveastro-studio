@@ -53,7 +53,13 @@ public enum AutoStretch {
         let denom = max(1 - shadow, 1e-9)
         let r = min(max((median - shadow) / denom, 1e-9), 1)
         let strengthFactor = pow(2.0, -min(max(midtoneStrength, -1), 1))
-        let midtone = min(max(mtf(r, targetBackground) * strengthFactor, 1e-4), 1 - 1e-4)
+        let baseMidtone = mtf(r, targetBackground)
+        // strengthFactor==1 (neutral) must reproduce today's UNclamped midtone exactly,
+        // preserving byte-identity for all inputs. Clamp only when strength is engaged
+        // (protects mtf from a degenerate midtone near 0/1 on the strength≠0 path).
+        let midtone = strengthFactor == 1.0
+            ? baseMidtone
+            : min(max(baseMidtone * strengthFactor, 1e-4), 1 - 1e-4)
 
         var out = [Float](repeating: 0, count: image.pixels.count)
         for idx in 0..<image.pixels.count {
