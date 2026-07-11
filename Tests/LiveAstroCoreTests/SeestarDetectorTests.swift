@@ -34,4 +34,27 @@ final class SeestarDetectorTests: XCTestCase {
     func testDetectReturnsNilWhenNoSub() throws {
         XCTAssertNil(SeestarDetector.detect(volumesRoot: try tmp()))
     }
+
+    func testParseCaptureTimestamp() {
+        XCTAssertEqual(
+            SeestarDetector.parseCaptureTimestamp(fromFilename: "Light_NGC 6960_30.0s_LP_20260711-013530.fit"),
+            "20260711-013530")
+        XCTAssertNil(SeestarDetector.parseCaptureTimestamp(fromFilename: "Light_M 8_10.0s_LP_1.fit"))
+        XCTAssertNil(SeestarDetector.parseCaptureTimestamp(fromFilename: "nope.fit"))
+    }
+
+    func testDetectPicksExposureOfNewestByTimestampToken() throws {
+        let vols = try tmp()
+        let works = vols.appendingPathComponent("EMMC Images/MyWorks")
+        try FileManager.default.createDirectory(at: works, withIntermediateDirectories: true)
+        let sub = works.appendingPathComponent("NGC 6960_sub")
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        // Older capture at 30s, NEWER capture at 20s. Full-name sort would wrongly
+        // pick "30.0s" (since '3' > '2'); token sort must pick the newer 20s file.
+        try Data(count: 8).write(to: sub.appendingPathComponent("Light_NGC 6960_30.0s_LP_20260710-220000.fit"))
+        try Data(count: 8).write(to: sub.appendingPathComponent("Light_NGC 6960_20.0s_LP_20260711-010000.fit"))
+        let found = SeestarDetector.detect(volumesRoot: vols)
+        XCTAssertEqual(found?.target, "NGC 6960")
+        XCTAssertEqual(found?.subExposure, 20.0)   // newest by capture-timestamp token
+    }
 }

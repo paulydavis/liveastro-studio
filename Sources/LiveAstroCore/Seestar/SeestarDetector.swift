@@ -28,15 +28,13 @@ public enum SeestarDetector {
         let target = String(best.url.lastPathComponent.dropLast("_sub".count))
         // Parse the exposure from the NEWEST .fit so a folder that ended up with
         // mixed exposures (e.g. a 30s → 20s restart) reports the current length.
-        let fits = ((try? fm.contentsOfDirectory(at: best.url, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
-            .filter { $0.pathExtension.lowercased() == "fit" }
-        let newest = fits.max { a, b in
-            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-            return da < db
+        let fitNames = ((try? fm.contentsOfDirectory(atPath: best.url.path)) ?? [])
+            .filter { ($0 as NSString).pathExtension.lowercased() == "fit" }
+        let newestName = fitNames.max { a, b in
+            (parseCaptureTimestamp(fromFilename: a) ?? "") < (parseCaptureTimestamp(fromFilename: b) ?? "")
         }
         return Found(subDir: best.url, target: target,
-                     subExposure: newest.map { $0.lastPathComponent }.flatMap(parseExposure(fromFilename:)))
+                     subExposure: newestName.flatMap(parseExposure(fromFilename:)))
     }
 
     /// Parse "..._10.0s_..." → 10.0
@@ -45,6 +43,23 @@ public enum SeestarDetector {
         for token in name.split(separator: "_") where token.hasSuffix("s") {
             let num = token.dropLast()
             if let v = Double(num) { return v }
+        }
+        return nil
+    }
+
+    /// Extract the sortable capture stamp "YYYYMMDD-HHMMSS" from a Seestar
+    /// filename like "Light_NGC 6960_30.0s_LP_20260711-013530.fit". nil if absent.
+    /// The token sorts chronologically as a plain string.
+    public static func parseCaptureTimestamp(fromFilename name: String) -> String? {
+        let base = (name as NSString).deletingPathExtension
+        for token in base.split(separator: "_") {
+            let t = String(token)
+            // 8 digits, '-', 6 digits
+            let parts = t.split(separator: "-")
+            if parts.count == 2, parts[0].count == 8, parts[1].count == 6,
+               parts[0].allSatisfy(\.isNumber), parts[1].allSatisfy(\.isNumber) {
+                return t
+            }
         }
         return nil
     }
