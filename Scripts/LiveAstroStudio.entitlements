@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LiveAstro Studio — entitlements for a NON-SANDBOXED Developer ID (notarized)
+  build. This is NOT a Mac App Store build; the App Store requires the App
+  Sandbox, which would break the GraXpert subprocess and the /Volumes SMB scan.
+
+  Outside the sandbox, LiveAstro's behaviors need almost nothing:
+    - spawning GraXpert as a subprocess    → allowed under Hardened Runtime
+    - localhost OBS WebSocket (URLSession)  → allowed (no sandbox to gate it)
+    - reading mounted /Volumes shares       → allowed (no sandbox)
+    - writing ~/LiveAstro                   → allowed (no sandbox)
+
+  Hardened Runtime is enabled at SIGN time via `codesign --options runtime`,
+  not here.
+
+  Enable com.apple.security.cs.disable-library-validation ONLY if a dylib
+  signed by a different Team ID must load INTO this process (not currently the
+  case — GraXpert runs as a separate process, nothing is loaded in-proc).
+-->
+<plist version="1.0">
+<dict>
+</dict>
+</plist>
