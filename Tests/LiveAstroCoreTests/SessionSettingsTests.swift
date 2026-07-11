@@ -79,3 +79,35 @@ final class SessionSettingsTests: XCTestCase {
         XCTAssertEqual(s.targetName, "M8")            // existing fields intact
     }
 }
+
+final class SessionSettingsDisplayAdjTests: XCTestCase {
+    func testDefaultsHaveNeutralAdjustments() {
+        XCTAssertEqual(SessionSettings.defaults.displayAdjustments, .neutral)
+    }
+
+    func testRoundTripPreservesAdjustments() throws {
+        var s = SessionSettings.defaults
+        s.displayAdjustments = DisplayAdjustments(blackPoint: 0.05, midtoneStrength: 0.3, saturation: 1.4)
+        let data = try JSONEncoder().encode(s)
+        let back = try JSONDecoder().decode(SessionSettings.self, from: data)
+        XCTAssertEqual(back.displayAdjustments, s.displayAdjustments)
+    }
+
+    func testOldBlobWithoutKeyDecodesNeutral() throws {
+        // A settings JSON written before this field existed must decode to neutral.
+        let json = """
+        {"sourceModeRaw":"nativeStack","filePrefix":"Light_","neutralizeBackground":true,
+         "subExposureSeconds":30,"targetName":"NGC 6960",
+         "calibration":\(try calibrationJSON()),
+         "rejectionEnabled":true,"rejectionStrength":"medium","processorBackend":"none"}
+        """
+        let s = try JSONDecoder().decode(SessionSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(s.displayAdjustments, .neutral)
+    }
+
+    // Encode the current default calibration so the old-blob JSON stays valid if
+    // CalibrationSelection's shape changes.
+    private func calibrationJSON() throws -> String {
+        String(data: try JSONEncoder().encode(SessionSettings.defaults.calibration), encoding: .utf8)!
+    }
+}
