@@ -52,6 +52,7 @@ final class AppModel {
     }
     var isRunning = false
     var isImporting = false
+    var isProcessing = false
     /// Accepted frames this session; updated only in .nativeStack mode
     /// (watcher mode reads 0 — use latestRecord?.index instead).
     var acceptedCount = 0
@@ -63,6 +64,8 @@ final class AppModel {
     var log: [String] = []
     var replayURL: URL?
     var isGeneratingReplay = false
+    var processorBackend: ProcessorBackend = .none
+    private(set) var lastSessionDirectory: URL?
     var errorMessage: String?
 
     /// Drives the error alert; dismissal (setting false) clears errorMessage.
@@ -150,7 +153,8 @@ final class AppModel {
             targetName: targetName,
             calibration: calibration,
             rejectionEnabled: rejectionEnabled,
-            rejectionStrength: rejectionStrength)
+            rejectionStrength: rejectionStrength,
+            processorBackend: processorBackend)
     }
 
     func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
@@ -166,6 +170,7 @@ final class AppModel {
         calibration = s.calibration
         rejectionEnabled = s.rejectionEnabled
         rejectionStrength = s.rejectionStrength
+        processorBackend = s.processorBackend
     }
 
     private func makeStackEngine() -> StackEngine {
@@ -342,6 +347,7 @@ final class AppModel {
                         self?.errorMessage = AppModel.noMatchMessage(prefix: prefix)
                     } else {
                         self?.replayURL = url
+                        self?.lastSessionDirectory = url.deletingLastPathComponent()
                         self?.log.append("Import complete. Replay: \(url.path)")
                     }
                     self?.isImporting = false
@@ -383,6 +389,34 @@ final class AppModel {
                 await MainActor.run { self?.errorMessage = "Regenerate failed: \(error)" }
             }
             await MainActor.run { self?.isGeneratingReplay = false }
+        }
+    }
+
+    func processMaster(sessionDirectory: URL) {
+        guard !isProcessing, !isImporting, !isRunning else { return }
+        guard processorBackend == .graxpert, let exe = GraXpertProcessor.defaultExecutable() else {
+            errorMessage = "GraXpert not found — install it from graxpert.com"; return
+        }
+        isProcessing = true
+        log.append("Processing master with GraXpert…")
+        Task.detached { [weak self] in
+            do {
+                let master = sessionDirectory.appendingPathComponent("master.fit")
+                let out = sessionDirectory.appendingPathComponent("master_processed.fit")
+                let proc = GraXpertProcessor(executable: exe)
+                try proc.process(masterURL: master, outputURL: out) { m in
+                    Task { @MainActor in self?.log.append(m) }
+                }
+                await MainActor.run {
+                    self?.isProcessing = false
+                    self?.log.append("Processed → \(out.lastPathComponent)")
+                }
+            } catch {
+                await MainActor.run {
+                    self?.isProcessing = false
+                    self?.errorMessage = "Processing failed: \(error)"
+                }
+            }
         }
     }
 
@@ -448,6 +482,7 @@ final class AppModel {
                 let url = try p.end()
                 await MainActor.run {
                     self?.replayURL = url
+                    self?.lastSessionDirectory = url.deletingLastPathComponent()
                     self?.log.append("Replay ready: \(url.lastPathComponent)")
                 }
             } catch {
