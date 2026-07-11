@@ -13,16 +13,19 @@ public struct SessionSettings: Codable, Equatable {
     public var calibration: CalibrationSelection
     public var rejectionEnabled: Bool
     public var rejectionStrength: RejectionStrength
+    public var processorBackend: ProcessorBackend
 
     public init(sourceModeRaw: String, watchFolderPath: String?, filePrefix: String,
                 neutralizeBackground: Bool, subExposureSeconds: Double, targetName: String,
                 calibration: CalibrationSelection,
-                rejectionEnabled: Bool = true, rejectionStrength: RejectionStrength = .medium) {
+                rejectionEnabled: Bool = true, rejectionStrength: RejectionStrength = .medium,
+                processorBackend: ProcessorBackend = .none) {
         self.sourceModeRaw = sourceModeRaw; self.watchFolderPath = watchFolderPath
         self.filePrefix = filePrefix; self.neutralizeBackground = neutralizeBackground
         self.subExposureSeconds = subExposureSeconds; self.targetName = targetName
         self.calibration = calibration
         self.rejectionEnabled = rejectionEnabled; self.rejectionStrength = rejectionStrength
+        self.processorBackend = processorBackend
     }
 
     // Backward-compatible decode: older blobs lack the rejection keys → default them
@@ -30,6 +33,7 @@ public struct SessionSettings: Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case sourceModeRaw, watchFolderPath, filePrefix, neutralizeBackground
         case subExposureSeconds, targetName, calibration, rejectionEnabled, rejectionStrength
+        case processorBackend
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -42,6 +46,7 @@ public struct SessionSettings: Codable, Equatable {
         calibration = try c.decode(CalibrationSelection.self, forKey: .calibration)
         rejectionEnabled = try c.decodeIfPresent(Bool.self, forKey: .rejectionEnabled) ?? true
         rejectionStrength = try c.decodeIfPresent(RejectionStrength.self, forKey: .rejectionStrength) ?? .medium
+        processorBackend = try c.decodeIfPresent(ProcessorBackend.self, forKey: .processorBackend) ?? .none
     }
 
     /// Matches the app's fresh-launch defaults (Siril mode, live_stack prefix, 60 s).
@@ -50,7 +55,8 @@ public struct SessionSettings: Codable, Equatable {
                         filePrefix: "live_stack", neutralizeBackground: false,
                         subExposureSeconds: 60, targetName: "",
                         calibration: CalibrationSelection(darkPath: nil, flatPath: nil, biasPath: nil),
-                        rejectionEnabled: true, rejectionStrength: .medium)
+                        rejectionEnabled: true, rejectionStrength: .medium,
+                        processorBackend: .none)
     }
 }
 

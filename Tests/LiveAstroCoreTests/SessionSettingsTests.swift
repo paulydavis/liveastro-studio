@@ -57,4 +57,25 @@ final class SessionSettingsTests: XCTestCase {
         XCTAssertTrue(loaded.rejectionEnabled)              // new fields defaulted
         XCTAssertEqual(loaded.rejectionStrength, .medium)
     }
+
+    func testProcessorBackendDefaultAndRoundTrip() throws {
+        XCTAssertEqual(SessionSettings.defaults.processorBackend, .none)
+        var s = SessionSettings.defaults
+        s.processorBackend = .graxpert
+        let data = try JSONEncoder().encode(s)
+        XCTAssertEqual(try JSONDecoder().decode(SessionSettings.self, from: data).processorBackend, .graxpert)
+    }
+
+    func testOldBlobWithoutProcessorBackendDecodesToNone() throws {
+        // A prior-version blob: has the existing keys but NOT processorBackend.
+        let json = """
+        {"sourceModeRaw":"Raw subs (native stacking)","watchFolderPath":null,
+         "filePrefix":"Light_","neutralizeBackground":true,"subExposureSeconds":10,
+         "targetName":"M8","calibration":{"darkPath":null,"flatPath":null,"biasPath":null},
+         "rejectionEnabled":true,"rejectionStrength":"medium"}
+        """.data(using: .utf8)!
+        let s = try JSONDecoder().decode(SessionSettings.self, from: json)
+        XCTAssertEqual(s.processorBackend, .none)     // missing key -> default
+        XCTAssertEqual(s.targetName, "M8")            // existing fields intact
+    }
 }
