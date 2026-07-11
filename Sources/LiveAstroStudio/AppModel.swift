@@ -37,6 +37,7 @@ final class AppModel {
 
     var fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
     var neutralizeBackground = false
+    var isDetecting = false
     var rejectionEnabled = true
     var rejectionStrength: RejectionStrength = .medium
     var calibration = CalibrationStore.load(.standard)
@@ -425,21 +426,33 @@ final class AppModel {
     }
 
     func startSeestarLive() {
-        guard let found = SeestarDetector.detect() else {
-            errorMessage = "No Seestar share found. Mount it first: Finder → Go → Connect to Server → the Seestar's smb:// address, then try again."
-            return
+        guard !isRunning, !isImporting, !isDetecting else { return }
+        isDetecting = true
+        log.append("Looking for Seestar share…")
+        Task.detached { [weak self] in
+            let found = SeestarDetector.detect()      // SMB directory work, off the main thread
+            await MainActor.run {
+                guard let self else { return }
+                self.isDetecting = false
+                guard let found else {
+                    self.errorMessage = "No Seestar share found. Mount it first: Finder → Go → Connect to Server → the Seestar's smb:// address, then try again."
+                    return
+                }
+                self.configureAndStartSeestar(found)
+            }
         }
-        // configure
+    }
+
+    /// The on-main configure + start body (unchanged from the old synchronous
+    /// startSeestarLive, from `found` onward). Runs on the main actor.
+    private func configureAndStartSeestar(_ found: SeestarDetector.Found) {
         sourceMode = .nativeStack
         fileNamePrefix = "Light_"
         neutralizeBackground = true
         targetName = found.target
-        // Relay exactly this session's exposure (10/20/30/60s), and give each
-        // exposure its own relay folder so a restart at a different length never
-        // mixes into one stack. Fall back to any-exposure if it can't be parsed.
         let exp = found.subExposure
         subExposureText = String(format: "%g", exp ?? 10)
-        let expToken = exp.map { String(format: "%.1f", $0) }        // e.g. "30.0"; nil if unknown
+        let expToken = exp.map { String(format: "%.1f", $0) }
         let glob = expToken.map { "Light_*_\($0)s_*.fit" } ?? "Light_*.fit"
         let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
         let relayDir = FileManager.default.homeDirectoryForCurrentUser
@@ -453,8 +466,8 @@ final class AppModel {
         seestarRelay = relay
         watchFolder = relayDir
         saveSettings()
-        startSession()             // existing native-start path (uses watchFolder + sourceMode)
-        if !isRunning {                       // startSession failed (e.g. pipeline start threw)
+        startSession()
+        if !isRunning {
             seestarRelay?.stop(); seestarRelay = nil
             return
         }
