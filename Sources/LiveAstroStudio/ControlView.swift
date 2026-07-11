@@ -51,6 +51,13 @@ struct ControlView: View {
                             .disabled(model.isRunning || model.isImporting)
                             .help("Higher = safer (rejects less); lower = more aggressive. Medium (κ=3) is the validated default.")
                         }
+                        Picker("Post-process", selection: $model.processorBackend) {
+                            Text("None").tag(ProcessorBackend.none)
+                            Text("GraXpert").tag(ProcessorBackend.graxpert)
+                        }
+                        .pickerStyle(.segmented)
+                        .disabled(model.isRunning || model.isImporting || model.isProcessing)
+                        .help("After stacking, optionally run GraXpert (background extraction + denoise) to write master_processed.fit next to the raw master. Requires GraXpert installed.")
                     }
                     if model.sourceMode == .nativeStack {
                         Section("Calibration") {
@@ -141,6 +148,15 @@ struct ControlView: View {
                             }
                         }
                     }
+                }
+                if model.processorBackend == .graxpert, let dir = model.lastSessionDirectory {
+                    Button(model.isProcessing ? "Processing…" : "Process master") {
+                        model.processMaster(sessionDirectory: dir)
+                    }
+                    .disabled(model.isProcessing || GraXpertProcessor.defaultExecutable() == nil)
+                    .help(GraXpertProcessor.defaultExecutable() == nil
+                          ? "GraXpert not found — install from graxpert.com"
+                          : "Run GraXpert on the last stacked master → master_processed.fit")
                 }
                 if model.isGeneratingReplay { ProgressView("Rendering replay…") }
             }
