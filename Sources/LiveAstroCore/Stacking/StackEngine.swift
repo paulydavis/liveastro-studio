@@ -239,14 +239,27 @@ public final class StackEngine {
         }
     }
 
-    /// Register `frame` against the ALREADY-SEEDED, immutable reference. Pure —
-    /// mutates no engine state, so it is safe to call concurrently from a worker
-    /// pool (reference state is set once by seedReference before the pool starts
-    /// and is never mutated during batch import). Returns nil if rejected.
+    /// Register `frame` against the ALREADY-SEEDED, immutable reference.
+    ///
+    /// Pure and lock-free: reads reference state (referenceStars, referenceSize,
+    /// referenceChannels) without the lock and mutates nothing, so it is safe to call
+    /// CONCURRENTLY from a worker pool.
+    ///
+    /// CONTRACT: the caller MUST ensure `seedReference(...)` has returned before
+    /// issuing any concurrent `register(...)` calls, and MUST NOT mutate the engine
+    /// (no `process`, `seedReference`, or `reseed`) during the concurrent phase.
+    /// Reference state is established once at seed and treated as immutable for the
+    /// duration of a batch import.
+    ///
+    /// (Swift 5.10: the lock-free reads are safe under this contract; a future
+    /// Swift 6 strict-concurrency migration would annotate the reference properties
+    /// accordingly.)
+    ///
+    /// Returns nil if rejected.
     public func register(_ frame: RawFrame, minRows: Int) -> RegisteredFrame? {
         let raw = frame.image
         guard raw.width >= 2, raw.height >= 2 else { return nil }
-        guard let refSize = referenceSize, refSize == (raw.width, raw.height) else { return nil }
+        guard let refSize = referenceSize, refSize == (raw.width, raw.height) else { return nil } // lock-free read — safe under the batch contract documented above
         let (lum, hw, hh) = Self.halfResLuminance(frame: frame, minRows: minRows)
         let stars = StarDetector.detect(luminance: lum, width: hw, height: hh)
         guard stars.count >= 3 else { return nil }
