@@ -9,10 +9,10 @@ public struct Star: Equatable {
 /// Threshold + connected-component star finder with grid-interpolated background
 /// (spec §4.2). Deterministic, no randomness.
 public enum StarDetector {
-    public static func detect(luminance: [Float], width: Int, height: Int,
-                              maxStars: Int = 60, sigmaThreshold: Double = 5.0) -> [Star] {
+    public static func detectWithStats(luminance: [Float], width: Int, height: Int,
+                                       maxStars: Int = 60, sigmaThreshold: Double = 5.0) -> (stars: [Star], backgroundSigma: Float) {
         precondition(luminance.count == width * height)
-        guard width >= 1, height >= 1 else { return [] }
+        guard width >= 1, height >= 1 else { return ([], 1e-6) }
         // Star blobs (5-10 px) ≪ cell, so each cell's median stays an unbiased sky estimate.
         let cell = 32
         let gw = max(1, (width + cell - 1) / cell), gh = max(1, (height + cell - 1) / cell)
@@ -93,6 +93,15 @@ public enum StarDetector {
             stars.append(Star(x: cx / flux, y: cy / flux, flux: flux))
         }
         stars.sort { $0.flux > $1.flux }
-        return Array(stars.prefix(maxStars))
+        var sig = sigGrid            // sigGrid is already computed above (per-cell 1.4826·MAD)
+        sig.sort()
+        let backgroundSigma = sig.isEmpty ? Float(1e-6) : sig[sig.count / 2]
+        return (Array(stars.prefix(maxStars)), backgroundSigma)
+    }
+
+    public static func detect(luminance: [Float], width: Int, height: Int,
+                              maxStars: Int = 60, sigmaThreshold: Double = 5.0) -> [Star] {
+        detectWithStats(luminance: luminance, width: width, height: height,
+                        maxStars: maxStars, sigmaThreshold: sigmaThreshold).stars
     }
 }
