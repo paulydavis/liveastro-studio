@@ -126,7 +126,7 @@ final class AppModel {
     var importTotal = 0
     private var pipeline: SessionPipeline?
     private var importPipeline: SessionPipeline?
-    private var seestarRelay: SeestarRelay?
+    private var frameRelay: FrameRelay?
 
     init() {
         // Route OBS diagnostics into the session log. onLog fires on the main
@@ -136,11 +136,11 @@ final class AppModel {
         }
         loadSettings()
 
-        // Save settings and stop the Seestar relay when the app is about to terminate.
+        // Save settings and stop the relay when the app is about to terminate.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.seestarRelay?.stop()
+                self?.frameRelay?.stop()
                 self?.saveSettings()
             }
         }
@@ -485,17 +485,17 @@ final class AppModel {
         let relayDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))\(expToken.map { "-\($0)s" } ?? "")",
                                     isDirectory: true)
-        let relay = SeestarRelay(source: found.subDir, destination: relayDir, glob: glob)
+        let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob)
         relay.onLog = { [weak self] msg in
             Task { @MainActor in self?.log.append(msg) }
         }
         do { try relay.start() } catch { errorMessage = "Relay failed to start: \(error)"; return }
-        seestarRelay = relay
+        frameRelay = relay
         watchFolder = relayDir
         saveSettings()
         startSession()
         if !isRunning {
-            seestarRelay?.stop(); seestarRelay = nil
+            frameRelay?.stop(); frameRelay = nil
             return
         }
         selectedTab = .live
@@ -508,9 +508,9 @@ final class AppModel {
         isGeneratingReplay = true
         log.append("Ending session — generating replay…")
 
-        // Stop the Seestar relay (if any) immediately — before the pipeline drains.
-        seestarRelay?.stop()
-        seestarRelay = nil
+        // Stop the relay (if any) immediately — before the pipeline drains.
+        frameRelay?.stop()
+        frameRelay = nil
 
         // Scene automation stops immediately; the OBS stream/record stop is
         // deferred until AFTER the pipeline end/replay flow below.

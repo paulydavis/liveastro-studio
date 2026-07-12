@@ -1,10 +1,10 @@
 import Foundation
 
-/// Watches a Seestar `_sub` folder and stage-copies new matching subs into a
-/// local destination, so the native watcher never reads a partial FITS off SMB.
+/// Watches a source folder and stage-copies new matching files into a
+/// local destination, so the native watcher never reads a partial file off a slow source.
 /// Mirrors the proven seestar_relay.sh: mktemp stage → cp source→stage →
 /// cp stage→dest, skip files already in dest.
-public final class SeestarRelay {
+public final class FrameRelay {
     private let source: URL
     private let destination: URL
     private let glob: String
@@ -15,7 +15,7 @@ public final class SeestarRelay {
     private var baseline: Set<String> = []
 
     private var timer: DispatchSourceTimer?
-    private let queue = DispatchQueue(label: "seestar.relay")
+    private let queue = DispatchQueue(label: "frame.relay")
 
     public init(source: URL, destination: URL,
                 glob: String = "Light_*_10.0s_*.fit", pollSeconds: Double = 5,
