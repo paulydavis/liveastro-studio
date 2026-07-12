@@ -99,6 +99,12 @@ final class AppModel {
     /// Scene shown when imaging stalls (e.g. a live scope/finder view).
     var scopeSceneName = ""
 
+    // MARK: Broadcast state
+    enum BroadcastState: Equatable { case idle, connecting, live, stopping }
+    var broadcastState: BroadcastState = .idle
+    var streamHealth: StreamHealth?
+    private var healthPollTask: Task<Void, Never>?
+
     /// bundle id used to resolve + launch OBS.
     private static let obsBundleID = "com.obsproject.obs-studio"
 
@@ -120,11 +126,6 @@ final class AppModel {
     private var pipeline: SessionPipeline?
     private var importPipeline: SessionPipeline?
     private var seestarRelay: SeestarRelay?
-
-    /// The fire-and-forget OBS bring-up task (connect + retry + startStream).
-    /// Stored so session teardown can cancel it before OBS finishes launching —
-    /// otherwise a late connect could start a stream the operator already ended.
-    private var obsBringUpTask: Task<Void, Never>?
 
     init() {
         // Route OBS diagnostics into the session log. onLog fires on the main
@@ -284,7 +285,6 @@ final class AppModel {
             replayURL = nil
             log.append("Session started — watching \(folder.path)")
             startSceneAutomation()
-            obsBringUpTask = Task { await bringUpOBS() }
         } catch {
             errorMessage = "Start failed: \(error.localizedDescription)"
         }
@@ -515,10 +515,14 @@ final class AppModel {
         // deferred until AFTER the pipeline end/replay flow below.
         stopSceneAutomation()
 
-        // Cancel any in-flight OBS bring-up so a late connect (OBS still
-        // launching) can't start a stream after we've asked it to stop below.
-        obsBringUpTask?.cancel()
-        obsBringUpTask = nil
+        // If a broadcast is live, reset its state so the UI returns to idle.
+        // The deliberate stopStream below acts as the safety net.
+        if broadcastState == .live || broadcastState == .connecting {
+            healthPollTask?.cancel()
+            healthPollTask = nil
+            streamHealth = nil
+            broadcastState = .idle
+        }
 
         Task.detached { [weak self] in
             do {
@@ -551,11 +555,10 @@ final class AppModel {
 
     // MARK: - OBS bring-up
 
-    /// Connect to OBS, launching it if needed, then start the stream and apply
-    /// initial recording/scene state. Every failure is logged and the session
-    /// continues regardless — OBS never blocks the session.
-    private func bringUpOBS() async {
-        guard obs.state == .disconnected else { return }
+    /// Connect to OBS, launching it if needed. Returns whether connected.
+    /// Does NOT start any stream — broadcasting is deliberate (goLive()).
+    private func connectOBS() async -> Bool {
+        guard obs.state == .disconnected else { return obs.state != .disconnected }
 
         var connected = await obs.connect(host: obsHost, port: obsPort,
                                           password: obsPassword.isEmpty ? nil : obsPassword)
@@ -564,10 +567,10 @@ final class AppModel {
             launchOBS()
             // Retry connect every 2 s until success or a 20 s budget elapses.
             let deadline = Date().addingTimeInterval(20)
-            while !connected && Date() < deadline && !Task.isCancelled && isRunning {
+            while !connected && Date() < deadline && !Task.isCancelled {
                 // Cancellation-aware sleep: a cancel throws here, which we treat
-                // as "stop retrying" — return out of bring-up entirely.
-                do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
+                // as "stop retrying" — return false.
+                do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return false }
                 if obs.state == .disconnected {
                     connected = await obs.connect(host: obsHost, port: obsPort,
                                                  password: obsPassword.isEmpty ? nil : obsPassword)
@@ -577,19 +580,53 @@ final class AppModel {
             }
         }
 
-        guard connected else {
-            log.append("OBS: not connected — continuing session without OBS")
-            return
+        if !connected {
+            log.append("OBS: not connected")
         }
+        return connected
+    }
 
-        // A connection that completes after the session ended (or after cancel)
-        // must not start a broadcast the operator already stopped.
-        guard isRunning, !Task.isCancelled else { return }
+    // MARK: - Broadcast orchestration
 
-        await obs.startStream()
-        if obsRecord { await obs.setRecording(true) }
-        if !stackSceneName.isEmpty {
-            await setSceneViaAutomation(stackSceneName)
+    func goLive() {
+        guard broadcastState == .idle else { return }
+        broadcastState = .connecting
+        Task { @MainActor in
+            let connected = await connectOBS()
+            guard connected else {
+                errorMessage = "OBS not reachable — is it installed and running?"
+                broadcastState = .idle; return
+            }
+            let scene = stackSceneName.isEmpty ? nil : stackSceneName
+            let live = await obs.startBroadcast(scene: scene)
+            if live {
+                broadcastState = .live
+                startHealthPoll()
+            } else {
+                errorMessage = "OBS started but the stream didn't go live — check OBS ▸ Settings ▸ Stream (YouTube server + key)."
+                broadcastState = .idle
+            }
+        }
+    }
+
+    func endBroadcast() {
+        guard broadcastState == .live || broadcastState == .connecting else { return }
+        broadcastState = .stopping
+        healthPollTask?.cancel(); healthPollTask = nil
+        Task { @MainActor in
+            await obs.stopBroadcast()
+            streamHealth = nil
+            broadcastState = .idle
+        }
+    }
+
+    private func startHealthPoll() {
+        healthPollTask?.cancel()
+        healthPollTask = Task { @MainActor in
+            while !Task.isCancelled && broadcastState == .live {
+                streamHealth = await obs.streamStatus()
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
         }
     }
 

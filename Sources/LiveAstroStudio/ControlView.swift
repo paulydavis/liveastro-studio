@@ -159,6 +159,27 @@ struct ControlView: View {
                         .disabled(model.isRunning || model.isImporting)
                         .help("Select a folder of previously captured FITS subs to stack offline, with progress tracking and Cancel support.")
                 }
+                // Go Live / End Broadcast — decoupled from session start.
+                HStack {
+                    switch model.broadcastState {
+                    case .idle:
+                        Button("Go Live") { model.goLive() }
+                            .help("Broadcast the live stack to YouTube via OBS (configure the YouTube key in OBS ▸ Settings ▸ Stream first).")
+                    case .connecting:
+                        HStack { ProgressView().controlSize(.small); Text("Connecting OBS…") }
+                    case .live:
+                        HStack(spacing: 10) {
+                            Button("End Broadcast", role: .destructive) { model.endBroadcast() }
+                            if let h = model.streamHealth {
+                                Text("● LIVE · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped")
+                                    .foregroundStyle(.red).font(.caption)
+                            }
+                        }
+                    case .stopping:
+                        HStack { ProgressView().controlSize(.small); Text("Stopping…") }
+                    }
+                    Spacer()
+                }
                 if model.isRunning && model.sourceMode == .nativeStack {
                     HStack {
                         Text("accepted \(model.acceptedCount) · rejected \(model.rejectedCount)")
@@ -209,6 +230,14 @@ struct ControlView: View {
         .alert("LiveAstro", isPresented: $model.isShowingError) {
             Button("OK") { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
+    }
+
+    private func formatDuration(_ s: Double) -> String {
+        let total = Int(s)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let sec = total % 60
+        return String(format: "%02d:%02d:%02d", h, m, sec)
     }
 
     private func makeDirectoryPanel(title: String? = nil, message: String? = nil) -> NSOpenPanel {
