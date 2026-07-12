@@ -102,6 +102,21 @@ struct ControlView: View {
                             }
                             .help("Color intensity. 1 = unchanged.")
                         }
+                        Toggle("Flatten background (DBE)", isOn: $model.displayAdjustments.backgroundExtraction)
+                            .help("Remove the light-pollution gradient so the sky darkens evenly. Off by default.")
+                            .onChange(of: model.displayAdjustments.backgroundExtraction) { _, _ in
+                                model.applyDisplayAdjustments()
+                            }
+                        Picker("Gradient shape", selection: $model.displayAdjustments.backgroundDegree) {
+                            Text("Planar").tag(1)
+                            Text("Quadratic").tag(2)
+                        }
+                        .pickerStyle(.segmented)
+                        .disabled(!model.displayAdjustments.backgroundExtraction)
+                        .help("Planar removes a linear tilt; Quadratic also removes curvature/vignette.")
+                        .onChange(of: model.displayAdjustments.backgroundDegree) { _, _ in
+                            model.applyDisplayAdjustments()
+                        }
                         Button("Reset") {
                             model.displayAdjustments = .neutral
                             model.applyDisplayAdjustments()
