@@ -538,6 +538,53 @@ final class AppModel {
         selectedTab = .live
     }
 
+    func startASIAIRLive() {
+        guard !isRunning, !isImporting, !isDetecting else { return }
+        zoomPan = .fit
+        isDetecting = true
+        log.append("Looking for ASIAIR share…")
+        Task.detached { [weak self] in
+            let found = ASIAIRDetector.detect()       // SMB directory work, off the main thread
+            await MainActor.run {
+                guard let self else { return }
+                self.isDetecting = false
+                guard let found else {
+                    self.errorMessage = "No ASIAIR share found. In the ASIAIR app: Settings → Network Share → Enable. Then on the Mac: Finder → Go → Connect to Server → smb://asiair.local, and try again."
+                    return
+                }
+                self.configureAndStartASIAIR(found)
+            }
+        }
+    }
+
+    /// On-main configure + start for an auto-detected ASIAIR target folder.
+    /// Unlike the Seestar path, the relay glob is `*.<ext>` (the ASIAIR target
+    /// folder is already target-scoped) and `fileNamePrefix` is cleared: the
+    /// relay dir is glob-filtered AND session-scoped, so the native stacker must
+    /// accept every FITS in it — ASIAIR light files are not guaranteed to start
+    /// with "Light_" (the .nativeStack default prefix would otherwise drop them).
+    private func configureAndStartASIAIR(_ found: ASIAIRDetector.Found) {
+        sourceMode = .nativeStack
+        fileNamePrefix = ""                 // accept-all: see doc comment above
+        neutralizeBackground = true
+        targetName = found.target
+        subExposureText = String(format: "%g", found.subExposure ?? 10)
+        let glob = "*.\(found.subFileExtension)"
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
+        let relayDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))",
+                                    isDirectory: true)
+        let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob)
+        relay.onLog = { [weak self] msg in Task { @MainActor in self?.log.append(msg) } }
+        do { try relay.start() } catch { errorMessage = "Relay failed to start: \(error)"; return }
+        frameRelay = relay
+        watchFolder = relayDir
+        saveSettings()
+        startSession()
+        if !isRunning { frameRelay?.stop(); frameRelay = nil; return }
+        selectedTab = .live
+    }
+
     func endSession() {
         saveSettings()
         guard let p = pipeline else { return }
