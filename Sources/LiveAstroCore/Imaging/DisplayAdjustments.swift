@@ -9,7 +9,9 @@ import Foundation
 /// - midtoneStrength:     −1 … +1, 0 neutral — scales the auto-MTF midpoint
 /// - saturation:          0 … 2, 1 neutral   — luminance-preserving chroma scale
 /// - backgroundExtraction false neutral       — flatten the LP gradient (DBE)
-/// - backgroundDegree:    1 planar / 2 quad   — DBE polynomial degree (clamped on apply)
+/// - backgroundDegree:    1 planar / 2 quad   — legacy polynomial DBE degree; retained for
+///                                             old-settings decode compat, no longer driven by the UI
+///                                             (the display path now uses the multiscale model)
 /// - bgScale:             3.0 neutral         — multiscale DBE top scale (pixels)
 /// - bgSmoothest:         0.5 neutral         — multiscale DBE smoothest octave weight
 public struct DisplayAdjustments: Equatable, Codable {

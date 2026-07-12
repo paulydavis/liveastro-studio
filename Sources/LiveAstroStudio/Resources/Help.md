@@ -95,6 +95,9 @@ Use the **Stack scene** / **Scope scene** pickers with **Scene automation** on t
 **"No share found" when tapping Start Seestar**
 The Seestar SMB share is not mounted. In Finder: **Go → Connect to Server** (`⌘K`), enter `smb://<seestar-ip>`, and mount the share. Then try Start Seestar again.
 
+**Start Seestar finds the share but never stacks**
+Check the Seestar's live-view format. In the Seestar app (v3.3.0+), the live-view format toggle must be set to **RAW**, not JPEG — in JPEG mode the Seestar does not write the raw `.fit` subs that LiveAstro relays, so the stack never builds.
+
 **Choose Folder… isn't stacking**
 Confirm the folder you picked is the one your rig actively writes subs to, and that new `.fit`/`.fits` files are appearing there. Only subs that arrive after you tap are relayed; a folder that is already full but idle will not produce new frames.
 

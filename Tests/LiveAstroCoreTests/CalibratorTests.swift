@@ -67,4 +67,24 @@ final class CalibratorTests: XCTestCase {
         assertPixelsEqual(out.image.pixels, [0.1, 0.1, 0.2, 0.2])
         XCTAssertTrue(out.bottomUp)   // orientation preserved for the engine
     }
+
+    // apply() is called concurrently by the import worker pool; every concurrent
+    // result must equal the serial calibration (the alignment/logging prefix is
+    // now lock-guarded). Exercises a FRESH calibrator so alignment is computed
+    // under concurrency (the worst case).
+    func testApplyIsThreadSafeUnderConcurrentImport() {
+        let dark = AstroImage(width: 4, height: 4, channels: 1,
+                              pixels: (0..<16).map { Float($0) * 0.01 }, sourceIsLinear: true)
+        let light = mono(4, 4, (0..<16).map { 0.5 + Float($0) * 0.01 })
+        let serial = Calibrator(dark: dark, flat: nil).apply(light).image.pixels
+
+        let cal = Calibrator(dark: dark, flat: nil)
+        var oks = [Bool](repeating: false, count: 128)
+        oks.withUnsafeMutableBufferPointer { buf in
+            DispatchQueue.concurrentPerform(iterations: 128) { i in
+                buf[i] = cal.apply(light).image.pixels == serial
+            }
+        }
+        XCTAssertTrue(oks.allSatisfy { $0 }, "concurrent apply() must match serial calibration")
+    }
 }

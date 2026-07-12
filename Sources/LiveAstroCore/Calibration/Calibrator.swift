@@ -17,6 +17,9 @@ public final class Calibrator {
     private var alignedForBottomUp: Bool?
     private var loggedDarkMismatch = false
     private var loggedFlatMismatch = false
+    /// Serializes the alignment/logging prefix of apply() — it is called
+    /// concurrently by the import worker pool (see apply()).
+    private let lock = NSLock()
 
     public init(dark: AstroImage?, flat: AstroImage?) {
         self.dark = dark
@@ -28,11 +31,19 @@ public final class Calibrator {
 
         let light = frame.image
         let n = light.pixels.count
-        computeAlignment(for: frame.bottomUp)
 
-        // Resolve masters usable for THIS frame's dimensions.
-        let d = usable(alignedDark, light: light, kind: "dark", logged: &loggedDarkMismatch)
-        let f = usable(alignedFlat, light: light, kind: "flat", logged: &loggedFlatMismatch)
+        // Alignment computation + mismatch-logging mutate shared state, and apply()
+        // is called concurrently by the import worker pool (BatchImporter). Serialize
+        // just that prefix under the lock; the per-pixel calibration below runs on the
+        // captured `d`/`f` locals, so it stays lock-free / parallel.
+        let d: AstroImage?
+        let f: AstroImage?
+        lock.lock()
+        computeAlignment(for: frame.bottomUp)
+        d = usable(alignedDark, light: light, kind: "dark", logged: &loggedDarkMismatch)
+        f = usable(alignedFlat, light: light, kind: "flat", logged: &loggedFlatMismatch)
+        lock.unlock()
+
         if d == nil && f == nil { return frame }
 
         var out = [Float](repeating: 0, count: n)
