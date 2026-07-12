@@ -86,6 +86,42 @@ public final class SessionPipeline {
     /// whatever completed into a valid master.fit + replay (not a hard abort).
     public func cancelImport() { cancelled.set(); source?.stop() }
 
+    /// Finalize one committed frame (import batch path): snapshot + progress.
+    /// Called serially by BatchImporter in completion order.
+    private func finalizeCommitted(index: Int, sourceName: String, timestamp: Date, metadata: SourceMetadata?, engine: StackEngine) {
+        if sourceMetadata == nil, let m = metadata { sourceMetadata = m }
+        processedCount += 1
+        guard let mean = engine.currentStack() else { return }
+        guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
+        do {
+            let cg = try displayCGImage(from: mean)
+            let record = try recorder.save(
+                cgImage: cg, linear: mean, sourceFile: sourceName,
+                index: index, timestamp: timestamp,
+                estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
+            try session.recordSnapshot(record)
+            onUpdate?(cg, record)
+        } catch {
+            onLog?("Skipped frame (\(sourceName)): \(error)")
+        }
+        if let total = source?.totalCount {
+            onImportProgress?(processedCount, total, engine.acceptedCount, engine.rejectedCount)
+        }
+    }
+
+    private func finalizeRejected(sourceName: String, engine: StackEngine) {
+        processedCount += 1
+        onRejected?(.noTransform, sourceName)
+        onLog?("Rejected \(sourceName)")
+        if let total = source?.totalCount {
+            onImportProgress?(processedCount, total, engine.acceptedCount, engine.rejectedCount)
+        }
+    }
+
+    private func captureMetadataAndFinalize(committed c: BatchImporter.Committed, engine: StackEngine) {
+        finalizeCommitted(index: c.index, sourceName: c.sourceName, timestamp: c.timestamp, metadata: c.metadata, engine: engine)
+    }
+
     public func start() throws {
         let dir = try session.startSession(profile: profile)
         recorder = SnapshotRecorder(sessionDirectory: dir)
@@ -95,11 +131,27 @@ public final class SessionPipeline {
             calibrator?.onLog = { [weak self] in self?.onLog?($0) }
             try src.start()
             let done = consumeDone
-            consumeTask = Task.detached(priority: .userInitiated) { [weak self] in
-                for await frame in src.frames {
-                    self?.handleNative(frame, engine: eng)
+            if src.isFinite {
+                // IMPORT: frame-per-core parallel batch.
+                let cal = calibrator
+                let importer = BatchImporter(engine: eng)
+                consumeTask = Task.detached(priority: .userInitiated) { [weak self] in
+                    await importer.run(
+                        source: src,
+                        prepare: { cal?.apply($0) ?? $0 },
+                        onCommitted: { c in
+                            self?.captureMetadataAndFinalize(committed: c, engine: eng)
+                        },
+                        onRejected: { name in self?.finalizeRejected(sourceName: name, engine: eng) },
+                        isCancelled: { self?.cancelled.isSet ?? true })
+                    done.signal()
                 }
-                done.signal()
+            } else {
+                // LIVE: serial (frames trickle in).
+                consumeTask = Task.detached(priority: .userInitiated) { [weak self] in
+                    for await frame in src.frames { self?.handleNative(frame, engine: eng) }
+                    done.signal()
+                }
             }
         } else {
             // Watcher mode

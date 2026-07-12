@@ -18,6 +18,7 @@ public final class BatchImporter {
         public let index: Int          // engine.acceptedCount after this commit
         public let sourceName: String
         public let timestamp: Date
+        public let metadata: SourceMetadata?
     }
 
     /// One worker's output: a warped frame (nil = rejected).
@@ -25,6 +26,7 @@ public final class BatchImporter {
         let warped: (image: AstroImage, mask: [Float])?
         let name: String
         let timestamp: Date
+        let metadata: SourceMetadata?
     }
 
     /// Run the import. Callbacks fire serially (from the single consumer) in
@@ -44,7 +46,7 @@ public final class BatchImporter {
             let prepared = prepare(frame)
             if engine.seedReference(prepared, minRows: .max) {
                 seeded = true
-                onCommitted(Committed(index: engine.acceptedCount, sourceName: frame.sourceName, timestamp: frame.timestamp))
+                onCommitted(Committed(index: engine.acceptedCount, sourceName: frame.sourceName, timestamp: frame.timestamp, metadata: frame.metadata))
             } else {
                 onRejected(frame.sourceName)
             }
@@ -61,11 +63,12 @@ public final class BatchImporter {
                 guard let frame = await iterator.next() else { return false }
                 group.addTask {
                     let prepared = prepare(frame)
+                    let frameMeta = frame.metadata
                     if let reg = engine.register(prepared, minRows: .max) {
                         let w = engine.warp(reg, minRows: .max)
-                        return Work(warped: w, name: frame.sourceName, timestamp: frame.timestamp)
+                        return Work(warped: w, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
                     }
-                    return Work(warped: nil, name: frame.sourceName, timestamp: frame.timestamp)
+                    return Work(warped: nil, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
                 }
                 inFlight += 1
                 return true
@@ -78,7 +81,7 @@ public final class BatchImporter {
                 inFlight -= 1
                 if let w = work.warped {
                     engine.commit(image: w.image, mask: w.mask, minRows: .max)
-                    onCommitted(Committed(index: engine.acceptedCount, sourceName: work.name, timestamp: work.timestamp))
+                    onCommitted(Committed(index: engine.acceptedCount, sourceName: work.name, timestamp: work.timestamp, metadata: work.metadata))
                 } else {
                     engine.commitRejection()
                     onRejected(work.name)
