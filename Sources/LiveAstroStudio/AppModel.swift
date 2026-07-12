@@ -104,6 +104,7 @@ final class AppModel {
     var broadcastState: BroadcastState = .idle
     var streamHealth: StreamHealth?
     private var healthPollTask: Task<Void, Never>?
+    private var goLiveTask: Task<Void, Never>?
 
     /// bundle id used to resolve + launch OBS.
     private static let obsBundleID = "com.obsproject.obs-studio"
@@ -518,6 +519,8 @@ final class AppModel {
         // If a broadcast is live, reset its state so the UI returns to idle.
         // The deliberate stopStream below acts as the safety net.
         if broadcastState == .live || broadcastState == .connecting {
+            goLiveTask?.cancel()
+            goLiveTask = nil
             healthPollTask?.cancel()
             healthPollTask = nil
             streamHealth = nil
@@ -558,7 +561,7 @@ final class AppModel {
     /// Connect to OBS, launching it if needed. Returns whether connected.
     /// Does NOT start any stream — broadcasting is deliberate (goLive()).
     private func connectOBS() async -> Bool {
-        guard obs.state == .disconnected else { return obs.state != .disconnected }
+        guard obs.state == .disconnected else { return true }  // already connected
 
         var connected = await obs.connect(host: obsHost, port: obsPort,
                                           password: obsPassword.isEmpty ? nil : obsPassword)
@@ -591,7 +594,7 @@ final class AppModel {
     func goLive() {
         guard broadcastState == .idle else { return }
         broadcastState = .connecting
-        Task { @MainActor in
+        goLiveTask = Task { @MainActor in
             let connected = await connectOBS()
             guard connected else {
                 errorMessage = "OBS not reachable — is it installed and running?"
@@ -599,6 +602,13 @@ final class AppModel {
             }
             let scene = stackSceneName.isEmpty ? nil : stackSceneName
             let live = await obs.startBroadcast(scene: scene)
+            // The user may have hit End Broadcast / End Session while we were
+            // connecting. If so, don't transition to .live — instead undo the
+            // broadcast we just started so nothing keeps running behind their back.
+            guard broadcastState == .connecting else {
+                if live { await obs.stopBroadcast() }
+                return
+            }
             if live {
                 broadcastState = .live
                 startHealthPoll()
@@ -612,6 +622,7 @@ final class AppModel {
     func endBroadcast() {
         guard broadcastState == .live || broadcastState == .connecting else { return }
         broadcastState = .stopping
+        goLiveTask?.cancel(); goLiveTask = nil
         healthPollTask?.cancel(); healthPollTask = nil
         Task { @MainActor in
             await obs.stopBroadcast()
