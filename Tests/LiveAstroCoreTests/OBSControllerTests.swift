@@ -271,6 +271,100 @@ final class OBSControllerTests: XCTestCase {
         controller.disconnect()
     }
 
+    // MARK: - Broadcast helper
+
+    /// Build a fully connected OBSController whose responder is pre-scripted to
+    /// answer SetCurrentProgramScene / StartStream / StopStream with ok:true, and
+    /// GetStreamStatus with outputActive set to `streamStatusActive`.
+    private func makeConnectedController(
+        streamStatusActive: Bool
+    ) async throws -> (OBSController, MockOBSSocket) {
+        let mock = MockOBSSocket()
+        let controller = makeController(mock)
+
+        mock.enqueueInbound(helloFrame())
+        mock.replyToLastSent { [self] sent in
+            // Identify → Identified
+            if sent.contains("\"op\":1") { return identifiedFrame }
+            guard sent.contains("\"op\":6") else { return nil }
+            let id = requestId(fromSent: sent)
+            let type = requestType(fromSent: sent)
+            switch type {
+            case "GetSceneList":
+                return responseFrame(requestId: id, ok: true, responseData: [
+                    "currentProgramSceneName": "Stack",
+                    "scenes": [["sceneName": "Stack"]]
+                ])
+            case "GetStreamStatus":
+                return responseFrame(requestId: id, ok: true, responseData: [
+                    "outputActive": streamStatusActive,
+                    "outputDuration": 1000,
+                    "outputTotalFrames": 100,
+                    "outputSkippedFrames": 0,
+                    "outputCongestion": 0
+                ])
+            case "GetRecordStatus":
+                return responseFrame(requestId: id, ok: true,
+                                     responseData: ["outputActive": false])
+            default:
+                // Covers SetCurrentProgramScene, StartStream, StopStream,
+                // StartRecord, StopRecord, and anything else.
+                return responseFrame(requestId: id, ok: true, responseData: [:])
+            }
+        }
+
+        let ok = await controller.connect(host: "localhost", port: 4455, password: nil)
+        XCTAssertTrue(ok, "makeConnectedController: connect must succeed")
+        return (controller, mock)
+    }
+
+    // MARK: - Broadcast tests
+
+    func testStartBroadcastSendsSceneThenStreamAndConfirmsActive() async throws {
+        let (controller, mock) = try await makeConnectedController(streamStatusActive: true)
+        let ok = await controller.startBroadcast(scene: "Stack", confirmPollSeconds: 0, maxConfirmPolls: 3)
+        XCTAssertTrue(ok)
+        let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
+                                   .map { requestType(fromSent: $0) }
+        XCTAssertTrue(types.contains("SetCurrentProgramScene"))
+        XCTAssertTrue(types.contains("StartStream"))
+        // SetCurrentProgramScene comes before StartStream
+        XCTAssertLessThan(types.firstIndex(of: "SetCurrentProgramScene")!,
+                          types.firstIndex(of: "StartStream")!)
+        controller.disconnect()
+    }
+
+    func testStartBroadcastNoSceneSkipsSetScene() async throws {
+        let (controller, mock) = try await makeConnectedController(streamStatusActive: true)
+        _ = await controller.startBroadcast(scene: nil as String?, confirmPollSeconds: 0, maxConfirmPolls: 3)
+        let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
+                                   .map { requestType(fromSent: $0) }
+        XCTAssertFalse(types.contains("SetCurrentProgramScene"))
+        XCTAssertTrue(types.contains("StartStream"))
+        controller.disconnect()
+    }
+
+    func testStartBroadcastNeverActiveStopsAndReturnsFalse() async throws {
+        // GetStreamStatus always reports outputActive:false → give up + StopStream.
+        let (controller, mock) = try await makeConnectedController(streamStatusActive: false)
+        let ok = await controller.startBroadcast(scene: "Stack", confirmPollSeconds: 0, maxConfirmPolls: 3)
+        XCTAssertFalse(ok)
+        let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
+                                   .map { requestType(fromSent: $0) }
+        XCTAssertTrue(types.contains("StartStream"))
+        XCTAssertTrue(types.contains("StopStream"))   // reset OBS on failure
+        controller.disconnect()
+    }
+
+    func testStopBroadcastSendsStopStream() async throws {
+        let (controller, mock) = try await makeConnectedController(streamStatusActive: true)
+        await controller.stopBroadcast()
+        let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
+                                   .map { requestType(fromSent: $0) }
+        XCTAssertTrue(types.contains("StopStream"))
+        controller.disconnect()
+    }
+
     /// connect failure (bad handshake) returns false and leaves .disconnected.
     func testConnectFailureReturnsFalse() async {
         let mock = MockOBSSocket()

@@ -156,6 +156,43 @@ public final class OBSController: ObservableObject {
         _ = await requestData(on ? "StartRecord" : "StopRecord", nil)
     }
 
+    // MARK: - Broadcast operations
+
+    /// Fetch the current stream health, or nil if unavailable.
+    public func streamStatus() async -> StreamHealth? {
+        guard let data = await requestData("GetStreamStatus", nil) else { return nil }
+        return StreamHealth.parse(data)
+    }
+
+    /// Deliberate broadcast: switch to `scene` (if given), start the stream, and
+    /// confirm it went live by polling GetStreamStatus. On failure to confirm,
+    /// send StopStream to reset OBS (don't leave it half-streaming) and return
+    /// false. Returns true once outputActive is confirmed.
+    @discardableResult
+    public func startBroadcast(scene: String?, confirmPollSeconds: Double = 1.0,
+                               maxConfirmPolls: Int = 5) async -> Bool {
+        if let scene, !scene.isEmpty { await setScene(scene) }
+        await startStream()
+        for i in 0..<max(1, maxConfirmPolls) {
+            if let h = await streamStatus(), h.active {
+                log("broadcast live")
+                return true
+            }
+            if i < maxConfirmPolls - 1, confirmPollSeconds > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(confirmPollSeconds * 1_000_000_000))
+            }
+        }
+        log("stream did not go active — stopping; check OBS ▸ Settings ▸ Stream")
+        await stopStream()
+        return false
+    }
+
+    /// Stop a broadcast: stop the stream and turn recording off.
+    public func stopBroadcast() async {
+        await stopStream()
+        await setRecording(false)
+    }
+
     // MARK: - Request plumbing
 
     /// Issue a request; on success return its responseData, on failure log and
