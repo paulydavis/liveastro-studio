@@ -58,6 +58,7 @@ struct BroadcastView: View {
             .background(configuresWindow ? AnyView(BroadcastWindowConfigurator()) : AnyView(EmptyView()))
         }
         .onAppear { showControlsThenScheduleHide() }
+        .onDisappear { hideTask?.cancel() }
     }
 
     // MARK: - Fitted content size
@@ -215,6 +216,7 @@ private struct ScrollWheelZoom: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         view.wantsLayer = true
+        context.coordinator.nsView = view
         return view
     }
 
@@ -232,6 +234,7 @@ private struct ScrollWheelZoom: NSViewRepresentable {
         var viewSize: CGSize
         var fittedSize: CGSize
         var model: AppModel
+        weak var nsView: NSView?
         private var monitor: Any?
 
         init(viewSize: CGSize, fittedSize: CGSize, model: AppModel) {
@@ -240,7 +243,13 @@ private struct ScrollWheelZoom: NSViewRepresentable {
             self.model = model
             super.init()
             monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-                guard let self else { return event }
+                // Only zoom when the scroll happens over THIS view, in its own
+                // window — otherwise scrolling any other window (e.g. the Setup
+                // form sharing the main window) would zoom the broadcast image.
+                guard let self, let view = self.nsView, let win = view.window,
+                      event.window === win else { return event }
+                let ptInView = view.convert(event.locationInWindow, from: nil)
+                guard view.bounds.contains(ptInView) else { return event }
                 // scrollingDeltaY: positive = scroll up = zoom in
                 let delta = event.scrollingDeltaY
                 guard abs(delta) > 0 else { return event }
