@@ -222,7 +222,6 @@ final class AppModel {
     var integrationCaption: String {
         guard let rec = latestRecord else { return "waiting for first stack…" }
         return IntegrationFormat.caption(seconds: rec.estimatedIntegrationSeconds,
-                                         frames: rec.index,
                                          subSeconds: profile.subExposureSeconds)
     }
 

@@ -111,4 +111,13 @@ public enum IntegrationFormat {
             ? "\(Int(subSeconds))s" : "\(subSeconds)s"
         return "\(time) · \(frames) × \(sub)"
     }
+
+    /// Caption whose frame count is DERIVED from the integration seconds, so the
+    /// count and the time are always consistent (used for the live badge: a
+    /// reseed resets the current-stack integration, and the count follows it —
+    /// unlike the session-total accepted index).
+    public static func caption(seconds: Double, subSeconds: Double) -> String {
+        let frames = subSeconds > 0 ? Int((seconds / subSeconds).rounded()) : 0
+        return caption(seconds: seconds, frames: frames, subSeconds: subSeconds)
+    }
 }
