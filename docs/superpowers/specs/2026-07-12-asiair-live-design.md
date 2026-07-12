@@ -85,9 +85,26 @@ func startASIAIRLive() {
 
 `endSession()` already stops `frameRelay` unconditionally — no change needed.
 
-### 3. UI — `Sources/LiveAstroStudio/ControlView.swift`
+### 3. UI + naming — `Sources/LiveAstroStudio/ControlView.swift`
 
-Add an **ASIAIR Live** button in the footer beside **Seestar Live** and **Watch Folder Live**, calling `model.startASIAIRLive()`, with the same `.disabled(model.isRunning || model.isImporting || model.isDetecting)` idiom and a `.help(...)` tooltip ("Auto-detect the ASIAIR's Autorun/Light folder and start live stacking").
+The three one-tap live-source buttons all currently end in "Live" (repetitive) and "Watch Folder Live" is clunky. Adopt a **verb-led** naming scheme across all three — the buttons *start* a live session, so lead with the verb; the auto-detect sources use "Start", the manual pick uses "Choose…" (ellipsis signals a picker opens first):
+
+| Action | Current label (line) | New label |
+|---|---|---|
+| Auto-detect Seestar (`startSeestarLive`) | `"Seestar Live"` (ControlView.swift:155) | **`Start Seestar`** |
+| Auto-detect ASIAIR (`startASIAIRLive`) | — (new) | **`Start ASIAIR`** |
+| Manual folder pick (`pickWatchFolderLive`) | `"Watch Folder Live"` (ControlView.swift:158) | **`Choose Folder…`** |
+
+- Add the new **Start ASIAIR** button between Start Seestar and Choose Folder…, calling `model.startASIAIRLive()`, with the same `.disabled(model.isRunning || model.isImporting || model.isDetecting)` idiom (match whatever guard the sibling buttons use) and a `.help("Auto-detect the ASIAIR's Autorun/Light folder, relay its subs, and begin native stacking — one tap.")`.
+- Rename the two existing buttons' labels to the New labels above. Behavior/handlers unchanged — labels only. Keep each button's existing `.help(...)` tooltip text (still accurate).
+- The `Choose Folder…` live button sits in the footer one-tap row; it is distinct from the pre-existing `Choose…` sub-control in the Raw-subs watch-folder config section (ControlView.swift:30), which is unchanged.
+
+### 4. Help.md label consistency — `Sources/LiveAstroStudio/Resources/Help.md`
+
+Update the six references to the old button names so the docs match the new labels (the app just shipped with "Seestar Live"/"Watch Folder Live" wording):
+- "Seestar Live" → "Start Seestar" where it names the *button* (Quick Start step, Source Modes table row label, and the Troubleshooting `"No share found" when tapping Start Seestar` heading + body).
+- "Watch Folder Live" → "Choose Folder…" where it names the *button* (Quick Start step, Source Modes table row, Troubleshooting heading).
+- Keep prose that refers to the *concept* readable (e.g. "the folder your rig writes subs to"); only the button-name tokens change. Content must stay within the markdown subset the renderer supports (no new constructs).
 
 ## Error Handling
 
@@ -123,4 +140,4 @@ Add an **ASIAIR Live** button in the footer beside **Seestar Live** and **Watch 
 ## Task Order (for the plan)
 
 1. **T1 — `ASIAIRDetector` (TDD).** Detector + all detector tests. The shared interface the AppModel consumes.
-2. **T2 — AppModel `startASIAIRLive` + `configureAndStartASIAIR` + ControlView button (build/manual-verified).** Depends on T1's `Found` type. Wires detect → relay → stacking and adds the footer button.
+2. **T2 — AppModel wiring + ControlView button + verb-led rename + Help.md consistency (build/manual-verified).** Depends on T1's `Found` type. Adds `startASIAIRLive`/`configureAndStartASIAIR` (detect → relay → stacking), adds the **Start ASIAIR** button, renames the two existing buttons to **Start Seestar** / **Choose Folder…**, and updates the six Help.md button-name references to match. All build/manual-verified (SwiftUI + docs). Keep the change label-only for the existing buttons — no handler/behavior changes.
