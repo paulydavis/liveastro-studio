@@ -47,7 +47,7 @@ public enum BackgroundExtraction {
             for _ in 0..<3 {
                 let kept = sv.enumerated().filter { keep[$0.offset] }.map { $0.element }
                 if kept.count <= nCoeff { break }
-                var sorted = kept.sorted()
+                let sorted = kept.sorted()
                 let med = sorted[sorted.count/2]
                 var dev = sorted.map { abs($0 - med) }; dev.sort()
                 let madn = 1.4826 * dev[dev.count/2]
