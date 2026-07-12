@@ -152,11 +152,16 @@ struct ControlView: View {
                     Spacer()
                     Button {
                         model.startSeestarLive()
-                    } label: { Label("Seestar Live", systemImage: "dot.radiowaves.left.and.right") }
+                    } label: { Label("Start Seestar", systemImage: "dot.radiowaves.left.and.right") }
                     .help("Auto-detect the mounted Seestar folder, start relaying its 10s subs, and begin native stacking — one tap.")
                     .disabled(model.isRunning || model.isImporting || model.isDetecting)
-                    Button("Watch Folder Live") { pickWatchFolderLive() }
-                        .help("Live-stack subs from any folder your rig writes to (ASIAIR / NINA / ASI camera) — session-scoped from the moment you start.")
+                    Button {
+                        model.startASIAIRLive()
+                    } label: { Label("Start ASIAIR", systemImage: "camera.aperture") }
+                    .help("Auto-detect the ASIAIR's Autorun/Light folder, relay its subs, and begin native stacking — one tap.")
+                    .disabled(model.isRunning || model.isImporting || model.isDetecting)
+                    Button("Choose Folder…") { pickWatchFolderLive() }
+                        .help("Live-stack subs from any folder your rig writes to (NINA / ASI camera / any incoming-subs folder) — session-scoped from the moment you start.")
                         .disabled(model.isRunning || model.isImporting || model.isDetecting)
                     Button("Import Subs…") { pickImportFolder() }
                         .disabled(model.isRunning || model.isImporting)

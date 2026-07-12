@@ -6,10 +6,11 @@ LiveAstro Studio watches your incoming sub-exposures, stacks them live, and show
 
 ## Quick Start
 
-There are two one-tap live paths. Both relay only the subs that arrive **after** you tap (session-scoped), then stack them natively.
+There are three one-tap live paths. Each relays only the subs that arrive **after** you tap (session-scoped), then stacks them natively.
 
-1. **Seestar Live** — mount the Seestar's SMB share in Finder, then tap **Seestar Live**. The app auto-detects the share, relays 10-second subs to a local folder, and begins stacking.
-2. **Watch Folder Live** — tap **Watch Folder Live** and pick the folder your rig writes subs to (ASI2600/ASIAIR autorun folder, a NINA output folder, or any incoming-subs folder). The app relays new subs from that folder and stacks them.
+1. **Start Seestar** — mount the Seestar's SMB share in Finder, then tap **Start Seestar**. The app auto-detects the share, relays 10-second subs to a local folder, and begins stacking.
+2. **Start ASIAIR** — mount the ASIAIR's SMB share (ASIAIR app: Settings → Network Share → Enable), then tap **Start ASIAIR**. The app auto-detects the ASIAIR's `Autorun/Light` target folder and stacks its subs live.
+3. **Choose Folder…** — tap **Choose Folder…** and pick the folder your rig writes subs to (a NINA output folder, or any incoming-subs folder). The app relays new subs from that folder and stacks them.
 
 Switch to the **Live** tab to watch the stack build in real time. Tap **Detach** to pop the display into its own window for OBS capture.
 
@@ -19,8 +20,9 @@ Switch to the **Live** tab to watch the stack build in real time. Tap **Detach**
 
 | Mode | What it does |
 |------|-------------|
-| **Seestar Live** | Auto-detects the Seestar SMB share and stacks its 10s subs live. |
-| **Watch Folder Live** | Relays new subs from a folder you pick (any rig) and stacks them live. |
+| **Start Seestar** | Auto-detects the Seestar SMB share and stacks its 10s subs live. |
+| **Start ASIAIR** | Auto-detects the ASIAIR's Autorun/Light folder and stacks its subs live. |
+| **Choose Folder…** | Relays new subs from a folder you pick (any rig) and stacks them live. |
 | **Raw subs** | Imports and stacks a folder of existing sub-exposures with the native stacker. |
 
 The source mode is locked while a session is running. End the session to change it.
@@ -59,7 +61,7 @@ Calibration applies only in **Raw subs** mode.
 For each frame type you can either:
 
 - **Use file…** — point to a pre-built master FITS file.
-- **Build…** — select a folder of raw calibration frames; the app combines them into a master and saves it to `~/Library/Application Support/LiveAstroStudio/masters/`.
+- **Build…** — select a folder of raw calibration frames; the app combines them into a master and saves it to `~/LiveAstro/masters/`.
 
 Leave a row empty to skip that calibration type.
 
@@ -90,14 +92,14 @@ Use the **Stack scene** / **Scope scene** pickers with **Scene automation** on t
 
 ## Troubleshooting
 
-**"No share found" when tapping Seestar Live**
-The Seestar SMB share is not mounted. In Finder: **Go → Connect to Server** (`⌘K`), enter `smb://<seestar-ip>`, and mount the share. Then try Seestar Live again.
+**"No share found" when tapping Start Seestar**
+The Seestar SMB share is not mounted. In Finder: **Go → Connect to Server** (`⌘K`), enter `smb://<seestar-ip>`, and mount the share. Then try Start Seestar again.
 
-**Watch Folder Live isn't stacking**
+**Choose Folder… isn't stacking**
 Confirm the folder you picked is the one your rig actively writes subs to, and that new `.fit`/`.fits` files are appearing there. Only subs that arrive after you tap are relayed; a folder that is already full but idle will not produce new frames.
 
 **Stack not updating**
-Check that the relay folder (`~/Library/Application Support/LiveAstroStudio/relay/`) is receiving new files. If it is empty, end the session, re-select the source, and start again.
+Check that the relay folder (`~/LiveAstro/relay/`) is receiving new files. If it is empty, end the session, re-select the source, and start again.
 
 **OBS scene not switching automatically**
 Ensure you have selected both a **Stack scene** and a **Scope scene** in the OBS section and that **Scene automation** is toggled on.
