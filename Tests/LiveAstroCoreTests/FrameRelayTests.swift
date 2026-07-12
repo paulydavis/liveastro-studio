@@ -74,7 +74,7 @@ final class FrameRelayTests: XCTestCase {
         XCTAssertEqual(try r.copyOnce(), 1)                        // only the matching new one
     }
 
-    func testBroadFitsGlobRelaysBothExtensionsSessionScoped() throws {
+    func testBroadFitsGlobRelaysSessionScoped() throws {
         let src = try tmp(), dst = try tmp()
         try write(src, "old.fit")                        // backlog
         let r = FrameRelay(source: src, destination: dst, glob: "*.fit")

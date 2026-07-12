@@ -79,4 +79,16 @@ final class BackgroundExtractionTests: XCTestCase {
                              pixels: [Float](repeating: 0.3, count: 64), sourceIsLinear: true)
         XCTAssertEqual(BackgroundExtraction.flatten(img, degree: 1).pixels, img.pixels)
     }
+
+    // Defense-in-depth: a NaN slipping past ingest sanitization must not poison the
+    // output (Swift's min/max don't clamp NaN). Every output pixel stays finite.
+    func testNaNInputDoesNotPoisonOutput() {
+        let w = 32, h = 32, plane = w * h
+        var px = gradientImage(w: w, h: h, base: 0.1, slope: 0.4).pixels
+        px[plane / 2] = Float.nan          // inject a NaN into channel 0
+        px[plane + 7] = Float.infinity     // and an Inf into channel 1
+        let img = AstroImage(width: w, height: h, channels: 3, pixels: px, sourceIsLinear: true)
+        let out = BackgroundExtraction.flatten(img, degree: 1)
+        XCTAssertTrue(out.pixels.allSatisfy { $0.isFinite }, "flatten output must contain no NaN/Inf")
+    }
 }

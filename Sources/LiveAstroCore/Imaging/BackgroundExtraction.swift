@@ -21,7 +21,12 @@ public enum BackgroundExtraction {
             deg == 1 ? [1, x, y] : [1, x, y, x*x, x*y, y*y]
         }
 
-        var out = image.pixels
+        // Sanitize non-finite inputs up front (matches ingest: FITSReader/Calibrator).
+        // A NaN/Inf pixel otherwise poisons tile medians (Swift sort of NaN is
+        // undefined-order) and the output (min/max don't clamp NaN). Passthrough
+        // channels then also carry clean data.
+        let src = image.pixels.map { $0.isFinite ? $0 : Float(0) }
+        var out = src
         for c in 0..<3 {
             let base = c * plane
             // 1. tile samples: (nx, ny, median)
@@ -34,7 +39,7 @@ public enum BackgroundExtraction {
                     let x0 = tx * w / tiles, x1 = (tx + 1) * w / tiles
                     if x1 <= x0 { continue }
                     var vals: [Float] = []; vals.reserveCapacity((y1-y0)*(x1-x0))
-                    for yy in y0..<y1 { for xx in x0..<x1 { vals.append(image.pixels[base + yy*w + xx]) } }
+                    for yy in y0..<y1 { for xx in x0..<x1 { vals.append(src[base + yy*w + xx]) } }
                     vals.sort()
                     let med = Double(vals[vals.count/2])
                     let cx = (Double(x0 + x1) / 2) / Double(w) * 2 - 1   // → [-1,1]
@@ -68,6 +73,9 @@ public enum BackgroundExtraction {
                 for r in 0..<nCoeff { atb[r] += b[r] * v; for col in 0..<nCoeff { ata[r][col] += b[r] * b[col] } }
             }
             guard let coeff = solveSymmetric(&ata, atb) else { continue }  // singular → passthrough channel
+            // Defense-in-depth: a non-finite fit (e.g. a NaN slipping past ingest
+            // sanitization) must not poison the surface — passthrough this channel.
+            guard coeff.allSatisfy({ $0.isFinite }) else { continue }
 
             // 4. evaluate surface, find pedestal (min), subtract + re-add pedestal.
             var surface = [Float](repeating: 0, count: plane)
@@ -83,7 +91,7 @@ public enum BackgroundExtraction {
             }
             let ped = Float(minS)
             for i in 0..<plane {
-                out[base + i] = min(max(image.pixels[base + i] - surface[i] + ped, 0), 1)
+                out[base + i] = min(max(src[base + i] - surface[i] + ped, 0), 1)
             }
         }
         return AstroImage(width: w, height: h, channels: image.channels, pixels: out,

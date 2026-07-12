@@ -174,7 +174,7 @@ struct ControlView: View {
                         HStack(spacing: 10) {
                             Button("End Broadcast", role: .destructive) { model.endBroadcast() }
                             if let h = model.streamHealth {
-                                Text("● LIVE · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped")
+                                Text("● LIVE · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
                                     .foregroundStyle(.red).font(.caption)
                             }
                         }

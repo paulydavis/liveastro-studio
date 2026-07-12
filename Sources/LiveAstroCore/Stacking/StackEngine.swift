@@ -143,6 +143,9 @@ public final class StackEngine {
         // Invariant: referenceSize != nil (checked above) implies the accumulator was
         // created when the reference seeded. Guard rather than trap so a violated
         // invariant degrades to a rejection instead of crashing the session.
+        // Deliberately does NOT bump consecutiveNoTransform: this is the unreachable
+        // invariant-degradation path, not a real target mismatch, so it must not
+        // count toward auto-reseed (would only ever under-count, never spuriously trip).
         guard let accumulator else {
             rejectedCount += 1
             return .rejected(.noTransform)
