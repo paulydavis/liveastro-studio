@@ -451,6 +451,43 @@ final class AppModel {
         }
     }
 
+    func startWatchFolderLive(source: URL) {
+        guard !isRunning, !isImporting, !isDetecting else { return }
+        zoomPan = .fit
+        isDetecting = true
+        log.append("Reading subs in \(source.lastPathComponent)…")
+        Task.detached { [weak self] in
+            let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: source)   // SMB header read, off main
+            await MainActor.run {
+                guard let self else { return }
+                self.isDetecting = false
+                self.configureAndStartWatchFolder(source: source, meta: meta)
+            }
+        }
+    }
+
+    private func configureAndStartWatchFolder(source: URL,
+                                              meta: (object: String?, exposureSeconds: Double?, fileExtension: String)?) {
+        sourceMode = .nativeStack
+        neutralizeBackground = true
+        if let object = meta?.object, !object.isEmpty { targetName = object }        // else keep form value
+        if let exp = meta?.exposureSeconds, exp > 0 { subExposureText = String(format: "%g", exp) }
+        let target = targetName.isEmpty ? "Live" : targetName
+        let glob = "*.\(meta?.fileExtension ?? "fit")"       // *.fit or *.fits per the folder's subs
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
+        let relayDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("LiveAstro/relay/\(target)-\(df.string(from: Date()))", isDirectory: true)
+        let relay = FrameRelay(source: source, destination: relayDir, glob: glob)
+        relay.onLog = { [weak self] msg in Task { @MainActor in self?.log.append(msg) } }
+        do { try relay.start() } catch { errorMessage = "Relay failed to start: \(error)"; return }
+        frameRelay = relay
+        watchFolder = relayDir
+        saveSettings()
+        startSession()
+        if !isRunning { frameRelay?.stop(); frameRelay = nil; return }
+        selectedTab = .live
+    }
+
     func startSeestarLive() {
         guard !isRunning, !isImporting, !isDetecting else { return }
         zoomPan = .fit

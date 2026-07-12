@@ -154,7 +154,10 @@ struct ControlView: View {
                         model.startSeestarLive()
                     } label: { Label("Seestar Live", systemImage: "dot.radiowaves.left.and.right") }
                     .help("Auto-detect the mounted Seestar folder, start relaying its 10s subs, and begin native stacking — one tap.")
-                    .disabled(model.isRunning)
+                    .disabled(model.isRunning || model.isImporting || model.isDetecting)
+                    Button("Watch Folder Live") { pickWatchFolderLive() }
+                        .help("Live-stack subs from any folder your rig writes to (ASIAIR / NINA / ASI camera) — session-scoped from the moment you start.")
+                        .disabled(model.isRunning || model.isImporting || model.isDetecting)
                     Button("Import Subs…") { pickImportFolder() }
                         .disabled(model.isRunning || model.isImporting)
                         .help("Select a folder of previously captured FITS subs to stack offline, with progress tracking and Cancel support.")
@@ -253,6 +256,17 @@ struct ControlView: View {
     private func pickFolder() {
         let panel = makeDirectoryPanel()
         if panel.runModal() == .OK { model.watchFolder = panel.url }
+    }
+
+    private func pickWatchFolderLive() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Watch"
+        if panel.runModal() == .OK, let url = panel.url {
+            model.startWatchFolderLive(source: url)
+        }
     }
 
     private func pickImportFolder() {
