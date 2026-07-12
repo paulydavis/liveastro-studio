@@ -23,6 +23,7 @@ public final class SessionPipeline {
     private let cancelled = NSLock_Flag()
     private var processedCount = 0
     private var sourceMetadata: SourceMetadata?
+    private var lastAutoReseedCount = 0
 
     private let adjLock = NSLock()
     private var _displayAdjustments = DisplayAdjustments.neutral
@@ -159,6 +160,10 @@ public final class SessionPipeline {
         if sourceMetadata == nil, let m = rawFrame.metadata { sourceMetadata = m }
         let frame = calibrator?.apply(rawFrame) ?? rawFrame
         let outcome = engine.process(frame)
+        if engine.autoReseedCount != lastAutoReseedCount {
+            lastAutoReseedCount = engine.autoReseedCount
+            onLog?("Auto-reseeded — the reference frame didn't match; re-seeding on the next good sub. (Earlier subs that couldn't register stay rejected.)")
+        }
         processedCount += 1
         switch outcome {
         case .becameReference, .stacked:
