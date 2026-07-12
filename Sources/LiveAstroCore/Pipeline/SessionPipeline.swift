@@ -121,9 +121,19 @@ public final class SessionPipeline {
     /// if still linear, then pack to CGImage.
     private func displayCGImage(from linear: AstroImage) throws -> CGImage {
         let adj = displayAdjustments                         // single locked read
-        let balanced = neutralizeBackground
-            ? AutoStretch.neutralizeBackground(AutoStretch.neutralizeBackgroundAdditive(linear))
+        // DBE first, on linear data. When on, it removes the per-channel spatial
+        // background, so skip the additive neutralize (keep multiplicative WB).
+        let flattened = adj.backgroundExtraction
+            ? BackgroundExtraction.flatten(linear, degree: adj.backgroundDegree)
             : linear
+        let balanced: AstroImage
+        if neutralizeBackground {
+            balanced = adj.backgroundExtraction
+                ? AutoStretch.neutralizeBackground(flattened)                              // multiplicative only
+                : AutoStretch.neutralizeBackground(AutoStretch.neutralizeBackgroundAdditive(flattened))
+        } else {
+            balanced = flattened
+        }
         let stretched = balanced.sourceIsLinear
             ? AutoStretch.stretch(balanced, blackPoint: adj.blackPoint, midtoneStrength: adj.midtoneStrength)
             : balanced

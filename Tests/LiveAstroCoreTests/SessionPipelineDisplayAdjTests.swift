@@ -45,4 +45,20 @@ final class SessionPipelineDisplayAdjTests: XCTestCase {
         XCTAssertNotNil(pipeline.renderCurrentDisplay(adjustments: DisplayAdjustments(saturation: 1.5)))
         XCTAssertEqual(pipeline.displayAdjustments.saturation, 1.5)
     }
+    func testRenderWithDBEEnabledProducesImage() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let subsDir = sandbox.appendingPathComponent("subs")
+        try FileManager.default.createDirectory(at: subsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        var field: [(Double, Double)] = []
+        for i in 0..<20 { field.append((Double((i*47)%240+8), Double((i*83)%240+8))) }
+        try writeSub(subsDir, "Light_001.fit", stars: field)
+        try writeSub(subsDir, "Light_002.fit", stars: field.map { ($0.0+2.4, $0.1-1.1) })
+        let pipeline = makePipeline(sandbox, subsDir)
+        try pipeline.start()
+        _ = try pipeline.end()
+        let adj = DisplayAdjustments(backgroundExtraction: true, backgroundDegree: 2)
+        XCTAssertNotNil(pipeline.renderCurrentDisplay(adjustments: adj))   // DBE path renders, no crash
+        XCTAssertTrue(pipeline.displayAdjustments.backgroundExtraction)
+    }
 }
