@@ -41,6 +41,9 @@ struct ControlView: View {
                         Toggle("Reject outliers (σ-clip)", isOn: $model.rejectionEnabled)
                             .disabled(model.isRunning || model.isImporting)
                             .help("Drop satellite / plane / cosmic-ray streaks by clamping pixels that deviate from the per-pixel stack statistics (winsorized κ-σ). On by default.")
+                        Toggle("Weight frames by quality", isOn: $model.frameWeightingEnabled)
+                            .disabled(model.isRunning || model.isImporting)
+                            .help("Give sharper, lower-noise subs more influence in the stack (star count + background noise). Turn off for an equal-weight stack.")
                         if model.rejectionEnabled {
                             Picker("Strength", selection: $model.rejectionStrength) {
                                 Text("Low").tag(RejectionStrength.low)

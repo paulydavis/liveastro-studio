@@ -13,6 +13,7 @@ public struct SessionSettings: Codable, Equatable {
     public var calibration: CalibrationSelection
     public var rejectionEnabled: Bool
     public var rejectionStrength: RejectionStrength
+    public var frameWeightingEnabled: Bool
     public var processorBackend: ProcessorBackend
     public var displayAdjustments: DisplayAdjustments
 
@@ -20,6 +21,7 @@ public struct SessionSettings: Codable, Equatable {
                 neutralizeBackground: Bool, subExposureSeconds: Double, targetName: String,
                 calibration: CalibrationSelection,
                 rejectionEnabled: Bool = true, rejectionStrength: RejectionStrength = .medium,
+                frameWeightingEnabled: Bool = true,
                 processorBackend: ProcessorBackend = .none,
                 displayAdjustments: DisplayAdjustments = .neutral) {
         self.sourceModeRaw = sourceModeRaw; self.watchFolderPath = watchFolderPath
@@ -27,6 +29,7 @@ public struct SessionSettings: Codable, Equatable {
         self.subExposureSeconds = subExposureSeconds; self.targetName = targetName
         self.calibration = calibration
         self.rejectionEnabled = rejectionEnabled; self.rejectionStrength = rejectionStrength
+        self.frameWeightingEnabled = frameWeightingEnabled
         self.processorBackend = processorBackend; self.displayAdjustments = displayAdjustments
     }
 
@@ -35,7 +38,7 @@ public struct SessionSettings: Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case sourceModeRaw, watchFolderPath, filePrefix, neutralizeBackground
         case subExposureSeconds, targetName, calibration, rejectionEnabled, rejectionStrength
-        case processorBackend, displayAdjustments
+        case frameWeightingEnabled, processorBackend, displayAdjustments
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -48,6 +51,7 @@ public struct SessionSettings: Codable, Equatable {
         calibration = try c.decode(CalibrationSelection.self, forKey: .calibration)
         rejectionEnabled = try c.decodeIfPresent(Bool.self, forKey: .rejectionEnabled) ?? true
         rejectionStrength = try c.decodeIfPresent(RejectionStrength.self, forKey: .rejectionStrength) ?? .medium
+        frameWeightingEnabled = try c.decodeIfPresent(Bool.self, forKey: .frameWeightingEnabled) ?? true
         processorBackend = try c.decodeIfPresent(ProcessorBackend.self, forKey: .processorBackend) ?? .none
         displayAdjustments = try c.decodeIfPresent(DisplayAdjustments.self, forKey: .displayAdjustments) ?? .neutral
     }
@@ -59,6 +63,7 @@ public struct SessionSettings: Codable, Equatable {
                         subExposureSeconds: 60, targetName: "",
                         calibration: CalibrationSelection(darkPath: nil, flatPath: nil, biasPath: nil),
                         rejectionEnabled: true, rejectionStrength: .medium,
+                        frameWeightingEnabled: true,
                         processorBackend: .none, displayAdjustments: .neutral)
     }
 }

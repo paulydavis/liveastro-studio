@@ -19,6 +19,12 @@ public final class StackEngine {
     private let minMatches: Int
     private let inlierTolerance: Double
     private let rejection: RejectionMethod
+    private let frameWeighting: Bool
+    private var weightBaseline: (stars: Int, sigma: Float)?    // set at seed, reset on reseed
+    // Task-1 validated constants:
+    static let weightExponent: Float = 1.0
+    static let weightLo: Float = 0.25
+    static let weightHi: Float = 4.0
     /// Serializes process()/reseed()/currentStack()/stackFrameCount: reseed() runs on the
     /// main thread while process() runs on the pipeline's consume task. A reseed issued
     /// mid-frame applies before the NEXT frame (the intended UX).
@@ -41,12 +47,14 @@ public final class StackEngine {
     /// seedMinStars: must comfortably exceed minMatches (8); 15 gives
     /// C(15,3)=455 triangles for reliable initial matching.
     public init(seedMinStars: Int = 15, minMatches: Int = 8, inlierTolerance: Double = 2.0,
-                rejection: RejectionMethod = NoRejection(), autoReseedThreshold: Int = 6) {
+                rejection: RejectionMethod = NoRejection(), autoReseedThreshold: Int = 6,
+                frameWeighting: Bool = false) {
         self.seedMinStars = seedMinStars
         self.minMatches = minMatches
         self.inlierTolerance = inlierTolerance
         self.rejection = rejection
         self.autoReseedThreshold = autoReseedThreshold
+        self.frameWeighting = frameWeighting
     }
 
     public func reseed() {
@@ -55,9 +63,21 @@ public final class StackEngine {
             referenceStars = []
             referenceSize = nil
             referenceChannels = nil
+            weightBaseline = nil
             rejection.reset()
         }
     }
+
+    /// Per-frame stacking weight from star count + background σ, relative to the
+    /// seed (stars₀, σ₀). Returns 1.0 when weighting is off or before seeding.
+    public func frameWeight(stars: Int, sigma: Float) -> Float {
+        guard frameWeighting, let base = weightBaseline else { return 1.0 }
+        let starTerm = powf(Float(stars) / Float(max(base.stars, 1)), Self.weightExponent)
+        let noiseTerm = powf(base.sigma / max(sigma, 1e-6), 2)
+        return min(max(starTerm * noiseTerm, Self.weightLo), Self.weightHi)
+    }
+
+    func setWeightBaselineForTesting(stars: Int, sigma: Float) { weightBaseline = (stars, sigma) }
 
     public func currentStack() -> AstroImage? {
         lock.withLock { accumulator?.mean() }
@@ -90,7 +110,7 @@ public final class StackEngine {
             return .rejected(.dimensionMismatch)
         }
         let (lum, hw, hh) = Self.halfResLuminance(frame: frame)
-        let stars = StarDetector.detect(luminance: lum, width: hw, height: hh)
+        let (stars, sigma) = StarDetector.detectWithStats(luminance: lum, width: hw, height: hh)
 
         if referenceSize == nil {
             guard stars.count >= seedMinStars else {
@@ -106,6 +126,7 @@ public final class StackEngine {
             referenceStars = stars
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
+            weightBaseline = (stars.count, sigma)
             acceptedCount += 1
             consecutiveNoTransform = 0
             return .becameReference
@@ -130,6 +151,7 @@ public final class StackEngine {
                 referenceSize = nil
                 referenceChannels = nil
                 accumulator = nil
+                weightBaseline = nil
                 consecutiveNoTransform = 0
                 autoReseedCount += 1
             }
@@ -152,7 +174,7 @@ public final class StackEngine {
         }
         let (warped, mask) = Warp.apply(rgb, transform: half.liftedToFullResolution())
         let cleaned = rejection.apply(warped, mask: mask)
-        accumulator.add(cleaned, mask: mask)
+        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma))
         acceptedCount += 1
         consecutiveNoTransform = 0
         return .stacked(frameCount: accumulator.frameCount)
@@ -212,6 +234,7 @@ public final class StackEngine {
     public struct RegisteredFrame {
         public let transform: SimilarityTransform   // half-res transform (lift in warp)
         public let rgb: AstroImage                  // display-oriented RGB
+        public let weight: Float                    // quality-based stacking weight (1.0 when off)
     }
 
     /// Establish the fixed reference from `frame` if it has ≥ seedMinStars.
@@ -222,7 +245,7 @@ public final class StackEngine {
             let raw = frame.image
             guard raw.width >= 2, raw.height >= 2 else { rejectedCount += 1; return false }
             let (lum, hw, hh) = Self.halfResLuminance(frame: frame, minRows: minRows)
-            let stars = StarDetector.detect(luminance: lum, width: hw, height: hh)
+            let (stars, sigma) = StarDetector.detectWithStats(luminance: lum, width: hw, height: hh)
             guard stars.count >= seedMinStars else { rejectedCount += 1; return false }
             let rgb = displayRGB(frame, minRows: minRows)
             let ones = [Float](repeating: 1, count: rgb.width * rgb.height)
@@ -233,6 +256,7 @@ public final class StackEngine {
             referenceStars = stars
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
+            weightBaseline = (stars.count, sigma)
             acceptedCount += 1
             consecutiveNoTransform = 0
             return true
@@ -261,7 +285,7 @@ public final class StackEngine {
         guard raw.width >= 2, raw.height >= 2 else { return nil }
         guard let refSize = referenceSize, refSize == (raw.width, raw.height) else { return nil } // lock-free read — safe under the batch contract documented above
         let (lum, hw, hh) = Self.halfResLuminance(frame: frame, minRows: minRows)
-        let stars = StarDetector.detect(luminance: lum, width: hw, height: hh)
+        let (stars, sigma) = StarDetector.detectWithStats(luminance: lum, width: hw, height: hh)
         guard stars.count >= 3 else { return nil }
         let pairs = TriangleMatcher.correspondences(source: stars, target: referenceStars)
         guard let half = TransformSolver.solve(source: stars, target: referenceStars, pairs: pairs,
@@ -269,7 +293,8 @@ public final class StackEngine {
         else { return nil }
         let rgb = displayRGB(frame, minRows: minRows)
         guard rgb.channels == referenceChannels else { return nil }
-        return RegisteredFrame(transform: half, rgb: rgb)
+        let weight = frameWeight(stars: stars.count, sigma: sigma)
+        return RegisteredFrame(transform: half, rgb: rgb, weight: weight)
     }
 
     /// Warp a registered frame to reference alignment. Pure, concurrent-safe.
@@ -280,11 +305,11 @@ public final class StackEngine {
     /// Accumulate a warped frame into the shared stack under the engine lock.
     /// Bumps acceptedCount. Rejection filtering runs here (serial), preserving any
     /// stateful RejectionMethod. Call from the single serial consumer.
-    public func commit(image: AstroImage, mask: [Float], minRows: Int) {
+    public func commit(image: AstroImage, mask: [Float], frameWeight: Float = 1.0, minRows: Int) {
         lock.withLock {
             guard let accumulator else { return }
             let cleaned = rejection.apply(image, mask: mask)
-            accumulator.add(cleaned, mask: mask, minRows: minRows)
+            accumulator.add(cleaned, mask: mask, frameWeight: frameWeight, minRows: minRows)
             acceptedCount += 1
             consecutiveNoTransform = 0
         }
