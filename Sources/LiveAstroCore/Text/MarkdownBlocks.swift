@@ -105,6 +105,7 @@ public enum MarkdownBlocks {
     }
 
     private static func isTableSeparator(_ line: String) -> Bool {
+        guard line.hasPrefix("|") else { return false }
         guard line.contains("-") else { return false }
         return line.allSatisfy { $0 == "|" || $0 == "-" || $0 == ":" || $0 == " " }
     }

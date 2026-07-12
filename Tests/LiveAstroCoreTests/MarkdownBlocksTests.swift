@@ -48,6 +48,17 @@ final class MarkdownBlocksTests: XCTestCase {
                        [.paragraph("| not a table")])
     }
 
+    func testDashLineWithoutPipeIsNotTableSeparator() {
+        // A pipe header line followed by a dash-only line (no pipe) must NOT be
+        // parsed as a table — the dash line is not a separator row.
+        let md = "| a | b |\n- - -\n| c | d |"
+        let blocks = MarkdownBlocks.parse(md)
+        // No .table should be produced; the first line is a lone pipe-paragraph.
+        for block in blocks {
+            if case .table = block { XCTFail("dash-only line must not form a table separator") }
+        }
+    }
+
     func testBulletListGroupsAndStripsMarker() {
         let md = "- one\n* two\n- three"
         XCTAssertEqual(MarkdownBlocks.parse(md),
