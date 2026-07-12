@@ -160,17 +160,24 @@ public final class StackEngine {
 
     /// Half-res superpixel luminance in DISPLAY orientation (flip rows if bottom-up).
     /// Internal so parity tests exercise the exact production binning.
-    static func halfResLuminance(frame: RawFrame) -> (lum: [Float], width: Int, height: Int) {
+    static func halfResLuminance(frame: RawFrame, minRows: Int = 64)
+        -> (lum: [Float], width: Int, height: Int) {
         let raw = frame.image
         let hw = raw.width / 2, hh = raw.height / 2
         var lum = [Float](repeating: 0, count: hw * hh)
+        let bottomUp = frame.bottomUp
+        let rw = raw.width
         raw.pixels.withUnsafeBufferPointer { p in
-            for j in 0..<hh {
-                let srcRow = frame.bottomUp ? (hh - 1 - j) : j
-                for i in 0..<hw {
-                    let r0 = 2 * srcRow * raw.width + 2 * i
-                    let r1 = r0 + raw.width
-                    lum[j * hw + i] = (p[r0] + p[r0 + 1] + p[r1] + p[r1 + 1]) / 4
+            lum.withUnsafeMutableBufferPointer { lumBuf in
+                Parallel.rows(hh, minRows: minRows) { rows in
+                    for j in rows {
+                        let srcRow = bottomUp ? (hh - 1 - j) : j
+                        for i in 0..<hw {
+                            let r0 = 2 * srcRow * rw + 2 * i
+                            let r1 = r0 + rw
+                            lumBuf[j * hw + i] = (p[r0] + p[r0 + 1] + p[r1] + p[r1 + 1]) / 4
+                        }
+                    }
                 }
             }
         }

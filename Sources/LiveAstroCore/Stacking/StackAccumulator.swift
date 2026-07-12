@@ -13,14 +13,28 @@ public final class StackAccumulator {
         weight = [Float](repeating: 0, count: width * height)
     }
 
-    public func add(_ image: AstroImage, mask: [Float]) {
+    public func add(_ image: AstroImage, mask: [Float], minRows: Int = 64) {
         precondition(image.width == width && image.height == height && image.channels == channels)
         let plane = width * height
-        for i in 0..<plane {
-            let m = mask[i]
-            guard m > 0 else { continue }
-            weight[i] += m
-            for c in 0..<channels { sum[c * plane + i] += m * image.pixels[c * plane + i] }
+        let w = width, chans = channels
+        image.pixels.withUnsafeBufferPointer { src in
+            mask.withUnsafeBufferPointer { m in
+                sum.withUnsafeMutableBufferPointer { sumBuf in
+                    weight.withUnsafeMutableBufferPointer { wBuf in
+                        Parallel.rows(height, minRows: minRows) { rows in
+                            for y in rows {
+                                for x in 0..<w {
+                                    let i = y * w + x
+                                    let mv = m[i]
+                                    guard mv > 0 else { continue }
+                                    wBuf[i] += mv
+                                    for c in 0..<chans { sumBuf[c * plane + i] += mv * src[c * plane + i] }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         frameCount += 1
     }
