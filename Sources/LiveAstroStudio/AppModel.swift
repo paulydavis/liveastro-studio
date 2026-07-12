@@ -69,6 +69,7 @@ final class AppModel {
     var displayAdjustments = DisplayAdjustments.neutral
     private(set) var lastSessionDirectory: URL?
     var errorMessage: String?
+    var zoomPan = ZoomPanState.fit
 
     /// Drives the error alert; dismissal (setting false) clears errorMessage.
     /// Setting true directly is a no-op — present errors via errorMessage.
@@ -233,6 +234,7 @@ final class AppModel {
         guard !isRunning else { return }
         guard !isImporting else { errorMessage = "Finish the import before starting a session."; return }
         guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return }
+        zoomPan = .fit
         let root = liveAstroRoot
 
         let p: SessionPipeline
@@ -450,6 +452,7 @@ final class AppModel {
 
     func startSeestarLive() {
         guard !isRunning, !isImporting, !isDetecting else { return }
+        zoomPan = .fit
         isDetecting = true
         log.append("Looking for Seestar share…")
         Task.detached { [weak self] in
