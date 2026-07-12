@@ -105,6 +105,13 @@ final class SessionSettingsDisplayAdjTests: XCTestCase {
         XCTAssertEqual(s.displayAdjustments, .neutral)
     }
 
+    func testFrameWeightingDefaultsTrueAndBackwardCompat() throws {
+        // An old settings blob without the key decodes to true (default on).
+        let old = #"{"sourceModeRaw":"Raw subs (native stacking)","filePrefix":"Light_","neutralizeBackground":false,"subExposureSeconds":10,"targetName":"M8","calibration":{},"rejectionEnabled":true,"rejectionStrength":"medium"}"#
+        let s = try JSONDecoder().decode(SessionSettings.self, from: Data(old.utf8))
+        XCTAssertTrue(s.frameWeightingEnabled)
+    }
+
     // Encode the current default calibration so the old-blob JSON stays valid if
     // CalibrationSelection's shape changes.
     private func calibrationJSON() throws -> String {
