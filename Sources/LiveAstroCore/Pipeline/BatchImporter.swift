@@ -24,6 +24,7 @@ public final class BatchImporter {
     /// One worker's output: a warped frame (nil = rejected).
     private struct Work {
         let warped: (image: AstroImage, mask: [Float])?
+        let frameWeight: Float
         let name: String
         let timestamp: Date
         let metadata: SourceMetadata?
@@ -66,9 +67,9 @@ public final class BatchImporter {
                     let frameMeta = frame.metadata
                     if let reg = engine.register(prepared, minRows: .max) {
                         let w = engine.warp(reg, minRows: .max)
-                        return Work(warped: w, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
+                        return Work(warped: w, frameWeight: reg.weight, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
                     }
-                    return Work(warped: nil, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
+                    return Work(warped: nil, frameWeight: 1.0, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
                 }
                 inFlight += 1
                 return true
@@ -80,7 +81,7 @@ public final class BatchImporter {
                 guard let work = await group.next() else { break }
                 inFlight -= 1
                 if let w = work.warped {
-                    engine.commit(image: w.image, mask: w.mask, minRows: .max)
+                    engine.commit(image: w.image, mask: w.mask, frameWeight: work.frameWeight, minRows: .max)
                     onCommitted(Committed(index: engine.acceptedCount, sourceName: work.name, timestamp: work.timestamp, metadata: work.metadata))
                 } else {
                     engine.commitRejection()

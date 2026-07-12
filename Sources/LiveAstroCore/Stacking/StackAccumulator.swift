@@ -13,7 +13,7 @@ public final class StackAccumulator {
         weight = [Float](repeating: 0, count: width * height)
     }
 
-    public func add(_ image: AstroImage, mask: [Float], minRows: Int = 64) {
+    public func add(_ image: AstroImage, mask: [Float], frameWeight: Float = 1.0, minRows: Int = 64) {
         precondition(image.width == width && image.height == height && image.channels == channels)
         let plane = width * height
         let w = width, chans = channels
@@ -25,7 +25,7 @@ public final class StackAccumulator {
                             for y in rows {
                                 for x in 0..<w {
                                     let i = y * w + x
-                                    let mv = m[i]
+                                    let mv = frameWeight * m[i]
                                     guard mv > 0 else { continue }
                                     wBuf[i] += mv
                                     for c in 0..<chans { sumBuf[c * plane + i] += mv * src[c * plane + i] }
