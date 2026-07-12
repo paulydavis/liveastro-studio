@@ -107,15 +107,25 @@ struct ControlView: View {
                             .onChange(of: model.displayAdjustments.backgroundExtraction) { _, _ in
                                 model.applyDisplayAdjustments()
                             }
-                        Picker("Gradient shape", selection: $model.displayAdjustments.backgroundDegree) {
-                            Text("Planar").tag(1)
-                            Text("Quadratic").tag(2)
-                        }
-                        .pickerStyle(.segmented)
-                        .disabled(!model.displayAdjustments.backgroundExtraction)
-                        .help("Planar removes a linear tilt; Quadratic also removes curvature/vignette.")
-                        .onChange(of: model.displayAdjustments.backgroundDegree) { _, _ in
-                            model.applyDisplayAdjustments()
+                        if model.displayAdjustments.backgroundExtraction {
+                            HStack {
+                                Text("Scale").frame(width: 90, alignment: .leading)
+                                Slider(value: $model.displayAdjustments.bgScale, in: 1...15) { editing in
+                                    if !editing { model.applyDisplayAdjustments() }
+                                }
+                                Text(String(format: "%.1f%%", model.displayAdjustments.bgScale))
+                                    .frame(width: 48, alignment: .trailing).monospacedDigit()
+                            }
+                            .help("Smoothing scale as % of image size — lower follows local/corner gradients, higher removes only broad gradients.")
+                            HStack {
+                                Text("Smoothest").frame(width: 90, alignment: .leading)
+                                Slider(value: $model.displayAdjustments.bgSmoothest, in: 0...3) { editing in
+                                    if !editing { model.applyDisplayAdjustments() }
+                                }
+                                Text(String(format: "%.1f", model.displayAdjustments.bgSmoothest))
+                                    .frame(width: 48, alignment: .trailing).monospacedDigit()
+                            }
+                            .help("Extra blur on the background model — raise to remove residual blotchiness, lower to track non-smooth gradients.")
                         }
                         Button("Reset") {
                             model.displayAdjustments = .neutral

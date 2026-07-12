@@ -40,7 +40,7 @@ These sliders are **non-destructive** — they change only what you see, never t
 Press **Reset** to return to neutral (the default, byte-identical to the unadjusted view). Two background tools help with light pollution:
 
 - **Neutralize background** — removes an overall color cast (e.g. the green tint on one-shot-color sky).
-- **Background extraction (DBE)** — fits and subtracts a smooth gradient across the frame.
+- **Background extraction (DBE)** — fits and subtracts a smooth gradient across the frame. For a nebula that fills the whole frame, raise Scale or leave it off — the model can over-flatten a frame-filling nebula in the display (the master is never affected).
 
 ---
 

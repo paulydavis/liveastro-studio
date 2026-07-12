@@ -177,7 +177,7 @@ public final class SessionPipeline {
         // DBE first, on linear data. When on, it removes the per-channel spatial
         // background, so skip the additive neutralize (keep multiplicative WB).
         let flattened = adj.backgroundExtraction
-            ? BackgroundExtraction.flatten(linear, degree: adj.backgroundDegree)
+            ? BackgroundExtraction.flattenMultiscale(linear, scale: adj.bgScale, smoothest: adj.bgSmoothest)
             : linear
         let balanced: AstroImage
         if neutralizeBackground {
