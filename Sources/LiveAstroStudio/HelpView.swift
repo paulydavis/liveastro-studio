@@ -61,7 +61,9 @@ struct HelpView: View {
                         Text(inline(h)).bold()
                     }
                 }
-                Divider()
+                GridRow {
+                    Divider().gridCellColumns(headers.count)
+                }
                 ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                     GridRow {
                         ForEach(Array(row.enumerated()), id: \.offset) { _, cell in
