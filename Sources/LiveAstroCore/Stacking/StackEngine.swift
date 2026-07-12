@@ -187,10 +187,10 @@ public final class StackEngine {
     /// Debayer in stored order (never flip the CFA), then flip rows to top-down display.
     /// RawFrame contract: bayerPattern != nil implies channels == 1 (a violated
     /// contract traps in Debayer.bilinear rather than silently mis-rendering).
-    private func displayRGB(_ frame: RawFrame) -> AstroImage {
+    private func displayRGB(_ frame: RawFrame, minRows: Int = 64) -> AstroImage {
         var rgb: AstroImage
         if let pattern = frame.bayerPattern, frame.image.channels == 1 {
-            rgb = Debayer.bilinear(cfa: frame.image, pattern: pattern)
+            rgb = Debayer.bilinear(cfa: frame.image, pattern: pattern, minRows: minRows)
         } else {
             rgb = frame.image
         }
@@ -206,5 +206,92 @@ public final class StackEngine {
         }
         return AstroImage(width: w, height: h, channels: rgb.channels,
                           pixels: flipped, sourceIsLinear: rgb.sourceIsLinear)
+    }
+
+    /// A frame that registered against the current reference; ready to warp+commit.
+    public struct RegisteredFrame {
+        public let transform: SimilarityTransform   // half-res transform (lift in warp)
+        public let rgb: AstroImage                  // display-oriented RGB
+    }
+
+    /// Establish the fixed reference from `frame` if it has ≥ seedMinStars.
+    /// Returns true on success (frame counts as accepted). Serial — call before
+    /// any concurrent register(). Bumps rejectedCount on a too-few-stars frame.
+    public func seedReference(_ frame: RawFrame, minRows: Int) -> Bool {
+        lock.withLock {
+            let raw = frame.image
+            guard raw.width >= 2, raw.height >= 2 else { rejectedCount += 1; return false }
+            let (lum, hw, hh) = Self.halfResLuminance(frame: frame, minRows: minRows)
+            let stars = StarDetector.detect(luminance: lum, width: hw, height: hh)
+            guard stars.count >= seedMinStars else { rejectedCount += 1; return false }
+            let rgb = displayRGB(frame, minRows: minRows)
+            let ones = [Float](repeating: 1, count: rgb.width * rgb.height)
+            let seed = rejection.apply(rgb, mask: ones)
+            let acc = StackAccumulator(width: rgb.width, height: rgb.height, channels: rgb.channels)
+            acc.add(seed, mask: ones, minRows: minRows)
+            accumulator = acc
+            referenceStars = stars
+            referenceSize = (raw.width, raw.height)
+            referenceChannels = rgb.channels
+            acceptedCount += 1
+            consecutiveNoTransform = 0
+            return true
+        }
+    }
+
+    /// Register `frame` against the ALREADY-SEEDED, immutable reference.
+    ///
+    /// Pure and lock-free: reads reference state (referenceStars, referenceSize,
+    /// referenceChannels) without the lock and mutates nothing, so it is safe to call
+    /// CONCURRENTLY from a worker pool.
+    ///
+    /// CONTRACT: the caller MUST ensure `seedReference(...)` has returned before
+    /// issuing any concurrent `register(...)` calls, and MUST NOT mutate the engine
+    /// (no `process`, `seedReference`, or `reseed`) during the concurrent phase.
+    /// Reference state is established once at seed and treated as immutable for the
+    /// duration of a batch import.
+    ///
+    /// (Swift 5.10: the lock-free reads are safe under this contract; a future
+    /// Swift 6 strict-concurrency migration would annotate the reference properties
+    /// accordingly.)
+    ///
+    /// Returns nil if rejected.
+    public func register(_ frame: RawFrame, minRows: Int) -> RegisteredFrame? {
+        let raw = frame.image
+        guard raw.width >= 2, raw.height >= 2 else { return nil }
+        guard let refSize = referenceSize, refSize == (raw.width, raw.height) else { return nil } // lock-free read — safe under the batch contract documented above
+        let (lum, hw, hh) = Self.halfResLuminance(frame: frame, minRows: minRows)
+        let stars = StarDetector.detect(luminance: lum, width: hw, height: hh)
+        guard stars.count >= 3 else { return nil }
+        let pairs = TriangleMatcher.correspondences(source: stars, target: referenceStars)
+        guard let half = TransformSolver.solve(source: stars, target: referenceStars, pairs: pairs,
+                                               minMatches: minMatches, inlierTolerance: inlierTolerance)
+        else { return nil }
+        let rgb = displayRGB(frame, minRows: minRows)
+        guard rgb.channels == referenceChannels else { return nil }
+        return RegisteredFrame(transform: half, rgb: rgb)
+    }
+
+    /// Warp a registered frame to reference alignment. Pure, concurrent-safe.
+    public func warp(_ reg: RegisteredFrame, minRows: Int) -> (image: AstroImage, mask: [Float]) {
+        Warp.apply(reg.rgb, transform: reg.transform.liftedToFullResolution(), minRows: minRows)
+    }
+
+    /// Accumulate a warped frame into the shared stack under the engine lock.
+    /// Bumps acceptedCount. Rejection filtering runs here (serial), preserving any
+    /// stateful RejectionMethod. Call from the single serial consumer.
+    public func commit(image: AstroImage, mask: [Float], minRows: Int) {
+        lock.withLock {
+            guard let accumulator else { return }
+            let cleaned = rejection.apply(image, mask: mask)
+            accumulator.add(cleaned, mask: mask, minRows: minRows)
+            acceptedCount += 1
+            consecutiveNoTransform = 0
+        }
+    }
+
+    /// Record a batch rejection (bumps rejectedCount) under the lock.
+    public func commitRejection() {
+        lock.withLock { rejectedCount += 1 }
     }
 }
