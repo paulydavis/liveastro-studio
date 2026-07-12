@@ -331,6 +331,7 @@ final class OBSControllerTests: XCTestCase {
         // SetCurrentProgramScene comes before StartStream
         XCTAssertLessThan(types.firstIndex(of: "SetCurrentProgramScene")!,
                           types.firstIndex(of: "StartStream")!)
+        XCTAssertFalse(types.contains("StopStream"))   // success must NOT stop the stream
         controller.disconnect()
     }
 

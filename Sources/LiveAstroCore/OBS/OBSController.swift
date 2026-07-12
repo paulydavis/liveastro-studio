@@ -168,6 +168,7 @@ public final class OBSController: ObservableObject {
     /// confirm it went live by polling GetStreamStatus. On failure to confirm,
     /// send StopStream to reset OBS (don't leave it half-streaming) and return
     /// false. Returns true once outputActive is confirmed.
+    /// At least one confirmation poll is always performed (maxConfirmPolls is floored to 1).
     @discardableResult
     public func startBroadcast(scene: String?, confirmPollSeconds: Double = 1.0,
                                maxConfirmPolls: Int = 5) async -> Bool {
