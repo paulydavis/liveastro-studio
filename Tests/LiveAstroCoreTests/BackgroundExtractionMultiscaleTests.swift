@@ -75,13 +75,4 @@ final class BackgroundExtractionMultiscaleTests: XCTestCase {
         XCTAssertEqual(a.pixels, b.pixels)
     }
 
-    func testStructureFillsFrameFallsBackToPolynomial() {
-        // A frame that is almost entirely bright structure → too little sky → poly fallback.
-        let w = 96, h = 96
-        let img = AstroImage(width: w, height: h, channels: 3,
-                             pixels: [Float](repeating: 0.8, count: w*h*3), sourceIsLinear: true)
-        let ms = BackgroundExtraction.flattenMultiscale(img, scale: 3, smoothest: 0.5)
-        let poly = BackgroundExtraction.flatten(img, degree: 2)
-        XCTAssertEqual(ms.pixels, poly.pixels)   // fell back to the polynomial
-    }
 }

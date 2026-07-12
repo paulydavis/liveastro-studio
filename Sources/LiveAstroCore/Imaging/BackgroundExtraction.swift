@@ -101,9 +101,9 @@ public enum BackgroundExtraction {
     /// Spatially-varying, structure-protected background model (DBE v3 primary).
     /// Iteratively smooths at the `scale` radius, rejects+inpaints structure, then
     /// subtracts the model. Follows LOCAL/corner gradients a low-order polynomial
-    /// cannot. Falls back to `flatten(_,degree:2)` when structure fills the frame.
-    /// Display-path only; deterministic. `scale` is % of image size; `smoothest`
-    /// is the final blur strength.
+    /// cannot. Multiscale is the sole model; polynomial `flatten` is retained for
+    /// direct use. Display-path only; deterministic. `scale` is % of image size;
+    /// `smoothest` is the final blur strength.
     public static func flattenMultiscale(_ image: AstroImage,
                                          scale: Double, smoothest: Double) -> AstroImage {
         guard image.channels == 3 else { return image }               // mono passthrough
@@ -116,13 +116,11 @@ public enum BackgroundExtraction {
         let maxIters = 5
         let k: Float = 3.0              // structure rejection sigma
         let grow = 2                    // mask grow (downsampled px)
-        let fallbackFraction: Float = 0.5
 
         let sw = max(2, w / D), sh = max(2, h / D)
         let scaleRadius = max(1, Int((scale / 100.0) * Double(max(sw, sh))))
 
         var out = src
-        var totalStructureFrac: Float = 0
         var perChannelModelUp = [[Float]](repeating: [], count: 3)
 
         for c in 0..<3 {
@@ -138,11 +136,9 @@ public enum BackgroundExtraction {
                 small[j*sw + i] = n > 0 ? s / n : 0
             } }
             // 2. iterate smooth → reject → inpaint
-            // Triple box blur ≈ Gaussian (closer to scipy gaussian_filter than a single pass),
-            // ensuring structure is well-suppressed before residual computation.
             var work = small
-            var lastMask = [Bool](repeating: false, count: sw*sh)
             for _ in 0..<maxIters {
+                // Triple box blur ≈ Gaussian (box³ → Gaussian by CLT) — approximates the prototype's scipy gaussian_filter without changing the validated constants.
                 var bg = boxBlur(work, sw, sh, radius: scaleRadius)
                 bg = boxBlur(bg, sw, sh, radius: scaleRadius)
                 bg = boxBlur(bg, sw, sh, radius: scaleRadius)
@@ -153,7 +149,6 @@ public enum BackgroundExtraction {
                 for idx in 0..<mask.count where resid[idx] > k * s { mask[idx] = true }
                 mask = dilate(mask, sw, sh, iterations: grow)
                 for idx in 0..<work.count where mask[idx] { work[idx] = bg[idx] }
-                lastMask = mask
             }
             var bg = boxBlur(work, sw, sh, radius: scaleRadius)
             bg = boxBlur(bg, sw, sh, radius: scaleRadius)
@@ -164,7 +159,6 @@ public enum BackgroundExtraction {
                 bg = boxBlur(bg, sw, sh, radius: sr)
                 bg = boxBlur(bg, sw, sh, radius: sr)
             }
-            totalStructureFrac += Float(lastMask.lazy.filter { $0 }.count) / Float(sw*sh) / 3
             // 3. upsample (block replicate) to full res
             var up = [Float](repeating: 0, count: plane)
             for y in 0..<h { for x in 0..<w {
@@ -173,10 +167,7 @@ public enum BackgroundExtraction {
             perChannelModelUp[c] = up
         }
 
-        // 4. structure fills frame → too little sky → polynomial fallback
-        if totalStructureFrac > fallbackFraction { return flatten(image, degree: 2) }
-
-        // 5. subtract with clamp-safe pedestal re-add
+        // 4. subtract with clamp-safe pedestal re-add
         for c in 0..<3 {
             let base = c * plane
             let up = perChannelModelUp[c]
