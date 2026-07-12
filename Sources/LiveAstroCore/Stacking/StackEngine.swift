@@ -32,15 +32,21 @@ public final class StackEngine {
     public private(set) var acceptedCount = 0
     /// Session-total rejected frames; deliberately NOT reset by reseed().
     public private(set) var rejectedCount = 0
+    /// Session-total automatic reseeds (reference cleared after systematic
+    /// registration failure). Not reset by reseed(), like acceptedCount.
+    public private(set) var autoReseedCount = 0
+    private let autoReseedThreshold: Int
+    private var consecutiveNoTransform = 0
 
     /// seedMinStars: must comfortably exceed minMatches (8); 15 gives
     /// C(15,3)=455 triangles for reliable initial matching.
     public init(seedMinStars: Int = 15, minMatches: Int = 8, inlierTolerance: Double = 2.0,
-                rejection: RejectionMethod = NoRejection()) {
+                rejection: RejectionMethod = NoRejection(), autoReseedThreshold: Int = 6) {
         self.seedMinStars = seedMinStars
         self.minMatches = minMatches
         self.inlierTolerance = inlierTolerance
         self.rejection = rejection
+        self.autoReseedThreshold = autoReseedThreshold
     }
 
     public func reseed() {
@@ -101,6 +107,7 @@ public final class StackEngine {
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
             acceptedCount += 1
+            consecutiveNoTransform = 0
             return .becameReference
         }
 
@@ -115,6 +122,17 @@ public final class StackEngine {
                                                minMatches: minMatches, inlierTolerance: inlierTolerance)
         else {
             rejectedCount += 1
+            consecutiveNoTransform += 1
+            if autoReseedThreshold > 0 && consecutiveNoTransform >= autoReseedThreshold {
+                // Systematic mismatch ⇒ the reference is probably a wrong-target
+                // frame. Clear it so the next ≥seedMinStars frame re-seeds.
+                referenceStars = []
+                referenceSize = nil
+                referenceChannels = nil
+                accumulator = nil
+                consecutiveNoTransform = 0
+                autoReseedCount += 1
+            }
             return .rejected(.noTransform)
         }
         let rgb = displayRGB(frame)
@@ -133,6 +151,7 @@ public final class StackEngine {
         let cleaned = rejection.apply(warped, mask: mask)
         accumulator.add(cleaned, mask: mask)
         acceptedCount += 1
+        consecutiveNoTransform = 0
         return .stacked(frameCount: accumulator.frameCount)
     }
 
