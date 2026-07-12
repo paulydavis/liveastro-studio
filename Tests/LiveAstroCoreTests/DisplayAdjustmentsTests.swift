@@ -48,3 +48,25 @@ final class DisplayAdjustmentsTests: XCTestCase {
         XCTAssertEqual(a.backgroundDegree, 1)    // absent → default
     }
 }
+
+final class DisplayAdjustmentsDBEv3Tests: XCTestCase {
+    func testNewFieldsHaveDefaultsAndRoundTrip() throws {
+        var a = DisplayAdjustments.neutral
+        XCTAssertEqual(a.bgScale, 3.0, accuracy: 1e-9)      // Task-1 validated default
+        XCTAssertEqual(a.bgSmoothest, 0.5, accuracy: 1e-9)
+        a.bgScale = 2.0; a.bgSmoothest = 0.2
+        let data = try JSONEncoder().encode(a)
+        let back = try JSONDecoder().decode(DisplayAdjustments.self, from: data)
+        XCTAssertEqual(back.bgScale, 2.0, accuracy: 1e-9)
+        XCTAssertEqual(back.bgSmoothest, 0.2, accuracy: 1e-9)
+    }
+
+    func testDecodesOldSettingsWithoutBgFields() throws {
+        // An old settings blob (no bgScale/bgSmoothest) must decode to defaults.
+        let old = #"{"blackPoint":0,"midtoneStrength":0,"saturation":1,"backgroundExtraction":true,"backgroundDegree":2}"#
+        let a = try JSONDecoder().decode(DisplayAdjustments.self, from: Data(old.utf8))
+        XCTAssertEqual(a.bgScale, 3.0, accuracy: 1e-9)
+        XCTAssertEqual(a.bgSmoothest, 0.5, accuracy: 1e-9)
+        XCTAssertTrue(a.backgroundExtraction)
+    }
+}
