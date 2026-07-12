@@ -73,4 +73,15 @@ final class FrameRelayTests: XCTestCase {
         try write(src, "Light_M 8_10.0s_LP_20260711-010002.fit")   // new and matches
         XCTAssertEqual(try r.copyOnce(), 1)                        // only the matching new one
     }
+
+    func testBroadFitsGlobRelaysBothExtensionsSessionScoped() throws {
+        let src = try tmp(), dst = try tmp()
+        try write(src, "old.fit")                        // backlog
+        let r = FrameRelay(source: src, destination: dst, glob: "*.fit")
+        r.snapshotBaseline()                             // exclude backlog
+        try write(src, "new1.fit")
+        try write(src, "note.txt")                       // non-FITS ignored
+        XCTAssertEqual(try r.copyOnce(), 1)              // only the new .fit
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dst.appendingPathComponent("new1.fit").path))
+    }
 }
