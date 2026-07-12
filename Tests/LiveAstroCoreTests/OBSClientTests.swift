@@ -59,6 +59,13 @@ final class OBSClientTests: XCTestCase {
         return d["requestId"] as! String
     }
 
+    private func requestType(fromSent frame: String) -> String {
+        let data = frame.data(using: .utf8)!
+        let obj = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let d = obj["d"] as! [String: Any]
+        return d["requestType"] as! String
+    }
+
     /// Extract `authentication` string from a sent op-1 Identify frame (nil if absent).
     private func authString(fromSent frame: String) -> String? {
         let data = frame.data(using: .utf8)!
@@ -185,13 +192,19 @@ final class OBSClientTests: XCTestCase {
         try await waitUntil { await mock.sentFrames.filter { $0.contains("\"op\":6") }.count == 2 }
 
         let sent6 = await mock.sentFrames.filter { $0.contains("\"op\":6") }
-        let id1 = requestId(fromSent: sent6[0])
-        let id2 = requestId(fromSent: sent6[1])
+        // Match each id to its request TYPE, not its position in `sent6`. The two
+        // `async let` requests send concurrently via child Tasks, so their frames
+        // can be recorded in EITHER order — indexing sent6[0]/[1] would flip the
+        // id↔request mapping under that race and mis-address the responses.
+        let firstFrame = sent6.first { requestType(fromSent: $0) == "First" }!
+        let secondFrame = sent6.first { requestType(fromSent: $0) == "Second" }!
+        let firstId = requestId(fromSent: firstFrame)
+        let secondId = requestId(fromSent: secondFrame)
 
-        // Respond to the SECOND request first, then the first.
-        mock.enqueueInbound(responseFrame(requestId: id2, requestType: "Second", ok: true,
+        // Respond to the SECOND request first, then the first (out of order).
+        mock.enqueueInbound(responseFrame(requestId: secondId, requestType: "Second", ok: true,
                                           code: 100, responseData: ["which": "second"]))
-        mock.enqueueInbound(responseFrame(requestId: id1, requestType: "First", ok: true,
+        mock.enqueueInbound(responseFrame(requestId: firstId, requestType: "First", ok: true,
                                           code: 100, responseData: ["which": "first"]))
 
         let d1 = try await r1
