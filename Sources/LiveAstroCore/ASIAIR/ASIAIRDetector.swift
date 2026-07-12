@@ -49,7 +49,11 @@ public enum ASIAIRDetector {
     }
 
     private static func folderContainsFITS(_ folder: URL, fm: FileManager) -> Bool {
-        let items = (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
-        return items.contains { ["fit", "fits"].contains(($0 as NSString).pathExtension.lowercased()) }
+        let items = (try? fm.contentsOfDirectory(at: folder,
+                        includingPropertiesForKeys: [.isRegularFileKey])) ?? []
+        return items.contains { url in
+            guard ["fit", "fits"].contains(url.pathExtension.lowercased()) else { return false }
+            return (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile ?? false
+        }
     }
 }

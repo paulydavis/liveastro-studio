@@ -98,4 +98,14 @@ final class ASIAIRDetectorTests: XCTestCase {
         XCTAssertEqual(found?.subFileExtension, "fits")
         XCTAssertEqual(found?.subExposure, 45)
     }
+
+    func testDirectoryNamedLikeFITSIsNotCounted() throws {
+        let volumes = try tmp()
+        let vol = volumes.appendingPathComponent("ASIAIR", isDirectory: true)
+        let t = try makeTarget(vol, "M 1")
+        // A *directory* named like a FITS file must not satisfy the containment guard.
+        try FileManager.default.createDirectory(at: t.appendingPathComponent("nested.fit"),
+                                                withIntermediateDirectories: true)
+        XCTAssertNil(ASIAIRDetector.detect(volumesRoot: volumes))
+    }
 }
