@@ -41,12 +41,23 @@ public enum BackgroundExtraction {
         }
     }
 
+    /// Minimum fraction of covered pixels a tile must have to be included when a
+    /// mask is supplied. Partial border tiles at a looser gate bias the degree-2
+    /// quadratic terms; 0.75 matches the R1 prototype threshold.
+    static let minTileCoverage: Float = 0.75
+
     /// Fit a per-channel low-order polynomial background (steps 1–3 of flatten):
     /// tile medians → σ-clip bright tiles → least-squares. 3-channel only (others
     /// get all-nil coeffs). Deterministic; NaN/Inf sanitized up front.
+    ///
+    /// - Parameter mask: optional coverage mask of length `w*h` (1 = covered, 0 = outside).
+    ///   A tile is included only when its covered fraction ≥ `minTileCoverage`.
+    ///   When `nil`, all tiles are included — behaviour is EXACTLY as before
+    ///   (flatten's byte-identity depends on this).
     public static func fitBackground(_ image: AstroImage, degree: Int,
                                      tilesPerAxis: Int = 32,
-                                     rejectionSigma: Double = 2.0) -> BackgroundModel {
+                                     rejectionSigma: Double = 2.0,
+                                     mask: [Float]? = nil) -> BackgroundModel {
         let w = image.width, h = image.height, plane = w * h
         let deg = min(max(degree, 1), 2)
         let nCoeff = deg == 1 ? 3 : 6
@@ -68,6 +79,16 @@ public enum BackgroundExtraction {
                 for tx in 0..<tiles {
                     let x0 = tx * w / tiles, x1 = (tx + 1) * w / tiles
                     if x1 <= x0 { continue }
+                    // When a mask is provided, check tile coverage fraction.
+                    // mask: nil → include all tiles (exact legacy path, byte-identical).
+                    if let mask = mask {
+                        var covered: Float = 0
+                        let tileCount = Float((y1 - y0) * (x1 - x0))
+                        for yy in y0..<y1 { for xx in x0..<x1 {
+                            if mask[yy * w + xx] > 0 { covered += 1 }
+                        } }
+                        if tileCount == 0 || covered / tileCount < minTileCoverage { continue }
+                    }
                     var vals: [Float] = []; vals.reserveCapacity((y1-y0)*(x1-x0))
                     for yy in y0..<y1 { for xx in x0..<x1 { vals.append(src[base + yy*w + xx]) } }
                     vals.sort()
