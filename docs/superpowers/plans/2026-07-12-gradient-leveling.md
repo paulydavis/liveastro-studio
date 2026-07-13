@@ -810,3 +810,32 @@ git commit -m "feat: 'Match sky background' toggle (default on) wired to the sta
 ## After all tasks
 
 Dispatch the final whole-branch review (opus) per subagent-driven-development, then finish the branch (merge to main + push + repackage dist). Repackage recipe: `swift build -c release --scratch-path /private/tmp/las-release-build`, then `ditto` the binary + `LiveAstroStudio_LiveAstroStudio.bundle` into `dist/LiveAstroStudio.app/Contents/MacOS/`, `xattr -cr`, `codesign --force --sign -` the executable, verify `codesign --verify --ignore-resources`.
+
+---
+
+# REWORK ADDENDUM (post-adversarial-review): fit-on-warped
+
+Adversarial cold review proved two Criticals in the as-built feature: (C1) the sub model is fit on the UN-warped frame but applied in the WARPED grid — injects spurious gradient under rotation (133 ADU at a meridian flip); (C2) a frame-filling nebula contaminates the fit and a dithered nebula creates a spurious differential. Both fixed by fitting the sub model on the WARPED, reference-aligned frame, mask-aware. R1 prototype (commit a350b50) validated: degree 2, coverage gate ≥ 0.75.
+
+### Task R2: `fitBackground` mask-aware + degree-2 default
+
+**Files:** Modify `Sources/LiveAstroCore/Imaging/BackgroundExtraction.swift`, `Tests/LiveAstroCoreTests/BackgroundModelTests.swift`
+
+Add `mask: [Float]? = nil` parameter to `fitBackground(_:degree:tilesPerAxis:rejectionSigma:mask:)`. When non-nil (length w*h), a tile is included ONLY if its covered fraction (mean of mask values > 0 over the tile) ≥ 0.75 (named constant `minTileCoverage: Float = 0.75`, cite the R1 prototype). `flatten` continues to call with `mask: nil` (byte-identical — existing BackgroundExtractionTests stay green + unmodified). TDD: a test with a synthetic border-zero region (right 40% masked out) shows the masked fit recovers the true gradient of the covered region while the unmasked fit is biased; a fully-covered mask equals nil-mask fit exactly.
+
+### Task R3: `GradientLeveler` surface-subtract + guards
+
+**Files:** Modify `Sources/LiveAstroCore/Stacking/GradientLeveler.swift`, `Tests/LiveAstroCoreTests/GradientLevelerTests.swift`
+
+Replace the coefficient-zip with per-model surface evaluation: `surfSub = evaluate(cs, subModel.degree, …)`, `surfRef = evaluate(cr, refModel.degree, …)`, subtract `surfSub[i] − surfRef[i]` per pixel (fixes the PROVEN degree-mismatch crash and the zip-truncation silent corruption; models of different degrees now compose correctly). Keep the identical-model byte-identical fast path (skip when `cs == cr && subModel.degree == refModel.degree`). Sanitize: if either surface value or the pixel result is non-finite, passthrough that pixel's original value (fixes the NaN-through-clamp gap). TDD: regression test sub.deg2/ref.deg1 (crashed before — now correct surface difference); sub.deg1/ref.deg2 quadratic no longer silently dropped; NaN coeff → output finite and equal to input.
+
+### Task R4: `StackEngine` fit AFTER warp + degree 2
+
+**Files:** Modify `Sources/LiveAstroCore/Stacking/StackEngine.swift`, `Sources/LiveAstroCore/Pipeline/BatchImporter.swift`, `Tests/LiveAstroCoreTests/GradientLevelingEngineTests.swift`
+
+- `backgroundDegree` 1 → 2 (cite R1).
+- Remove the fit from `register` (drop `RegisteredFrame.backgroundModel`). Add a pure, lock-free helper `fitWarpedBackground(image: AstroImage, mask: [Float]) -> BackgroundExtraction.BackgroundModel?` — nil when `normalization` off; else `fitBackground(image, degree: Self.backgroundDegree, mask: mask)`.
+- Live path (`processLocked`): after `Warp.apply`, `let subModel = fitWarpedBackground(image: warped, mask: mask)` then level (both-non-nil guard unchanged).
+- Import path: `BatchImporter` worker calls `engine.warp(...)` then `engine.fitWarpedBackground(image: w.image, mask: w.mask)` (still on the pool — pure) and carries it in `Work.backgroundModel` → `commit` (signature unchanged).
+- Seed baseline unchanged: fit on the seed rgb with a full-coverage mask (`mask: nil` domain equivalent — pass `nil`-mask path by fitting `fitBackground(rgb, degree: Self.backgroundDegree)`); the seed IS reference coords.
+- Tests: update engine tests for the new call shape; add a rotation regression — a sub captured with a strong gradient and warped under rotation levels toward the reference (the old pre-warp fit left/injected error); reseed + off-path parity tests unchanged and green.
