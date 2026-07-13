@@ -21,7 +21,10 @@ public final class StackEngine {
     private let rejection: RejectionMethod
     private let frameWeighting: Bool
     private var weightBaseline: (stars: Int, sigma: Float)?    // set at seed, reset on reseed
+    private let normalization: Bool
+    private var backgroundBaseline: BackgroundExtraction.BackgroundModel?   // seed model; reset on reseed
     // Task-1 validated constants:
+    static let backgroundDegree = 1   // Task-1 validated; bump to 2 only if the prototype chose it
     static let weightExponent: Float = 1.0
     static let weightLo: Float = 0.25
     static let weightHi: Float = 4.0
@@ -48,13 +51,14 @@ public final class StackEngine {
     /// C(15,3)=455 triangles for reliable initial matching.
     public init(seedMinStars: Int = 15, minMatches: Int = 8, inlierTolerance: Double = 2.0,
                 rejection: RejectionMethod = NoRejection(), autoReseedThreshold: Int = 6,
-                frameWeighting: Bool = false) {
+                frameWeighting: Bool = false, normalization: Bool = false) {
         self.seedMinStars = seedMinStars
         self.minMatches = minMatches
         self.inlierTolerance = inlierTolerance
         self.rejection = rejection
         self.autoReseedThreshold = autoReseedThreshold
         self.frameWeighting = frameWeighting
+        self.normalization = normalization
     }
 
     public func reseed() {
@@ -64,6 +68,7 @@ public final class StackEngine {
             referenceSize = nil
             referenceChannels = nil
             weightBaseline = nil
+            backgroundBaseline = nil
             rejection.reset()
         }
     }
@@ -127,6 +132,8 @@ public final class StackEngine {
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
             weightBaseline = (stars.count, sigma)
+            backgroundBaseline = normalization
+                ? BackgroundExtraction.fitBackground(rgb, degree: Self.backgroundDegree) : nil
             acceptedCount += 1
             consecutiveNoTransform = 0
             return .becameReference
@@ -152,6 +159,7 @@ public final class StackEngine {
                 referenceChannels = nil
                 accumulator = nil
                 weightBaseline = nil
+                backgroundBaseline = nil
                 rejection.reset()   // else the new field's seed is sigma-clipped against the old field's stats
                 consecutiveNoTransform = 0
                 autoReseedCount += 1
@@ -174,7 +182,12 @@ public final class StackEngine {
             return .rejected(.noTransform)
         }
         let (warped, mask) = Warp.apply(rgb, transform: half.liftedToFullResolution())
-        let cleaned = rejection.apply(warped, mask: mask)
+        var frame = warped
+        if normalization, let ref = backgroundBaseline {
+            let subModel = BackgroundExtraction.fitBackground(rgb, degree: Self.backgroundDegree)
+            frame = GradientLeveler.apply(warped, subModel: subModel, refModel: ref)
+        }
+        let cleaned = rejection.apply(frame, mask: mask)
         accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma))
         acceptedCount += 1
         consecutiveNoTransform = 0
@@ -236,6 +249,7 @@ public final class StackEngine {
         public let transform: SimilarityTransform   // half-res transform (lift in warp)
         public let rgb: AstroImage                  // display-oriented RGB
         public let weight: Float                    // quality-based stacking weight (1.0 when off)
+        public let backgroundModel: BackgroundExtraction.BackgroundModel?   // nil when leveling off
     }
 
     /// Establish the fixed reference from `frame` if it has ≥ seedMinStars.
@@ -258,6 +272,8 @@ public final class StackEngine {
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
             weightBaseline = (stars.count, sigma)
+            backgroundBaseline = normalization
+                ? BackgroundExtraction.fitBackground(rgb, degree: Self.backgroundDegree) : nil
             acceptedCount += 1
             consecutiveNoTransform = 0
             return true
@@ -295,7 +311,8 @@ public final class StackEngine {
         let rgb = displayRGB(frame, minRows: minRows)
         guard rgb.channels == referenceChannels else { return nil }
         let weight = frameWeight(stars: stars.count, sigma: sigma)
-        return RegisteredFrame(transform: half, rgb: rgb, weight: weight)
+        let bgModel = normalization ? BackgroundExtraction.fitBackground(rgb, degree: Self.backgroundDegree) : nil
+        return RegisteredFrame(transform: half, rgb: rgb, weight: weight, backgroundModel: bgModel)
     }
 
     /// Warp a registered frame to reference alignment. Pure, concurrent-safe.
@@ -306,10 +323,15 @@ public final class StackEngine {
     /// Accumulate a warped frame into the shared stack under the engine lock.
     /// Bumps acceptedCount. Rejection filtering runs here (serial), preserving any
     /// stateful RejectionMethod. Call from the single serial consumer.
-    public func commit(image: AstroImage, mask: [Float], frameWeight: Float = 1.0, minRows: Int) {
+    public func commit(image: AstroImage, mask: [Float], frameWeight: Float = 1.0,
+                       backgroundModel: BackgroundExtraction.BackgroundModel? = nil, minRows: Int) {
         lock.withLock {
             guard let accumulator else { return }
-            let cleaned = rejection.apply(image, mask: mask)
+            var frame = image
+            if let sub = backgroundModel, let ref = backgroundBaseline {
+                frame = GradientLeveler.apply(image, subModel: sub, refModel: ref, minRows: minRows)
+            }
+            let cleaned = rejection.apply(frame, mask: mask)
             accumulator.add(cleaned, mask: mask, frameWeight: frameWeight, minRows: minRows)
             acceptedCount += 1
             consecutiveNoTransform = 0
