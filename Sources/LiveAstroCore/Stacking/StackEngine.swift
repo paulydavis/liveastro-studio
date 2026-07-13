@@ -23,8 +23,8 @@ public final class StackEngine {
     private var weightBaseline: (stars: Int, sigma: Float)?    // set at seed, reset on reseed
     private let normalization: Bool
     private var backgroundBaseline: BackgroundExtraction.BackgroundModel?   // seed model; reset on reseed
-    // Task-1 validated constants:
-    static let backgroundDegree = 1   // Task-1 validated; bump to 2 only if the prototype chose it
+    // R4: degree 2 (R1 rework prototype: degree 1 cannot model a frame-filling nebula differential).
+    static let backgroundDegree = 2
     static let weightExponent: Float = 1.0
     static let weightLo: Float = 0.25
     static let weightHi: Float = 4.0
@@ -182,10 +182,13 @@ public final class StackEngine {
             return .rejected(.noTransform)
         }
         let (warped, mask) = Warp.apply(rgb, transform: half.liftedToFullResolution())
+        // R4: fit on the WARPED frame (reference-aligned, mask-aware) — kills rotation-injection (C1)
+        // and nebula differential (C2). Pre-warp fit used the unrotated gradient, which after warp
+        // described the wrong direction and injected error rather than correcting it.
+        let subModel = fitWarpedBackground(image: warped, mask: mask)
         var frame = warped
-        if normalization, let ref = backgroundBaseline {
-            let subModel = BackgroundExtraction.fitBackground(rgb, degree: Self.backgroundDegree)
-            frame = GradientLeveler.apply(warped, subModel: subModel, refModel: ref)
+        if let sub = subModel, let ref = backgroundBaseline {
+            frame = GradientLeveler.apply(warped, subModel: sub, refModel: ref)
         }
         let cleaned = rejection.apply(frame, mask: mask)
         accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma))
@@ -249,7 +252,8 @@ public final class StackEngine {
         public let transform: SimilarityTransform   // half-res transform (lift in warp)
         public let rgb: AstroImage                  // display-oriented RGB
         public let weight: Float                    // quality-based stacking weight (1.0 when off)
-        public let backgroundModel: BackgroundExtraction.BackgroundModel?   // nil when leveling off
+        // R4: backgroundModel removed from RegisteredFrame — fit is now done on the WARPED frame
+        // (see fitWarpedBackground). Fitting pre-warp injected rotation-induced gradient error (C1).
     }
 
     /// Establish the fixed reference from `frame` if it has ≥ seedMinStars.
@@ -311,8 +315,19 @@ public final class StackEngine {
         let rgb = displayRGB(frame, minRows: minRows)
         guard rgb.channels == referenceChannels else { return nil }
         let weight = frameWeight(stars: stars.count, sigma: sigma)
-        let bgModel = normalization ? BackgroundExtraction.fitBackground(rgb, degree: Self.backgroundDegree) : nil
-        return RegisteredFrame(transform: half, rgb: rgb, weight: weight, backgroundModel: bgModel)
+        // R4: background fit removed from register — see fitWarpedBackground (fit on WARPED frame).
+        return RegisteredFrame(transform: half, rgb: rgb, weight: weight)
+    }
+
+    /// Fit a background model on a WARPED (reference-aligned) frame using the warp coverage mask.
+    /// Pure and lock-free: reads only `normalization` (immutable after init) + static `backgroundDegree`.
+    /// Safe to call concurrently from an import worker pool (same contract as register).
+    ///
+    /// Returns nil when normalization is off (off-path parity: caller passes nil to commit → no leveling).
+    public func fitWarpedBackground(image: AstroImage,
+                                    mask: [Float]) -> BackgroundExtraction.BackgroundModel? {
+        guard normalization else { return nil }
+        return BackgroundExtraction.fitBackground(image, degree: Self.backgroundDegree, mask: mask)
     }
 
     /// Warp a registered frame to reference alignment. Pure, concurrent-safe.

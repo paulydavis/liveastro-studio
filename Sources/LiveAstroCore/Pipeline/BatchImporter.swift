@@ -68,7 +68,9 @@ public final class BatchImporter {
                     let frameMeta = frame.metadata
                     if let reg = engine.register(prepared, minRows: .max) {
                         let w = engine.warp(reg, minRows: .max)
-                        return Work(warped: w, frameWeight: reg.weight, backgroundModel: reg.backgroundModel, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
+                        // R4: fit background on the WARPED frame (mask-aware) — pure, concurrent-safe.
+                        let bg = engine.fitWarpedBackground(image: w.image, mask: w.mask)
+                        return Work(warped: w, frameWeight: reg.weight, backgroundModel: bg, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
                     }
                     return Work(warped: nil, frameWeight: 1.0, backgroundModel: nil, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
                 }
