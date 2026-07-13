@@ -8,6 +8,17 @@ final class WinsorizedSigmaClipTests: XCTestCase {
     }
     let m: [Float] = [1]
 
+    // Regression (cold-review Important, 2026-07-12): warmUp < 2 previously made
+    // the second frame compute σ from a single sample (σ = 0) and clamp every
+    // later pixel to the first frame's value — a silent whole-stack freeze. The
+    // init now clamps warmUp to ≥ 2, so distinct early frames pass through raw.
+    func testWarmUpBelowTwoDoesNotFreezeToFirstFrame() {
+        let r = WinsorizedSigmaClip(kappa: 3, warmUp: 0)
+        _ = r.apply(px(0.1), mask: m)                       // first frame establishes the pixel
+        let out = r.apply(px(0.9), mask: m).pixels[0]       // buggy path clamped this to 0.1
+        XCTAssertEqual(out, 0.9, accuracy: 1e-6)
+    }
+
     func testWarmUpPassesRaw() {
         let r = WinsorizedSigmaClip(kappa: 3, warmUp: 8)
         // first frame is a wild outlier; within warm-up it must pass through untouched

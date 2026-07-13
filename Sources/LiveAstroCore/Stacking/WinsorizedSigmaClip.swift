@@ -12,7 +12,11 @@ public final class WinsorizedSigmaClip: RejectionMethod {
 
     public init(kappa: Float = 3.0, warmUp: Int = 8) {
         self.kappa = kappa
-        self.warmUp = Float(warmUp)
+        // A meaningful σ needs ≥ 2 samples. warmUp < 2 makes the first clipped
+        // frame compute σ from 0/1 samples (σ = 0), which freezes every later
+        // pixel to the first frame's value — a silent whole-stack corruption.
+        // Clamp to 2 so the guarantee "no clipping until σ is defined" always holds.
+        self.warmUp = Float(max(2, warmUp))
     }
 
     public func reset() { count = []; mean = []; m2 = [] }
@@ -20,7 +24,14 @@ public final class WinsorizedSigmaClip: RejectionMethod {
     public func apply(_ frame: AstroImage, mask: [Float]) -> AstroImage {
         let plane = frame.width * frame.height
         let n = frame.pixels.count
-        if count.count != n {                 // lazy alloc / dimension change
+        if count.count != n {                 // lazy alloc (first frame) or dimension change
+            // A mid-session dimension change silently discards accumulated warm-up
+            // stats. StackEngine's dimension gate rejects size-mismatched frames
+            // before they reach here, so this only ever fires as the first-frame
+            // lazy allocation. Assert to catch a future path that loosens the gate
+            // (debug-only; release still reinitializes gracefully).
+            assert(count.isEmpty,
+                   "WinsorizedSigmaClip dimension change mid-session (\(count.count) → \(n)); warm-up stats reset")
             count = [Float](repeating: 0, count: n)
             mean  = [Float](repeating: 0, count: n)
             m2    = [Float](repeating: 0, count: n)

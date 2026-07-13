@@ -38,6 +38,10 @@ public struct AstroImage {
 
     /// Stats over a stride-sampled subset (≤ 262144 samples) — full sort of a 24MP plane is wasteful.
     static func computeStats(_ slice: ArraySlice<Float>) -> ChannelStats {
+        // A zero-pixel plane has no samples: median indexing would trap. Production
+        // paths guard against empty images (FITSReader dims > 0, StackEngine ≥ 2×2),
+        // but AstroImage.init is public, so return neutral stats rather than crash.
+        guard !slice.isEmpty else { return ChannelStats(mean: 0, median: 0, stddev: 0) }
         let n = slice.count
         let stride = Self.sampleStride(count: n)
         var samples: [Float] = []
