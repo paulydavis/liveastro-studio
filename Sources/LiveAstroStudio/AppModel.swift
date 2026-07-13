@@ -41,6 +41,7 @@ final class AppModel {
     var rejectionEnabled = true
     var rejectionStrength: RejectionStrength = .medium
     var frameWeightingEnabled = true
+    var backgroundNormalizationEnabled = true
     var calibration = CalibrationStore.load(.standard)
     var watchFolder: URL?
     var sourceMode: SourceMode = .stackerOutput {
@@ -161,6 +162,7 @@ final class AppModel {
             rejectionEnabled: rejectionEnabled,
             rejectionStrength: rejectionStrength,
             frameWeightingEnabled: frameWeightingEnabled,
+            backgroundNormalizationEnabled: backgroundNormalizationEnabled,
             processorBackend: processorBackend,
             displayAdjustments: displayAdjustments)
     }
@@ -179,6 +181,7 @@ final class AppModel {
         rejectionEnabled = s.rejectionEnabled
         rejectionStrength = s.rejectionStrength
         frameWeightingEnabled = s.frameWeightingEnabled
+        backgroundNormalizationEnabled = s.backgroundNormalizationEnabled
         processorBackend = s.processorBackend
         displayAdjustments = s.displayAdjustments
     }
@@ -208,7 +211,8 @@ final class AppModel {
         let rejection: RejectionMethod = rejectionEnabled
             ? WinsorizedSigmaClip(kappa: rejectionStrength.kappa)
             : NoRejection()
-        return StackEngine(rejection: rejection, frameWeighting: frameWeightingEnabled)
+        return StackEngine(rejection: rejection, frameWeighting: frameWeightingEnabled,
+                           normalization: backgroundNormalizationEnabled)
     }
 
     /// Root for all session output; every session/import directory lives under here.

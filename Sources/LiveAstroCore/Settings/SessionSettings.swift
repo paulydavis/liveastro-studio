@@ -14,6 +14,7 @@ public struct SessionSettings: Codable, Equatable {
     public var rejectionEnabled: Bool
     public var rejectionStrength: RejectionStrength
     public var frameWeightingEnabled: Bool
+    public var backgroundNormalizationEnabled: Bool
     public var processorBackend: ProcessorBackend
     public var displayAdjustments: DisplayAdjustments
 
@@ -22,6 +23,7 @@ public struct SessionSettings: Codable, Equatable {
                 calibration: CalibrationSelection,
                 rejectionEnabled: Bool = true, rejectionStrength: RejectionStrength = .medium,
                 frameWeightingEnabled: Bool = true,
+                backgroundNormalizationEnabled: Bool = true,
                 processorBackend: ProcessorBackend = .none,
                 displayAdjustments: DisplayAdjustments = .neutral) {
         self.sourceModeRaw = sourceModeRaw; self.watchFolderPath = watchFolderPath
@@ -30,15 +32,19 @@ public struct SessionSettings: Codable, Equatable {
         self.calibration = calibration
         self.rejectionEnabled = rejectionEnabled; self.rejectionStrength = rejectionStrength
         self.frameWeightingEnabled = frameWeightingEnabled
+        self.backgroundNormalizationEnabled = backgroundNormalizationEnabled
         self.processorBackend = processorBackend; self.displayAdjustments = displayAdjustments
     }
+
+    /// Convenience no-arg init that returns the application's fresh-launch defaults.
+    public init() { self = .defaults }
 
     // Backward-compatible decode: older blobs lack the rejection keys → default them
     // (so updating the app doesn't wipe the user's other saved settings).
     private enum CodingKeys: String, CodingKey {
         case sourceModeRaw, watchFolderPath, filePrefix, neutralizeBackground
         case subExposureSeconds, targetName, calibration, rejectionEnabled, rejectionStrength
-        case frameWeightingEnabled, processorBackend, displayAdjustments
+        case frameWeightingEnabled, backgroundNormalizationEnabled, processorBackend, displayAdjustments
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -52,6 +58,7 @@ public struct SessionSettings: Codable, Equatable {
         rejectionEnabled = try c.decodeIfPresent(Bool.self, forKey: .rejectionEnabled) ?? true
         rejectionStrength = try c.decodeIfPresent(RejectionStrength.self, forKey: .rejectionStrength) ?? .medium
         frameWeightingEnabled = try c.decodeIfPresent(Bool.self, forKey: .frameWeightingEnabled) ?? true
+        backgroundNormalizationEnabled = try c.decodeIfPresent(Bool.self, forKey: .backgroundNormalizationEnabled) ?? true
         processorBackend = try c.decodeIfPresent(ProcessorBackend.self, forKey: .processorBackend) ?? .none
         displayAdjustments = try c.decodeIfPresent(DisplayAdjustments.self, forKey: .displayAdjustments) ?? .neutral
     }
@@ -64,6 +71,7 @@ public struct SessionSettings: Codable, Equatable {
                         calibration: CalibrationSelection(darkPath: nil, flatPath: nil, biasPath: nil),
                         rejectionEnabled: true, rejectionStrength: .medium,
                         frameWeightingEnabled: true,
+                        backgroundNormalizationEnabled: true,
                         processorBackend: .none, displayAdjustments: .neutral)
     }
 }

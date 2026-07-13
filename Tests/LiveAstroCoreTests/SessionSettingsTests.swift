@@ -112,6 +112,21 @@ final class SessionSettingsDisplayAdjTests: XCTestCase {
         XCTAssertTrue(s.frameWeightingEnabled)
     }
 
+    func testBackgroundNormalizationDefaultsOnAndRoundTrips() throws {
+        var s = SessionSettings()
+        XCTAssertTrue(s.backgroundNormalizationEnabled)               // default on
+        s.backgroundNormalizationEnabled = false
+        let data = try JSONEncoder().encode(s)
+        let back = try JSONDecoder().decode(SessionSettings.self, from: data)
+        XCTAssertFalse(back.backgroundNormalizationEnabled)
+    }
+
+    func testBackgroundNormalizationBackwardCompatDefaultsOn() throws {
+        let json = #"{"sourceModeRaw":"Raw subs (native stacking)","filePrefix":"Light_","neutralizeBackground":false,"subExposureSeconds":60,"targetName":"","calibration":{},"rejectionEnabled":true}"#
+        let s = try JSONDecoder().decode(SessionSettings.self, from: Data(json.utf8))
+        XCTAssertTrue(s.backgroundNormalizationEnabled)
+    }
+
     // Encode the current default calibration so the old-blob JSON stays valid if
     // CalibrationSelection's shape changes.
     private func calibrationJSON() throws -> String {
