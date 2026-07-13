@@ -152,6 +152,7 @@ public final class StackEngine {
                 referenceChannels = nil
                 accumulator = nil
                 weightBaseline = nil
+                rejection.reset()   // else the new field's seed is sigma-clipped against the old field's stats
                 consecutiveNoTransform = 0
                 autoReseedCount += 1
             }

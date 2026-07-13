@@ -29,6 +29,9 @@ public enum AutoStretch {
         }
 
         let plane = image.width * image.height
+        // A zero-pixel image has no samples: median indexing below would trap. Nothing
+        // to stretch — return it unchanged (mirrors the AstroImage.computeStats guard).
+        guard plane > 0 else { return image }
         // Combined luminance sample (mean across channels), stride-sampled.
         let stride = AstroImage.sampleStride(count: plane)
         var sample: [Float] = []
