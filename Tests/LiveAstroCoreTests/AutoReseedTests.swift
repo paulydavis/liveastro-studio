@@ -51,6 +51,32 @@ final class AutoReseedTests: XCTestCase {
         }
     }
 
+    // Regression (cold-review Critical, 2026-07-12): auto-reseed cleared reference/
+    // accumulator/baseline but NOT the rejection state, so the new field's seed frame
+    // got σ-clipped against the OLD field's warmed-up stats. Manual reseed() reset it;
+    // auto-reseed must too. Proof: an engine warmed on A then auto-reseeded to B must
+    // produce a B-seed stack byte-identical to a fresh engine seeded on B directly.
+    func testAutoReseedResetsRejectionState() {
+        let engine = StackEngine(rejection: WinsorizedSigmaClip(kappa: 3, warmUp: 8), autoReseedThreshold: 6)
+        _ = engine.process(cfaFrame(stars: fieldA))                                   // seed A
+        for i in 0..<10 { _ = engine.process(cfaFrame(stars: fieldA, name: "a\(i).fit")) }  // warm rejection past warmUp
+        for i in 0..<6 { _ = engine.process(cfaFrame(stars: fieldB, name: "b\(i).fit")) }   // 6 noTransform → auto-reseed
+        XCTAssertEqual(engine.autoReseedCount, 1)
+        XCTAssertEqual(engine.process(cfaFrame(stars: fieldB, name: "seedB.fit")), .becameReference)
+        let afterReseed = engine.currentStack()!
+
+        // Control: fresh engine seeded on B with pristine rejection state.
+        let fresh = StackEngine(rejection: WinsorizedSigmaClip(kappa: 3, warmUp: 8), autoReseedThreshold: 6)
+        XCTAssertEqual(fresh.process(cfaFrame(stars: fieldB, name: "seedB.fit")), .becameReference)
+        let control = fresh.currentStack()!
+
+        XCTAssertEqual(afterReseed.pixels.count, control.pixels.count)
+        var maxDiff: Float = 0
+        for (a, b) in zip(afterReseed.pixels, control.pixels) { maxDiff = max(maxDiff, abs(a - b)) }
+        XCTAssertLessThan(maxDiff, 1e-6,
+                          "auto-reseed must reset rejection — the B seed must not be clipped against field-A stats")
+    }
+
     func testNoFalseReseedOnGoodReference() {
         let engine = StackEngine(autoReseedThreshold: 6)
         _ = engine.process(cfaFrame(stars: fieldA))                       // seed A
