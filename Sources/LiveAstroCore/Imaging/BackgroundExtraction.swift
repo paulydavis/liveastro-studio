@@ -7,29 +7,59 @@ import Foundation
 /// subtract a non-smooth nebula. Returns the image UNCHANGED on any condition
 /// that makes a fit unsafe (see guards).
 public enum BackgroundExtraction {
-    public static func flatten(_ image: AstroImage, degree: Int,
-                               tilesPerAxis: Int = 32,
-                               rejectionSigma: Double = 2.0) -> AstroImage {
-        guard image.channels == 3 else { return image }        // mono display path unchanged
-        let deg = min(max(degree, 1), 2)
-        let nCoeff = deg == 1 ? 3 : 6
-        let w = image.width, h = image.height, plane = w * h
-        let tiles = max(1, tilesPerAxis)
 
-        // Polynomial basis at normalized coords x,y ∈ [-1,1].
-        func basis(_ x: Double, _ y: Double) -> [Double] {
-            deg == 1 ? [1, x, y] : [1, x, y, x*x, x*y, y*y]
+    /// A fitted per-channel low-order polynomial background (degree 1 or 2).
+    /// `coeffPerChannel[c] == nil` means that channel could not be fit (too few
+    /// sky tiles or singular) — callers treat it as passthrough.
+    public struct BackgroundModel {
+        public let degree: Int
+        public let width: Int
+        public let height: Int
+        public let coeffPerChannel: [[Double]?]
+
+        /// Raw polynomial surface for one channel (no pedestal), or nil if unfit.
+        public func rawSurface(channel: Int) -> [Float]? {
+            guard channel < coeffPerChannel.count, let c = coeffPerChannel[channel] else { return nil }
+            return BackgroundModel.evaluate(coeff: c, degree: degree, width: width, height: height)
         }
 
-        // Sanitize non-finite inputs up front (matches ingest: FITSReader/Calibrator).
-        // A NaN/Inf pixel otherwise poisons tile medians (Swift sort of NaN is
-        // undefined-order) and the output (min/max don't clamp NaN). Passthrough
-        // channels then also carry clean data.
+        /// Evaluate a coefficient vector over a width×height grid at normalized
+        /// coords x,y ∈ [-1,1] (SAME mapping as flatten: coord/dim*2 − 1).
+        public static func evaluate(coeff: [Double], degree: Int, width w: Int, height h: Int) -> [Float] {
+            let deg = min(max(degree, 1), 2)
+            var surface = [Float](repeating: 0, count: w * h)
+            for yy in 0..<h {
+                let ny = Double(yy) / Double(h) * 2 - 1
+                for xx in 0..<w {
+                    let nx = Double(xx) / Double(w) * 2 - 1
+                    let bb: [Double] = deg == 1 ? [1, nx, ny] : [1, nx, ny, nx*nx, nx*ny, ny*ny]
+                    var s = 0.0; for r in 0..<bb.count { s += coeff[r] * bb[r] }
+                    surface[yy*w + xx] = Float(s)
+                }
+            }
+            return surface
+        }
+    }
+
+    /// Fit a per-channel low-order polynomial background (steps 1–3 of flatten):
+    /// tile medians → σ-clip bright tiles → least-squares. 3-channel only (others
+    /// get all-nil coeffs). Deterministic; NaN/Inf sanitized up front.
+    public static func fitBackground(_ image: AstroImage, degree: Int,
+                                     tilesPerAxis: Int = 32,
+                                     rejectionSigma: Double = 2.0) -> BackgroundModel {
+        let w = image.width, h = image.height, plane = w * h
+        let deg = min(max(degree, 1), 2)
+        let nCoeff = deg == 1 ? 3 : 6
+        guard image.channels == 3 else {
+            return BackgroundModel(degree: deg, width: w, height: h,
+                                   coeffPerChannel: Array(repeating: nil, count: image.channels))
+        }
+        let tiles = max(1, tilesPerAxis)
+        func basis(_ x: Double, _ y: Double) -> [Double] { deg == 1 ? [1, x, y] : [1, x, y, x*x, x*y, y*y] }
         let src = image.pixels.map { $0.isFinite ? $0 : Float(0) }
-        var out = src
+        var coeffs = [[Double]?](repeating: nil, count: 3)
         for c in 0..<3 {
             let base = c * plane
-            // 1. tile samples: (nx, ny, median)
             var sx: [Double] = [], sy: [Double] = [], sv: [Double] = []
             sx.reserveCapacity(tiles*tiles); sy.reserveCapacity(tiles*tiles); sv.reserveCapacity(tiles*tiles)
             for ty in 0..<tiles {
@@ -41,19 +71,16 @@ public enum BackgroundExtraction {
                     var vals: [Float] = []; vals.reserveCapacity((y1-y0)*(x1-x0))
                     for yy in y0..<y1 { for xx in x0..<x1 { vals.append(src[base + yy*w + xx]) } }
                     vals.sort()
-                    let med = Double(vals[vals.count/2])
-                    let cx = (Double(x0 + x1) / 2) / Double(w) * 2 - 1   // → [-1,1]
-                    let cy = (Double(y0 + y1) / 2) / Double(h) * 2 - 1
-                    sx.append(cx); sy.append(cy); sv.append(med)
+                    sx.append((Double(x0 + x1) / 2) / Double(w) * 2 - 1)
+                    sy.append((Double(y0 + y1) / 2) / Double(h) * 2 - 1)
+                    sv.append(Double(vals[vals.count/2]))
                 }
             }
-            // 2. sigma-clip bright tiles (nebula/stars) out of the sky set.
             var keep = [Bool](repeating: true, count: sv.count)
             for _ in 0..<3 {
                 let kept = sv.enumerated().filter { keep[$0.offset] }.map { $0.element }
                 if kept.count <= nCoeff { break }
-                let sorted = kept.sorted()
-                let med = sorted[sorted.count/2]
+                let sorted = kept.sorted(); let med = sorted[sorted.count/2]
                 var dev = sorted.map { abs($0 - med) }; dev.sort()
                 let madn = 1.4826 * dev[dev.count/2]
                 if madn <= 1e-12 { break }
@@ -63,39 +90,34 @@ public enum BackgroundExtraction {
                 if !changed { break }
             }
             let idx = (0..<sv.count).filter { keep[$0] }
-            guard idx.count >= nCoeff else { continue }        // too few sky tiles → passthrough this channel
-
-            // 3. least-squares normal equations AᵀA c = Aᵀb over kept tiles.
+            guard idx.count >= nCoeff else { continue }
             var ata = [[Double]](repeating: [Double](repeating: 0, count: nCoeff), count: nCoeff)
             var atb = [Double](repeating: 0, count: nCoeff)
             for i in idx {
                 let b = basis(sx[i], sy[i]); let v = sv[i]
                 for r in 0..<nCoeff { atb[r] += b[r] * v; for col in 0..<nCoeff { ata[r][col] += b[r] * b[col] } }
             }
-            guard let coeff = solveSymmetric(&ata, atb) else { continue }  // singular → passthrough channel
-            // Defense-in-depth: a non-finite fit (e.g. a NaN slipping past ingest
-            // sanitization) must not poison the surface — passthrough this channel.
-            guard coeff.allSatisfy({ $0.isFinite }) else { continue }
-
-            // 4. evaluate surface, find pedestal (min), subtract + re-add pedestal.
-            var surface = [Float](repeating: 0, count: plane)
-            var minS = Double.greatestFiniteMagnitude
-            for yy in 0..<h {
-                let ny = Double(yy) / Double(h) * 2 - 1
-                for xx in 0..<w {
-                    let nx = Double(xx) / Double(w) * 2 - 1
-                    let bb = basis(nx, ny)
-                    var s = 0.0; for r in 0..<nCoeff { s += coeff[r] * bb[r] }
-                    surface[yy*w + xx] = Float(s); if s < minS { minS = s }
-                }
-            }
-            let ped = Float(minS)
-            for i in 0..<plane {
-                out[base + i] = min(max(src[base + i] - surface[i] + ped, 0), 1)
-            }
+            guard let coeff = solveSymmetric(&ata, atb), coeff.allSatisfy({ $0.isFinite }) else { continue }
+            coeffs[c] = coeff
         }
-        return AstroImage(width: w, height: h, channels: image.channels, pixels: out,
-                          sourceIsLinear: image.sourceIsLinear)
+        return BackgroundModel(degree: deg, width: w, height: h, coeffPerChannel: coeffs)
+    }
+
+    public static func flatten(_ image: AstroImage, degree: Int,
+                               tilesPerAxis: Int = 32,
+                               rejectionSigma: Double = 2.0) -> AstroImage {
+        guard image.channels == 3 else { return image }
+        let w = image.width, h = image.height, plane = w * h
+        let model = fitBackground(image, degree: degree, tilesPerAxis: tilesPerAxis, rejectionSigma: rejectionSigma)
+        let src = image.pixels.map { $0.isFinite ? $0 : Float(0) }
+        var out = src
+        for c in 0..<3 {
+            guard let surface = model.rawSurface(channel: c) else { continue }   // passthrough this channel
+            let base = c * plane
+            let ped = surface.min() ?? 0
+            for i in 0..<plane { out[base + i] = min(max(src[base + i] - surface[i] + ped, 0), 1) }
+        }
+        return AstroImage(width: w, height: h, channels: image.channels, pixels: out, sourceIsLinear: image.sourceIsLinear)
     }
 
     /// Spatially-varying, structure-protected background model (DBE v3 primary).
