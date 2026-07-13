@@ -62,10 +62,13 @@ final class WinsorizedSigmaClipTests: XCTestCase {
     }
 
     func testMaskedPixelUntouched() {
-        let r = WinsorizedSigmaClip(kappa: 3, warmUp: 1)
-        // 2-pixel frame; pixel 1 masked-out (mask 0) must pass through with no state/clamp
-        _ = r.apply(AstroImage(width: 2, height: 1, channels: 1, pixels: [0.05, 0.9], sourceIsLinear: true), mask: [1, 0])
-        let out = r.apply(AstroImage(width: 2, height: 1, channels: 1, pixels: [0.05, 0.9], sourceIsLinear: true), mask: [1, 0])
-        XCTAssertEqual(out.pixels[1], 0.9, accuracy: 1e-6)   // never clamped — always out-of-bounds
+        // warmUp 2 (the minimum after the clamp) + THREE frames so pixel 0 is in
+        // active clipping mode on frame 3; the masked-out pixel 1 must still pass raw.
+        let r = WinsorizedSigmaClip(kappa: 3, warmUp: 2)
+        let f = AstroImage(width: 2, height: 1, channels: 1, pixels: [0.05, 0.9], sourceIsLinear: true)
+        _ = r.apply(f, mask: [1, 0])   // frame 1: pixel0 count→1 (warm-up)
+        _ = r.apply(f, mask: [1, 0])   // frame 2: pixel0 count→2 (reaches warmUp)
+        let out = r.apply(f, mask: [1, 0])   // frame 3: pixel0 clipping ACTIVE, pixel1 masked
+        XCTAssertEqual(out.pixels[1], 0.9, accuracy: 1e-6)   // masked pixel never clamped
     }
 }
