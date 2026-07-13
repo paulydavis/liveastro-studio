@@ -55,4 +55,142 @@ final class GradientLevelerTests: XCTestCase {
         XCTAssertEqual(GradientLeveler.apply(a, subModel: sub, refModel: ref, minRows: .max).pixels,
                        GradientLeveler.apply(a, subModel: sub, refModel: ref, minRows: 1).pixels)
     }
+
+    // --- NEW TESTS (R3) ---
+
+    /// Regression: sub degree-2 (6 coeffs) vs ref degree-1 (3 coeffs).
+    /// Pre-fix: zip truncates to 3, evaluate(deg2) indexes coeff[3..5] → crash (exit 133).
+    /// Post-fix: each model evaluated with its OWN degree; output = pixel - (surfDeg2 - surfDeg1).
+    func testDegreeMismatchSubDeg2RefDeg1() {
+        // 2×1 image, single channel (channels=3, only ch0 has coeffs).
+        // sub: degree 2, constant term 0.1 only (coeff = [0.1, 0, 0, 0, 0, 0])
+        //   → surfSub = 0.1 everywhere
+        // ref: degree 1, constant term 0.05 (coeff = [0.05, 0, 0])
+        //   → surfRef = 0.05 everywhere
+        // expected correction: surfSub - surfRef = 0.05 everywhere
+        // pixel 0: 0.5 - 0.05 = 0.45
+        // pixel 1: 0.6 - 0.05 = 0.55
+        let px: [Float] = [0.5, 0.6,   // ch0
+                           0.0, 0.0,   // ch1 (nil)
+                           0.0, 0.0]   // ch2 (nil)
+        let a = AstroImage(width: 2, height: 1, channels: 3, pixels: px, sourceIsLinear: true)
+        let sub = BackgroundExtraction.BackgroundModel(
+            degree: 2, width: 2, height: 1,
+            coeffPerChannel: [[0.1, 0.0, 0.0, 0.0, 0.0, 0.0], nil, nil])
+        let ref = BackgroundExtraction.BackgroundModel(
+            degree: 1, width: 2, height: 1,
+            coeffPerChannel: [[0.05, 0.0, 0.0], nil, nil])
+        let out = GradientLeveler.apply(a, subModel: sub, refModel: ref)
+        XCTAssertEqual(out.pixels[0], 0.45, accuracy: 1e-5)  // 0.5 - (0.1 - 0.05)
+        XCTAssertEqual(out.pixels[1], 0.55, accuracy: 1e-5)  // 0.6 - (0.1 - 0.05)
+        // ch1, ch2 nil → passthrough
+        XCTAssertEqual(out.pixels[2], 0.0, accuracy: 1e-6)
+        XCTAssertEqual(out.pixels[3], 0.0, accuracy: 1e-6)
+    }
+
+    /// Reverse mismatch: sub degree-1 vs ref degree-2.
+    /// Pre-fix: zip truncates ref to 3 coeffs, dropping quadratic terms → ref quadratic silently dropped.
+    /// Post-fix: ref evaluated with degree-2, quadratic term IS subtracted.
+    func testDegreeMismatchSubDeg1RefDeg2QuadraticNotDropped() {
+        // 1×1 image at normalized coord (0,0): basis deg1=[1,0,0], deg2=[1,0,0,0,0,0]
+        // sub: degree 1, coeff=[0.3, 0, 0] → surfSub at (0,0) = 0.3
+        // ref: degree 2, coeff=[0.1, 0, 0, 0.2, 0, 0] → surfRef at (0,0) = 0.1 + 0.2*(0^2) = 0.1
+        //   (nx = 0/1*2-1 = -1 for x=0 in a 1-wide image)
+        //   Actually for 1×1: nx = Double(0)/Double(1)*2 - 1 = -1, ny = -1
+        //   deg2 basis = [1, nx, ny, nx*nx, nx*ny, ny*ny] = [1, -1, -1, 1, 1, 1]
+        //   surfSub = 0.3*1 + 0*(-1) + 0*(-1) = 0.3
+        //   surfRef = 0.1*1 + 0*(-1) + 0*(-1) + 0.2*1 + 0*1 + 0*1 = 0.3
+        //   correction = surfSub - surfRef = 0.3 - 0.3 = 0.0 → pixel unchanged
+        // To make the quadratic term visible, use a pixel value not at nx=0.
+        // Use 2×1 so we get nx=-1 (x=0) and nx=1 (x=1).
+        // sub: deg1 coeff=[0.3, 0, 0] → surf = [0.3, 0.3]
+        // ref: deg2 coeff=[0.1, 0, 0, 0.2, 0, 0] → surf at nx=-1: 0.1+0.2=0.3; at nx=+1: 0.1+0.2=0.3
+        //   Hmm, nx²=1 in both cases. Use a linear ref term to distinguish.
+        // ref: deg2 coeff=[0.1, 0.1, 0, 0, 0, 0] → surf at nx=-1: 0.1-0.1=0.0; at nx=+1: 0.1+0.1=0.2
+        // sub: deg1 coeff=[0.1, 0.1, 0, 0, 0, 0] ... but sub is deg1 so only 3 coeffs
+        // sub: deg1 coeff=[0.1, 0.1, 0] → surf at nx=-1: 0.1-0.1=0.0; at nx=+1: 0.1+0.1=0.2
+        // correction = 0 - 0 = 0 at both pixels → uninformative.
+        //
+        // Better: linear parts match exactly, but ref has an extra quadratic term.
+        // sub: deg1 coeff=[0.2, 0, 0]      → surf = [0.2, 0.2] (constant)
+        // ref: deg2 coeff=[0.2, 0, 0, 0.1, 0, 0]
+        //   at nx=-1: 0.2 + 0.1*1 = 0.3; at nx=+1: 0.2 + 0.1*1 = 0.3
+        //   (nx² is always 1 at ±1 so same) — need interior point.
+        //
+        // Use 3×1 to get nx=-1, nx=0 (approx), nx=+1:
+        //   nx = Double(x)/Double(3)*2 - 1: x=0→-1, x=1→-1/3, x=2→+1/3
+        //   (3-wide: x=0→-1, x=1→-0.333, x=2→+0.333)
+        // ref: deg2 coeff=[0.2, 0, 0, 0.1, 0, 0]
+        //   x=0: surf = 0.2 + 0.1*1 = 0.3
+        //   x=1: surf = 0.2 + 0.1*(1/9) = 0.2 + 0.0111 = 0.2111
+        //   x=2: surf = 0.2 + 0.1*(1/9) = 0.2111
+        // sub: deg1 coeff=[0.2, 0, 0] → surf = [0.2, 0.2, 0.2] everywhere
+        // correction = sub - ref:
+        //   x=0: 0.2 - 0.3 = -0.1   → pixel += 0.1
+        //   x=1: 0.2 - 0.2111 = -0.0111 → pixel += 0.0111
+        //   x=2: same as x=1
+        // Pre-fix: zip truncates ref to [0.2, 0, 0] (deg1 parts), diff=[0,0,0] → passthrough (WRONG)
+        // Post-fix: uses full ref quad surface → correction applied
+        let px: [Float] = [0.5, 0.5, 0.5,   // ch0
+                           0.0, 0.0, 0.0,   // ch1
+                           0.0, 0.0, 0.0]   // ch2
+        let a = AstroImage(width: 3, height: 1, channels: 3, pixels: px, sourceIsLinear: true)
+        let sub = BackgroundExtraction.BackgroundModel(
+            degree: 1, width: 3, height: 1,
+            coeffPerChannel: [[0.2, 0.0, 0.0], nil, nil])
+        let ref = BackgroundExtraction.BackgroundModel(
+            degree: 2, width: 3, height: 1,
+            coeffPerChannel: [[0.2, 0.0, 0.0, 0.1, 0.0, 0.0], nil, nil])
+
+        let out = GradientLeveler.apply(a, subModel: sub, refModel: ref)
+
+        // Compute expected values using BackgroundExtraction.BackgroundModel.evaluate
+        let sSub = BackgroundExtraction.BackgroundModel.evaluate(coeff: [0.2, 0.0, 0.0], degree: 1, width: 3, height: 1)
+        let sRef = BackgroundExtraction.BackgroundModel.evaluate(coeff: [0.2, 0.0, 0.0, 0.1, 0.0, 0.0], degree: 2, width: 3, height: 1)
+
+        for x in 0..<3 {
+            let expected = (0.5 - (sSub[x] - sRef[x])).clamped(to: 0...1)
+            XCTAssertEqual(out.pixels[x], expected, accuracy: 1e-5,
+                           "Pixel \(x): ref quadratic term must be subtracted, not silently dropped")
+        }
+        // Verify the correction is non-trivial (ref quadratic IS applied)
+        // At x=0: nx=-1, nx²=1 → sRef=0.2+0.1=0.3, sSub=0.2, correction=-0.1 → out[0]≈0.6
+        XCTAssertGreaterThan(out.pixels[0], 0.55, "ref quadratic term must increase output at x=0")
+    }
+
+    /// NaN in a model coefficient → output pixel is finite and equals the original input (passthrough).
+    func testNaNCoeffProducesFinitePassthrough() {
+        let px: [Float] = [0.3, 0.6, 0.9,   // ch0
+                           0.1, 0.2, 0.3,   // ch1 (passthrough: ref nil)
+                           0.4, 0.5, 0.6]   // ch2 (passthrough: sub nil)
+        let a = AstroImage(width: 3, height: 1, channels: 3, pixels: px, sourceIsLinear: true)
+        // ch0 sub has a NaN coefficient → surface will be NaN → passthrough each pixel
+        let sub = BackgroundExtraction.BackgroundModel(
+            degree: 1, width: 3, height: 1,
+            coeffPerChannel: [[Double.nan, 0.0, 0.0], [0.1, 0, 0], nil])
+        let ref = BackgroundExtraction.BackgroundModel(
+            degree: 1, width: 3, height: 1,
+            coeffPerChannel: [[0.0, 0.0, 0.0], nil, nil])
+        let out = GradientLeveler.apply(a, subModel: sub, refModel: ref)
+        // ch0: NaN coeff → each pixel passthrough (finite, equal to input)
+        for x in 0..<3 {
+            XCTAssert(out.pixels[x].isFinite, "Output pixel \(x) must be finite when NaN coeff encountered")
+            XCTAssertEqual(out.pixels[x], px[x], accuracy: 1e-6,
+                           "Output pixel \(x) must equal input (passthrough) when NaN coeff encountered")
+        }
+        // ch1: ref nil → passthrough
+        for x in 3..<6 {
+            XCTAssertEqual(out.pixels[x], px[x], accuracy: 1e-6)
+        }
+        // ch2: sub nil → passthrough
+        for x in 6..<9 {
+            XCTAssertEqual(out.pixels[x], px[x], accuracy: 1e-6)
+        }
+    }
+}
+
+extension Float {
+    func clamped(to range: ClosedRange<Float>) -> Float {
+        return Swift.min(Swift.max(self, range.lowerBound), range.upperBound)
+    }
 }
