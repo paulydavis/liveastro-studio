@@ -81,6 +81,22 @@ struct ControlView: View {
                         helpToggle("Match sky background", isOn: $model.backgroundNormalizationEnabled,
                                    help: "Level each sub's sky gradient to the reference before stacking, so a drifting light-pollution ramp or moonrise gradient doesn't leave a residual gradient the master can't remove. Low-order per channel; off for an unadjusted stack.")
                             .disabled(model.isRunning || model.isImporting)
+                        HStack(spacing: 6) {
+                            Text("Keep relay sessions")
+                            InfoButton(text: "Live sessions stage incoming subs in ~/LiveAstro/relay. Sessions older than this are deleted automatically when a new session starts — they are copies; originals stay on the Seestar/rig. Off disables pruning.")
+                            Spacer()
+                            Picker("", selection: $model.relayRetentionDays) {
+                                Text("Off").tag(0)
+                                Text("3d").tag(3)
+                                Text("7d").tag(7)
+                                Text("14d").tag(14)
+                                Text("30d").tag(30)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(maxWidth: 300)
+                            .disabled(model.isRunning || model.isImporting)
+                        }
                         if model.rejectionEnabled {
                             Picker("Strength", selection: $model.rejectionStrength) {
                                 Text("Low").tag(RejectionStrength.low)
