@@ -28,4 +28,12 @@ final class AstroImageTests: XCTestCase {
                              pixels: [0.0, 0.2, 0.8, 1.0], sourceIsLinear: true)
         XCTAssertEqual(img.stats[0].median, 0.5, accuracy: 1e-6)
     }
+    // Regression (cold-review Critical, 2026-07-12): a zero-pixel plane has no
+    // samples; computeStats' median indexing used to trap. It now returns neutral
+    // stats so a degenerate image constructed via the public init cannot crash.
+    func testZeroPixelImageYieldsNeutralStatsNoCrash() {
+        let img = AstroImage(width: 0, height: 0, channels: 1, pixels: [], sourceIsLinear: true)
+        XCTAssertEqual(img.stats.count, 1)
+        XCTAssertEqual(img.stats[0], ChannelStats(mean: 0, median: 0, stddev: 0))
+    }
 }
