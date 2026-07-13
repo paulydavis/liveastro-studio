@@ -78,6 +78,9 @@ struct ControlView: View {
                         helpToggle("Weight frames by quality", isOn: $model.frameWeightingEnabled,
                                    help: "Give sharper, lower-noise subs more influence in the stack (star count + background noise). Turn off for an equal-weight stack.")
                             .disabled(model.isRunning || model.isImporting)
+                        helpToggle("Match sky background", isOn: $model.backgroundNormalizationEnabled,
+                                   help: "Level each sub's sky gradient to the reference before stacking, so a drifting light-pollution ramp or moonrise gradient doesn't leave a residual gradient the master can't remove. Low-order per channel; off for an unadjusted stack.")
+                            .disabled(model.isRunning || model.isImporting)
                         if model.rejectionEnabled {
                             Picker("Strength", selection: $model.rejectionStrength) {
                                 Text("Low").tag(RejectionStrength.low)
