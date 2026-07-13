@@ -337,6 +337,14 @@ final class AppModel {
         saveSettings()
         guard !isRunning else { errorMessage = "End the session before importing."; return }
         guard !isImporting else { return }
+        // Reflect the imported subs' actual target/exposure in the profile + Live
+        // overlay instead of showing stale form values from a prior session (matches
+        // the live/auto-detect paths, which fill these from the newest sub's header).
+        if let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder) {
+            if let object = meta.object, !object.isEmpty { targetName = object }
+            if let exp = meta.exposureSeconds, exp > 0 { subExposureText = String(format: "%g", exp) }
+            saveSettings()
+        }
         let source = FolderFrameSource(folder: folder, mode: .importOnce,
                                         fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
         let engine = makeStackEngine()

@@ -31,6 +31,22 @@ final class LiveSourceMetadataTests: XCTestCase {
         XCTAssertEqual(m?.fileExtension, "fit")
     }
 
+    // Regression: a truncated/zero-byte sub that is the NEWEST by mtime (a mid-write
+    // capture or interrupted copy) must be skipped, falling back to the newest
+    // readable sub — not returning nil.
+    func testSkipsUnreadableNewestAndFallsBackToNextReadable() throws {
+        let dir = try tmp()
+        try writeFITS(dir, "good.fit", object: "NGC 6888", exposure: 20)
+        try Data().write(to: dir.appendingPathComponent("partial.fit"))   // zero-byte, unreadable
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -60)],
+            ofItemAtPath: dir.appendingPathComponent("good.fit").path)
+        try FileManager.default.setAttributes([.modificationDate: Date()],
+            ofItemAtPath: dir.appendingPathComponent("partial.fit").path)   // newest, but empty
+        let m = LiveSourceMetadata.newestFITSMetadata(inFolder: dir)
+        XCTAssertEqual(m?.object, "NGC 6888")
+        XCTAssertEqual(m?.exposureSeconds, 20)
+    }
+
     func testNoFITSReturnsNil() throws {
         let dir = try tmp()
         try Data("not fits".utf8).write(to: dir.appendingPathComponent("readme.txt"))
