@@ -127,6 +127,23 @@ final class SessionSettingsDisplayAdjTests: XCTestCase {
         XCTAssertTrue(s.backgroundNormalizationEnabled)
     }
 
+    func testRelayRetentionDefaultsSevenAndRoundTrips() throws {
+        var s = SessionSettings()
+        XCTAssertEqual(s.relayRetentionDays, 7)                       // default 7
+        s.relayRetentionDays = 0                                       // Off
+        let back = try JSONDecoder().decode(SessionSettings.self,
+                                            from: JSONEncoder().encode(s))
+        XCTAssertEqual(back.relayRetentionDays, 0)
+    }
+
+    func testRelayRetentionBackwardCompatDefaultsSeven() throws {
+        // A blob written before this field existed must decode to 7. Reuse the same
+        // minimal-valid JSON shape as testBackgroundNormalizationBackwardCompatDefaultsOn.
+        let json = #"{"sourceModeRaw":"Raw subs (native stacking)","filePrefix":"Light_","neutralizeBackground":false,"subExposureSeconds":60,"targetName":"","calibration":{},"rejectionEnabled":true}"#
+        let s = try JSONDecoder().decode(SessionSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(s.relayRetentionDays, 7)
+    }
+
     // Encode the current default calibration so the old-blob JSON stays valid if
     // CalibrationSelection's shape changes.
     private func calibrationJSON() throws -> String {

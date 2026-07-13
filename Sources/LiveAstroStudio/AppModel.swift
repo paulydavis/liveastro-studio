@@ -42,6 +42,7 @@ final class AppModel {
     var rejectionStrength: RejectionStrength = .medium
     var frameWeightingEnabled = true
     var backgroundNormalizationEnabled = true
+    var relayRetentionDays = 7
     var calibration = CalibrationStore.load(.standard)
     var watchFolder: URL?
     var sourceMode: SourceMode = .stackerOutput {
@@ -164,7 +165,8 @@ final class AppModel {
             frameWeightingEnabled: frameWeightingEnabled,
             backgroundNormalizationEnabled: backgroundNormalizationEnabled,
             processorBackend: processorBackend,
-            displayAdjustments: displayAdjustments)
+            displayAdjustments: displayAdjustments,
+            relayRetentionDays: relayRetentionDays)
     }
 
     func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
@@ -182,6 +184,7 @@ final class AppModel {
         rejectionStrength = s.rejectionStrength
         frameWeightingEnabled = s.frameWeightingEnabled
         backgroundNormalizationEnabled = s.backgroundNormalizationEnabled
+        relayRetentionDays = s.relayRetentionDays
         processorBackend = s.processorBackend
         displayAdjustments = s.displayAdjustments
     }
@@ -204,6 +207,18 @@ final class AppModel {
                 guard let self, let cg else { return }
                 self.latestImage = cg
             }
+        }
+    }
+
+    /// Age-prune old relay sessions just before a new one is created (spec:
+    /// relay auto-prune). `relayDir` is the incoming session — never pruned.
+    private func pruneRelay(excluding relayDir: URL) {
+        let relayRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("LiveAstro/relay", isDirectory: true)
+        for r in RelayPruner.prune(root: relayRoot, olderThanDays: relayRetentionDays,
+                                   excluding: relayDir) {
+            let size = ByteCountFormatter.string(fromByteCount: r.bytes, countStyle: .file)
+            log.append("pruned relay \(r.name) (\(size))")
         }
     }
 
@@ -492,6 +507,7 @@ final class AppModel {
         let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
         let relayDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("LiveAstro/relay/\(target)-\(df.string(from: Date()))", isDirectory: true)
+        pruneRelay(excluding: relayDir)
         let relay = FrameRelay(source: source, destination: relayDir, glob: glob)
         relay.onLog = { [weak self] msg in Task { @MainActor in self?.log.append(msg) } }
         do { try relay.start() } catch { errorMessage = "Relay failed to start: \(error)"; return }
@@ -537,6 +553,7 @@ final class AppModel {
         let relayDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))\(expToken.map { "-\($0)s" } ?? "")",
                                     isDirectory: true)
+        pruneRelay(excluding: relayDir)
         let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob)
         relay.onLog = { [weak self] msg in
             Task { @MainActor in self?.log.append(msg) }
@@ -589,6 +606,7 @@ final class AppModel {
         let relayDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))",
                                     isDirectory: true)
+        pruneRelay(excluding: relayDir)
         let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob)
         relay.onLog = { [weak self] msg in Task { @MainActor in self?.log.append(msg) } }
         do { try relay.start() } catch { errorMessage = "Relay failed to start: \(error)"; return }

@@ -17,6 +17,7 @@ public struct SessionSettings: Codable, Equatable {
     public var backgroundNormalizationEnabled: Bool
     public var processorBackend: ProcessorBackend
     public var displayAdjustments: DisplayAdjustments
+    public var relayRetentionDays: Int
 
     public init(sourceModeRaw: String, watchFolderPath: String?, filePrefix: String,
                 neutralizeBackground: Bool, subExposureSeconds: Double, targetName: String,
@@ -25,7 +26,8 @@ public struct SessionSettings: Codable, Equatable {
                 frameWeightingEnabled: Bool = true,
                 backgroundNormalizationEnabled: Bool = true,
                 processorBackend: ProcessorBackend = .none,
-                displayAdjustments: DisplayAdjustments = .neutral) {
+                displayAdjustments: DisplayAdjustments = .neutral,
+                relayRetentionDays: Int = 7) {
         self.sourceModeRaw = sourceModeRaw; self.watchFolderPath = watchFolderPath
         self.filePrefix = filePrefix; self.neutralizeBackground = neutralizeBackground
         self.subExposureSeconds = subExposureSeconds; self.targetName = targetName
@@ -34,6 +36,7 @@ public struct SessionSettings: Codable, Equatable {
         self.frameWeightingEnabled = frameWeightingEnabled
         self.backgroundNormalizationEnabled = backgroundNormalizationEnabled
         self.processorBackend = processorBackend; self.displayAdjustments = displayAdjustments
+        self.relayRetentionDays = relayRetentionDays
     }
 
     /// Convenience no-arg init that returns the application's fresh-launch defaults.
@@ -45,6 +48,7 @@ public struct SessionSettings: Codable, Equatable {
         case sourceModeRaw, watchFolderPath, filePrefix, neutralizeBackground
         case subExposureSeconds, targetName, calibration, rejectionEnabled, rejectionStrength
         case frameWeightingEnabled, backgroundNormalizationEnabled, processorBackend, displayAdjustments
+        case relayRetentionDays
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -61,6 +65,7 @@ public struct SessionSettings: Codable, Equatable {
         backgroundNormalizationEnabled = try c.decodeIfPresent(Bool.self, forKey: .backgroundNormalizationEnabled) ?? true
         processorBackend = try c.decodeIfPresent(ProcessorBackend.self, forKey: .processorBackend) ?? .none
         displayAdjustments = try c.decodeIfPresent(DisplayAdjustments.self, forKey: .displayAdjustments) ?? .neutral
+        relayRetentionDays = try c.decodeIfPresent(Int.self, forKey: .relayRetentionDays) ?? 7
     }
 
     /// Matches the app's fresh-launch defaults (Siril mode, live_stack prefix, 60 s).
@@ -72,7 +77,8 @@ public struct SessionSettings: Codable, Equatable {
                         rejectionEnabled: true, rejectionStrength: .medium,
                         frameWeightingEnabled: true,
                         backgroundNormalizationEnabled: true,
-                        processorBackend: .none, displayAdjustments: .neutral)
+                        processorBackend: .none, displayAdjustments: .neutral,
+                        relayRetentionDays: 7)
     }
 }
 
