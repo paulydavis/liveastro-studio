@@ -25,7 +25,8 @@ public final class BatchImporter {
     private struct Work {
         let warped: (image: AstroImage, mask: [Float])?
         let frameWeight: Float
-        let backgroundModel: BackgroundExtraction.BackgroundModel?
+        let leveling: (sub: BackgroundExtraction.BackgroundModel,
+                       ref: BackgroundExtraction.BackgroundModel)?
         let name: String
         let timestamp: Date
         let metadata: SourceMetadata?
@@ -68,11 +69,12 @@ public final class BatchImporter {
                     let frameMeta = frame.metadata
                     if let reg = engine.register(prepared, minRows: .max) {
                         let w = engine.warp(reg, minRows: .max)
-                        // R4: fit background on the WARPED frame (mask-aware) — pure, concurrent-safe.
-                        let bg = engine.fitWarpedBackground(image: w.image, mask: w.mask)
-                        return Work(warped: w, frameWeight: reg.weight, backgroundModel: bg, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
+                        // R5: solve both domain-matched leveling models on the WARPED frame
+                        // (mask-aware, shared tile subset) — pure, concurrent-safe.
+                        let lv = engine.levelingModels(image: w.image, mask: w.mask)
+                        return Work(warped: w, frameWeight: reg.weight, leveling: lv, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
                     }
-                    return Work(warped: nil, frameWeight: 1.0, backgroundModel: nil, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
+                    return Work(warped: nil, frameWeight: 1.0, leveling: nil, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
                 }
                 inFlight += 1
                 return true
@@ -84,7 +86,7 @@ public final class BatchImporter {
                 guard let work = await group.next() else { break }
                 inFlight -= 1
                 if let w = work.warped {
-                    engine.commit(image: w.image, mask: w.mask, frameWeight: work.frameWeight, backgroundModel: work.backgroundModel, minRows: .max)
+                    engine.commit(image: w.image, mask: w.mask, frameWeight: work.frameWeight, leveling: work.leveling, minRows: .max)
                     onCommitted(Committed(index: engine.acceptedCount, sourceName: work.name, timestamp: work.timestamp, metadata: work.metadata))
                 } else {
                     engine.commitRejection()

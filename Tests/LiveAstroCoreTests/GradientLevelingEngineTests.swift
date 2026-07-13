@@ -52,28 +52,29 @@ final class GradientLevelingEngineTests: XCTestCase {
 
     // MARK: - Tests that must remain green (existing invariants)
 
-    /// After R4: register no longer produces a backgroundModel — test fitWarpedBackground instead.
-    func testFitWarpedBackgroundWhenOn() {
+    /// After R5: register no longer produces a backgroundModel — test levelingModels instead.
+    func testLevelingModelsWhenOn() {
         let eng = StackEngine(normalization: true)
         _ = eng.seedReference(cfaFrame(stars: field, slope: 0.0), minRows: .max)
         let reg = eng.register(cfaFrame(stars: field, slope: 0.10), minRows: .max)
         XCTAssertNotNil(reg, "register should succeed")
         guard let reg else { return }
         let w = eng.warp(reg, minRows: .max)
-        let model = eng.fitWarpedBackground(image: w.image, mask: w.mask)
-        XCTAssertNotNil(model, "fitWarpedBackground must return a model when normalization is on")
-        XCTAssertNotNil(model?.coeffPerChannel[0] ?? nil)
+        let models = eng.levelingModels(image: w.image, mask: w.mask)
+        XCTAssertNotNil(models, "levelingModels must return a pair when normalization is on")
+        XCTAssertNotNil(models?.sub.coeffPerChannel[0] ?? nil)
+        XCTAssertNotNil(models?.ref.coeffPerChannel[0] ?? nil)
     }
 
-    func testFitWarpedBackgroundNilWhenOff() {
+    func testLevelingModelsNilWhenOff() {
         let eng = StackEngine(normalization: false)
         _ = eng.seedReference(cfaFrame(stars: field, slope: 0.0), minRows: .max)
         let reg = eng.register(cfaFrame(stars: field, slope: 0.10), minRows: .max)
         XCTAssertNotNil(reg, "register should succeed")
         guard let reg else { return }
         let w = eng.warp(reg, minRows: .max)
-        XCTAssertNil(eng.fitWarpedBackground(image: w.image, mask: w.mask),
-                     "fitWarpedBackground must return nil when normalization is off")
+        XCTAssertNil(eng.levelingModels(image: w.image, mask: w.mask),
+                     "levelingModels must return nil when normalization is off")
     }
 
     func testOffPathByteIdentical() {
@@ -84,9 +85,9 @@ final class GradientLevelingEngineTests: XCTestCase {
             for _ in 0..<4 {
                 if let reg = eng.register(cfaFrame(stars: field, slope: 0.0), minRows: .max) {
                     let (img, mask) = eng.warp(reg, minRows: .max)
-                    let bgModel = eng.fitWarpedBackground(image: img, mask: mask)
+                    let lv = eng.levelingModels(image: img, mask: mask)
                     eng.commit(image: img, mask: mask, frameWeight: reg.weight,
-                               backgroundModel: bgModel, minRows: .max)
+                               leveling: lv, minRows: .max)
                 }
             }
             return eng.currentStack()!.pixels
@@ -105,9 +106,9 @@ final class GradientLevelingEngineTests: XCTestCase {
             for _ in 0..<9 {
                 if let reg = eng.register(cfaFrame(stars: field, slope: 0.30), minRows: .max) {
                     let (img, mask) = eng.warp(reg, minRows: .max)
-                    let bgModel = eng.fitWarpedBackground(image: img, mask: mask)
+                    let lv = eng.levelingModels(image: img, mask: mask)
                     eng.commit(image: img, mask: mask, frameWeight: reg.weight,
-                               backgroundModel: bgModel, minRows: .max)
+                               leveling: lv, minRows: .max)
                 }
             }
             let m = eng.currentStack()!
@@ -130,8 +131,8 @@ final class GradientLevelingEngineTests: XCTestCase {
         if let reg = eng.register(cfaFrame(stars: field, slope: 0.0), minRows: .max) {
             let (img, mask) = eng.warp(reg, minRows: .max)
             let before = img.pixels
-            let bgModel = eng.fitWarpedBackground(image: img, mask: mask)
-            eng.commit(image: img, mask: mask, frameWeight: reg.weight, backgroundModel: bgModel, minRows: .max)
+            let lv = eng.levelingModels(image: img, mask: mask)
+            eng.commit(image: img, mask: mask, frameWeight: reg.weight, leveling: lv, minRows: .max)
             // the committed (leveled) frame ≈ the warped frame (flat vs flat → ~no change) at a mid sky pixel
             XCTAssertEqual(eng.currentStack()!.pixels[100*eng.currentStack()!.width + 5], before[100*img.width + 5], accuracy: 0.03)
         } else { XCTFail("register failed") }
@@ -183,9 +184,9 @@ final class GradientLevelingEngineTests: XCTestCase {
             let sub = cfaFrameYGradient(stars: rotatedStars, ySlope: 0.30, w: w, h: h)
             if let reg = engOn.register(sub, minRows: .max) {
                 let (img, mask) = engOn.warp(reg, minRows: .max)
-                let bgModel = engOn.fitWarpedBackground(image: img, mask: mask)
+                let lv = engOn.levelingModels(image: img, mask: mask)
                 engOn.commit(image: img, mask: mask, frameWeight: reg.weight,
-                             backgroundModel: bgModel, minRows: .max)
+                             leveling: lv, minRows: .max)
             }
         }
 
@@ -197,7 +198,7 @@ final class GradientLevelingEngineTests: XCTestCase {
             if let reg = engOff.register(sub, minRows: .max) {
                 let (img, mask) = engOff.warp(reg, minRows: .max)
                 engOff.commit(image: img, mask: mask, frameWeight: reg.weight,
-                              backgroundModel: nil, minRows: .max)
+                              leveling: nil, minRows: .max)
             }
         }
 
@@ -219,5 +220,88 @@ final class GradientLevelingEngineTests: XCTestCase {
         // (2) Sanity: leveled is not WORSE than unleveled (10% slack for float rounding).
         XCTAssertLessThanOrEqual(leveled, unleveled * 1.10,
             "Fit-on-warped(R4): leveled L→R delta (\(leveled)) must be ≤ unleveled * 1.10 (\(unleveled * 1.10)).")
+    }
+
+    // MARK: - Domain-asymmetry regression (R5 Critical fix)
+
+    /// CFA frame whose sky is NOT low-order: linear x-gradient + a broad OFF-CENTER
+    /// Gaussian blob (nebula-like), plus registration stars.
+    func cfaFrameNonPolynomial(stars: [(Double, Double)], w: Int = 256, h: Int = 256) -> RawFrame {
+        var px = [Float](repeating: 0.10, count: w * h)
+        // linear gradient
+        for y in 0..<h { for x in 0..<w { px[y*w+x] += 0.20 * Float(x) / Float(w-1) } }
+        // broad off-center Gaussian blob (well away from center → asymmetric structure)
+        let bx = Double(w) * 0.30, by = Double(h) * 0.35, sig = Double(w) * 0.22
+        for y in 0..<h { for x in 0..<w {
+            let dx = Double(x) - bx, dy = Double(y) - by
+            px[y*w+x] += 0.35 * Float(exp(-(dx*dx + dy*dy) / (2*sig*sig)))
+        } }
+        for s in stars {
+            for y in max(0, Int(s.1)-6)...min(h-1, Int(s.1)+6) {
+                for x in max(0, Int(s.0)-6)...min(w-1, Int(s.0)+6) {
+                    let dx = Double(x)-s.0, dy = Double(y)-s.1
+                    px[y*w+x] += 0.8 * Float(exp(-(dx*dx+dy*dy)/(2*2.0*2.0)))
+                }
+            }
+        }
+        return RawFrame(image: AstroImage(width: w, height: h, channels: 1, pixels: px, sourceIsLinear: true),
+                        bayerPattern: .grbg, bottomUp: false, timestamp: Date(timeIntervalSince1970: 0), sourceName: "t.fit")
+    }
+
+    /// R5 Critical: leveling a sub that is byte-identical to the seed over the covered
+    /// region must be a ~no-op even when the covered region is an ASYMMETRIC subset of a
+    /// non-polynomial sky.
+    ///
+    /// Pre-fix (seed fit UNMASKED over the full frame, sub fit MASKED over the subregion):
+    /// the two least-squares fits span different spatial domains of the nebula, so
+    /// surfSub − surfRef is a nonzero spurious surface → the "identical" sub is CHANGED.
+    /// Post-fix (both models solved over the SAME masked tile subset): surfSub ≈ surfRef →
+    /// the correction is ~0 and the covered pixels are unchanged.
+    ///
+    /// Staged path: seed → register the same frame (identity-ish transform) → warp →
+    /// replace the mask with an asymmetric (left 75%) mask → levelingModels → apply.
+    func testIdenticalSubOverAsymmetricMaskIsNoOp() {
+        let w = 256, h = 256
+        let eng = StackEngine(normalization: true)
+        let seed = cfaFrameNonPolynomial(stars: field, w: w, h: h)
+        XCTAssertTrue(eng.seedReference(seed, minRows: .max), "seed must succeed")
+
+        // Register the SAME frame → transform ~identity; warp → pixels ≈ seed rgb.
+        guard let reg = eng.register(cfaFrameNonPolynomial(stars: field, w: w, h: h), minRows: .max) else {
+            return XCTFail("register failed")
+        }
+        let (warped, warpMask) = eng.warp(reg, minRows: .max)
+
+        // Hand-built ASYMMETRIC coverage mask: left 75% covered, right 25% uncovered.
+        // AND with the real warp mask so we never mark an out-of-bounds pixel as covered.
+        let cutX = Int(Double(w) * 0.75)
+        var mask = [Float](repeating: 0, count: w * h)
+        for y in 0..<h { for x in 0..<w {
+            if x < cutX && warpMask[y*w + x] > 0 { mask[y*w + x] = 1 }
+        } }
+
+        guard let pair = eng.levelingModels(image: warped, mask: mask) else {
+            return XCTFail("levelingModels returned nil with normalization on")
+        }
+        let leveled = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref, minRows: .max)
+
+        // RMS difference over COVERED pixels only (per channel), leveled vs input warped frame.
+        let plane = w * h
+        var sumSq = 0.0, n = 0
+        for c in 0..<warped.channels {
+            let base = c * plane
+            for i in 0..<plane where mask[i] > 0 {
+                let d = Double(leveled.pixels[base + i] - warped.pixels[base + i])
+                sumSq += d * d; n += 1
+            }
+        }
+        let rms = n > 0 ? (sumSq / Double(n)).squareRoot() : 0
+        print("R5 domain-asymmetry regression: covered-pixel leveling rms = \(rms)")
+
+        // Leveling an identical sky must be a ~no-op. Pre-fix this rms is ~0.01–0.05
+        // (spurious differential from mismatched fit domains); post-fix it is ~0.
+        XCTAssertLessThan(rms, 1e-3,
+            "Leveling an identical sky over an asymmetric mask must be ~no-op (rms=\(rms)). " +
+            "A larger rms means the seed and sub models were fit over different domains (R5 Critical).")
     }
 }

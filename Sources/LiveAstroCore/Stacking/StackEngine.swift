@@ -22,7 +22,14 @@ public final class StackEngine {
     private let frameWeighting: Bool
     private var weightBaseline: (stars: Int, sigma: Float)?    // set at seed, reset on reseed
     private let normalization: Bool
-    private var backgroundBaseline: BackgroundExtraction.BackgroundModel?   // seed model; reset on reseed
+    /// R5: the seed's TILE SAMPLES (not a fitted model). Stored so each sub's reference
+    /// model can be re-solved over the SAME masked tile subset as the sub — killing the
+    /// seed-vs-sub fit-domain asymmetry (a full-frame seed fit vs a masked sub fit gave
+    /// different coeffs over a non-polynomial sky, injecting a spurious differential).
+    /// Set at seed (serial, before the concurrent register/warp phase per the batch
+    /// contract) and read lock-free in `levelingModels` — same contract as `referenceStars`.
+    /// Reset to nil on reseed. nil when normalization is off.
+    private var referenceBackgroundSamples: (x: [Double], y: [Double], v: [[Double]?])?
     // R4: degree 2 (R1 rework prototype: degree 1 cannot model a frame-filling nebula differential).
     static let backgroundDegree = 2
     static let weightExponent: Float = 1.0
@@ -68,7 +75,7 @@ public final class StackEngine {
             referenceSize = nil
             referenceChannels = nil
             weightBaseline = nil
-            backgroundBaseline = nil
+            referenceBackgroundSamples = nil
             rejection.reset()
         }
     }
@@ -132,8 +139,8 @@ public final class StackEngine {
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
             weightBaseline = (stars.count, sigma)
-            backgroundBaseline = normalization
-                ? BackgroundExtraction.fitBackground(rgb, degree: Self.backgroundDegree) : nil
+            referenceBackgroundSamples = normalization
+                ? BackgroundExtraction.tileSamples(rgb) : nil
             acceptedCount += 1
             consecutiveNoTransform = 0
             return .becameReference
@@ -159,7 +166,7 @@ public final class StackEngine {
                 referenceChannels = nil
                 accumulator = nil
                 weightBaseline = nil
-                backgroundBaseline = nil
+                referenceBackgroundSamples = nil
                 rejection.reset()   // else the new field's seed is sigma-clipped against the old field's stats
                 consecutiveNoTransform = 0
                 autoReseedCount += 1
@@ -182,13 +189,12 @@ public final class StackEngine {
             return .rejected(.noTransform)
         }
         let (warped, mask) = Warp.apply(rgb, transform: half.liftedToFullResolution())
-        // R4: fit on the WARPED frame (reference-aligned, mask-aware) — kills rotation-injection (C1)
-        // and nebula differential (C2). Pre-warp fit used the unrotated gradient, which after warp
-        // described the wrong direction and injected error rather than correcting it.
-        let subModel = fitWarpedBackground(image: warped, mask: mask)
+        // R5: solve BOTH the sub and reference models over the SAME masked tile subset of the
+        // WARPED frame — kills the seed-vs-sub fit-domain asymmetry (C, R5) on top of R4's
+        // fit-on-warped (kills rotation-injection C1 / nebula differential C2).
         var frame = warped
-        if let sub = subModel, let ref = backgroundBaseline {
-            frame = GradientLeveler.apply(warped, subModel: sub, refModel: ref)
+        if let pair = levelingModels(image: warped, mask: mask) {
+            frame = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref)
         }
         let cleaned = rejection.apply(frame, mask: mask)
         accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma))
@@ -252,8 +258,8 @@ public final class StackEngine {
         public let transform: SimilarityTransform   // half-res transform (lift in warp)
         public let rgb: AstroImage                  // display-oriented RGB
         public let weight: Float                    // quality-based stacking weight (1.0 when off)
-        // R4: backgroundModel removed from RegisteredFrame — fit is now done on the WARPED frame
-        // (see fitWarpedBackground). Fitting pre-warp injected rotation-induced gradient error (C1).
+        // R4/R5: backgroundModel removed from RegisteredFrame — fits are now done on the WARPED
+        // frame (see levelingModels). Fitting pre-warp injected rotation-induced gradient error (C1).
     }
 
     /// Establish the fixed reference from `frame` if it has ≥ seedMinStars.
@@ -276,8 +282,8 @@ public final class StackEngine {
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
             weightBaseline = (stars.count, sigma)
-            backgroundBaseline = normalization
-                ? BackgroundExtraction.fitBackground(rgb, degree: Self.backgroundDegree) : nil
+            referenceBackgroundSamples = normalization
+                ? BackgroundExtraction.tileSamples(rgb) : nil
             acceptedCount += 1
             consecutiveNoTransform = 0
             return true
@@ -315,19 +321,53 @@ public final class StackEngine {
         let rgb = displayRGB(frame, minRows: minRows)
         guard rgb.channels == referenceChannels else { return nil }
         let weight = frameWeight(stars: stars.count, sigma: sigma)
-        // R4: background fit removed from register — see fitWarpedBackground (fit on WARPED frame).
+        // R4/R5: background fit removed from register — see levelingModels (fit on WARPED frame).
         return RegisteredFrame(transform: half, rgb: rgb, weight: weight)
     }
 
-    /// Fit a background model on a WARPED (reference-aligned) frame using the warp coverage mask.
-    /// Pure and lock-free: reads only `normalization` (immutable after init) + static `backgroundDegree`.
-    /// Safe to call concurrently from an import worker pool (same contract as register).
+    /// Produce BOTH domain-matched leveling models for a WARPED (reference-aligned) frame:
+    /// the SUB model (fit from the warped frame's tile samples) and the REF model (fit from
+    /// the STORED seed tile samples) — BOTH solved over the SAME masked tile subset, so the
+    /// two least-squares fits share a spatial domain. This is the R5 fix: a full-frame seed
+    /// fit vs a masked sub fit over a non-polynomial sky gave different coeffs, injecting a
+    /// spurious `surfSub − surfRef` differential even when the sub was identical to the seed
+    /// over the covered region. Matching the domain drives that injected error to ~0.
     ///
-    /// Returns nil when normalization is off (off-path parity: caller passes nil to commit → no leveling).
-    public func fitWarpedBackground(image: AstroImage,
-                                    mask: [Float]) -> BackgroundExtraction.BackgroundModel? {
-        guard normalization else { return nil }
-        return BackgroundExtraction.fitBackground(image, degree: Self.backgroundDegree, mask: mask)
+    /// Returns nil when normalization is off OR the reference samples are absent (off-path
+    /// parity: caller applies no leveling). Per-channel nil coeffs propagate as today
+    /// (GradientLeveler treats a nil channel as passthrough).
+    ///
+    /// Pure and lock-free: reads only `normalization` (immutable) + `referenceBackgroundSamples`,
+    /// which is set at seed (serial, before the concurrent register/warp phase per the batch
+    /// contract) and treated as immutable for the batch — same contract as `referenceStars`.
+    /// The live path calls this inside `processLocked` (under the lock).
+    public func levelingModels(image: AstroImage, mask: [Float])
+        -> (sub: BackgroundExtraction.BackgroundModel, ref: BackgroundExtraction.BackgroundModel)? {
+        guard normalization, let refSamples = referenceBackgroundSamples else { return nil }
+        let deg = Self.backgroundDegree
+        let w = image.width, h = image.height
+        let subSamples = BackgroundExtraction.tileSamples(image)
+        let included = BackgroundExtraction.maskGatedTileIndices(
+            width: w, height: h, mask: mask)
+        let subX = included.map { subSamples.x[$0] }
+        let subY = included.map { subSamples.y[$0] }
+        let refX = included.map { refSamples.x[$0] }
+        let refY = included.map { refSamples.y[$0] }
+        var subCoeffs = [[Double]?](repeating: nil, count: max(image.channels, subSamples.v.count))
+        var refCoeffs = [[Double]?](repeating: nil, count: subCoeffs.count)
+        for c in 0..<subCoeffs.count {
+            if c < subSamples.v.count, let sv = subSamples.v[c] {
+                let vals = included.map { sv[$0] }
+                subCoeffs[c] = BackgroundExtraction.solveModel(x: subX, y: subY, v: vals, degree: deg)
+            }
+            if c < refSamples.v.count, let rv = refSamples.v[c] {
+                let vals = included.map { rv[$0] }
+                refCoeffs[c] = BackgroundExtraction.solveModel(x: refX, y: refY, v: vals, degree: deg)
+            }
+        }
+        let sub = BackgroundExtraction.BackgroundModel(degree: deg, width: w, height: h, coeffPerChannel: subCoeffs)
+        let ref = BackgroundExtraction.BackgroundModel(degree: deg, width: w, height: h, coeffPerChannel: refCoeffs)
+        return (sub, ref)
     }
 
     /// Warp a registered frame to reference alignment. Pure, concurrent-safe.
@@ -339,12 +379,13 @@ public final class StackEngine {
     /// Bumps acceptedCount. Rejection filtering runs here (serial), preserving any
     /// stateful RejectionMethod. Call from the single serial consumer.
     public func commit(image: AstroImage, mask: [Float], frameWeight: Float = 1.0,
-                       backgroundModel: BackgroundExtraction.BackgroundModel? = nil, minRows: Int) {
+                       leveling: (sub: BackgroundExtraction.BackgroundModel,
+                                  ref: BackgroundExtraction.BackgroundModel)? = nil, minRows: Int) {
         lock.withLock {
             guard let accumulator else { return }
             var frame = image
-            if let sub = backgroundModel, let ref = backgroundBaseline {
-                frame = GradientLeveler.apply(image, subModel: sub, refModel: ref, minRows: minRows)
+            if let pair = leveling {
+                frame = GradientLeveler.apply(image, subModel: pair.sub, refModel: pair.ref, minRows: minRows)
             }
             let cleaned = rejection.apply(frame, mask: mask)
             accumulator.add(cleaned, mask: mask, frameWeight: frameWeight, minRows: minRows)
