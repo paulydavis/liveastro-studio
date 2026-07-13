@@ -8,6 +8,40 @@ struct ControlView: View {
     private let logDisplayCap = 200
     private let logMinHeight: CGFloat = 120
 
+    /// A Form toggle row with a visible ⓘ info button next to the label. macOS `Form`
+    /// only attaches `.help()` tooltips to the switch control, not the label text, so
+    /// hovering the label showed nothing. A tap-to-reveal info button is an explicit,
+    /// discoverable affordance that doesn't depend on hover tracking.
+    private func helpToggle(_ title: String, isOn: Binding<Bool>, help: String) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+            InfoButton(text: help)
+            Spacer()
+            Toggle("", isOn: isOn).labelsHidden()
+        }
+    }
+
+    /// Small ⓘ affordance that reveals its help text in a popover on tap (and, as a
+    /// bonus, a tooltip on hover — `.help()` works reliably on a Button control).
+    private struct InfoButton: View {
+        let text: String
+        @State private var showing = false
+        var body: some View {
+            Button { showing.toggle() } label: {
+                Image(systemName: "info.circle").foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help(text)
+            .popover(isPresented: $showing, arrowEdge: .bottom) {
+                Text(text)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(12)
+                    .frame(width: 300)
+            }
+        }
+    }
+
     var body: some View {
         @Bindable var model = model
         VStack(spacing: 0) {
@@ -35,15 +69,15 @@ struct ControlView: View {
                                   text: $model.fileNamePrefix)
                             .disabled(model.isRunning || model.isImporting)
                             .help("Only process files whose name starts with this prefix; leave empty to accept all FITS files in the watch folder.")
-                        Toggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground)
+                        helpToggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground,
+                                   help: "Apply a per-channel background neutralization pass after stacking to correct OSC white balance drift.")
                             .disabled(model.isRunning || model.isImporting)
-                            .help("Apply a per-channel background neutralization pass after stacking to correct OSC white balance drift.")
-                        Toggle("Reject outliers (σ-clip)", isOn: $model.rejectionEnabled)
+                        helpToggle("Reject outliers (σ-clip)", isOn: $model.rejectionEnabled,
+                                   help: "Drop satellite / plane / cosmic-ray streaks by clamping pixels that deviate from the per-pixel stack statistics (winsorized κ-σ). On by default.")
                             .disabled(model.isRunning || model.isImporting)
-                            .help("Drop satellite / plane / cosmic-ray streaks by clamping pixels that deviate from the per-pixel stack statistics (winsorized κ-σ). On by default.")
-                        Toggle("Weight frames by quality", isOn: $model.frameWeightingEnabled)
+                        helpToggle("Weight frames by quality", isOn: $model.frameWeightingEnabled,
+                                   help: "Give sharper, lower-noise subs more influence in the stack (star count + background noise). Turn off for an equal-weight stack.")
                             .disabled(model.isRunning || model.isImporting)
-                            .help("Give sharper, lower-noise subs more influence in the stack (star count + background noise). Turn off for an equal-weight stack.")
                         if model.rejectionEnabled {
                             Picker("Strength", selection: $model.rejectionStrength) {
                                 Text("Low").tag(RejectionStrength.low)
@@ -105,8 +139,8 @@ struct ControlView: View {
                             }
                             .help("Color intensity. 1 = unchanged.")
                         }
-                        Toggle("Flatten background (DBE)", isOn: $model.displayAdjustments.backgroundExtraction)
-                            .help("Remove the light-pollution gradient so the sky darkens evenly. Off by default.")
+                        helpToggle("Flatten background (DBE)", isOn: $model.displayAdjustments.backgroundExtraction,
+                                   help: "Remove the light-pollution gradient so the sky darkens evenly. Off by default.")
                             .onChange(of: model.displayAdjustments.backgroundExtraction) { _, _ in
                                 model.applyDisplayAdjustments()
                             }
