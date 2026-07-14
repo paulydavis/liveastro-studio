@@ -98,7 +98,7 @@ struct ControlView: View {
                             .disabled(model.isRunning || model.isImporting)
                         }
                         HStack(spacing: 6) {
-                            Text("Demosaic")
+                            Text("Debayer")
                             InfoButton(text: "RCD keeps star cores sharp and fringe-free (recommended). Bilinear is the legacy demosaic.")
                             Spacer()
                             Picker("", selection: $model.demosaic) {
