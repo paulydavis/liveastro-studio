@@ -43,6 +43,7 @@ final class AppModel {
     var frameWeightingEnabled = true
     var backgroundNormalizationEnabled = true
     var relayRetentionDays = 7
+    var demosaic: DemosaicMethod = .rcd
     var calibration = CalibrationStore.load(.standard)
     var watchFolder: URL?
     var sourceMode: SourceMode = .stackerOutput {
@@ -166,7 +167,8 @@ final class AppModel {
             backgroundNormalizationEnabled: backgroundNormalizationEnabled,
             processorBackend: processorBackend,
             displayAdjustments: displayAdjustments,
-            relayRetentionDays: relayRetentionDays)
+            relayRetentionDays: relayRetentionDays,
+            demosaic: demosaic)
     }
 
     func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
@@ -185,6 +187,7 @@ final class AppModel {
         frameWeightingEnabled = s.frameWeightingEnabled
         backgroundNormalizationEnabled = s.backgroundNormalizationEnabled
         relayRetentionDays = s.relayRetentionDays
+        demosaic = s.demosaic
         processorBackend = s.processorBackend
         displayAdjustments = s.displayAdjustments
     }
@@ -227,7 +230,8 @@ final class AppModel {
             ? WinsorizedSigmaClip(kappa: rejectionStrength.kappa)
             : NoRejection()
         return StackEngine(rejection: rejection, frameWeighting: frameWeightingEnabled,
-                           normalization: backgroundNormalizationEnabled)
+                           normalization: backgroundNormalizationEnabled,
+                           demosaic: demosaic)
     }
 
     /// Root for all session output; every session/import directory lives under here.

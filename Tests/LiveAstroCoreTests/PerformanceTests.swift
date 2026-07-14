@@ -111,4 +111,49 @@ final class PerformanceTests: XCTestCase {
             XCTFail("Unexpected .becameReference on second frame")
         }
     }
+
+    // MARK: – RCD vs Bilinear perf pin
+
+    /// 3840×2160 random CFA: assert rcd ≤ 5× bilinear elapsed.
+    /// Run only in release — debug builds have no optimisations.
+    func testRCDWithin5xBilinear() throws {
+        #if DEBUG
+        throw XCTSkip("perf pin is meaningful only with optimizations — run: swift test -c release --filter PerformanceTests")
+        #endif
+        let width = 3840, height = 2160
+        // Random CFA (not star-synthesized — just measures demosaic, not detection).
+        var rng: UInt64 = 0xDEAD_BEEF_CAFE_BABE
+        @inline(__always) func nextF() -> Float {
+            rng = rng &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Float(rng >> 33) / Float(1 << 31)
+        }
+        var pixels = [Float](repeating: 0, count: width * height)
+        for i in 0..<pixels.count { pixels[i] = nextF() }
+        let cfa = AstroImage(width: width, height: height, channels: 1,
+                             pixels: pixels, sourceIsLinear: true)
+
+        // Warm up caches / JIT (one small run each; timing is below).
+        let tiny = AstroImage(width: 16, height: 16, channels: 1,
+                              pixels: [Float](repeating: 0.1, count: 16 * 16), sourceIsLinear: true)
+        _ = Debayer.bilinear(cfa: tiny, pattern: .grbg)
+        _ = Debayer.rcd(cfa: tiny, pattern: .grbg)
+
+        // ── Timed: bilinear ──────────────────────────────────────────────────
+        let t0 = Date()
+        _ = Debayer.bilinear(cfa: cfa, pattern: .grbg)
+        let bilinearElapsed = Date().timeIntervalSince(t0)
+
+        // ── Timed: rcd ───────────────────────────────────────────────────────
+        let t1 = Date()
+        _ = Debayer.rcd(cfa: cfa, pattern: .grbg)
+        let rcdElapsed = Date().timeIntervalSince(t1)
+
+        let ratio = rcdElapsed / max(bilinearElapsed, 1e-9)
+        print(String(format: "PerformanceTests · 4K demosaic: bilinear=%.3fs  rcd=%.3fs  ratio=%.2f×",
+                     bilinearElapsed, rcdElapsed, ratio))
+
+        XCTAssertLessThanOrEqual(ratio, 5.0,
+            String(format: "RCD perf pin FAILED: rcd=%.3fs bilinear=%.3fs ratio=%.2f× (limit 5×)",
+                   rcdElapsed, bilinearElapsed, ratio))
+    }
 }

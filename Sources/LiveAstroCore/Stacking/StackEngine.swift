@@ -22,6 +22,7 @@ public final class StackEngine {
     private let frameWeighting: Bool
     private var weightBaseline: (stars: Int, sigma: Float)?    // set at seed, reset on reseed
     private let normalization: Bool
+    private let demosaic: DemosaicMethod
     /// R5: the seed's TILE SAMPLES (not a fitted model). Stored so each sub's reference
     /// model can be re-solved over the SAME masked tile subset as the sub — killing the
     /// seed-vs-sub fit-domain asymmetry (a full-frame seed fit vs a masked sub fit gave
@@ -58,7 +59,8 @@ public final class StackEngine {
     /// C(15,3)=455 triangles for reliable initial matching.
     public init(seedMinStars: Int = 15, minMatches: Int = 8, inlierTolerance: Double = 2.0,
                 rejection: RejectionMethod = NoRejection(), autoReseedThreshold: Int = 6,
-                frameWeighting: Bool = false, normalization: Bool = false) {
+                frameWeighting: Bool = false, normalization: Bool = false,
+                demosaic: DemosaicMethod = .bilinear) {
         self.seedMinStars = seedMinStars
         self.minMatches = minMatches
         self.inlierTolerance = inlierTolerance
@@ -66,6 +68,7 @@ public final class StackEngine {
         self.autoReseedThreshold = autoReseedThreshold
         self.frameWeighting = frameWeighting
         self.normalization = normalization
+        self.demosaic = demosaic
     }
 
     public func reseed() {
@@ -235,7 +238,12 @@ public final class StackEngine {
     private func displayRGB(_ frame: RawFrame, minRows: Int = 64) -> AstroImage {
         var rgb: AstroImage
         if let pattern = frame.bayerPattern, frame.image.channels == 1 {
-            rgb = Debayer.bilinear(cfa: frame.image, pattern: pattern, minRows: minRows)
+            switch demosaic {
+            case .bilinear:
+                rgb = Debayer.bilinear(cfa: frame.image, pattern: pattern, minRows: minRows)
+            case .rcd:
+                rgb = Debayer.rcd(cfa: frame.image, pattern: pattern, minRows: minRows)
+            }
         } else {
             rgb = frame.image
         }
