@@ -16,6 +16,48 @@ private let expected_GBRG: [Float] = [0.050938, 0.052227, 0.053516, 0.056322, 0.
 
 final class DebayerRCDTests: XCTestCase {
 
+    // MARK: - Golden-vector regeneration utility
+    //
+    // Run with:  DUMP_GOLDENS=1 swift test --filter testDumpGoldenVectors
+    //
+    // This test is skipped in normal CI.  When DUMP_GOLDENS=1 it runs the ACTUAL
+    // Debayer.rcd on the committed 16×16 CFA input literals (above) and prints the
+    // expected arrays as Swift literals — correct by construction because the shipped
+    // implementation IS the generator.  Copy-paste the output to replace the
+    // expected_* arrays above.
+    //
+    // NOTE: the Python generator in scratchpad/rcd_debayer.py --golden computes in
+    // float64 and fills borders with Python's bilinear (includes diagonal taps),
+    // so its output DOES NOT match the Swift float32 sequential implementation.
+    // Use THIS test to regenerate, not the Python path.
+    func testDumpGoldenVectors() throws {
+        guard ProcessInfo.processInfo.environment["DUMP_GOLDENS"] == "1" else {
+            throw XCTSkip("regeneration utility — set DUMP_GOLDENS=1 to emit Swift literals")
+        }
+
+        let cases: [(name: String, cfa: [Float], pattern: BayerPattern)] = [
+            ("GRBG", cfa_GRBG, .grbg),
+            ("RGGB", cfa_RGGB, .rggb),
+            ("BGGR", cfa_BGGR, .bggr),
+            ("GBRG", cfa_GBRG, .gbrg),
+        ]
+
+        func swiftLiteral(name: String, values: [Float]) -> String {
+            let body = values.map { String(format: "%.6f", $0) }.joined(separator: ", ")
+            return "private let \(name): [Float] = [\(body)]"
+        }
+
+        print("\n==== DUMP_GOLDENS — paste into DebayerRCDTests.swift ====\n")
+        for c in cases {
+            let img = AstroImage(width: goldenW, height: goldenH,
+                                 channels: 1, pixels: c.cfa, sourceIsLinear: true)
+            let out = Debayer.rcd(cfa: img, pattern: c.pattern)
+            print(swiftLiteral(name: "expected_\(c.name)", values: out.pixels))
+            print()
+        }
+        print("==== END DUMP_GOLDENS ====\n")
+    }
+
     // MARK: Helpers
 
     private func makeImage(pixels: [Float], w: Int, h: Int) -> AstroImage {

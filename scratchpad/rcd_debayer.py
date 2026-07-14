@@ -404,7 +404,23 @@ if __name__ == "__main__":
               f"skyPSNR bi={sky_psnr(bi, truth):.2f} rcd={sky_psnr(rc, truth):.2f}")
 
     if "--golden" in sys.argv:
-        print("\n==== GOLDEN VECTORS ====")
+        # -----------------------------------------------------------------------
+        # WARNING: This Python generator computes in float64 (numpy default) and
+        # fills the outer 4-px border with Python's bilinear (which includes
+        # diagonal taps weighted 0.25).  The committed Swift implementation uses
+        # float32 sequential arithmetic and Swift's bilinear (cross-only, no
+        # diagonals).  The two differ by up to ~4.3e-2 on border pixels and
+        # ~1.2e-4 on interior pixels, so the output of "--golden" WILL NOT match
+        # the committed expected_* arrays in DebayerRCDTests.swift and WILL fail
+        # the 1e-4 tolerance tests.
+        #
+        # RECOMMENDED regeneration path (correct by construction):
+        #   DUMP_GOLDENS=1 swift test --filter testDumpGoldenVectors
+        # See Tests/LiveAstroCoreTests/DebayerRCDTests.swift  testDumpGoldenVectors
+        # for instructions.  That test runs the actual Debayer.rcd implementation
+        # on the committed CFA input literals and prints Swift-ready expected arrays.
+        # -----------------------------------------------------------------------
+        print("\n==== GOLDEN VECTORS (Python/float64 — see WARNING above) ====")
         for pat, (cfa_lit, exp_lit) in golden_vectors().items():
             print(f"\n// ---- {pat} ----")
             print(cfa_lit)
