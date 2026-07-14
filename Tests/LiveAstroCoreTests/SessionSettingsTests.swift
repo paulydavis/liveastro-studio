@@ -144,6 +144,21 @@ final class SessionSettingsDisplayAdjTests: XCTestCase {
         XCTAssertEqual(s.relayRetentionDays, 7)
     }
 
+    func testDemosaicDefaultsRCDAndRoundTrips() throws {
+        var s = SessionSettings()
+        XCTAssertEqual(s.demosaic, .rcd)              // default is RCD
+        s.demosaic = .bilinear
+        let data = try JSONEncoder().encode(s)
+        let back = try JSONDecoder().decode(SessionSettings.self, from: data)
+        XCTAssertEqual(back.demosaic, .bilinear)       // round-trips
+    }
+
+    func testDemosaicBackwardCompatDefaultsRCD() throws {
+        let json = #"{"sourceModeRaw":"Raw subs (native stacking)","filePrefix":"Light_","neutralizeBackground":false,"subExposureSeconds":60,"targetName":"","calibration":{},"rejectionEnabled":true}"#
+        let s = try JSONDecoder().decode(SessionSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(s.demosaic, .rcd)
+    }
+
     // Encode the current default calibration so the old-blob JSON stays valid if
     // CalibrationSelection's shape changes.
     private func calibrationJSON() throws -> String {

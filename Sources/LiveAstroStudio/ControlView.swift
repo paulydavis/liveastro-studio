@@ -97,6 +97,19 @@ struct ControlView: View {
                             .frame(maxWidth: 300)
                             .disabled(model.isRunning || model.isImporting)
                         }
+                        HStack(spacing: 6) {
+                            Text("Demosaic")
+                            InfoButton(text: "RCD keeps star cores sharp and fringe-free (recommended). Bilinear is the legacy demosaic.")
+                            Spacer()
+                            Picker("", selection: $model.demosaic) {
+                                Text("Bilinear").tag(DemosaicMethod.bilinear)
+                                Text("RCD").tag(DemosaicMethod.rcd)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(maxWidth: 220)
+                            .disabled(model.isRunning || model.isImporting)
+                        }
                         if model.rejectionEnabled {
                             Picker("Strength", selection: $model.rejectionStrength) {
                                 Text("Low").tag(RejectionStrength.low)
