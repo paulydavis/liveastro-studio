@@ -23,7 +23,6 @@ public final class StackEngine {
     private var weightBaseline: (stars: Int, sigma: Float)?    // set at seed, reset on reseed
     private let normalization: Bool
     private let scaleNormalization: Bool
-    private var scaleBaseline: [Float]?
     private let demosaic: DemosaicMethod
     /// R5: the seed's TILE SAMPLES (not a fitted model). Stored so each sub's reference
     /// model can be re-solved over the SAME masked tile subset as the sub — killing the
@@ -91,7 +90,11 @@ public final class StackEngine {
         self.autoReseedThreshold = autoReseedThreshold
         self.frameWeighting = frameWeighting
         self.normalization = normalization
-        self.scaleNormalization = scaleNormalization
+        // Gate: scaling pivots about the reference background SURFACE, which only exists
+        // when leveling is on. An unleveled sub has no matched background to pivot about —
+        // the adversarial repro shows a scalar pivot injects a per-sub pedestal
+        // (bg_sub − bg₀)(s − 1). So scaling is only active when leveling is also on.
+        self.scaleNormalization = scaleNormalization && normalization
         self.demosaic = demosaic
     }
 
@@ -102,7 +105,6 @@ public final class StackEngine {
             referenceSize = nil
             referenceChannels = nil
             weightBaseline = nil
-            scaleBaseline = nil
             referenceBackgroundSamples = nil
             rejection.reset()
         }
@@ -167,7 +169,6 @@ public final class StackEngine {
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
             weightBaseline = (stars.count, sigma)
-            scaleBaseline = scaleNormalization ? (0..<rgb.channels).map { Float(rgb.stats[$0].median) } : nil
             referenceBackgroundSamples = normalization
                 ? BackgroundExtraction.tileSamples(rgb) : nil
             acceptedCount += 1
@@ -195,7 +196,6 @@ public final class StackEngine {
                 referenceChannels = nil
                 accumulator = nil
                 weightBaseline = nil
-                scaleBaseline = nil
                 referenceBackgroundSamples = nil
                 rejection.reset()   // else the new field's seed is sigma-clipped against the old field's stats
                 consecutiveNoTransform = 0
@@ -228,12 +228,12 @@ public final class StackEngine {
         // R5: solve BOTH the sub and reference models over the SAME masked tile subset of the
         // WARPED frame — kills the seed-vs-sub fit-domain asymmetry (C, R5) on top of R4's
         // fit-on-warped (kills rotation-injection C1 / nebula differential C2).
+        // Scaling is fused into leveling with a per-pixel reference-background pivot.
+        // When the per-frame fit fails (leveling pair nil) NO scaling happens either —
+        // consistent with the gate (no matched background surface to pivot about).
         var frame = warped
         if let pair = levelingModels(image: warped, mask: mask) {
-            frame = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref)
-        }
-        if scale != 1.0, let bg = scaleBaseline {
-            frame = SignalScaler.apply(frame, scale: scale, background: bg)
+            frame = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref, scale: scale)
         }
         let cleaned = rejection.apply(frame, mask: mask)
         // σ·s: scaling amplifies noise too — weight must see post-scale noise
@@ -328,7 +328,6 @@ public final class StackEngine {
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
             weightBaseline = (stars.count, sigma)
-            scaleBaseline = scaleNormalization ? (0..<rgb.channels).map { Float(rgb.stats[$0].median) } : nil
             referenceBackgroundSamples = normalization
                 ? BackgroundExtraction.tileSamples(rgb) : nil
             acceptedCount += 1
@@ -436,12 +435,14 @@ public final class StackEngine {
                                   ref: BackgroundExtraction.BackgroundModel)? = nil, minRows: Int) {
         lock.withLock {
             guard let accumulator else { return }
+            // Scaling is fused into leveling with a per-pixel reference-background pivot.
+            // When the leveling pair is nil (per-frame fit failure) NO scaling happens for
+            // this frame — consistent with the gate. Note: the weight was computed with σ·s
+            // at register time; a rare per-frame fit failure leaves that weight slightly
+            // conservative (an unscaled frame carrying a scaled-noise weight) — acceptable.
             var frame = image
             if let pair = leveling {
-                frame = GradientLeveler.apply(image, subModel: pair.sub, refModel: pair.ref, minRows: minRows)
-            }
-            if scale != 1.0, let bg = scaleBaseline {
-                frame = SignalScaler.apply(frame, scale: scale, background: bg, minRows: minRows)
+                frame = GradientLeveler.apply(image, subModel: pair.sub, refModel: pair.ref, scale: scale, minRows: minRows)
             }
             let cleaned = rejection.apply(frame, mask: mask)
             accumulator.add(cleaned, mask: mask, frameWeight: frameWeight, minRows: minRows)

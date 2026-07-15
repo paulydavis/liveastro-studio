@@ -82,7 +82,7 @@ struct ControlView: View {
                                    help: "Level each sub's sky gradient to the reference before stacking, so a drifting light-pollution ramp or moonrise gradient doesn't leave a residual gradient the master can't remove. Low-order per channel; off for an unadjusted stack.")
                             .disabled(model.isRunning || model.isImporting)
                         helpToggle("Match transparency", isOn: $model.scaleNormalizationEnabled,
-                                   help: "Scale each sub's signal to the reference brightness using matched star fluxes, so haze or thin cloud doesn't dim the master. Off for an unadjusted stack.")
+                                   help: "Scale each sub's signal to the reference brightness using matched star fluxes, so haze or thin cloud doesn't dim the master. Off for an unadjusted stack. Requires Match sky background (scaling pivots about the matched background).")
                             .disabled(model.isRunning || model.isImporting)
                         HStack(spacing: 6) {
                             Text("Keep relay sessions")

@@ -187,6 +187,39 @@ final class GradientLevelerTests: XCTestCase {
             XCTAssertEqual(out.pixels[x], px[x], accuracy: 1e-6)
         }
     }
+
+    // --- FUSED SCALE TESTS ---
+
+    /// Hand-computed fused case: out = surfRef + (x − surfSub)·scale.
+    /// 1×1, surfSub const 0.1, surfRef const 0.05, x=0.3, s=1.5 → 0.05 + 0.2·1.5 = 0.35.
+    func testFusedScaleHandComputed() {
+        let a = img(1, 1, 3, [0.3, 0.0, 0.0])
+        let sub = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.1, 0, 0], nil, nil])
+        let ref = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.05, 0, 0], nil, nil])
+        let out = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.5)
+        XCTAssertEqual(out.pixels[0], 0.35, accuracy: 1e-6)   // 0.05 + (0.3 - 0.1)·1.5
+    }
+
+    /// Identical models WITH scale != 1 must NOT take the fast path:
+    /// out = surfRef + (x − surfRef)·scale (surfSub == surfRef here).
+    /// surf const 0.1, x=0.4, s=2.0 → 0.1 + (0.4 − 0.1)·2 = 0.7.
+    func testIdenticalModelsWithScaleNotSkipped() {
+        let a = img(1, 1, 3, [0.4, 0.0, 0.0])
+        let m = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.1, 0, 0], nil, nil])
+        let out = GradientLeveler.apply(a, subModel: m, refModel: m, scale: 2.0)
+        XCTAssertEqual(out.pixels[0], 0.7, accuracy: 1e-6)   // 0.1 + (0.4 - 0.1)·2 — NOT byte-identical
+    }
+
+    /// scale: 1.0 (default) must be byte-identical to the old two-arg call — the fused form
+    /// reduces to x − surfSub + surfRef.
+    func testScaleOneByteIdenticalToDefault() {
+        let a = img(2, 1, 3, [0.5, 0.5, 0.3, 0.3, 0.2, 0.2])
+        let sub = Model(degree: 1, width: 2, height: 1, coeffPerChannel: [[0.1, 0, 0], nil, nil])
+        let ref = Model(degree: 1, width: 2, height: 1, coeffPerChannel: [[0.0, 0, 0], nil, nil])
+        let defaulted = GradientLeveler.apply(a, subModel: sub, refModel: ref).pixels
+        let explicitOne = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.0).pixels
+        XCTAssertEqual(defaulted, explicitOne)
+    }
 }
 
 extension Float {
