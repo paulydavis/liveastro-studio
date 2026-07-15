@@ -53,29 +53,43 @@ public final class SessionManager {
         let dir = rootDirectory.appendingPathComponent(id, isDirectory: true)
         try FileManager.default.createDirectory(
             at: dir.appendingPathComponent("snapshots"), withIntermediateDirectories: true)
-        manifest = SessionManifest(
+        // Write-then-commit: build the proposed manifest, persist it, and only mutate
+        // in-memory state once the write succeeds. A failed persist must leave the manager
+        // idle (no half-started session that disk doesn't reflect).
+        let proposed = SessionManifest(
             sessionId: id, targetName: profile.targetName, startTime: date, endTime: nil,
             subExposureSeconds: profile.subExposureSeconds, bortle: profile.bortle,
             locationLabel: profile.locationLabel, telescope: profile.telescope,
             camera: profile.camera, mount: profile.mount, filter: profile.filter,
             notes: profile.notes, snapshots: [])
+        try persist(proposed, to: dir)
+        manifest = proposed
         sessionDirectory = dir
         state = .running
-        try persist()
         return dir
     }
 
     public func recordSnapshot(_ record: SnapshotRecord) throws {
-        guard state == .running, manifest != nil else { throw SessionError.notRunning }
-        manifest!.snapshots.append(record)
-        try persist()
+        guard state == .running, var proposed = manifest, let dir = sessionDirectory else {
+            throw SessionError.notRunning
+        }
+        // Write-then-commit: persist the proposed manifest first; only append in memory
+        // once the write lands, so a failed write can't leave a counted-but-unpersisted frame.
+        proposed.snapshots.append(record)
+        try persist(proposed, to: dir)
+        manifest = proposed
     }
 
     public func endSession(at date: Date = .init()) throws {
-        guard state == .running, manifest != nil else { throw SessionError.notRunning }
-        manifest!.endTime = date
+        guard state == .running, var proposed = manifest, let dir = sessionDirectory else {
+            throw SessionError.notRunning
+        }
+        // Write-then-commit: persist the ended manifest first; only mark ended once it lands,
+        // so a failed write can't leave the manager ended with an unpersisted endTime.
+        proposed.endTime = date
+        try persist(proposed, to: dir)
+        manifest = proposed
         state = .ended
-        try persist()
     }
 
     /// Fill blank manifest metadata from the source header. User-entered values always win.
@@ -88,8 +102,9 @@ public final class SessionManager {
     }
 
     /// Atomic write: temp file + rename via Data(.atomic). Crash loses at most the in-flight update (spec §7).
-    private func persist() throws {
-        guard let dir = sessionDirectory, let m = manifest else { return }
+    /// Takes the manifest + directory explicitly so callers can persist a PROPOSED manifest
+    /// before committing it to in-memory state (write-then-commit — see startSession/record/end).
+    private func persist(_ m: SessionManifest, to dir: URL) throws {
         let data = try ManifestCoding.encoder().encode(m)
         try data.write(to: dir.appendingPathComponent("manifest.json"), options: .atomic)
     }
