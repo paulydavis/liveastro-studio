@@ -236,7 +236,7 @@ public final class StackEngine {
             frame = SignalScaler.apply(frame, scale: scale, background: bg)
         }
         let cleaned = rejection.apply(frame, mask: mask)
-        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma * scale))
+        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma * scale)   // σ·s: scaling amplifies noise too — weight must see post-scale noise)
         acceptedCount += 1
         consecutiveNoTransform = 0
         return .stacked(frameCount: accumulator.frameCount)
@@ -372,7 +372,7 @@ public final class StackEngine {
                                               pairs: pairs, tolerance: inlierTolerance)
             scale = Self.scaleFactor(fluxPairs: ins.map { (sub: stars[$0.source].flux, ref: referenceStars[$0.target].flux) })
         }
-        let weight = frameWeight(stars: stars.count, sigma: sigma * scale)
+        let weight = frameWeight(stars: stars.count, sigma: sigma * scale)   // σ·s: scaling amplifies noise too — weight must see post-scale noise
         // R4/R5: background fit removed from register — see levelingModels (fit on WARPED frame).
         return RegisteredFrame(transform: half, rgb: rgb, weight: weight, scale: scale)
     }
