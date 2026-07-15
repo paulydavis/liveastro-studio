@@ -251,16 +251,16 @@ struct ControlView: View {
                 }
                 // Go Live / End Broadcast — decoupled from session start.
                 HStack {
-                    switch model.broadcastState {
+                    switch model.broadcast.broadcastState {
                     case .idle:
-                        Button("Go Live") { model.goLive() }
+                        Button("Go Live") { model.broadcast.goLive() }
                             .help("Broadcast the live stack to YouTube via OBS (configure the YouTube key in OBS ▸ Settings ▸ Stream first).")
                     case .connecting:
                         HStack { ProgressView().controlSize(.small); Text("Connecting OBS…") }
                     case .live:
                         HStack(spacing: 10) {
-                            Button("End Broadcast", role: .destructive) { model.endBroadcast() }
-                            if let h = model.streamHealth {
+                            Button("End Broadcast", role: .destructive) { model.broadcast.endBroadcast() }
+                            if let h = model.broadcast.streamHealth {
                                 Text("● LIVE · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
                                     .foregroundStyle(.red).font(.caption)
                             }
@@ -391,7 +391,7 @@ private struct OBSSection: View {
 
     init(model: AppModel) {
         self.model = model
-        self.obs = model.obs
+        self.obs = model.broadcast.obs
     }
 
     /// True once the controller is connected (any non-disconnected state).
@@ -443,16 +443,16 @@ private struct OBSSection: View {
             }
 
             // Connection config — locked while connected.
-            TextField("Host", text: $model.obsHost)
+            TextField("Host", text: $model.broadcast.obsHost)
                 .disabled(connected)
                 .help("Hostname or IP address of the machine running OBS (use 127.0.0.1 when OBS is on the same Mac).")
-            TextField("Port", value: $model.obsPort, format: .number.grouping(.never))
+            TextField("Port", value: $model.broadcast.obsPort, format: .number.grouping(.never))
                 .disabled(connected)
                 .help("OBS WebSocket server port — default is 4455; change only if you customised it in OBS → Tools → WebSocket Server Settings.")
-            SecureField("Password (empty if auth off)", text: $model.obsPassword)
+            SecureField("Password (empty if auth off)", text: $model.broadcast.obsPassword)
                 .disabled(connected)
                 .help("OBS WebSocket password — copy it from OBS → Tools → WebSocket Server Settings → Show Connect Info (it regenerates each time OBS restarts with auto-generate on).")
-            Toggle("Auto-launch OBS on session start", isOn: $model.obsAutoLaunch)
+            Toggle("Auto-launch OBS on session start", isOn: $model.broadcast.obsAutoLaunch)
 
             // Scene selection, fed by the controller's live scene list.
             HStack {
@@ -469,21 +469,21 @@ private struct OBSSection: View {
                 .disabled(!connected)
             }
 
-            Toggle("Record while streaming", isOn: $model.obsRecord)
+            Toggle("Record while streaming", isOn: $model.broadcast.obsRecord)
 
             // Scene automation: switch to the scope scene on a stall, back to the
             // stack scene on resume.
-            Toggle("Scene automation (scope on stall)", isOn: $model.sceneAutomationOn)
-            Picker("Stack scene", selection: $model.stackSceneName) {
+            Toggle("Scene automation (scope on stall)", isOn: $model.broadcast.sceneAutomationOn)
+            Picker("Stack scene", selection: $model.broadcast.stackSceneName) {
                 Text("—").tag("")
                 ForEach(obs.sceneNames, id: \.self) { Text($0).tag($0) }
             }
-            .disabled(!model.sceneAutomationOn)
-            Picker("Scope scene", selection: $model.scopeSceneName) {
+            .disabled(!model.broadcast.sceneAutomationOn)
+            Picker("Scope scene", selection: $model.broadcast.scopeSceneName) {
                 Text("—").tag("")
                 ForEach(obs.sceneNames, id: \.self) { Text($0).tag($0) }
             }
-            .disabled(!model.sceneAutomationOn)
+            .disabled(!model.broadcast.sceneAutomationOn)
         }
     }
 
@@ -491,8 +491,8 @@ private struct OBSSection: View {
     private func connectOBS() {
         Task {
             let ok = await obs.connect(
-                host: model.obsHost, port: model.obsPort,
-                password: model.obsPassword.isEmpty ? nil : model.obsPassword)
+                host: model.broadcast.obsHost, port: model.broadcast.obsPort,
+                password: model.broadcast.obsPassword.isEmpty ? nil : model.broadcast.obsPassword)
             if ok { await obs.refreshScenes() }
         }
     }
