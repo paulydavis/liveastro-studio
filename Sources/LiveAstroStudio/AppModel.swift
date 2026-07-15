@@ -37,13 +37,11 @@ final class AppModel {
 
     var fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
     var neutralizeBackground = false
-    var isDetecting = false
     var rejectionEnabled = true
     var rejectionStrength: RejectionStrength = .medium
     var frameWeightingEnabled = true
     var backgroundNormalizationEnabled = true
     var scaleNormalizationEnabled = true
-    var relayRetentionDays = 7
     var demosaic: DemosaicMethod = .rcd
     var calibration = CalibrationStore.load(.standard)
     var watchFolder: URL?
@@ -95,11 +93,18 @@ final class AppModel {
     /// (`$model.broadcast.obsHost`); the reference itself is never rebound.
     var broadcast: BroadcastController!
 
+    /// Live-source orchestration cluster (T2 extraction): the frame relay, its
+    /// retention policy, and the three auto-detect/configure paths. Same IUO
+    /// init-order rationale as `broadcast` above — assigned exactly once early in
+    /// `init` (its `AppSurface` closures capture `self`, so it can't be a stored
+    /// `let`), never reassigned; `var` only so SwiftUI can bind through it
+    /// (`$model.liveSource.relayRetentionDays`).
+    var liveSource: LiveSourceController!
+
     var importProcessed = 0
     var importTotal = 0
     private var pipeline: SessionPipeline?
     private var importPipeline: SessionPipeline?
-    private var frameRelay: FrameRelay?
 
     init() {
         // Build the seam bundle and the Broadcast controller first. The closures
@@ -109,16 +114,43 @@ final class AppModel {
             log: { [weak self] message in MainActor.assumeIsolated { self?.log.append(message) } },
             presentError: { [weak self] message in MainActor.assumeIsolated { self?.errorMessage = message } },
             isSessionRunning: { [weak self] in MainActor.assumeIsolated { self?.isRunning ?? false } }))
+
+        // Live-source cluster: same seam, plus the T2 closures for the detect
+        // paths (draft writes, tab/zoom, save + start). applyDetectedProfile
+        // writes only the non-nil fields — byte-identical to the old inline sets.
+        liveSource = LiveSourceController(surface: AppSurface(
+            log: { [weak self] message in MainActor.assumeIsolated { self?.log.append(message) } },
+            presentError: { [weak self] message in MainActor.assumeIsolated { self?.errorMessage = message } },
+            isSessionRunning: { [weak self] in MainActor.assumeIsolated { self?.isRunning ?? false } },
+            isImporting: { [weak self] in MainActor.assumeIsolated { self?.isImporting ?? false } },
+            applyDetectedProfile: { [weak self] p in MainActor.assumeIsolated { self?.applyDetectedProfile(p) } },
+            currentTargetName: { [weak self] in MainActor.assumeIsolated { self?.targetName ?? "" } },
+            resetZoomPan: { [weak self] in MainActor.assumeIsolated { self?.zoomPan = .fit } },
+            selectLiveTab: { [weak self] in MainActor.assumeIsolated { self?.selectedTab = .live } },
+            startSession: { [weak self] in MainActor.assumeIsolated { self?.startSession() } },
+            saveSettings: { [weak self] in MainActor.assumeIsolated { self?.saveSettings() } }))
         loadSettings()
 
         // Save settings and stop the relay when the app is about to terminate.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.frameRelay?.stop()
+                self?.liveSource.stopRelay()
                 self?.saveSettings()
             }
         }
+    }
+
+    /// Writes the non-nil fields of a detected capture profile onto the session
+    /// draft. Called by `LiveSourceController` through the `AppSurface` seam; each
+    /// `if let` matches an old inline field write in a configure path.
+    private func applyDetectedProfile(_ p: DetectedProfile) {
+        if let v = p.sourceMode { sourceMode = v }
+        if let v = p.neutralizeBackground { neutralizeBackground = v }
+        if let v = p.targetName { targetName = v }
+        if let v = p.subExposureText { subExposureText = v }
+        if let v = p.fileNamePrefix { fileNamePrefix = v }
+        if let v = p.watchFolder { watchFolder = v }
     }
 
     // MARK: - Settings persistence
@@ -139,7 +171,7 @@ final class AppModel {
             scaleNormalizationEnabled: scaleNormalizationEnabled,
             processorBackend: processorBackend,
             displayAdjustments: displayAdjustments,
-            relayRetentionDays: relayRetentionDays,
+            relayRetentionDays: liveSource.relayRetentionDays,
             demosaic: demosaic)
     }
 
@@ -159,7 +191,7 @@ final class AppModel {
         frameWeightingEnabled = s.frameWeightingEnabled
         backgroundNormalizationEnabled = s.backgroundNormalizationEnabled
         scaleNormalizationEnabled = s.scaleNormalizationEnabled
-        relayRetentionDays = s.relayRetentionDays
+        liveSource.relayRetentionDays = s.relayRetentionDays
         demosaic = s.demosaic
         processorBackend = s.processorBackend
         displayAdjustments = s.displayAdjustments
@@ -187,18 +219,6 @@ final class AppModel {
                 guard let cg else { return }
                 self.latestImage = cg
             }
-        }
-    }
-
-    /// Age-prune old relay sessions just before a new one is created (spec:
-    /// relay auto-prune). `relayDir` is the incoming session — never pruned.
-    private func pruneRelay(excluding relayDir: URL) {
-        let relayRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("LiveAstro/relay", isDirectory: true)
-        for r in RelayPruner.prune(root: relayRoot, olderThanDays: relayRetentionDays,
-                                   excluding: relayDir) {
-            let size = ByteCountFormatter.string(fromByteCount: r.bytes, countStyle: .file)
-            log.append("pruned relay \(r.name) (\(size))")
         }
     }
 
@@ -468,143 +488,6 @@ final class AppModel {
         }
     }
 
-    func startWatchFolderLive(source: URL) {
-        guard !isRunning, !isImporting, !isDetecting else { return }
-        zoomPan = .fit
-        isDetecting = true
-        log.append("Reading subs in \(source.lastPathComponent)…")
-        Task.detached { [weak self] in
-            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
-            let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: source)   // SMB header read, off main
-            await MainActor.run {
-                self.isDetecting = false
-                self.configureAndStartWatchFolder(source: source, meta: meta)
-            }
-        }
-    }
-
-    private func configureAndStartWatchFolder(source: URL,
-                                              meta: (object: String?, exposureSeconds: Double?, fileExtension: String)?) {
-        sourceMode = .nativeStack
-        neutralizeBackground = true
-        if let object = meta?.object, !object.isEmpty { targetName = object }        // else keep form value
-        if let exp = meta?.exposureSeconds, exp > 0 { subExposureText = String(format: "%g", exp) }
-        let target = targetName.isEmpty ? "Live" : targetName
-        let glob = "*.\(meta?.fileExtension ?? "fit")"       // *.fit or *.fits per the folder's subs
-        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
-        let relayDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("LiveAstro/relay/\(target)-\(df.string(from: Date()))", isDirectory: true)
-        pruneRelay(excluding: relayDir)
-        let relay = FrameRelay(source: source, destination: relayDir, glob: glob)
-        relay.onLog = { [weak self] msg in Task { @MainActor in self?.log.append(msg) } }
-        do { try relay.start() } catch { errorMessage = "Relay failed to start: \(error)"; return }
-        frameRelay = relay
-        watchFolder = relayDir
-        saveSettings()
-        startSession()
-        if !isRunning { frameRelay?.stop(); frameRelay = nil; return }
-        selectedTab = .live
-    }
-
-    func startSeestarLive() {
-        guard !isRunning, !isImporting, !isDetecting else { return }
-        zoomPan = .fit
-        isDetecting = true
-        log.append("Looking for Seestar share…")
-        Task.detached { [weak self] in
-            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
-            let found = SeestarDetector.detect()      // SMB directory work, off the main thread
-            await MainActor.run {
-                self.isDetecting = false
-                guard let found else {
-                    self.errorMessage = "No Seestar share found. Mount it first: Finder → Go → Connect to Server → the Seestar's smb:// address, then try again."
-                    return
-                }
-                self.configureAndStartSeestar(found)
-            }
-        }
-    }
-
-    /// The on-main configure + start body (unchanged from the old synchronous
-    /// startSeestarLive, from `found` onward). Runs on the main actor.
-    private func configureAndStartSeestar(_ found: SeestarDetector.Found) {
-        sourceMode = .nativeStack
-        fileNamePrefix = "Light_"
-        neutralizeBackground = true
-        targetName = found.target
-        let exp = found.subExposure
-        subExposureText = String(format: "%g", exp ?? 10)
-        let expToken = exp.map { String(format: "%.1f", $0) }
-        let glob = expToken.map { "Light_*_\($0)s_*.fit" } ?? "Light_*.fit"
-        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
-        let relayDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))\(expToken.map { "-\($0)s" } ?? "")",
-                                    isDirectory: true)
-        pruneRelay(excluding: relayDir)
-        let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob)
-        relay.onLog = { [weak self] msg in
-            Task { @MainActor in self?.log.append(msg) }
-        }
-        do { try relay.start() } catch { errorMessage = "Relay failed to start: \(error)"; return }
-        frameRelay = relay
-        watchFolder = relayDir
-        saveSettings()
-        startSession()
-        if !isRunning {
-            frameRelay?.stop(); frameRelay = nil
-            return
-        }
-        selectedTab = .live
-    }
-
-    func startASIAIRLive() {
-        guard !isRunning, !isImporting, !isDetecting else { return }
-        zoomPan = .fit
-        isDetecting = true
-        log.append("Looking for ASIAIR share…")
-        Task.detached { [weak self] in
-            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
-            let found = ASIAIRDetector.detect()       // SMB directory work, off the main thread
-            await MainActor.run {
-                self.isDetecting = false
-                guard let found else {
-                    self.errorMessage = "No ASIAIR share found. In the ASIAIR app: Settings → Network Share → Enable. Then on the Mac: Finder → Go → Connect to Server → smb://asiair.local, and try again."
-                    return
-                }
-                self.configureAndStartASIAIR(found)
-            }
-        }
-    }
-
-    /// On-main configure + start for an auto-detected ASIAIR target folder.
-    /// Unlike the Seestar path, the relay glob is `*.<ext>` (the ASIAIR target
-    /// folder is already target-scoped) and `fileNamePrefix` is cleared: the
-    /// relay dir is glob-filtered AND session-scoped, so the native stacker must
-    /// accept every FITS in it — ASIAIR light files are not guaranteed to start
-    /// with "Light_" (the .nativeStack default prefix would otherwise drop them).
-    private func configureAndStartASIAIR(_ found: ASIAIRDetector.Found) {
-        sourceMode = .nativeStack
-        fileNamePrefix = ""                 // accept-all: see doc comment above
-        neutralizeBackground = true
-        targetName = found.target
-        subExposureText = String(format: "%g", found.subExposure ?? 10)
-        let glob = "*.\(found.subFileExtension)"
-        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
-        let relayDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))",
-                                    isDirectory: true)
-        pruneRelay(excluding: relayDir)
-        let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob)
-        relay.onLog = { [weak self] msg in Task { @MainActor in self?.log.append(msg) } }
-        do { try relay.start() } catch { errorMessage = "Relay failed to start: \(error)"; return }
-        frameRelay = relay
-        watchFolder = relayDir
-        saveSettings()
-        startSession()
-        if !isRunning { frameRelay?.stop(); frameRelay = nil; return }
-        selectedTab = .live
-    }
-
     func endSession() {
         saveSettings()
         guard let p = pipeline else { return }
@@ -613,8 +496,7 @@ final class AppModel {
         log.append("Ending session — generating replay…")
 
         // Stop the relay (if any) immediately — before the pipeline drains.
-        frameRelay?.stop()
-        frameRelay = nil
+        liveSource.stopRelay()
 
         // Scene automation stops immediately, live broadcast state resets, and the
         // deliberate end-of-session OBS stop is issued — all in the controller, at

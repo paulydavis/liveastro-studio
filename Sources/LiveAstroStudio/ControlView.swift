@@ -88,7 +88,7 @@ struct ControlView: View {
                             Text("Keep relay sessions")
                             InfoButton(text: "Live sessions stage incoming subs in ~/LiveAstro/relay. Sessions older than this are deleted automatically when a new session starts — they are copies; originals stay on the Seestar/rig. Off disables pruning.")
                             Spacer()
-                            Picker("", selection: $model.relayRetentionDays) {
+                            Picker("", selection: $model.liveSource.relayRetentionDays) {
                                 Text("Off").tag(0)
                                 Text("3d").tag(3)
                                 Text("7d").tag(7)
@@ -233,18 +233,18 @@ struct ControlView: View {
                     }
                     Spacer()
                     Button {
-                        model.startSeestarLive()
+                        model.liveSource.startSeestarLive()
                     } label: { Label("Start Seestar", systemImage: "dot.radiowaves.left.and.right") }
                     .help("Auto-detect the mounted Seestar folder, start relaying its 10s subs, and begin native stacking — one tap.")
-                    .disabled(model.isRunning || model.isImporting || model.isDetecting)
+                    .disabled(model.isRunning || model.isImporting || model.liveSource.isDetecting)
                     Button {
-                        model.startASIAIRLive()
+                        model.liveSource.startASIAIRLive()
                     } label: { Label("Start ASIAIR", systemImage: "camera.aperture") }
                     .help("Auto-detect the ASIAIR's Autorun/Light folder, relay its subs, and begin native stacking — one tap.")
-                    .disabled(model.isRunning || model.isImporting || model.isDetecting)
+                    .disabled(model.isRunning || model.isImporting || model.liveSource.isDetecting)
                     Button("Choose Folder…") { pickWatchFolderLive() }
                         .help("Live-stack subs from any folder your rig writes to (NINA / ASI camera / any incoming-subs folder) — session-scoped from the moment you start.")
-                        .disabled(model.isRunning || model.isImporting || model.isDetecting)
+                        .disabled(model.isRunning || model.isImporting || model.liveSource.isDetecting)
                     Button("Import Subs…") { pickImportFolder() }
                         .disabled(model.isRunning || model.isImporting)
                         .help("Select a folder of previously captured FITS subs to stack offline, with progress tracking and Cancel support.")
@@ -352,7 +352,7 @@ struct ControlView: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Watch"
         if panel.runModal() == .OK, let url = panel.url {
-            model.startWatchFolderLive(source: url)
+            model.liveSource.startWatchFolderLive(source: url)
         }
     }
 
