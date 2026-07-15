@@ -69,6 +69,36 @@ final class StackFileWatcherTests: XCTestCase {
         XCTAssertTrue(got)
     }
 
+    func testIgnoresPreallocatedFITSUntilStable() async throws {
+        // A writer that preallocates the FULL declared size, then fills pixels in place,
+        // passes the size>=declared check on the first sighting. It must NOT emit until the
+        // file is stable (size AND mtime unchanged across two ticks).
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.3)
+        let collector = collect(watcher)
+        try watcher.start()
+        let full = makeFITS(0.5, size: 64)
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        // Preallocate full size with zeroed pixel region (header valid, size == declared),
+        // then keep bumping mtime as if pixels are being written in place.
+        let header = full.prefix(full.count).count   // full declared length
+        _ = header
+        try full.write(to: url)                       // full size on disk immediately
+        // Simulate in-place pixel writes: rewrite the file (bumps mtime) a few times.
+        for _ in 0..<3 {
+            try await Task.sleep(nanoseconds: 250_000_000)
+            let fh = try FileHandle(forWritingTo: url)
+            try fh.seek(toOffset: 0)
+            fh.write(full)                            // same size, new mtime → not stable
+            try fh.close()
+        }
+        // During the active-write window it must not have emitted.
+        let premature = await collector.waitForCount(1, timeout: 0.1)
+        XCTAssertFalse(premature, "must not emit a preallocated FITS while it is still being written")
+        // Now stop touching it → it stabilizes → emits once.
+        let got = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(got, "a stabilized FITS must emit")
+    }
+
     func testDeduplicatesIdenticalContent() async throws {
         watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.3)
         let collector = collect(watcher)

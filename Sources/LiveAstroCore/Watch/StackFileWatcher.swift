@@ -22,8 +22,9 @@ public final class StackFileWatcher {
     private var debounceWork: DispatchWorkItem?
     private var folderFD: Int32 = -1
 
-    /// Per-file state for stability + dedupe.
-    private var lastSeenSize: [String: Int] = [:]
+    /// Per-file state for stability + dedupe. Stability now tracks (size, mtime) so a
+    /// preallocated-but-still-filling FITS (full size, advancing mtime) is not emitted early.
+    private var lastSeenStat: [String: (size: Int, mtime: TimeInterval)] = [:]
     private var lastEmittedDigest: [String: String] = [:]
 
     private let fileNamePrefix: String?
@@ -98,18 +99,25 @@ public final class StackFileWatcher {
             let url = folder.appendingPathComponent(name)
             guard let attrs = try? fm.attributesOfItem(atPath: url.path),
                   let size = (attrs[.size] as? NSNumber)?.intValue, size > 0 else { continue }
+            let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            let stat = (size: size, mtime: mtime)
 
-            let previousSize = lastSeenSize[name]
-            lastSeenSize[name] = size
+            let previous = lastSeenStat[name]
+            lastSeenStat[name] = stat
+
+            // Stability gate (P1-2): require (size, mtime) unchanged across two consecutive
+            // scans for BOTH file kinds. A writer that preallocates the full declared size and
+            // then fills pixels in place satisfies size>=declared on the first sighting; the
+            // stability requirement holds it back until the in-place writes stop.
+            guard previous?.size == stat.size, previous?.mtime == stat.mtime else { continue }
 
             if isFITS {
                 // Bulletproof completeness: header declares exact expected data length (spec §5.2).
+                // Combined with the stability gate above, this rejects both truncated files
+                // (size<declared) and preallocated-but-unfilled files (stable check).
                 guard let head = try? readHead(url: url, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
                       let header = try? FITSReader.readHeader(head),
                       size >= header.minimumFileSize else { continue }
-            } else {
-                // Bitmaps: require size stable across two consecutive scans.
-                guard previousSize == size else { continue }
             }
 
             guard let digest = contentDigest(url: url, size: size) else { continue }
