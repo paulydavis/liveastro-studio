@@ -187,6 +187,94 @@ final class GradientLevelerTests: XCTestCase {
             XCTAssertEqual(out.pixels[x], px[x], accuracy: 1e-6)
         }
     }
+
+    // --- FUSED SCALE TESTS ---
+
+    /// Hand-computed fused case: out = surfRef + (x − surfSub)·scale.
+    /// 1×1, surfSub const 0.1, surfRef const 0.05, x=0.3, s=1.5 → 0.05 + 0.2·1.5 = 0.35.
+    func testFusedScaleHandComputed() {
+        let a = img(1, 1, 3, [0.3, 0.0, 0.0])
+        // All channels populated: partial-nil models disable scaling frame-wide by design
+        // (all-or-nothing guard), so a scaled expectation needs full coeff pairs.
+        let sub = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.1, 0, 0], [0.1, 0, 0], [0.1, 0, 0]])
+        let ref = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.05, 0, 0], [0.05, 0, 0], [0.05, 0, 0]])
+        let out = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.5)
+        XCTAssertEqual(out.pixels[0], 0.35, accuracy: 1e-6)   // 0.05 + (0.3 - 0.1)·1.5
+    }
+
+    /// Identical models WITH scale != 1 must NOT take the fast path:
+    /// out = surfRef + (x − surfRef)·scale (surfSub == surfRef here).
+    /// surf const 0.1, x=0.4, s=2.0 → 0.1 + (0.4 − 0.1)·2 = 0.7.
+    func testIdenticalModelsWithScaleNotSkipped() {
+        let a = img(1, 1, 3, [0.4, 0.0, 0.0])
+        // fully populated for the same all-or-nothing reason as above
+        let m = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.1, 0, 0], [0.1, 0, 0], [0.1, 0, 0]])
+        let out = GradientLeveler.apply(a, subModel: m, refModel: m, scale: 2.0)
+        XCTAssertEqual(out.pixels[0], 0.7, accuracy: 1e-6)   // 0.1 + (0.4 - 0.1)·2 — NOT byte-identical
+    }
+
+    /// scale: 1.0 (default) must be byte-identical to the old two-arg call — the fused form
+    /// reduces to x − surfSub + surfRef.
+    func testScaleOneByteIdenticalToDefault() {
+        let a = img(2, 1, 3, [0.5, 0.5, 0.3, 0.3, 0.2, 0.2])
+        let sub = Model(degree: 1, width: 2, height: 1, coeffPerChannel: [[0.1, 0, 0], nil, nil])
+        let ref = Model(degree: 1, width: 2, height: 1, coeffPerChannel: [[0.0, 0, 0], nil, nil])
+        let defaulted = GradientLeveler.apply(a, subModel: sub, refModel: ref).pixels
+        let explicitOne = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.0).pixels
+        XCTAssertEqual(defaulted, explicitOne)
+    }
+
+    // --- ALL-OR-NOTHING SCALING (R4) ---
+
+    /// When ANY channel's sub OR ref coeff is nil and scale != 1, scaling must be suppressed
+    /// for ALL channels (effective scale = 1.0). This prevents a silent per-sub color shift
+    /// when one channel's polynomial fit fails.
+    ///
+    /// Setup: 3-channel grey (0.5, 0.5, 0.5), 1×1 frame.
+    ///   ch0 sub coeff: nil   ← triggers all-or-nothing guard
+    ///   ch1 sub coeff: valid (const 0.0), ref coeff: valid (const 0.0)
+    ///   ch2 sub coeff: valid (const 0.0), ref coeff: valid (const 0.0)
+    /// With scale=1.5, the buggy version would scale ch1 and ch2 to 0.75 while leaving ch0
+    /// at 0.5 (passthrough) → color shift. With the fix, ch1 and ch2 must equal the
+    /// scale=1.0 output (passthrough when sub==ref==0 constant).
+    // Regression (cold verify, 2026-07-15): a channel where BOTH sub and ref coeffs
+    // are nil is just as unlevelable as a one-sided nil — scaling only the remaining
+    // channels color-shifts the sub. The original guard used XOR and missed this.
+    func testBothNilChannelAlsoDisablesScalingEverywhere() {
+        let a = img(1, 1, 3, [0.5, 0.5, 0.5])
+        let sub = Model(degree: 1, width: 1, height: 1,
+                        coeffPerChannel: [nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        let ref = Model(degree: 1, width: 1, height: 1,
+                        coeffPerChannel: [nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])   // ch0 nil on BOTH sides
+        let out = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.5)
+        XCTAssertEqual(out.pixels, [0.5, 0.5, 0.5],
+                       "both-nil channel must disable scaling frame-wide (no color shift)")
+    }
+
+    func testPartialChannelNilDisablesScalingEverywhere() {
+        // 1×1, 3-channel grey image
+        let a = img(1, 1, 3, [0.5, 0.5, 0.5])
+        // ch0 sub coeff is nil — triggers all-or-nothing scaling guard
+        let sub = Model(degree: 1, width: 1, height: 1,
+                        coeffPerChannel: [nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        let ref = Model(degree: 1, width: 1, height: 1,
+                        coeffPerChannel: [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+
+        let outWithScale = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.5)
+        let outWithoutScale = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.0)
+
+        // With the fix: output must be byte-equal to scale=1.0 call (all channels).
+        // ch0 is passthrough in both (sub coeff nil). ch1/ch2 leveling still applies (but
+        // sub==ref==const 0 so leveling is a no-op here — the key check is they are NOT scaled).
+        XCTAssertEqual(outWithScale.pixels, outWithoutScale.pixels,
+                       "scale != 1 with any nil coeff must produce byte-identical output to scale=1 (all-or-nothing)")
+
+        // Confirm ch1 and ch2 are NOT at the naively-scaled value 0.75 (= 0.0 + (0.5-0.0)*1.5)
+        XCTAssertEqual(outWithScale.pixels[1], 0.5, accuracy: 1e-6,
+                       "ch1 must NOT be scaled when ch0 sub coeff is nil")
+        XCTAssertEqual(outWithScale.pixels[2], 0.5, accuracy: 1e-6,
+                       "ch2 must NOT be scaled when ch0 sub coeff is nil")
+    }
 }
 
 extension Float {

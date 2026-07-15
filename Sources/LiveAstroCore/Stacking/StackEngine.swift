@@ -22,6 +22,7 @@ public final class StackEngine {
     private let frameWeighting: Bool
     private var weightBaseline: (stars: Int, sigma: Float)?    // set at seed, reset on reseed
     private let normalization: Bool
+    private let scaleNormalization: Bool
     private let demosaic: DemosaicMethod
     /// R5: the seed's TILE SAMPLES (not a fitted model). Stored so each sub's reference
     /// model can be re-solved over the SAME masked tile subset as the sub — killing the
@@ -36,6 +37,26 @@ public final class StackEngine {
     static let weightExponent: Float = 1.0
     static let weightLo: Float = 0.25
     static let weightHi: Float = 4.0
+    // Scale-normalization constants (spec: multiplicative scale). Transparency
+    // beyond a 2× swing is clouds — weighting/rejection's job, not scaling's.
+    static let scaleLo: Float = 0.5
+    static let scaleHi: Float = 2.0
+    static let minScalePairs = 5
+
+    /// Median matched-star flux ratio (ref/sub) over RANSAC inlier pairs — the
+    /// sub's transparency correction. Pure. Invalid pairs (non-finite or ≤ 0 flux)
+    /// are skipped; fewer than minScalePairs valid pairs ⇒ 1.0 (no scaling).
+    public static func scaleFactor(fluxPairs: [(sub: Double, ref: Double)]) -> Float {
+        let ratios = fluxPairs.compactMap { p -> Double? in
+            guard p.sub.isFinite, p.ref.isFinite, p.sub > 0, p.ref > 0 else { return nil }
+            return p.ref / p.sub
+        }
+        guard ratios.count >= minScalePairs else { return 1.0 }
+        let sorted = ratios.sorted()
+        let median = sorted[sorted.count / 2]
+        return min(max(Float(median), scaleLo), scaleHi)
+    }
+
     /// Serializes process()/reseed()/currentStack()/stackFrameCount: reseed() runs on the
     /// main thread while process() runs on the pipeline's consume task. A reseed issued
     /// mid-frame applies before the NEXT frame (the intended UX).
@@ -60,6 +81,7 @@ public final class StackEngine {
     public init(seedMinStars: Int = 15, minMatches: Int = 8, inlierTolerance: Double = 2.0,
                 rejection: RejectionMethod = NoRejection(), autoReseedThreshold: Int = 6,
                 frameWeighting: Bool = false, normalization: Bool = false,
+                scaleNormalization: Bool = false,
                 demosaic: DemosaicMethod = .bilinear) {
         self.seedMinStars = seedMinStars
         self.minMatches = minMatches
@@ -68,6 +90,11 @@ public final class StackEngine {
         self.autoReseedThreshold = autoReseedThreshold
         self.frameWeighting = frameWeighting
         self.normalization = normalization
+        // Gate: scaling pivots about the reference background SURFACE, which only exists
+        // when leveling is on. An unleveled sub has no matched background to pivot about —
+        // the adversarial repro shows a scalar pivot injects a per-sub pedestal
+        // (bg_sub − bg₀)(s − 1). So scaling is only active when leveling is also on.
+        self.scaleNormalization = scaleNormalization && normalization
         self.demosaic = demosaic
     }
 
@@ -176,6 +203,12 @@ public final class StackEngine {
             }
             return .rejected(.noTransform)
         }
+        var scale: Float = 1.0
+        if scaleNormalization {
+            let ins = TransformSolver.inliers(half, source: stars, target: referenceStars,
+                                              pairs: pairs, tolerance: inlierTolerance)
+            scale = Self.scaleFactor(fluxPairs: ins.map { (sub: stars[$0.source].flux, ref: referenceStars[$0.target].flux) })
+        }
         let rgb = displayRGB(frame)
         guard rgb.channels == referenceChannels else {
             rejectedCount += 1
@@ -195,12 +228,16 @@ public final class StackEngine {
         // R5: solve BOTH the sub and reference models over the SAME masked tile subset of the
         // WARPED frame — kills the seed-vs-sub fit-domain asymmetry (C, R5) on top of R4's
         // fit-on-warped (kills rotation-injection C1 / nebula differential C2).
+        // Scaling is fused into leveling with a per-pixel reference-background pivot.
+        // When the per-frame fit fails (leveling pair nil) NO scaling happens either —
+        // consistent with the gate (no matched background surface to pivot about).
         var frame = warped
         if let pair = levelingModels(image: warped, mask: mask) {
-            frame = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref)
+            frame = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref, scale: scale)
         }
         let cleaned = rejection.apply(frame, mask: mask)
-        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma))
+        // σ·s: scaling amplifies noise too — weight must see post-scale noise
+        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma * scale))
         acceptedCount += 1
         consecutiveNoTransform = 0
         return .stacked(frameCount: accumulator.frameCount)
@@ -266,6 +303,7 @@ public final class StackEngine {
         public let transform: SimilarityTransform   // half-res transform (lift in warp)
         public let rgb: AstroImage                  // display-oriented RGB
         public let weight: Float                    // quality-based stacking weight (1.0 when off)
+        public let scale: Float                     // matched-flux transparency correction (1.0 when off)
         // R4/R5: backgroundModel removed from RegisteredFrame — fits are now done on the WARPED
         // frame (see levelingModels). Fitting pre-warp injected rotation-induced gradient error (C1).
     }
@@ -328,9 +366,15 @@ public final class StackEngine {
         else { return nil }
         let rgb = displayRGB(frame, minRows: minRows)
         guard rgb.channels == referenceChannels else { return nil }
-        let weight = frameWeight(stars: stars.count, sigma: sigma)
+        var scale: Float = 1.0
+        if scaleNormalization {
+            let ins = TransformSolver.inliers(half, source: stars, target: referenceStars,
+                                              pairs: pairs, tolerance: inlierTolerance)
+            scale = Self.scaleFactor(fluxPairs: ins.map { (sub: stars[$0.source].flux, ref: referenceStars[$0.target].flux) })
+        }
+        let weight = frameWeight(stars: stars.count, sigma: sigma * scale)   // σ·s: scaling amplifies noise too — weight must see post-scale noise
         // R4/R5: background fit removed from register — see levelingModels (fit on WARPED frame).
-        return RegisteredFrame(transform: half, rgb: rgb, weight: weight)
+        return RegisteredFrame(transform: half, rgb: rgb, weight: weight, scale: scale)
     }
 
     /// Produce BOTH domain-matched leveling models for a WARPED (reference-aligned) frame:
@@ -386,14 +430,19 @@ public final class StackEngine {
     /// Accumulate a warped frame into the shared stack under the engine lock.
     /// Bumps acceptedCount. Rejection filtering runs here (serial), preserving any
     /// stateful RejectionMethod. Call from the single serial consumer.
-    public func commit(image: AstroImage, mask: [Float], frameWeight: Float = 1.0,
+    public func commit(image: AstroImage, mask: [Float], frameWeight: Float = 1.0, scale: Float = 1.0,
                        leveling: (sub: BackgroundExtraction.BackgroundModel,
                                   ref: BackgroundExtraction.BackgroundModel)? = nil, minRows: Int) {
         lock.withLock {
             guard let accumulator else { return }
+            // Scaling is fused into leveling with a per-pixel reference-background pivot.
+            // When the leveling pair is nil (per-frame fit failure) NO scaling happens for
+            // this frame — consistent with the gate. Note: the weight was computed with σ·s
+            // at register time; a rare per-frame fit failure leaves that weight slightly
+            // conservative (an unscaled frame carrying a scaled-noise weight) — acceptable.
             var frame = image
             if let pair = leveling {
-                frame = GradientLeveler.apply(image, subModel: pair.sub, refModel: pair.ref, minRows: minRows)
+                frame = GradientLeveler.apply(image, subModel: pair.sub, refModel: pair.ref, scale: scale, minRows: minRows)
             }
             let cleaned = rejection.apply(frame, mask: mask)
             accumulator.add(cleaned, mask: mask, frameWeight: frameWeight, minRows: minRows)

@@ -127,6 +127,23 @@ final class SessionSettingsDisplayAdjTests: XCTestCase {
         XCTAssertTrue(s.backgroundNormalizationEnabled)
     }
 
+    func testScaleNormalizationDefaultsOnAndRoundTrips() throws {
+        var s = SessionSettings()
+        XCTAssertTrue(s.scaleNormalizationEnabled)                // default on
+        s.scaleNormalizationEnabled = false
+        let data = try JSONEncoder().encode(s)
+        let back = try JSONDecoder().decode(SessionSettings.self, from: data)
+        XCTAssertFalse(back.scaleNormalizationEnabled)
+    }
+
+    func testScaleNormalizationBackwardCompatDefaultsOn() throws {
+        // Reuse the same JSON literal as testBackgroundNormalizationBackwardCompatDefaultsOn —
+        // an old blob without scaleNormalizationEnabled must decode to true (default on).
+        let json = #"{"sourceModeRaw":"Raw subs (native stacking)","filePrefix":"Light_","neutralizeBackground":false,"subExposureSeconds":60,"targetName":"","calibration":{},"rejectionEnabled":true}"#
+        let s = try JSONDecoder().decode(SessionSettings.self, from: Data(json.utf8))
+        XCTAssertTrue(s.scaleNormalizationEnabled)
+    }
+
     func testRelayRetentionDefaultsSevenAndRoundTrips() throws {
         var s = SessionSettings()
         XCTAssertEqual(s.relayRetentionDays, 7)                       // default 7
