@@ -1,4 +1,7 @@
 import XCTest
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 @testable import LiveAstroCore
 
 /// Tests that pin FaultKit itself (T1, spec §"Testing the tests"): the harness that
@@ -139,6 +142,21 @@ final class FaultKitTests: XCTestCase {
                                                        expectedAcceptedCount: 2))
             }
         }
+
+        // (d) Replace a listed snapshot PNG with garbage bytes (nonempty, undecodable)
+        //     → clause 4 (decodable image) must FAIL — a nonempty-bytes check would miss this.
+        try withCorruptedCopy(of: sessionRoot, under: fs, name: "garbage-snap") { root in
+            let manifest = try ManifestCoding.decoder()
+                .decode(SessionManifest.self, from: Data(contentsOf: root.appendingPathComponent("manifest.json")))
+            let target = root.appendingPathComponent(manifest.snapshots[0].snapshotFile)
+            try Data("this is not a PNG — just text pretending to be an image".utf8).write(to: target)
+            XCTExpectFailure("a listed snapshot that is not a decodable image must fail clause 4") {
+                assertSessionOracle(sessionRoot: root, log: [],
+                                    OracleExpectations(lossLogPattern: nil,
+                                                       laterFramesApplicable: false,
+                                                       expectedAcceptedCount: 2))
+            }
+        }
     }
 
     // MARK: - Local helpers
@@ -166,7 +184,9 @@ final class FaultKitTests: XCTestCase {
         var records: [SnapshotRecord] = []
         for i in 0..<count {
             let name = String(format: "snapshots/%04d.png", i)
-            try Data("png-bytes-\(i)".utf8).write(to: root.appendingPathComponent(name))
+            // Write a REAL 2×2 PNG so clause 4 (decode) passes on the base case — text-as-.png would
+            // sail past a nonempty-bytes check but is not a decodable image.
+            try Self.tinyPNGData().write(to: root.appendingPathComponent(name))
             records.append(SnapshotRecord(index: i, timestamp: Date(), sourceFile: "live_stack.fit",
                                           snapshotFile: name, estimatedIntegrationSeconds: 60,
                                           width: 10, height: 10, mean: 0.1, median: 0.08, stddev: 0.02))
@@ -187,6 +207,27 @@ final class FaultKitTests: XCTestCase {
         try? FileManager.default.removeItem(at: dst)
         try FileManager.default.copyItem(at: source, to: dst)
         try mutate(dst)
+    }
+
+    /// Encode a real, decodable 2×2 PNG (via a CGImage → ImageIO destination) so clause 4's decode
+    /// check passes on genuine snapshot output.
+    static func tinyPNGData() throws -> Data {
+        let w = 2, h = 2
+        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceGray(),
+                            bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+        ctx.setFillColor(gray: 0.5, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        let cg = ctx.makeImage()!
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else {
+            throw NSError(domain: "FaultKitTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "PNG destination"])
+        }
+        CGImageDestinationAddImage(dest, cg, nil)
+        guard CGImageDestinationFinalize(dest) else {
+            throw NSError(domain: "FaultKitTests", code: 2, userInfo: [NSLocalizedDescriptionKey: "PNG finalize"])
+        }
+        return data as Data
     }
 
     /// Rewrite the manifest with an end_time set (claims the session ended) — the caller

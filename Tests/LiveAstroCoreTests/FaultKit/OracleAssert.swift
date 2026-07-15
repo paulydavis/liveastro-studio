@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import ImageIO
 @testable import LiveAstroCore
 
 /// Scenario-specific expectations, passed EXPLICITLY so the oracle is never silently weakened.
@@ -21,7 +22,9 @@ struct OracleExpectations {
 ///   (2) snapshots listed in the manifest exist on disk; count matches `expectedAcceptedCount` if set.
 ///   (3) later valid frames continue to be accepted — asserted by the TEST; documented via
 ///       `laterFramesApplicable` (a value of true without the test feeding frames is a test smell).
-///   (4) finalization inputs are readable: every listed snapshot PNG opens (recoverable output path).
+///   (4) finalization inputs are readable AND decodable: every listed snapshot PNG opens as a real
+///       image (CGImageSource decodes at least one frame) — non-empty bytes are not enough; a listed
+///       snapshot that is garbage/text fails here (recoverable output path).
 ///   (5) unpersisted work is never reported successful: a manifest with `end_time` set (claims the
 ///       session ended) MUST have a durable `master.fit` — an ended claim without the persisted end
 ///       artifact is dishonest. (SessionManifest has no separate status field; `end_time` + master.fit
@@ -56,11 +59,20 @@ func assertSessionOracle(sessionRoot: URL, log: [String],
                        file: file, line: line)
     }
 
-    // Clause 4: finalization/replay inputs readable — every listed snapshot opens with content.
+    // Clause 4: finalization/replay inputs readable AND decodable — every listed snapshot must open
+    // as a real image, not merely be non-empty bytes. A listed snapshot replaced by text/garbage
+    // (nonzero length, undecodable) is a silently-corrupt output and must fail here.
     for snap in manifest.snapshots {
         let p = sessionRoot.appendingPathComponent(snap.snapshotFile)
         guard let bytes = try? Data(contentsOf: p), !bytes.isEmpty else {
             XCTFail("oracle clause 4: snapshot not readable for finalization: \(snap.snapshotFile)",
+                    file: file, line: line)
+            continue
+        }
+        guard let src = CGImageSourceCreateWithData(bytes as CFData, nil),
+              CGImageSourceGetCount(src) > 0,
+              CGImageSourceCreateImageAtIndex(src, 0, nil) != nil else {
+            XCTFail("oracle clause 4: snapshot present but not decodable as an image: \(snap.snapshotFile)",
                     file: file, line: line)
             continue
         }

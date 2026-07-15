@@ -122,82 +122,85 @@ final class FaultMatrixLifecycleTests: XCTestCase {
         XCTAssertEqual(mgr.acceptedCount, 3, "the failed record must not be counted")
 
         // The REMAINS: nothing was persisted after removal, and the manager never claimed success.
-        // Re-create just enough to run the oracle against what the manager believes is durable by
-        // re-persisting the last good manifest (models an operator re-mounting the volume). The
-        // manager's in-memory manifest is the last durable truth (3 snapshots + their PNGs gone with
-        // the dir), so we restore the dir and re-write the manifest+PNGs to prove the counts the
-        // manager reports are honest and recoverable, not fabricated.
-        try FileManager.default.createDirectory(at: dir.appendingPathComponent("snapshots"),
-                                                withIntermediateDirectories: true)
-        let restored = SnapshotRecorder(sessionDirectory: dir)
-        for i in 0..<3 { _ = try restored.save(cgImage: cg, linear: linear, sourceFile: "live_stack.fit",
-                                               index: i, timestamp: Date(), estimatedIntegrationSeconds: 120) }
-        // Re-persist the manager's in-memory manifest (3 snapshots) so the oracle can verify the
-        // count the manager reports is internally consistent (never a false 4).
-        try mgr.recordSnapshot(SnapshotRecord(index: 99, timestamp: Date(), sourceFile: "x",
-                                              snapshotFile: "snapshots/0002.png",
-                                              estimatedIntegrationSeconds: 0, width: 1, height: 1,
-                                              mean: 0, median: 0, stddev: 0))
-        // Now 4 in memory + durable (the record above referenced an existing PNG). The point stands:
-        // the earlier failed record never inflated the count; it did so ONLY after a real durable
-        // write succeeded.
-        XCTAssertEqual(mgr.acceptedCount, 4)
-        assertSessionOracle(sessionRoot: dir, log: [],
+        // The honest post-fault truth is EXACTLY 3 snapshots — the failed record never inflated the
+        // count. Model recovery (operator re-mounts the volume) with a FRESH manager that re-records
+        // the 3 recoverable snapshots into a clean session, then oracle at the REAL aftermath count
+        // of 3 — no synthetic 4th record inflating it beyond what was durable.
+        let recoveryMgr = SessionManager(rootDirectory: fs.root)
+        let recoveredDir = try recoveryMgr.startSession(profile: profile("Recovered"))
+        let recoveredRecorder = SnapshotRecorder(sessionDirectory: recoveredDir)
+        try recordSnapshots(3, mgr: recoveryMgr, recorder: recoveredRecorder)
+        XCTAssertEqual(recoveryMgr.acceptedCount, 3, "the honest recoverable count is 3 — never a false 4")
+        assertSessionOracle(sessionRoot: recoveredDir, log: [],
                             OracleExpectations(lossLogPattern: nil,
                                                laterFramesApplicable: false,
-                                               expectedAcceptedCount: 4))
+                                               expectedAcceptedCount: 3))
     }
 
     // ============================================================================================
     // MARK: SnapshotRecorder row
     // ============================================================================================
 
-    /// SnapshotRecorder × read-only / dir-removed (via the pipeline path): a snapshot save that
-    /// fails is logged as a dropped/skipped frame, the session continues, and the manifest never
-    /// lists the unsaved snapshot. Driven through SessionPipeline.finalizeCommitted's real
-    /// try/catch (a recorder.save failure logs "Skipped frame"). We assert component-level: the
-    /// recorder throws cleanly on a removed snapshots dir, and the manifest that the SessionManager
-    /// persists never references the unsaved file.
+    /// SnapshotRecorder × dir-removed (driven through the REAL SessionPipeline import path): with the
+    /// snapshots/ subdir removed, every finalizeCommitted save throws and the PIPELINE logs the
+    /// production "Skipped frame" line via `onLog` (captured here — NOT hand-authored). The session
+    /// survives, the manifest lists none of the unsaved snapshots, and a fresh import after restore
+    /// is accepted. Clause 6 is exercised against the string the production code actually emits.
     func testSnapshotRecorder_dirRemoved_saveFailsSessionContinuesManifestOmitsIt() throws {
         let fs = try TempFS("rec-dirremoved"); defer { fs.tearDown() }
-        let mgr = SessionManager(rootDirectory: fs.root)
-        let dir = try mgr.startSession(profile: profile())
-        let recorder = SnapshotRecorder(sessionDirectory: dir)
-        try recordSnapshots(1, mgr: mgr, recorder: recorder)         // 1 good snapshot
-        XCTAssertEqual(mgr.acceptedCount, 1)
+        let sessions = try fs.dir("sessions")
 
-        // Remove the snapshots/ subdir → the next save fails cleanly (no partial PNG committed).
+        // Drive a real import of two registerable frames through the pipeline, but remove snapshots/
+        // right after start() creates it — so finalizeCommitted's recorder.save throws for real.
+        let good1 = Self.starField(name: "sub_000.fit", dx: 0, dy: 0)
+        let good2 = Self.starField(name: "sub_001.fit", dx: 1.1, dy: -0.9)
+        let engine = StackEngine()
+        let pipeline = SessionPipeline(nativeSource: FaultMatrixLifecycleTests.ArrayFrameSource([good1, good2]),
+                                       engine: engine, profile: profile("RecDrop"),
+                                       rootDirectory: sessions)
+        var log: [String] = []
+        let logLock = NSLock()
+        pipeline.onLog = { msg in logLock.lock(); log.append(msg); logLock.unlock() }
+
+        try pipeline.start()
+        let dir = pipeline.session.sessionDirectory!
+        // Remove snapshots/ out from under the running import: every save now fails → the PIPELINE
+        // itself emits "Skipped frame (...)" (production string) for each committed frame.
         let snaps = dir.appendingPathComponent("snapshots")
         try Disruptor.removeDirectory(snaps)
+        _ = try pipeline.end()   // drains the finite import fully (all saves fail into onLog)
 
-        let (cg, linear) = snapshotInputs()
-        var log: [String] = []
-        // Model the pipeline's finalizeCommitted try/catch: a save failure is caught and logged as a
-        // dropped frame; recordSnapshot is NEVER reached, so the manifest cannot list it.
-        do {
-            let rec = try recorder.save(cgImage: cg, linear: linear, sourceFile: "live_stack.fit",
-                                        index: 1, timestamp: Date(), estimatedIntegrationSeconds: 120)
-            try mgr.recordSnapshot(rec)
-            XCTFail("save into a removed snapshots/ dir must throw")
-        } catch {
-            log.append("Skipped frame (live_stack.fit): \(error)")   // exactly the pipeline's log line
-        }
-        XCTAssertEqual(mgr.acceptedCount, 1, "manifest must not list the unsaved snapshot")
+        logLock.lock(); let capturedAfterDrop = log; logLock.unlock()
+        let joined = capturedAfterDrop.joined(separator: "\n")
+        XCTAssertTrue(joined.contains("Skipped frame"),
+                      "the PIPELINE must emit the production 'Skipped frame' log when the save fails:\n\(joined)")
+        // The manifest must not list any snapshot whose PNG never wrote.
+        let manifest = try ManifestCoding.decoder()
+            .decode(SessionManifest.self, from: Data(contentsOf: dir.appendingPathComponent("manifest.json")))
+        XCTAssertTrue(manifest.snapshots.isEmpty, "manifest must not list an unsaved snapshot")
 
-        // Session continues: restore snapshots/ and record another — accepted.
+        // Session survives + continues: restore snapshots/ and run a fresh import → snapshots land.
         try FileManager.default.createDirectory(at: snaps, withIntermediateDirectories: true)
-        try recordSnapshots(1, mgr: mgr, recorder: recorder, from: 2)
-        XCTAssertEqual(mgr.acceptedCount, 2)
+        let engine2 = StackEngine()
+        let pipeline2 = SessionPipeline(nativeSource: FaultMatrixLifecycleTests.ArrayFrameSource([good1, good2]),
+                                        engine: engine2, profile: profile("RecHeal"),
+                                        rootDirectory: sessions)
+        var healLog: [String] = []
+        let healLock = NSLock()
+        pipeline2.onLog = { msg in healLock.lock(); healLog.append(msg); healLock.unlock() }
+        try pipeline2.start()
+        _ = try pipeline2.end()
+        let healedDir = pipeline2.session.sessionDirectory!
+        let healedManifest = try ManifestCoding.decoder()
+            .decode(SessionManifest.self, from: Data(contentsOf: healedDir.appendingPathComponent("manifest.json")))
+        XCTAssertFalse(healedManifest.snapshots.isEmpty, "after restore, a fresh import records snapshots")
 
-        // Oracle: the manifest lists exactly the 2 saved snapshots; the dropped one is absent.
-        // Re-write the index-0 PNG which was lost with the removed dir so clause 2/4 (listed →
-        // exists+readable) holds for the pre-drop snapshot too.
-        _ = try recorder.save(cgImage: cg, linear: linear, sourceFile: "live_stack.fit",
-                              index: 0, timestamp: Date(), estimatedIntegrationSeconds: 120)
-        assertSessionOracle(sessionRoot: dir, log: log,
+        // Oracle on the DROPPED session with the PIPELINE-captured log: clause 6 matches the real
+        // production string; the manifest is honest (lists nothing that failed to save).
+        assertSessionOracle(sessionRoot: dir, log: capturedAfterDrop,
                             OracleExpectations(lossLogPattern: "Skipped frame",
                                                laterFramesApplicable: true,
-                                               expectedAcceptedCount: 2))
+                                               expectedAcceptedCount: 0))
     }
 
     // ============================================================================================
@@ -248,6 +251,12 @@ final class FaultMatrixLifecycleTests: XCTestCase {
                                        rootDirectory: sessions)
         let consumer = SlowConsumer()
         pipeline.onUpdate = { _, _ in consumer.wedge() }   // wedges the consume task inside handling
+        // Capture the pipeline's REAL log so clause 6 matches the production-emitted string (the
+        // "refusing to finalize" line is written by SessionPipeline.drainConsumeTaskOrThrow, not by
+        // this test). frameFlood-cell pattern: thread-safe append behind a lock.
+        var log: [String] = []
+        let logLock = NSLock()
+        pipeline.onLog = { msg in logLock.lock(); log.append(msg); logLock.unlock() }
         pipeline.drainPrimaryTimeout = .milliseconds(200)
         pipeline.drainGraceTimeout = .milliseconds(200)
         try pipeline.start()
@@ -270,8 +279,11 @@ final class FaultMatrixLifecycleTests: XCTestCase {
         XCTAssertNil(manifest.endTime, "wedged end must not set endTime")
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("master.fit").path),
                        "no master.fit may be finalized over a racing stack")
+        logLock.lock(); let captured = log; logLock.unlock()
+        XCTAssertTrue(captured.joined(separator: "\n").contains("refusing to finalize"),
+                      "the PIPELINE must emit the production 'refusing to finalize' log on a wedged end")
         assertSessionOracle(sessionRoot: dir,
-                            log: ["Shutdown timed out: the frame consumer did not stop — refusing to finalize."],
+                            log: captured,
                             OracleExpectations(lossLogPattern: "refusing to finalize",
                                                laterFramesApplicable: false,
                                                expectedAcceptedCount: nil))
@@ -320,45 +332,44 @@ final class FaultMatrixLifecycleTests: XCTestCase {
     // MARK: BatchImporter row
     // ============================================================================================
 
-    /// BatchImporter × cancel mid-import: cancelImport() during a coordinated import → the in-flight
-    /// work is drained, the committed count is truthful, and the oracle passes on the
-    /// partial-but-honest session. Cancellation is coordinated by a gate closure so the cancel lands
-    /// deterministically after the seed commits (semaphore-gated, no sleep).
-    func testBatchImporter_cancelMidImport_drainsInFlightCountTruthful() async throws {
+    /// BatchImporter × cancel mid-import, DRIVEN THROUGH THE REAL PIPELINE: a SessionPipeline import
+    /// of 12 subs is cancelled (via cancelImport()) after a few snapshots commit; end() finalizes the
+    /// partial-but-honest session. The oracle runs on the session the PIPELINE actually produced
+    /// (`pipeline.session.sessionDirectory`) — not a hand-built synthetic one — so the manifest count
+    /// it validates is the real committed count. Cancel lands deterministically off the onUpdate
+    /// callback (fires once per committed snapshot); no sleeps.
+    func testBatchImporter_cancelMidImport_drainsInFlightCountTruthful() throws {
         let fs = try TempFS("batch-cancel"); defer { fs.tearDown() }
+        let sessions = try fs.dir("sessions")
         let subs = (0..<12).map { Self.starField(name: String(format: "sub_%03d.fit", $0),
                                                   dx: Double($0 % 5) * 1.3 - 2.0,
                                                   dy: Double($0 % 3) * 1.1 - 1.0) }
         let engine = StackEngine()
-        let importer = BatchImporter(engine: engine, poolSize: 3)
+        let pipeline = SessionPipeline(nativeSource: FaultMatrixLifecycleTests.ArrayFrameSource(subs),
+                                       engine: engine, profile: profile("Cancel"),
+                                       rootDirectory: sessions)
+        // Cancel once a few snapshots have committed. onUpdate fires per committed snapshot on the
+        // detached import task; the flip is idempotent so extra in-flight fires are harmless.
+        let committedCounter = AtomicIntBox()
+        pipeline.onUpdate = { _, _ in
+            committedCounter.increment()
+            if committedCounter.value >= 4 { pipeline.cancelImport() }
+        }
 
-        // Cancel after a few commits: isCancelled flips true once `committed` reaches a threshold.
-        let counter = AtomicIntBox()
-        var committed = 0, rejected = 0
-        let commitLock = NSLock()
-        await importer.run(source: FaultMatrixLifecycleTests.ArrayFrameSource(subs),
-                           onCommitted: { _ in
-                               commitLock.lock(); committed += 1; commitLock.unlock()
-                               counter.increment()
-                           },
-                           onRejected: { _ in commitLock.lock(); rejected += 1; commitLock.unlock() },
-                           isCancelled: { counter.value >= 4 })   // stop feeding after 4 commits
+        try pipeline.start()
+        _ = try pipeline.end()   // drains in-flight work, finalizes the partial session
 
-        // Truthful accounting: the committed count reported to the caller equals the engine's
-        // accepted count (no over-count, no phantom commit). Cancellation drained in-flight work.
-        XCTAssertEqual(committed, engine.acceptedCount,
-                       "committed callback count must match engine.acceptedCount (truthful)")
+        let dir = pipeline.session.sessionDirectory!
+        let manifest = try ManifestCoding.decoder()
+            .decode(SessionManifest.self, from: Data(contentsOf: dir.appendingPathComponent("manifest.json")))
+        let committed = manifest.snapshots.count
+        // Truthful accounting on the REAL session: at least the pre-cancel commits landed, and the
+        // cancel stopped a full 12-frame import.
         XCTAssertGreaterThanOrEqual(committed, 4, "at least the pre-cancel commits landed")
         XCTAssertLessThan(committed, subs.count, "cancellation must have stopped a full import")
 
-        // Persist the partial-but-honest session so the oracle can verify it (the importer path in
-        // production goes through SessionPipeline; here we assert on a manifest built from the
-        // truthful committed count).
-        let mgr = SessionManager(rootDirectory: fs.root)
-        let dir = try mgr.startSession(profile: profile("Cancel"))
-        let recorder = SnapshotRecorder(sessionDirectory: dir)
-        try recordSnapshots(committed, mgr: mgr, recorder: recorder)
-        XCTAssertEqual(mgr.acceptedCount, committed, "manifest reflects the truthful committed count")
+        // Oracle on the pipeline-produced session: manifest parses, every listed snapshot PNG exists
+        // and decodes (clause 4), count is exactly what the pipeline durably committed.
         assertSessionOracle(sessionRoot: dir, log: [],
                             OracleExpectations(lossLogPattern: nil,
                                                laterFramesApplicable: false,

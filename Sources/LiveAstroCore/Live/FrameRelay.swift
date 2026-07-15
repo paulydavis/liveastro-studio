@@ -14,6 +14,15 @@ public final class FrameRelay {
     /// static file relays on its first tick without a perceptible delay.
     private let stabilityInterval: Double
     public var onLog: ((String) -> Void)?
+    /// TEST-ONLY synchronization hook (spec §Seams, pre-approved). Invoked exactly once per relayed
+    /// file, at the single point BETWEEN copy-verification (the post-copy re-stat that confirms the
+    /// staged `.relaytmp` is a faithful copy) and the atomic rename that publishes it under the final
+    /// name. It is a synchronization point, not behavior: production leaves it nil (no-op). Tests set
+    /// it to force a deterministic interleaving — e.g. the `relay-midcopy` crash cell blocks inside it
+    /// so a SIGKILL lands genuinely mid-copy, with the `.relaytmp` staged file present and no
+    /// glob-visible destination file. Justification note: docs/superpowers/fault-matrix.md
+    /// (`relay-midcopy` cell). Nothing in the shipped app reads or sets this.
+    public var onPrePublish: (() -> Void)?
     public private(set) var relayedCount = 0
     private let sessionScoped: Bool
     private var baseline: Set<String> = []
@@ -130,6 +139,10 @@ public final class FrameRelay {
                     onLog?("changed during copy, retry next poll: \(name)")
                     continue
                 }
+                // Copy verified faithful (post == now) but not yet published. TEST-ONLY sync point:
+                // a kill landing HERE leaves the staged `.relaytmp` on disk and NO glob-visible dest
+                // file — exactly the state the relay-midcopy crash cell asserts. Production: nil no-op.
+                onPrePublish?()
                 // Atomic placement: if dest already exists (truncated-heal path) replaceItemAt
                 // atomically swaps it; otherwise moveItem renames into place. Both ensure the
                 // watcher never observes a partial file under the final name.

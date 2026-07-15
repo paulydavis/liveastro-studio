@@ -12,11 +12,17 @@ import LiveAstroCore
 //
 // Scenarios:
 //   session-midframes <root> <flag>  begin a session, record 3 real snapshots, touch flag, block.
-//   manifest-midwrite <root> <flag>  begin a session, loop rewriting the manifest with a growing
-//                                     snapshot list; touch flag after the FIRST write, then block.
-//   relay-midcopy <src> <dst> <flag> start a FrameRelay against a large source, touch flag after
-//                                     the first tick begins, then block. (Here <root>==<src>; the
-//                                     builder passes a single aftermath root, so dst is derived.)
+//   manifest-midwrite <root> <flag>  begin a session, pre-seed a LARGE (multi-MB) manifest, touch
+//                                     flag, then LOOP FOREVER rewriting the manifest (tight loop, no
+//                                     sleeps, never blocks). The SIGKILL lands mid-loop — during or
+//                                     between atomic manifest writes. The .atomic guarantee: any kill
+//                                     point leaves a COMPLETE manifest version (never a torn file).
+//   relay-midcopy <src> <dst> <flag> start a FrameRelay against a large source; the pre-approved
+//                                     onPrePublish sync hook touches the flag then blocks forever, so
+//                                     the SIGKILL lands GENUINELY between the staged copy and the
+//                                     atomic publish — .relaytmp present, no glob-visible dest.
+//                                     (Here <root>==<src>; the builder passes a single aftermath
+//                                     root, so dst is derived.)
 
 func touchFlag(_ path: String) {
     FileManager.default.createFile(atPath: path, contents: Data("ready".utf8))
@@ -77,15 +83,34 @@ do {
         let dir = try mgr.startSession(profile: profile())
         let recorder = SnapshotRecorder(sessionDirectory: dir)
         let (cg, linear) = makeSnapshotInputs()
-        var i = 0
-        // Loop rewriting the manifest with a growing snapshot list; flag after the first write.
+        // Build a record that serializes to a LARGE JSON payload (a fat `sourceFile` string) so each
+        // manifest write moves multiple MB — this widens the tear window enough that a NON-atomic
+        // write is observably caught mid-write, while keeping the pre-seed fast (few records, so no
+        // quadratic build cost). All records reference the SAME real on-disk PNG (index 0), so clauses
+        // 2 & 4 (exists + decodable) hold for every listed entry.
+        let seedRec = try recorder.save(cgImage: cg, linear: linear, sourceFile: "live_stack.fit",
+                                        index: 0, timestamp: Date(), estimatedIntegrationSeconds: 60)
+        let fatSource = String(repeating: "x", count: 40_000)   // ~40 KB per record
+        func fatRecord(_ idx: Int) -> SnapshotRecord {
+            SnapshotRecord(index: idx, timestamp: Date(), sourceFile: fatSource,
+                           snapshotFile: seedRec.snapshotFile,
+                           estimatedIntegrationSeconds: seedRec.estimatedIntegrationSeconds,
+                           width: seedRec.width, height: seedRec.height,
+                           mean: seedRec.mean, median: seedRec.median, stddev: seedRec.stddev)
+        }
+        // Pre-seed 120 fat records → ~5 MB manifest. Only 120 (fast) intermediate writes.
+        for idx in 0..<120 { try mgr.recordSnapshot(fatRecord(idx)) }
+        touchFlag(flag)   // coordinated point: manifest is large + live → the builder may SIGKILL now
+        var i = 120
+        // Loop FOREVER rewriting the ~5 MB manifest — a tight loop with no sleeps, no blocking, and no
+        // per-iteration PNG encode, so the big atomic manifest write DOMINATES the loop (maximizing the
+        // fraction of wall time spent inside write()). The kill lands MID-ACTIVITY, so the .atomic
+        // guarantee is genuinely exercised: whatever instant the kill lands, the manifest on disk is
+        // SOME complete version, never a torn/half-serialized file. (What is NOT guaranteed: WHICH
+        // version survives — the test asserts only that it parses.)
         while true {
-            let rec = try recorder.save(cgImage: cg, linear: linear, sourceFile: "live_stack.fit",
-                                        index: i, timestamp: Date(), estimatedIntegrationSeconds: 60)
-            try mgr.recordSnapshot(rec)
-            if i == 0 { touchFlag(flag) }   // first write landed → coordinated point
+            try mgr.recordSnapshot(fatRecord(i))
             i += 1
-            if i == 1 { blockForever() }    // block after the first write so SIGKILL is deterministic
         }
 
     case "relay-midcopy":
@@ -99,12 +124,14 @@ do {
                                        contents: Data(count: 64 * 1024 * 1024))   // 64 MiB
         let relay = FrameRelay(source: src, destination: dst, pollSeconds: 0.05,
                                sessionScoped: false, stabilityInterval: 0.01)
-        var flagged = false
-        relay.onLog = { (_: String) in
-            if !flagged { flagged = true; touchFlag(flag) }   // first tick began
-        }
+        // Pre-approved sync hook (FIRST JUSTIFIED USE): the relay copies src → staged `.relaytmp`,
+        // re-stats to verify the copy is faithful, then calls onPrePublish RIGHT BEFORE the atomic
+        // rename. Here we touch the flag (so the builder SIGKILLs us) and block forever — the kill
+        // therefore lands GENUINELY between staged-copy and publish: `.relaytmp` is on disk, no
+        // glob-visible destination file exists yet.
+        relay.onPrePublish = { touchFlag(flag); blockForever() }
         try relay.start()
-        blockForever()
+        blockForever()   // unreachable once a file relays, but keeps main alive until then
 
     default:
         FileHandle.standardError.write(Data("unknown scenario: \(scenario)\n".utf8))

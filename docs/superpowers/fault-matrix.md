@@ -3,8 +3,10 @@
 Living document (spec `docs/superpowers/specs/2026-07-15-fault-injection-design.md`, §"The Fault Matrix").
 Updated in the same commit as its tests; a stale matrix is a review defect.
 
-**Seams: none required — all cells drivable via FaultKit; the two pre-approved seams remain
-unimplemented by design** (YAGNI — no T2/T3/T4 cell proved undrivable without them).
+**Seams: ONE of the two pre-approved seams is now in use.** The `FrameRelay.onPrePublish` sync hook
+(spec §Seams) is required by the `relay-midcopy` crash cell — the ONLY way to land a SIGKILL
+genuinely between the staged copy and the atomic publish (justification note below). The other
+pre-approved seam (injectable manifest writer) remains unimplemented (YAGNI — no cell requires it).
 
 ## How to add a row/cell
 
@@ -93,11 +95,38 @@ privileged runner.
   volume. The real errno is not claimed. The pre-approved injectable manifest writer (spec §Seams)
   is the future path to genuine ENOSPC/EIO — NOT added here: no T3 cell proved undrivable without it
   (the read-only dir drives the atomic-write failure faithfully). YAGNI holds.
-- **No production-code changes in T3.** No seam was required; every cell was drivable with FaultKit
-  against the real filesystem.
-- **Crash cells use a genuine SIGKILL.** `CrashArtifactBuilder` runs `faulthelper` to a coordinated
-  readiness flag, then `kill(pid, SIGKILL)` — the aftermath is a real killed-mid-state directory,
-  satisfying the spec's "terminated helper process, not merely objects released in-process" rule.
+- **Crash cells use a genuine SIGKILL that lands MID-ACTIVITY.** `CrashArtifactBuilder` runs
+  `faulthelper` to a coordinated readiness flag, then `kill(pid, SIGKILL)` — the aftermath is a real
+  killed-mid-state directory, satisfying the spec's "terminated helper process, not merely objects
+  released in-process" rule. Two cells were hardened after an oracle-evasion hunt found they were
+  killing an IDLE process (flag touched AFTER the op settled):
+  - `manifest-midwrite`: the helper pre-seeds a large (~8 MB) manifest, touches the flag, then LOOPS
+    FOREVER rewriting that manifest — no sleeps, no block, no per-iteration PNG encode (so the manifest
+    write dominates the loop). The kill lands during/between writes, so the `.atomic` guarantee is
+    genuinely exercised: **whatever instant the kill lands, the manifest on disk is SOME complete
+    version — never a torn/half-serialized file.** (What is NOT guaranteed: WHICH version survives —
+    the test asserts only that it parses.)
+    - **Platform note (mutation-check finding):** the prescribed mutation (switch `persist` from
+      `.atomic` to `options: []`) does NOT tear on this macOS/APFS host — verified over 100+ SIGKILL
+      samples at manifest sizes up to 300 MB, tear rate 0. `Data.write(options: [])` writes in-place
+      (O_TRUNC + a single large `write()` syscall that the kernel completes before the SIGKILL is
+      delivered), so a post-mortem reader always sees a complete version regardless of the `.atomic`
+      flag. The cell therefore cannot be killed by that mutation on this platform — the OS supplies the
+      guarantee. The oracle's clause-1 (parse) TEETH are proven independently by
+      `FaultKitTests.testOracleHasTeeth` (a truncated manifest fails clause 1). We keep `.atomic`
+      because it is the portable guarantee (other filesystems / larger-than-one-syscall writes CAN
+      tear), and keep the mid-activity loop so the kill is genuinely mid-write rather than post-settle.
+  - `relay-midcopy`: see the seam justification below.
+- **SEAM JUSTIFICATION — `FrameRelay.onPrePublish` (required by the `relay-midcopy` cell).** The relay
+  stages src → hidden `.<name>.relaytmp`, re-stats to verify the copy, then atomically renames it into
+  place. The invariant under test is "a SIGKILL between the staged copy and the publish leaves the
+  `.relaytmp` present and NO glob-visible destination file." That interleaving cannot be induced
+  reliably by wall-clock timing (the copy of a 64 MiB file completes in milliseconds; a flag-on-first-
+  log kill fired BEFORE the staged copy even existed — the original evasion). The pre-approved
+  `onPrePublish: (() -> Void)?` hook is invoked at exactly that one point; the helper sets it to
+  `{ touchFlag(); blockForever() }`, so the builder's SIGKILL lands deterministically mid-copy. It is
+  a synchronization point, not behavior: production leaves it nil. This is the FIRST (and only) use of
+  a pre-approved seam across the whole pillar.
 
 ### Notes / justification — Task 4 (matrix completion audit)
 
@@ -109,9 +138,12 @@ privileged runner.
   T3 rows expanded to full test method names.
 - **PROXY→T3 cells now name the test.** Both FrameRelay crash-terminated and restart-recovery cells
   now explicitly name `testCrash_relayMidcopy_noGlobVisiblePartialFreshRelayHeals`.
-- **No production-code seams added.** `git diff main..HEAD -- Sources/LiveAstroCore | grep -v faulthelper`
-  shows only the watcher fix (fa4cb4d): `onLog` seam + `folderMissing` flag + `armSource()` refactor.
-  The two pre-approved seams (injectable manifest writer, relay pre-publish hook) remain
-  unimplemented — YAGNI confirmed; no T4 cell proved undrivable without them.
-- **Total test count at pillar completion:** 29 fault-matrix tests (10 file-boundary, 10 lifecycle,
-  3 crash-artifact, 6 FaultKit self-tests). 0 blank cells. Every cell TEST, N/A, or PROXY.
+- **One pre-approved seam added (post oracle-evasion hunt).** `FrameRelay.onPrePublish` — the relay
+  pre-publish sync hook — is now implemented and used by the `relay-midcopy` crash cell (justification
+  above). The other pre-approved seam (injectable manifest writer) remains unimplemented — YAGNI
+  confirmed; no cell requires it (the `manifest-midwrite` loop drives the atomic-write guarantee
+  without one).
+- **Total test count at pillar completion:** 30 fault-matrix tests across three suites —
+  **15 file-boundary** (`FaultMatrixFileTests`), **10 lifecycle** (`FaultMatrixLifecycleTests`, of
+  which 3 are the crash-terminated `faulthelper` cells), and **5 FaultKit self-tests**
+  (`FaultKitTests`). 0 blank cells. Every cell TEST, N/A, or PROXY.
