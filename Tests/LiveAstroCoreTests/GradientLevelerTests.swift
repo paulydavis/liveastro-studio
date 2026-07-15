@@ -194,8 +194,10 @@ final class GradientLevelerTests: XCTestCase {
     /// 1×1, surfSub const 0.1, surfRef const 0.05, x=0.3, s=1.5 → 0.05 + 0.2·1.5 = 0.35.
     func testFusedScaleHandComputed() {
         let a = img(1, 1, 3, [0.3, 0.0, 0.0])
-        let sub = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.1, 0, 0], nil, nil])
-        let ref = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.05, 0, 0], nil, nil])
+        // All channels populated: partial-nil models disable scaling frame-wide by design
+        // (all-or-nothing guard), so a scaled expectation needs full coeff pairs.
+        let sub = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.1, 0, 0], [0.1, 0, 0], [0.1, 0, 0]])
+        let ref = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.05, 0, 0], [0.05, 0, 0], [0.05, 0, 0]])
         let out = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.5)
         XCTAssertEqual(out.pixels[0], 0.35, accuracy: 1e-6)   // 0.05 + (0.3 - 0.1)·1.5
     }
@@ -205,7 +207,8 @@ final class GradientLevelerTests: XCTestCase {
     /// surf const 0.1, x=0.4, s=2.0 → 0.1 + (0.4 − 0.1)·2 = 0.7.
     func testIdenticalModelsWithScaleNotSkipped() {
         let a = img(1, 1, 3, [0.4, 0.0, 0.0])
-        let m = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.1, 0, 0], nil, nil])
+        // fully populated for the same all-or-nothing reason as above
+        let m = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.1, 0, 0], [0.1, 0, 0], [0.1, 0, 0]])
         let out = GradientLeveler.apply(a, subModel: m, refModel: m, scale: 2.0)
         XCTAssertEqual(out.pixels[0], 0.7, accuracy: 1e-6)   // 0.1 + (0.4 - 0.1)·2 — NOT byte-identical
     }
