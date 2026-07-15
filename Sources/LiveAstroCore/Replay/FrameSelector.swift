@@ -8,8 +8,12 @@ public enum FrameSelector {
     /// without bloating the render.
     public static let defaultMaxKeyframes = 45
 
-    public static func logSpacedIndices(count: Int, maxKeyframes: Int) -> [Int] {
+    public static func logSpacedIndices(count: Int, maxKeyframes rawMaxKeyframes: Int) -> [Int] {
         guard count > 0 else { return [] }
+        // Clamp to ≥ 2: the log-spacing loop divides by (maxKeyframes - 1), so 1 (or less)
+        // would divide by zero → NaN → crash on Int(). Two keyframes = first + last, the
+        // minimum sensible replay.
+        let maxKeyframes = max(2, rawMaxKeyframes)
         guard count > maxKeyframes else { return Array(0..<count) }
         var out: Set<Int> = [0, count - 1]
         for j in 0..<maxKeyframes {
@@ -69,8 +73,11 @@ public enum FrameSelector {
     /// cloud band cannot drag the baseline up. First and last frames are always kept.
     public static func qualityGate(medians: [Double],
                                    deviationThreshold: Double = 0.5,
-                                   baselineWindow: Int = 5) -> [Int] {
+                                   baselineWindow rawBaselineWindow: Int = 5) -> [Int] {
         guard medians.count > 2 else { return Array(medians.indices) }
+        // Clamp to ≥ 1: a window of 0 (or less) takes .suffix(0) → empty window →
+        // sorted[0] on an empty array → crash. One kept-median is the minimum baseline.
+        let baselineWindow = max(1, rawBaselineWindow)
         // Below this the baseline is numerically meaningless (all-dark frames);
         // relative deviation would explode, so keep everything instead.
         let minimumMeaningfulMedian = 1e-12

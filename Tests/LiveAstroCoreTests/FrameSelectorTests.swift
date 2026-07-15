@@ -36,6 +36,33 @@ final class FrameSelectorTests: XCTestCase {
         XCTAssertLessThanOrEqual(picked.count, 3, "middle duplicates removed")
     }
 
+    func testMaxKeyframesOneDoesNotCrash() {
+        // maxKeyframes == 1 previously divided by (maxKeyframes - 1) == 0 (NaN → crash on Int()).
+        // Clamped to 2 → a sensible small selection, no crash.
+        let idx = FrameSelector.logSpacedIndices(count: 100, maxKeyframes: 1)
+        XCTAssertFalse(idx.isEmpty)
+        XCTAssertEqual(idx.first, 0)
+        XCTAssertEqual(idx.last, 99)
+        XCTAssertEqual(idx, idx.sorted())
+    }
+
+    func testMaxKeyframesZeroDoesNotCrash() {
+        let idx = FrameSelector.logSpacedIndices(count: 100, maxKeyframes: 0)
+        XCTAssertFalse(idx.isEmpty)
+        XCTAssertEqual(idx.first, 0)
+        XCTAssertEqual(idx.last, 99)
+    }
+
+    func testQualityGateZeroBaselineWindowDoesNotCrash() {
+        // baselineWindow == 0 previously took .suffix(0) → empty window → sorted[0] on empty → crash.
+        // Clamped to 1 → still keeps first/last and processes without crashing.
+        let medians = [0.020, 0.020, 0.019, 0.060, 0.018, 0.018]
+        let kept = FrameSelector.qualityGate(medians: medians, baselineWindow: 0)
+        XCTAssertEqual(kept.first, 0)
+        XCTAssertEqual(kept.last, medians.count - 1)
+        XCTAssertEqual(kept, kept.sorted())
+    }
+
     func testThumbnailDifference() {
         let a = AstroImage(width: 128, height: 128, channels: 1,
                            pixels: [Float](repeating: 0.2, count: 128 * 128), sourceIsLinear: false)
