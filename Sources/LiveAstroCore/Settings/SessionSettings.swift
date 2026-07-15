@@ -15,6 +15,7 @@ public struct SessionSettings: Codable, Equatable {
     public var rejectionStrength: RejectionStrength
     public var frameWeightingEnabled: Bool
     public var backgroundNormalizationEnabled: Bool
+    public var scaleNormalizationEnabled: Bool
     public var processorBackend: ProcessorBackend
     public var displayAdjustments: DisplayAdjustments
     public var relayRetentionDays: Int
@@ -26,6 +27,7 @@ public struct SessionSettings: Codable, Equatable {
                 rejectionEnabled: Bool = true, rejectionStrength: RejectionStrength = .medium,
                 frameWeightingEnabled: Bool = true,
                 backgroundNormalizationEnabled: Bool = true,
+                scaleNormalizationEnabled: Bool = true,
                 processorBackend: ProcessorBackend = .none,
                 displayAdjustments: DisplayAdjustments = .neutral,
                 relayRetentionDays: Int = 7,
@@ -37,6 +39,7 @@ public struct SessionSettings: Codable, Equatable {
         self.rejectionEnabled = rejectionEnabled; self.rejectionStrength = rejectionStrength
         self.frameWeightingEnabled = frameWeightingEnabled
         self.backgroundNormalizationEnabled = backgroundNormalizationEnabled
+        self.scaleNormalizationEnabled = scaleNormalizationEnabled
         self.processorBackend = processorBackend; self.displayAdjustments = displayAdjustments
         self.relayRetentionDays = relayRetentionDays
         self.demosaic = demosaic
@@ -50,7 +53,7 @@ public struct SessionSettings: Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case sourceModeRaw, watchFolderPath, filePrefix, neutralizeBackground
         case subExposureSeconds, targetName, calibration, rejectionEnabled, rejectionStrength
-        case frameWeightingEnabled, backgroundNormalizationEnabled, processorBackend, displayAdjustments
+        case frameWeightingEnabled, backgroundNormalizationEnabled, scaleNormalizationEnabled, processorBackend, displayAdjustments
         case relayRetentionDays, demosaic
     }
     public init(from decoder: Decoder) throws {
@@ -66,6 +69,7 @@ public struct SessionSettings: Codable, Equatable {
         rejectionStrength = try c.decodeIfPresent(RejectionStrength.self, forKey: .rejectionStrength) ?? .medium
         frameWeightingEnabled = try c.decodeIfPresent(Bool.self, forKey: .frameWeightingEnabled) ?? true
         backgroundNormalizationEnabled = try c.decodeIfPresent(Bool.self, forKey: .backgroundNormalizationEnabled) ?? true
+        scaleNormalizationEnabled = try c.decodeIfPresent(Bool.self, forKey: .scaleNormalizationEnabled) ?? true
         processorBackend = try c.decodeIfPresent(ProcessorBackend.self, forKey: .processorBackend) ?? .none
         displayAdjustments = try c.decodeIfPresent(DisplayAdjustments.self, forKey: .displayAdjustments) ?? .neutral
         relayRetentionDays = try c.decodeIfPresent(Int.self, forKey: .relayRetentionDays) ?? 7
@@ -81,6 +85,7 @@ public struct SessionSettings: Codable, Equatable {
                         rejectionEnabled: true, rejectionStrength: .medium,
                         frameWeightingEnabled: true,
                         backgroundNormalizationEnabled: true,
+                        scaleNormalizationEnabled: true,
                         processorBackend: .none, displayAdjustments: .neutral,
                         relayRetentionDays: 7,
                         demosaic: .rcd)

@@ -236,7 +236,8 @@ public final class StackEngine {
             frame = SignalScaler.apply(frame, scale: scale, background: bg)
         }
         let cleaned = rejection.apply(frame, mask: mask)
-        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma * scale)   // σ·s: scaling amplifies noise too — weight must see post-scale noise)
+        // σ·s: scaling amplifies noise too — weight must see post-scale noise
+        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma * scale))
         acceptedCount += 1
         consecutiveNoTransform = 0
         return .stacked(frameCount: accumulator.frameCount)

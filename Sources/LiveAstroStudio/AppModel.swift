@@ -42,6 +42,7 @@ final class AppModel {
     var rejectionStrength: RejectionStrength = .medium
     var frameWeightingEnabled = true
     var backgroundNormalizationEnabled = true
+    var scaleNormalizationEnabled = true
     var relayRetentionDays = 7
     var demosaic: DemosaicMethod = .rcd
     var calibration = CalibrationStore.load(.standard)
@@ -165,6 +166,7 @@ final class AppModel {
             rejectionStrength: rejectionStrength,
             frameWeightingEnabled: frameWeightingEnabled,
             backgroundNormalizationEnabled: backgroundNormalizationEnabled,
+            scaleNormalizationEnabled: scaleNormalizationEnabled,
             processorBackend: processorBackend,
             displayAdjustments: displayAdjustments,
             relayRetentionDays: relayRetentionDays,
@@ -186,6 +188,7 @@ final class AppModel {
         rejectionStrength = s.rejectionStrength
         frameWeightingEnabled = s.frameWeightingEnabled
         backgroundNormalizationEnabled = s.backgroundNormalizationEnabled
+        scaleNormalizationEnabled = s.scaleNormalizationEnabled
         relayRetentionDays = s.relayRetentionDays
         demosaic = s.demosaic
         processorBackend = s.processorBackend
@@ -231,6 +234,7 @@ final class AppModel {
             : NoRejection()
         return StackEngine(rejection: rejection, frameWeighting: frameWeightingEnabled,
                            normalization: backgroundNormalizationEnabled,
+                           scaleNormalization: scaleNormalizationEnabled,
                            demosaic: demosaic)
     }
 
