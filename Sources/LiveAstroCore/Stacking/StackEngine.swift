@@ -235,13 +235,20 @@ public final class StackEngine {
         // Scaling is fused into leveling with a per-pixel reference-background pivot.
         // When the per-frame fit fails (leveling pair nil) NO scaling happens either —
         // consistent with the gate (no matched background surface to pivot about).
+        // P1-4: the APPLIED scale — scale takes effect only when a leveling pair exists AND
+        // passes the all-or-nothing scalingApplies guard. When it doesn't, the frame is stacked
+        // UNSCALED, so the weight must use σ·1 (not σ·s) or an unscaled dim frame is over-weighted.
+        // Pass the same effectiveScale to apply so its internal guard and the weight can't disagree.
         var frame = warped
+        var effectiveScale: Float = 1.0
         if let pair = levelingModels(image: warped, mask: mask) {
-            frame = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref, scale: scale)
+            effectiveScale = GradientLeveler.scalingApplies(
+                subModel: pair.sub, refModel: pair.ref, channels: warped.channels) ? scale : 1.0
+            frame = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref, scale: effectiveScale)
         }
         let cleaned = rejection.apply(frame, mask: mask)
-        // σ·s: scaling amplifies noise too — weight must see post-scale noise
-        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma * scale))
+        // σ·effectiveScale: scaling amplifies noise too — weight must see the POST-(applied-)scale noise
+        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma * effectiveScale))
         acceptedCount += 1
         consecutiveNoTransform = 0
         return .stacked(frameCount: accumulator.frameCount)
@@ -306,8 +313,15 @@ public final class StackEngine {
     public struct RegisteredFrame {
         public let transform: SimilarityTransform   // half-res transform (lift in warp)
         public let rgb: AstroImage                  // display-oriented RGB
-        public let weight: Float                    // quality-based stacking weight (1.0 when off)
+        public let stars: Int                       // detected star count (for frameWeight)
+        public let sigma: Float                     // background σ (for frameWeight)
         public let scale: Float                     // matched-flux transparency correction (1.0 when off)
+        // P1-4: weight is NO LONGER computed at register — the σ·s weight must use the
+        // ACTUALLY-APPLIED scale, which is only known after the leveling pair is fit and the
+        // all-or-nothing scalingApplies guard is evaluated (a suppressed scale must weight σ·1,
+        // not σ·s). Callers compute weight via frameWeight(stars:sigma:) once effectiveScale is
+        // known (BatchImporter worker / processLocked). frameWeight reads only weightBaseline
+        // (immutable during a batch — same lock-free contract as referenceStars).
         // R4/R5: backgroundModel removed from RegisteredFrame — fits are now done on the WARPED
         // frame (see levelingModels). Fitting pre-warp injected rotation-induced gradient error (C1).
     }
@@ -376,9 +390,10 @@ public final class StackEngine {
                                               pairs: pairs, tolerance: inlierTolerance)
             scale = Self.scaleFactor(fluxPairs: ins.map { (sub: stars[$0.source].flux, ref: referenceStars[$0.target].flux) })
         }
-        let weight = frameWeight(stars: stars.count, sigma: sigma * scale)   // σ·s: scaling amplifies noise too — weight must see post-scale noise
+        // P1-4: weight is computed by the caller once the APPLIED scale is known (see
+        // RegisteredFrame). Carry the raw star count + σ so the caller can weight σ·effectiveScale.
         // R4/R5: background fit removed from register — see levelingModels (fit on WARPED frame).
-        return RegisteredFrame(transform: half, rgb: rgb, weight: weight, scale: scale)
+        return RegisteredFrame(transform: half, rgb: rgb, stars: stars.count, sigma: sigma, scale: scale)
     }
 
     /// Produce BOTH domain-matched leveling models for a WARPED (reference-aligned) frame:
@@ -440,10 +455,11 @@ public final class StackEngine {
         lock.withLock {
             guard let accumulator else { return }
             // Scaling is fused into leveling with a per-pixel reference-background pivot.
-            // When the leveling pair is nil (per-frame fit failure) NO scaling happens for
-            // this frame — consistent with the gate. Note: the weight was computed with σ·s
-            // at register time; a rare per-frame fit failure leaves that weight slightly
-            // conservative (an unscaled frame carrying a scaled-noise weight) — acceptable.
+            // When the leveling pair is nil (per-frame fit failure) NO scaling happens for this
+            // frame. P1-4: `scale` here is the EFFECTIVE (applied) scale the caller already
+            // resolved via scalingApplies, and the caller weighted σ·(that same scale) — so the
+            // weight and the applied scale can no longer disagree. apply's internal guard is a
+            // belt-and-suspenders consistency check (it sees scale==1.0 when suppressed).
             var frame = image
             if let pair = leveling {
                 frame = GradientLeveler.apply(image, subModel: pair.sub, refModel: pair.ref, scale: scale, minRows: minRows)

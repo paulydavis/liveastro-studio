@@ -73,7 +73,19 @@ public final class BatchImporter {
                         // R5: solve both domain-matched leveling models on the WARPED frame
                         // (mask-aware, shared tile subset) — pure, concurrent-safe.
                         let lv = engine.levelingModels(image: w.image, mask: w.mask)
-                        return Work(warped: w, frameWeight: reg.weight, scale: reg.scale, leveling: lv, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
+                        // P1-4: the APPLIED scale — reg.scale takes effect only when a leveling
+                        // pair exists AND passes the all-or-nothing scalingApplies guard. The
+                        // weight must use σ·effectiveScale so a scale-suppressed dim frame is not
+                        // over-weighted (σ·1, not σ·s). frameWeight reads only weightBaseline —
+                        // immutable during the batch (same lock-free contract as register).
+                        let effectiveScale: Float
+                        if let lv, GradientLeveler.scalingApplies(subModel: lv.sub, refModel: lv.ref, channels: w.image.channels) {
+                            effectiveScale = reg.scale
+                        } else {
+                            effectiveScale = 1.0
+                        }
+                        let weight = engine.frameWeight(stars: reg.stars, sigma: reg.sigma * effectiveScale)
+                        return Work(warped: w, frameWeight: weight, scale: effectiveScale, leveling: lv, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
                     }
                     return Work(warped: nil, frameWeight: 1.0, scale: 1.0, leveling: nil, name: frame.sourceName, timestamp: frame.timestamp, metadata: frameMeta)
                 }

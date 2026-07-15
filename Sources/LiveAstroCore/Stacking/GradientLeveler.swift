@@ -21,6 +21,24 @@
 /// conservative (σ·s computed at registration) — acceptable, mirrors the leveling-nil
 /// case. Deterministic; parallel over row bands.
 public enum GradientLeveler {
+    /// The all-or-nothing scaling predicate: scaling applies to a frame ONLY when EVERY
+    /// channel has a full (sub AND ref) coeff pair. Any channel missing either side (one-side
+    /// nil OR both nil) makes the frame unlevelable-for-scaling, so scaling is suppressed
+    /// frame-wide (scaling only some channels color-shifts the sub). This is the exact guard
+    /// `apply` uses internally; it is exposed so callers that compute the frame weight (which
+    /// must see the ACTUALLY-APPLIED scale) can agree with `apply` about whether scale took
+    /// effect — see StackEngine.processLocked / BatchImporter.
+    public static func scalingApplies(subModel: BackgroundExtraction.BackgroundModel,
+                                      refModel: BackgroundExtraction.BackgroundModel,
+                                      channels: Int) -> Bool {
+        for c in 0..<channels {
+            let hasSub = c < subModel.coeffPerChannel.count && subModel.coeffPerChannel[c] != nil
+            let hasRef = c < refModel.coeffPerChannel.count && refModel.coeffPerChannel[c] != nil
+            if !(hasSub && hasRef) { return false }
+        }
+        return true
+    }
+
     public static func apply(_ image: AstroImage,
                              subModel: BackgroundExtraction.BackgroundModel,
                              refModel: BackgroundExtraction.BackgroundModel,
@@ -35,12 +53,8 @@ public enum GradientLeveler {
         // is unlevelable, the whole frame levels-where-possible but scales nowhere.
         let effectiveScale: Float
         if scale != 1.0 {
-            let anyChannelUnlevelable = (0..<chans).contains { c in
-                let hasSub = c < subModel.coeffPerChannel.count && subModel.coeffPerChannel[c] != nil
-                let hasRef = c < refModel.coeffPerChannel.count && refModel.coeffPerChannel[c] != nil
-                return !(hasSub && hasRef)
-            }
-            effectiveScale = anyChannelUnlevelable ? 1.0 : scale
+            effectiveScale = scalingApplies(subModel: subModel, refModel: refModel, channels: chans)
+                ? scale : 1.0
         } else {
             effectiveScale = 1.0
         }

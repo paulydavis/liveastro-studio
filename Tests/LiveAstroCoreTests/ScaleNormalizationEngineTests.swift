@@ -157,8 +157,9 @@ final class ScaleNormalizationEngineTests: XCTestCase {
     // MARK: - σ·s weighting
 
     func testWeightSeesPostScaleNoise() {
-        // A dimmed sub's weight with scaling ON (σ·s) is LOWER than with scaling OFF (σ·1),
-        // because the scale factor s > 1 inflates the effective noise term.
+        // P1-4 new shape: RegisteredFrame carries stars+sigma+scale (weight is computed by the
+        // caller from the APPLIED scale). A dimmed sub weighted σ·s (scaling ON, applied) is
+        // LOWER than σ·1 (scaling OFF), because s > 1 inflates the effective noise term.
         let seedFrame = cfaFrame(stars: field, amp: 0.8)
         let shifted = field.map { (x: $0.x + 3.0, y: $0.y - 2.0) }
         let sub = cfaFrame(stars: shifted, amp: 0.8 * 0.7)
@@ -167,16 +168,64 @@ final class ScaleNormalizationEngineTests: XCTestCase {
         XCTAssertTrue(engineOff.seedReference(seedFrame, minRows: .max))
         let regOff = engineOff.register(sub, minRows: .max)
         XCTAssertNotNil(regOff)
+        // scaling off → scale is 1.0 → weight uses σ·1
+        let weightOff = engineOff.frameWeight(stars: regOff!.stars, sigma: regOff!.sigma * regOff!.scale)
 
         let engineOn = StackEngine(frameWeighting: true, normalization: true, scaleNormalization: true)
         XCTAssertTrue(engineOn.seedReference(seedFrame, minRows: .max))
         let regOn = engineOn.register(sub, minRows: .max)
         XCTAssertNotNil(regOn)
+        // The scale is APPLIED (full CFA field levels cleanly), so weight uses σ·s.
+        let wOn = engineOn.warp(regOn!, minRows: .max)
+        let lvOn = engineOn.levelingModels(image: wOn.image, mask: wOn.mask)
+        XCTAssertNotNil(lvOn)
+        XCTAssertTrue(GradientLeveler.scalingApplies(subModel: lvOn!.sub, refModel: lvOn!.ref,
+                                                     channels: wOn.image.channels),
+                      "the full CFA field should level cleanly so the scale is applied")
+        let weightOn = engineOn.frameWeight(stars: regOn!.stars, sigma: regOn!.sigma * regOn!.scale)
 
         // scale > 1 → σ·s > σ → noise is judged higher → weight is lower
         XCTAssertGreaterThan(regOn!.scale, 1.0)
-        XCTAssertLessThan(regOn!.weight, regOff!.weight,
-            "Weight with scaling ON (\(regOn!.weight)) should be < OFF (\(regOff!.weight)) for a dimmed sub")
+        XCTAssertLessThan(weightOn, weightOff,
+            "Applied-scale weight (\(weightOn)) should be < unscaled weight (\(weightOff)) for a dimmed sub")
+    }
+
+    /// P1-4 core fix: when scaling is SUPPRESSED (an unlevelable channel in the leveling pair),
+    /// the frame is stacked UNSCALED, so its weight must be the σ-only weight — NOT σ·s. Before
+    /// the fix, weight was computed at register with σ·s regardless, so a scale-0.5 frame whose
+    /// scaling was later suppressed was over-weighted (σ·0.5 → up to 4×).
+    func testSuppressedScaleWeightsSigmaOnly() {
+        let engine = StackEngine(frameWeighting: true)
+        engine.setWeightBaselineForTesting(stars: 100, sigma: 0.02)
+        let channels = 3
+        let scale: Float = 0.5
+        let sigma: Float = 0.02
+
+        // Leveling pair with ONE unlevelable channel (ch0 sub coeff nil) → scalingApplies false.
+        let suppressedSub = BackgroundExtraction.BackgroundModel(
+            degree: 1, width: 4, height: 4, coeffPerChannel: [nil, [0, 0, 0], [0, 0, 0]])
+        let suppressedRef = BackgroundExtraction.BackgroundModel(
+            degree: 1, width: 4, height: 4, coeffPerChannel: [[0, 0, 0], [0, 0, 0], [0, 0, 0]])
+        XCTAssertFalse(GradientLeveler.scalingApplies(subModel: suppressedSub, refModel: suppressedRef, channels: channels))
+        let effectiveSuppressed: Float = GradientLeveler.scalingApplies(subModel: suppressedSub, refModel: suppressedRef, channels: channels) ? scale : 1.0
+        XCTAssertEqual(effectiveSuppressed, 1.0)
+        let weightSuppressed = engine.frameWeight(stars: 100, sigma: sigma * effectiveSuppressed)
+
+        // The σ-only reference weight (what a correctly-unscaled frame must get).
+        let weightSigmaOnly = engine.frameWeight(stars: 100, sigma: sigma)
+        XCTAssertEqual(weightSuppressed, weightSigmaOnly, accuracy: 1e-6,
+                       "a scale-suppressed frame must be weighted σ·1, not σ·s")
+
+        // A full coeff pair → scale IS applied → weight uses σ·s (different from σ-only).
+        let fullSub = BackgroundExtraction.BackgroundModel(
+            degree: 1, width: 4, height: 4, coeffPerChannel: [[0, 0, 0], [0, 0, 0], [0, 0, 0]])
+        XCTAssertTrue(GradientLeveler.scalingApplies(subModel: fullSub, refModel: suppressedRef, channels: channels))
+        let effectiveFull: Float = GradientLeveler.scalingApplies(subModel: fullSub, refModel: suppressedRef, channels: channels) ? scale : 1.0
+        XCTAssertEqual(effectiveFull, scale)
+        let weightFull = engine.frameWeight(stars: 100, sigma: sigma * effectiveFull)
+        // s = 0.5 < 1 → σ·0.5 < σ → LOWER noise term → HIGHER weight (clamped at wHi 4)
+        XCTAssertGreaterThan(weightFull, weightSigmaOnly,
+                             "an APPLIED scale<1 raises the weight (σ·s < σ), distinct from the suppressed case")
     }
 
     // MARK: - reset on reseed
@@ -265,8 +314,9 @@ final class ScaleNormalizationEngineTests: XCTestCase {
             if let reg = engine.register(sub, minRows: .max) {
                 let w = engine.warp(reg, minRows: .max)
                 let lv = engine.levelingModels(image: w.image, mask: w.mask)
-                engine.commit(image: w.image, mask: w.mask, frameWeight: reg.weight,
-                              scale: reg.scale, leveling: lv, minRows: .max)
+                let ws = engine.committedWeightAndScale(reg: reg, leveling: lv, channels: w.image.channels)
+                engine.commit(image: w.image, mask: w.mask, frameWeight: ws.weight,
+                              scale: ws.scale, leveling: lv, minRows: .max)
             }
         }
 
@@ -327,8 +377,9 @@ final class ScaleNormalizationEngineTests: XCTestCase {
             if let reg = levelOnly.register(sub, minRows: .max) {
                 let w = levelOnly.warp(reg, minRows: .max)
                 let lv = levelOnly.levelingModels(image: w.image, mask: w.mask)
-                levelOnly.commit(image: w.image, mask: w.mask, frameWeight: reg.weight,
-                                 scale: reg.scale, leveling: lv, minRows: .max)
+                let ws = levelOnly.committedWeightAndScale(reg: reg, leveling: lv, channels: w.image.channels)
+                levelOnly.commit(image: w.image, mask: w.mask, frameWeight: ws.weight,
+                                 scale: ws.scale, leveling: lv, minRows: .max)
             }
         }
         let scaledPeak = peakNear(stack, cx: Int(shifted[0].x), cy: Int(shifted[0].y))
