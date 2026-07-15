@@ -134,6 +134,28 @@ public final class SessionPipeline {
 
     public func start() throws {
         let dir = try session.startSession(profile: profile)
+        // Transactional startup (P2-3): if anything after session creation throws (e.g. the
+        // source/watcher fails to start), roll back the just-created running session so a
+        // retry is clean (not blocked by alreadyRunning) and no stray dir stays marked running.
+        do {
+            try startSources(dir: dir)
+        } catch {
+            rollbackStartedSession(dir: dir)
+            throw error
+        }
+    }
+
+    /// Roll back a session that startSession() just created but that failed to fully start.
+    /// Ends it (so state leaves .running) and removes the just-created directory.
+    private func rollbackStartedSession(dir: URL) {
+        recorder = nil
+        consumeTask?.cancel()
+        consumeTask = nil
+        try? session.endSession()                       // leave .running so a retry is clean
+        try? FileManager.default.removeItem(at: dir)    // drop the orphan session dir
+    }
+
+    private func startSources(dir: URL) throws {
         recorder = SnapshotRecorder(sessionDirectory: dir)
 
         if let src = source, let eng = engine {

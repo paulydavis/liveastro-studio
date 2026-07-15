@@ -68,4 +68,42 @@ final class SessionPipelineShutdownTests: XCTestCase {
         }
         wedged.signal()   // release the wedged task so the process can exit cleanly
     }
+
+    /// A source that throws on start(), and can be flipped to succeed on a retry.
+    final class FlakyStartSource: FrameSource {
+        let frames: AsyncStream<RawFrame>
+        var isFinite: Bool { false }
+        var totalCount: Int? { nil }
+        var shouldThrow = true
+        init() { frames = AsyncStream { $0.finish() } }
+        func start() throws {
+            if shouldThrow { throw NSError(domain: "test", code: 1) }
+        }
+        func stop() {}
+    }
+
+    func testStartRollsBackOnSourceStartFailure() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "Flaky", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let source = FlakyStartSource()
+        let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
+                                       profile: profile, rootDirectory: sessions)
+
+        // First start(): the source throws → start() must roll back the just-created session.
+        XCTAssertThrowsError(try pipeline.start())
+        XCTAssertNotEqual(pipeline.session.state, .running,
+                          "a failed start must not leave the session marked running")
+
+        // Retry must NOT hit alreadyRunning.
+        source.shouldThrow = false
+        XCTAssertNoThrow(try pipeline.start(),
+                         "after a rolled-back start, a retry must succeed (not alreadyRunning)")
+    }
 }
