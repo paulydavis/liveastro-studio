@@ -161,6 +161,10 @@ public final class SessionPipeline {
         if let src = source, let eng = engine {
             // Native stacking mode
             calibrator?.onLog = { [weak self] in self?.onLog?($0) }
+            // Forward folder-disappearance log events from the watcher inside a live FolderFrameSource.
+            if let folderSrc = src as? FolderFrameSource {
+                folderSrc.onLog = { [weak self] msg in self?.onLog?(msg) }
+            }
             try src.start()
             let done = consumeDone
             if src.isFinite {
@@ -187,6 +191,7 @@ public final class SessionPipeline {
             }
         } else {
             // Watcher mode
+            watcher?.onLog = { [weak self] msg in self?.onLog?(msg) }
             try watcher?.start()
             let done = consumeDone
             consumeTask = Task.detached(priority: .userInitiated) { [weak self] in

@@ -404,46 +404,75 @@ final class FaultMatrixFileTests: XCTestCase {
                       "a new file after a deletion must still emit (watcher survived)")
     }
 
-    /// Watcher × dir-removed: the watched folder is removed mid-run → the watcher must survive
-    /// (no crash) and resume when the folder is recreated with a fresh file.
+    /// Watcher × dir-removed: the watched folder is removed mid-run.
     ///
-    /// Honesty note: the brief also wants "logs once" here. StackFileWatcher has NO onLog seam and
-    /// scan() swallows a missing folder silently (see its comment: "degrades to silent idle").
-    /// The recreate-resume leg below can hang because DispatchSourceFileSystemObject holds the
-    /// original (now-deleted) inode's fd — recreating the directory at the same PATH does not
-    /// re-arm the source, and the poll timer's contentsOfDirectory keeps failing on the stale path
-    /// on some filesystems. This is the matrix cell's yield → see FOUND-BUG note in the report.
-    /// We assert only the survivable, deterministic part: removal does not crash the process and a
-    /// fresh watcher on the recreated folder ingests normally.
-    func testWatcher_dirRemoved_survivesNoCrash() async throws {
+    /// Full invariant (FOUND-BUG #1, now fixed):
+    /// (a) The watcher must log ONCE that the folder disappeared — not every tick.
+    /// (b) When the folder is recreated, the SAME live watcher must resume (re-arm
+    ///     the DispatchSource fd) and successfully ingest a new FITS dropped in.
+    /// (c) No crash throughout; no spurious emit for the vanished baseline file.
+    /// (d) stop() after disappearance is a no-op / no crash.
+    func testWatcher_dirRemoved_logsOnceAndResumesOnRecreate() async throws {
         let fs = try TempFS("watch-dir"); defer { fs.tearDown() }
         let folder = try fs.dir("watched")
         let watcher = StackFileWatcher(folder: folder, quietPeriod: 0.2, pollInterval: 0.3)
+
+        // Capture all log lines through the onLog seam (mirrors FrameRelay).
+        var logLines: [String] = []
+        watcher.onLog = { msg in logLines.append(msg) }
+
         let collector = collect(watcher)
         try watcher.start()
 
+        // Baseline: emit a valid FITS before the disruption.
         try makeFITS(0.4).write(to: folder.appendingPathComponent("live_stack.fit"))
         let baselineEmit = await collector.waitForCount(1, timeout: 5)
-        XCTAssertTrue(baselineEmit, "baseline file emits")
+        XCTAssertTrue(baselineEmit, "baseline file emits before disruption")
 
-        // Remove the watched folder mid-run. The watcher's scan() must not crash on the missing dir.
+        // --- Disruption: remove the watched folder ---
         try Disruptor.removeDirectory(folder)
-        try await Task.sleep(nanoseconds: 800_000_000)   // let several polls hit the missing dir
-        // Survived: no crash, no spurious extra emit for the vanished file.
+        // Let several poll ticks fire against the missing folder.
+        try await Task.sleep(nanoseconds: 800_000_000)
+
+        // (a) Log exactly once — not every tick.
+        let disappearedLines = logLines.filter { $0.contains("watched folder disappeared") }
+        XCTAssertEqual(disappearedLines.count, 1,
+                       "must log exactly once that the folder disappeared (not every tick); got: \(logLines)")
+
+        // (c) No spurious emit.
         let afterRemovalCount = await collector.items.count
         XCTAssertEqual(afterRemovalCount, 1, "no spurious emit after the folder vanished")
-        watcher.stop()
 
-        // FOUND-BUG (watcher dir-removed, resume): a live watcher does NOT resume on recreate at the
-        // same path (fd bound to the deleted inode; no re-open on ENOENT) and has no log seam to
-        // report the degradation. Recovery here is only possible by constructing a NEW watcher.
+        // --- Recovery: recreate the folder and drop a new FITS ---
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let watcher2 = StackFileWatcher(folder: folder, quietPeriod: 0.2, pollInterval: 0.3)
-        let collector2 = collect(watcher2)
-        try watcher2.start(); defer { watcher2.stop() }
-        try makeFITS(0.6).write(to: folder.appendingPathComponent("live_stack.fit"))
-        let recoveryEmit = await collector2.waitForCount(1, timeout: 5)
+        // Give the poll timer time to notice the folder returned and re-arm.
+        try await Task.sleep(nanoseconds: 800_000_000)
+
+        // (b) Log that the folder returned (same live watcher).
+        let returnedLines = logLines.filter { $0.contains("watched folder returned") }
+        XCTAssertGreaterThanOrEqual(returnedLines.count, 1,
+                                    "must log that the folder returned; got: \(logLines)")
+
+        // (b) Drop a fresh FITS — the live watcher (not a new one) must emit it.
+        try makeFITS(0.6).write(to: folder.appendingPathComponent("live_stack2.fit"))
+        let recoveryEmit = await collector.waitForCount(2, timeout: 8)
+        let recoveryCount = await collector.items.count
         XCTAssertTrue(recoveryEmit,
-                      "recovery requires a fresh watcher — the recreated folder ingests normally")
+                      "SAME live watcher must emit after folder recreated (recovery proven); items=\(recoveryCount)")
+
+        // (d) stop() after disappearance/recovery must not crash.
+        watcher.stop()
+    }
+
+    /// stop() during the missing-folder window must be a no-op (no crash, idempotent).
+    func testWatcher_stopAfterDirRemoved_noCrash() async throws {
+        let fs = try TempFS("watch-stop-missing"); defer { fs.tearDown() }
+        let folder = try fs.dir("watched")
+        let watcher = StackFileWatcher(folder: folder, quietPeriod: 0.2, pollInterval: 0.3)
+        try watcher.start()
+        try Disruptor.removeDirectory(folder)
+        try await Task.sleep(nanoseconds: 400_000_000)   // let at least one poll fire
+        watcher.stop()   // must not crash
+        watcher.stop()   // idempotent — must not crash
     }
 }
