@@ -36,6 +36,26 @@ public final class StackEngine {
     static let weightExponent: Float = 1.0
     static let weightLo: Float = 0.25
     static let weightHi: Float = 4.0
+    // Scale-normalization constants (spec: multiplicative scale). Transparency
+    // beyond a 2× swing is clouds — weighting/rejection's job, not scaling's.
+    static let scaleLo: Float = 0.5
+    static let scaleHi: Float = 2.0
+    static let minScalePairs = 5
+
+    /// Median matched-star flux ratio (ref/sub) over RANSAC inlier pairs — the
+    /// sub's transparency correction. Pure. Invalid pairs (non-finite or ≤ 0 flux)
+    /// are skipped; fewer than minScalePairs valid pairs ⇒ 1.0 (no scaling).
+    public static func scaleFactor(fluxPairs: [(sub: Double, ref: Double)]) -> Float {
+        let ratios = fluxPairs.compactMap { p -> Double? in
+            guard p.sub.isFinite, p.ref.isFinite, p.sub > 0, p.ref > 0 else { return nil }
+            return p.ref / p.sub
+        }
+        guard ratios.count >= minScalePairs else { return 1.0 }
+        let sorted = ratios.sorted()
+        let median = sorted[sorted.count / 2]
+        return min(max(Float(median), scaleLo), scaleHi)
+    }
+
     /// Serializes process()/reseed()/currentStack()/stackFrameCount: reseed() runs on the
     /// main thread while process() runs on the pipeline's consume task. A reseed issued
     /// mid-frame applies before the NEXT frame (the intended UX).
