@@ -28,21 +28,19 @@ public enum GradientLeveler {
                              minRows: Int = 64) -> AstroImage {
         let w = image.width, h = image.height, chans = image.channels, plane = w * h
 
-        // All-or-nothing scaling guard: if ANY channel has a mismatched coeff pair (one
-        // side nil, the other non-nil) and scale != 1, suppress scaling for the entire
-        // frame to prevent per-sub color shifts. A channel where BOTH sub AND ref are nil
-        // is passthrough regardless and does not create a mismatch. A channel where BOTH
-        // are non-nil participates fully. Only when one side is nil and the other is not
-        // does scaling become asymmetric — that channel passes through unscaled while
-        // other channels are scaled, producing a color shift.
+        // All-or-nothing scaling guard: scaling applies only when EVERY channel has a
+        // full coeff pair. Any channel missing EITHER side (one-side nil OR both nil)
+        // is a passthrough — scaling only the remaining channels would color-shift the
+        // sub (the asymmetry is across channels, not within the pair). When any channel
+        // is unlevelable, the whole frame levels-where-possible but scales nowhere.
         let effectiveScale: Float
         if scale != 1.0 {
-            let hasAsymmetricChannel = (0..<chans).contains { c in
+            let anyChannelUnlevelable = (0..<chans).contains { c in
                 let hasSub = c < subModel.coeffPerChannel.count && subModel.coeffPerChannel[c] != nil
                 let hasRef = c < refModel.coeffPerChannel.count && refModel.coeffPerChannel[c] != nil
-                return hasSub != hasRef   // XOR: exactly one side present → mismatch
+                return !(hasSub && hasRef)
             }
-            effectiveScale = hasAsymmetricChannel ? 1.0 : scale
+            effectiveScale = anyChannelUnlevelable ? 1.0 : scale
         } else {
             effectiveScale = 1.0
         }

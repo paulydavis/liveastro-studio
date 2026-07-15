@@ -234,6 +234,20 @@ final class GradientLevelerTests: XCTestCase {
     /// With scale=1.5, the buggy version would scale ch1 and ch2 to 0.75 while leaving ch0
     /// at 0.5 (passthrough) → color shift. With the fix, ch1 and ch2 must equal the
     /// scale=1.0 output (passthrough when sub==ref==0 constant).
+    // Regression (cold verify, 2026-07-15): a channel where BOTH sub and ref coeffs
+    // are nil is just as unlevelable as a one-sided nil — scaling only the remaining
+    // channels color-shifts the sub. The original guard used XOR and missed this.
+    func testBothNilChannelAlsoDisablesScalingEverywhere() {
+        let a = img(1, 1, 3, [0.5, 0.5, 0.5])
+        let sub = Model(degree: 1, width: 1, height: 1,
+                        coeffPerChannel: [nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        let ref = Model(degree: 1, width: 1, height: 1,
+                        coeffPerChannel: [nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])   // ch0 nil on BOTH sides
+        let out = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.5)
+        XCTAssertEqual(out.pixels, [0.5, 0.5, 0.5],
+                       "both-nil channel must disable scaling frame-wide (no color shift)")
+    }
+
     func testPartialChannelNilDisablesScalingEverywhere() {
         // 1×1, 3-channel grey image
         let a = img(1, 1, 3, [0.5, 0.5, 0.5])
