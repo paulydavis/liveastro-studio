@@ -19,6 +19,17 @@ final class ScaleFactorTests: XCTestCase {
         let bright = (1...9).map { (sub: Double($0) * 10, ref: Double($0)) } // ratio 0.1 → clamp 0.5
         XCTAssertEqual(StackEngine.scaleFactor(fluxPairs: bright), 0.5)
     }
+    func testEvenCountMedianAveragesMiddlePair() {
+        // Ratios ref/sub: three at 0.5 and three at 2.0 → sorted [0.5,0.5,0.5,2,2,2].
+        // The even-count median is the average of the two middle elements (0.5+2)/2 = 1.25,
+        // NOT the upper-middle element (2.0).
+        let pairs: [(sub: Double, ref: Double)] = [
+            (sub: 2, ref: 1), (sub: 2, ref: 1), (sub: 2, ref: 1),   // ratio 0.5
+            (sub: 1, ref: 2), (sub: 1, ref: 2), (sub: 1, ref: 2),   // ratio 2.0
+        ]
+        XCTAssertEqual(StackEngine.scaleFactor(fluxPairs: pairs), 1.25, accuracy: 1e-5)
+    }
+
     func testTooFewPairsIsOne() {
         let pairs = (1...4).map { (sub: Double($0), ref: Double($0) * 2) }
         XCTAssertEqual(StackEngine.scaleFactor(fluxPairs: pairs), 1.0)

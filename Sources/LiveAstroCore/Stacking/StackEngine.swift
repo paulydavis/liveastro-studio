@@ -53,7 +53,11 @@ public final class StackEngine {
         }
         guard ratios.count >= minScalePairs else { return 1.0 }
         let sorted = ratios.sorted()
-        let median = sorted[sorted.count / 2]
+        // Even count → average the two middle elements (an odd count uses the single
+        // middle element). Taking sorted[count/2] alone biased even-count medians upward
+        // (e.g. [0.5,0.5,0.5,2,2,2] → 2 instead of 1.25).
+        let mid = sorted.count / 2
+        let median = sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
         return min(max(Float(median), scaleLo), scaleHi)
     }
 
