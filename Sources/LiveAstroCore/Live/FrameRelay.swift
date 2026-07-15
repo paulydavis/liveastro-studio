@@ -80,8 +80,19 @@ public final class FrameRelay {
         for name in names.sorted() where Self.wildcardMatch(name, glob) {
             if baseline.contains(name) { continue }
             let dst = destination.appendingPathComponent(name)
-            if fm.fileExists(atPath: dst.path) { continue }
             let src = source.appendingPathComponent(name)
+            if fm.fileExists(atPath: dst.path) {
+                // Presence-only skip would permanently block a truncated destination left by a
+                // crash or pre-fix code. Compare sizes: if the destination already matches the
+                // source (stable) size, it is fully relayed — skip as before. If it differs,
+                // fall through so the staged-copy + atomic-rename path heals it.
+                if let srcStat = stat(src), let dstAttrs = try? fm.attributesOfItem(atPath: dst.path),
+                   let dstSize = (dstAttrs[.size] as? NSNumber)?.intValue, dstSize == srcStat.size {
+                    continue   // sizes match → already fully relayed
+                }
+                // Size mismatch: treat as not-yet-relayed so it goes through the stability gate
+                // and staged-copy path below, which will atomically replace the truncated copy.
+            }
 
             guard let now = stat(src) else { continue }   // vanished between listing and stat
             seenThisTick[name] = now
@@ -119,7 +130,17 @@ public final class FrameRelay {
                     onLog?("changed during copy, retry next poll: \(name)")
                     continue
                 }
-                try fm.moveItem(at: tmpDst, to: dst)   // atomic rename into final name
+                // Atomic placement: if dest already exists (truncated-heal path) replaceItemAt
+                // atomically swaps it; otherwise moveItem renames into place. Both ensure the
+                // watcher never observes a partial file under the final name.
+                let healing = fm.fileExists(atPath: dst.path)
+                if healing {
+                    _ = try fm.replaceItemAt(dst, withItemAt: tmpDst, backupItemName: nil,
+                                             options: .usingNewMetadataOnly)
+                    onLog?("relay healed truncated \(name)")
+                } else {
+                    try fm.moveItem(at: tmpDst, to: dst)   // atomic rename into final name
+                }
                 copied += 1; relayedCount += 1
                 onLog?("relayed: \(name) (\(relayedCount))")
             } catch {

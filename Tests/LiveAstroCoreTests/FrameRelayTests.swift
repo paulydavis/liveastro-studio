@@ -114,6 +114,52 @@ final class FrameRelayTests: XCTestCase {
         XCTAssertEqual(r.relayedCount, 1)
     }
 
+    func testPreexistingTruncatedDestIsHealed() throws {
+        let src = try tmp(), dst = try tmp()
+        let name = "Light_M 8_10.0s_LP_heal.fit"
+        // Write the stable 300-byte source.
+        try Data(count: 300).write(to: src.appendingPathComponent(name))
+        // Pre-place a 100-byte truncated destination (left by a crash or pre-fix code).
+        try Data(count: 100).write(to: dst.appendingPathComponent(name))
+        let r = FrameRelay(source: src, destination: dst)
+        var healMessages = 0
+        r.onLog = { msg in if msg.contains("relay healed truncated") { healMessages += 1 } }
+        // prime: first tick records stat and defers (size mismatch keeps it in play).
+        _ = try r.copyOnce()
+        // heal tick: stable → replaces the truncated dest.
+        let n = try r.copyOnce()
+        XCTAssertEqual(n, 1, "truncated dest must be healed and count as one relay")
+        let healed = dst.appendingPathComponent(name)
+        XCTAssertEqual(try Data(contentsOf: healed).count, 300, "healed dest must be full size")
+        XCTAssertEqual(healMessages, 1, "exactly one heal log line must be emitted")
+        // Subsequent tick: sizes now match → must NOT re-copy.
+        let n2 = try r.copyOnce()
+        XCTAssertEqual(n2, 0, "once healed, subsequent ticks must skip the file")
+        XCTAssertEqual(healMessages, 1, "no additional heal log lines after first heal")
+    }
+
+    func testMatchingDestStillSkipped() throws {
+        let src = try tmp(), dst = try tmp()
+        let name = "Light_M 8_10.0s_LP_match.fit"
+        // Source and destination already byte-equal in size.
+        try Data(count: 200).write(to: src.appendingPathComponent(name))
+        let dstFile = dst.appendingPathComponent(name)
+        try Data(count: 200).write(to: dstFile)
+        // Record the destination mtime before any ticks.
+        let beforeAttrs = try FileManager.default.attributesOfItem(atPath: dstFile.path)
+        let beforeMtime = (beforeAttrs[.modificationDate] as? Date)?.timeIntervalSince1970
+        let r = FrameRelay(source: src, destination: dst)
+        var heals = 0
+        r.onLog = { msg in if msg.contains("relay healed") { heals += 1 } }
+        // Run two ticks; the file must never be re-copied.
+        _ = try r.copyOnce()
+        _ = try r.copyOnce()
+        let afterAttrs = try FileManager.default.attributesOfItem(atPath: dstFile.path)
+        let afterMtime = (afterAttrs[.modificationDate] as? Date)?.timeIntervalSince1970
+        XCTAssertEqual(beforeMtime, afterMtime, "dest mtime must be unchanged when sizes already match")
+        XCTAssertEqual(heals, 0, "no heal log lines when dest already matches source size")
+    }
+
     func testBroadFitsGlobRelaysSessionScoped() throws {
         let src = try tmp(), dst = try tmp()
         try write(src, "old.fit")                        // backlog
