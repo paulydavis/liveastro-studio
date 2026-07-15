@@ -208,9 +208,13 @@ final class AppModel {
         lastAdjustmentRender = now
         let adj = displayAdjustments
         Task.detached { [weak self] in
+            // Swift 6: rebind weak self to an immutable strong let up front — nested
+            // @Sendable closures may not reference a captured *var* (a weak binding).
+            // Lifetime extension is task-scoped (one-shot render); no retain cycle.
+            guard let self else { return }
             let cg = pipeline.renderCurrentDisplay(adjustments: adj)
             await MainActor.run {
-                guard let self, let cg else { return }
+                guard let cg else { return }
                 self.latestImage = cg
             }
         }
@@ -404,27 +408,28 @@ final class AppModel {
         log.append("Importing subs from \(folder.path)…")
         let prefix = fileNamePrefix
         Task.detached { [weak self] in
+            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             do {
                 try importPipeline.start()
                 let url = try importPipeline.end()
                 await MainActor.run {
                     if matchedFrames.value == 0 {
-                        self?.errorMessage = AppModel.noMatchMessage(prefix: prefix)
+                        self.errorMessage = AppModel.noMatchMessage(prefix: prefix)
                     } else {
-                        self?.replayURL = url
-                        self?.lastSessionDirectory = url.deletingLastPathComponent()
-                        self?.log.append("Import complete. Replay: \(url.path)")
+                        self.replayURL = url
+                        self.lastSessionDirectory = url.deletingLastPathComponent()
+                        self.log.append("Import complete. Replay: \(url.path)")
                     }
-                    self?.isImporting = false
+                    self.isImporting = false
                 }
             } catch {
                 await MainActor.run {
                     // A zero-match import may also surface as a downstream failure
                     // (nothing to render) — prefer the actionable message.
-                    self?.errorMessage = matchedFrames.value == 0
+                    self.errorMessage = matchedFrames.value == 0
                         ? AppModel.noMatchMessage(prefix: prefix)
                         : "Import failed: \(error)"
-                    self?.isImporting = false
+                    self.isImporting = false
                 }
             }
         }
@@ -444,16 +449,17 @@ final class AppModel {
         isGeneratingReplay = true
         log.append("Regenerating replay for \(sessionDirectory.lastPathComponent)…")
         Task.detached { [weak self] in
+            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             do {
                 let url = try ReplayService.regenerate(sessionDirectory: sessionDirectory)
                 await MainActor.run {
-                    self?.replayURL = url
-                    self?.log.append("Replay ready: \(url.lastPathComponent)")
+                    self.replayURL = url
+                    self.log.append("Replay ready: \(url.lastPathComponent)")
                 }
             } catch {
-                await MainActor.run { self?.errorMessage = "Regenerate failed: \(error)" }
+                await MainActor.run { self.errorMessage = "Regenerate failed: \(error)" }
             }
-            await MainActor.run { self?.isGeneratingReplay = false }
+            await MainActor.run { self.isGeneratingReplay = false }
         }
     }
 
@@ -470,20 +476,23 @@ final class AppModel {
         isProcessing = true
         log.append("Processing master with GraXpert…")
         Task.detached { [weak self] in
+            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             do {
                 let out = sessionDirectory.appendingPathComponent("master_processed.fit")
                 let proc = GraXpertProcessor(executable: exe)
-                try proc.process(masterURL: master, outputURL: out) { [weak self] m in
-                    Task { @MainActor in self?.log.append(m) }
+                // process() runs synchronously within this task, so the strong `self`
+                // let is safely captured by the progress callback for its duration.
+                try proc.process(masterURL: master, outputURL: out) { m in
+                    Task { @MainActor in self.log.append(m) }
                 }
                 await MainActor.run {
-                    self?.isProcessing = false
-                    self?.log.append("Processed → \(out.lastPathComponent)")
+                    self.isProcessing = false
+                    self.log.append("Processed → \(out.lastPathComponent)")
                 }
             } catch {
                 await MainActor.run {
-                    self?.isProcessing = false
-                    self?.errorMessage = "Processing failed: \(error)"
+                    self.isProcessing = false
+                    self.errorMessage = "Processing failed: \(error)"
                 }
             }
         }
@@ -495,9 +504,9 @@ final class AppModel {
         isDetecting = true
         log.append("Reading subs in \(source.lastPathComponent)…")
         Task.detached { [weak self] in
+            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: source)   // SMB header read, off main
             await MainActor.run {
-                guard let self else { return }
                 self.isDetecting = false
                 self.configureAndStartWatchFolder(source: source, meta: meta)
             }
@@ -533,9 +542,9 @@ final class AppModel {
         isDetecting = true
         log.append("Looking for Seestar share…")
         Task.detached { [weak self] in
+            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             let found = SeestarDetector.detect()      // SMB directory work, off the main thread
             await MainActor.run {
-                guard let self else { return }
                 self.isDetecting = false
                 guard let found else {
                     self.errorMessage = "No Seestar share found. Mount it first: Finder → Go → Connect to Server → the Seestar's smb:// address, then try again."
@@ -584,9 +593,9 @@ final class AppModel {
         isDetecting = true
         log.append("Looking for ASIAIR share…")
         Task.detached { [weak self] in
+            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             let found = ASIAIRDetector.detect()       // SMB directory work, off the main thread
             await MainActor.run {
-                guard let self else { return }
                 self.isDetecting = false
                 guard let found else {
                     self.errorMessage = "No ASIAIR share found. In the ASIAIR app: Settings → Network Share → Enable. Then on the Mac: Finder → Go → Connect to Server → smb://asiair.local, and try again."
@@ -653,21 +662,22 @@ final class AppModel {
         }
 
         Task.detached { [weak self] in
+            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             do {
                 let url = try p.end()
                 await MainActor.run {
-                    self?.replayURL = url
-                    self?.lastSessionDirectory = url.deletingLastPathComponent()
-                    self?.log.append("Replay ready: \(url.lastPathComponent)")
+                    self.replayURL = url
+                    self.lastSessionDirectory = url.deletingLastPathComponent()
+                    self.log.append("Replay ready: \(url.lastPathComponent)")
                 }
             } catch {
-                await MainActor.run { self?.errorMessage = "Replay failed: \(error)" }
+                await MainActor.run { self.errorMessage = "Replay failed: \(error)" }
             }
             await MainActor.run {
-                self?.isRunning = false
-                self?.isGeneratingReplay = false
-                self?.pipeline = nil
-                self?.sessionEnd = Date()
+                self.isRunning = false
+                self.isGeneratingReplay = false
+                self.pipeline = nil
+                self.sessionEnd = Date()
             }
         }
 
