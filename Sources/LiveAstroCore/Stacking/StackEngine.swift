@@ -22,6 +22,8 @@ public final class StackEngine {
     private let frameWeighting: Bool
     private var weightBaseline: (stars: Int, sigma: Float)?    // set at seed, reset on reseed
     private let normalization: Bool
+    private let scaleNormalization: Bool
+    private var scaleBaseline: [Float]?
     private let demosaic: DemosaicMethod
     /// R5: the seed's TILE SAMPLES (not a fitted model). Stored so each sub's reference
     /// model can be re-solved over the SAME masked tile subset as the sub — killing the
@@ -80,6 +82,7 @@ public final class StackEngine {
     public init(seedMinStars: Int = 15, minMatches: Int = 8, inlierTolerance: Double = 2.0,
                 rejection: RejectionMethod = NoRejection(), autoReseedThreshold: Int = 6,
                 frameWeighting: Bool = false, normalization: Bool = false,
+                scaleNormalization: Bool = false,
                 demosaic: DemosaicMethod = .bilinear) {
         self.seedMinStars = seedMinStars
         self.minMatches = minMatches
@@ -88,6 +91,7 @@ public final class StackEngine {
         self.autoReseedThreshold = autoReseedThreshold
         self.frameWeighting = frameWeighting
         self.normalization = normalization
+        self.scaleNormalization = scaleNormalization
         self.demosaic = demosaic
     }
 
@@ -98,6 +102,7 @@ public final class StackEngine {
             referenceSize = nil
             referenceChannels = nil
             weightBaseline = nil
+            scaleBaseline = nil
             referenceBackgroundSamples = nil
             rejection.reset()
         }
@@ -162,6 +167,7 @@ public final class StackEngine {
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
             weightBaseline = (stars.count, sigma)
+            scaleBaseline = scaleNormalization ? (0..<rgb.channels).map { Float(rgb.stats[$0].median) } : nil
             referenceBackgroundSamples = normalization
                 ? BackgroundExtraction.tileSamples(rgb) : nil
             acceptedCount += 1
@@ -189,12 +195,19 @@ public final class StackEngine {
                 referenceChannels = nil
                 accumulator = nil
                 weightBaseline = nil
+                scaleBaseline = nil
                 referenceBackgroundSamples = nil
                 rejection.reset()   // else the new field's seed is sigma-clipped against the old field's stats
                 consecutiveNoTransform = 0
                 autoReseedCount += 1
             }
             return .rejected(.noTransform)
+        }
+        var scale: Float = 1.0
+        if scaleNormalization {
+            let ins = TransformSolver.inliers(half, source: stars, target: referenceStars,
+                                              pairs: pairs, tolerance: inlierTolerance)
+            scale = Self.scaleFactor(fluxPairs: ins.map { (sub: stars[$0.source].flux, ref: referenceStars[$0.target].flux) })
         }
         let rgb = displayRGB(frame)
         guard rgb.channels == referenceChannels else {
@@ -219,8 +232,11 @@ public final class StackEngine {
         if let pair = levelingModels(image: warped, mask: mask) {
             frame = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref)
         }
+        if scale != 1.0, let bg = scaleBaseline {
+            frame = SignalScaler.apply(frame, scale: scale, background: bg)
+        }
         let cleaned = rejection.apply(frame, mask: mask)
-        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma))
+        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma * scale))
         acceptedCount += 1
         consecutiveNoTransform = 0
         return .stacked(frameCount: accumulator.frameCount)
@@ -286,6 +302,7 @@ public final class StackEngine {
         public let transform: SimilarityTransform   // half-res transform (lift in warp)
         public let rgb: AstroImage                  // display-oriented RGB
         public let weight: Float                    // quality-based stacking weight (1.0 when off)
+        public let scale: Float                     // matched-flux transparency correction (1.0 when off)
         // R4/R5: backgroundModel removed from RegisteredFrame — fits are now done on the WARPED
         // frame (see levelingModels). Fitting pre-warp injected rotation-induced gradient error (C1).
     }
@@ -310,6 +327,7 @@ public final class StackEngine {
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
             weightBaseline = (stars.count, sigma)
+            scaleBaseline = scaleNormalization ? (0..<rgb.channels).map { Float(rgb.stats[$0].median) } : nil
             referenceBackgroundSamples = normalization
                 ? BackgroundExtraction.tileSamples(rgb) : nil
             acceptedCount += 1
@@ -348,9 +366,15 @@ public final class StackEngine {
         else { return nil }
         let rgb = displayRGB(frame, minRows: minRows)
         guard rgb.channels == referenceChannels else { return nil }
-        let weight = frameWeight(stars: stars.count, sigma: sigma)
+        var scale: Float = 1.0
+        if scaleNormalization {
+            let ins = TransformSolver.inliers(half, source: stars, target: referenceStars,
+                                              pairs: pairs, tolerance: inlierTolerance)
+            scale = Self.scaleFactor(fluxPairs: ins.map { (sub: stars[$0.source].flux, ref: referenceStars[$0.target].flux) })
+        }
+        let weight = frameWeight(stars: stars.count, sigma: sigma * scale)
         // R4/R5: background fit removed from register — see levelingModels (fit on WARPED frame).
-        return RegisteredFrame(transform: half, rgb: rgb, weight: weight)
+        return RegisteredFrame(transform: half, rgb: rgb, weight: weight, scale: scale)
     }
 
     /// Produce BOTH domain-matched leveling models for a WARPED (reference-aligned) frame:
@@ -406,7 +430,7 @@ public final class StackEngine {
     /// Accumulate a warped frame into the shared stack under the engine lock.
     /// Bumps acceptedCount. Rejection filtering runs here (serial), preserving any
     /// stateful RejectionMethod. Call from the single serial consumer.
-    public func commit(image: AstroImage, mask: [Float], frameWeight: Float = 1.0,
+    public func commit(image: AstroImage, mask: [Float], frameWeight: Float = 1.0, scale: Float = 1.0,
                        leveling: (sub: BackgroundExtraction.BackgroundModel,
                                   ref: BackgroundExtraction.BackgroundModel)? = nil, minRows: Int) {
         lock.withLock {
@@ -414,6 +438,9 @@ public final class StackEngine {
             var frame = image
             if let pair = leveling {
                 frame = GradientLeveler.apply(image, subModel: pair.sub, refModel: pair.ref, minRows: minRows)
+            }
+            if scale != 1.0, let bg = scaleBaseline {
+                frame = SignalScaler.apply(frame, scale: scale, background: bg, minRows: minRows)
             }
             let cleaned = rejection.apply(frame, mask: mask)
             accumulator.add(cleaned, mask: mask, frameWeight: frameWeight, minRows: minRows)
