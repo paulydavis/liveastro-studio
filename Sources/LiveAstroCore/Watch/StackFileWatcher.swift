@@ -12,6 +12,10 @@ public struct StackUpdate: Equatable, Sendable {
 public final class StackFileWatcher {
     public let updates: AsyncStream<StackUpdate>
 
+    /// Logging seam (mirrors FrameRelay.onLog). Called on the internal serial queue;
+    /// wire to the app log in AppModel just like relay.onLog.
+    public var onLog: ((String) -> Void)?
+
     private let folder: URL
     private let quietPeriod: TimeInterval
     private let pollInterval: TimeInterval
@@ -21,6 +25,10 @@ public final class StackFileWatcher {
     private var pollTimer: DispatchSourceTimer?
     private var debounceWork: DispatchWorkItem?
     private var folderFD: Int32 = -1
+
+    /// True while the watched folder is absent. Used to log exactly once on
+    /// disappearance and once on return, rather than on every poll tick.
+    private var folderMissing = false
 
     /// Per-file state for stability + dedupe. Stability now tracks (size, mtime) so a
     /// preallocated-but-still-filling FITS (full size, advancing mtime) is not emitted early.
@@ -43,24 +51,10 @@ public final class StackFileWatcher {
     }
 
     public func start() throws {
-        folderFD = open(folder.path, O_EVTONLY)
-        guard folderFD >= 0 else {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
-                          userInfo: [NSLocalizedDescriptionKey: "cannot open \(folder.path)"])
-        }
-        let src = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: folderFD, eventMask: [.write, .extend], queue: queue)
-        // Kernel events can't be injected in tests; the poll fallback below
-        // exercises the same scheduleScan/scan path.
-        src.setEventHandler { [weak self] in self?.scheduleScan() }
-        // Apple's DispatchSource contract: the watched fd must stay open until the
-        // source's cancellation handler runs — closing it earlier races the kqueue.
-        let fd = folderFD
-        src.setCancelHandler { close(fd) }
-        src.resume()
-        source = src
+        try armSource()
 
         // Poll fallback: catches events DispatchSource misses (network volumes, in-place mmap writes).
+        // The timer keeps running even while the folder is missing — it's what detects the return.
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + pollInterval, repeating: pollInterval)
         timer.setEventHandler { [weak self] in self?.scan() }
@@ -68,11 +62,38 @@ public final class StackFileWatcher {
         pollTimer = timer
     }
 
-    public func stop() {
-        // The fd is closed by the source's cancel handler, never here (see start()).
-        source?.cancel(); source = nil
-        pollTimer?.cancel(); pollTimer = nil
+    /// Open the folder fd and arm the DispatchSource.
+    /// Called from start() and from scan() when recovering after folder return.
+    private func armSource() throws {
+        let fd = open(folder.path, O_EVTONLY)
+        guard fd >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                          userInfo: [NSLocalizedDescriptionKey: "cannot open \(folder.path)"])
+        }
+        folderFD = fd
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .extend], queue: queue)
+        // Kernel events can't be injected in tests; the poll fallback below
+        // exercises the same scheduleScan/scan path.
+        src.setEventHandler { [weak self] in self?.scheduleScan() }
+        // Apple's DispatchSource contract: the watched fd must stay open until the
+        // source's cancellation handler runs — closing it earlier races the kqueue.
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        source = src
+    }
+
+    /// Cancel and nil out the current DispatchSource (and its fd, via the cancel handler).
+    private func cancelSource() {
+        source?.cancel()
+        source = nil
         folderFD = -1
+    }
+
+    public func stop() {
+        // The fd is closed by the source's cancel handler, never here (see armSource()).
+        cancelSource()
+        pollTimer?.cancel(); pollTimer = nil
         continuation.finish()
     }
 
@@ -85,8 +106,30 @@ public final class StackFileWatcher {
 
     private func scan() {
         let fm = FileManager.default
-        // Folder unmount/delete mid-run degrades to silent idle; exercising this
-        // requires OS-level volume teardown, so it stays untested.
+
+        // --- Folder presence check (disappearance + return detection) ---
+        let folderExists = fm.fileExists(atPath: folder.path)
+
+        if !folderExists {
+            if !folderMissing {
+                // First tick to notice the folder is gone: log once and set flag.
+                folderMissing = true
+                onLog?("watched folder disappeared — waiting for it to return: \(folder.path)")
+                // Cancel the stale DispatchSource fd (bound to the deleted inode).
+                cancelSource()
+            }
+            // While missing, keep the timer running (it will notice the return).
+            return
+        }
+
+        if folderMissing {
+            // Folder just came back. Log, re-arm the source, clear the flag.
+            onLog?("watched folder returned — resuming: \(folder.path)")
+            folderMissing = false
+            // Re-arm: ignore errors (if this fails, the poll timer continues as the sole driver).
+            try? armSource()
+        }
+
         guard let names = try? fm.contentsOfDirectory(atPath: folder.path) else { return }
         for name in names {
             guard !name.hasPrefix("."), !name.lowercased().hasSuffix(".tmp") else { continue }

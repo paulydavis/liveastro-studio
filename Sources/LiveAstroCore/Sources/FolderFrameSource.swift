@@ -12,6 +12,9 @@ public final class FolderFrameSource: FrameSource {
     public let frames: AsyncStream<RawFrame>
     public var isFinite: Bool { mode == .importOnce }
     public let totalCount: Int?
+    /// Logging seam (mirrors FrameRelay.onLog). Forwarded to the inner StackFileWatcher
+    /// when in live mode so folder-disappearance events surface in the app log.
+    public var onLog: ((String) -> Void)?
     /// Live mode only; nil in import mode (which uses the pull-based cursor instead).
     private var continuation: AsyncStream<RawFrame>.Continuation?
 
@@ -65,6 +68,7 @@ public final class FolderFrameSource: FrameSource {
 
         case .live:
             let w = StackFileWatcher(folder: folder, fileNamePrefix: fileNamePrefix)
+            w.onLog = onLog   // forward folder-disappearance events to the app log
             self.watcher = w
             try w.start()
             let continuation = self.continuation!
