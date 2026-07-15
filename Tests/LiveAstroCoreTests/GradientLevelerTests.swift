@@ -220,6 +220,44 @@ final class GradientLevelerTests: XCTestCase {
         let explicitOne = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.0).pixels
         XCTAssertEqual(defaulted, explicitOne)
     }
+
+    // --- ALL-OR-NOTHING SCALING (R4) ---
+
+    /// When ANY channel's sub OR ref coeff is nil and scale != 1, scaling must be suppressed
+    /// for ALL channels (effective scale = 1.0). This prevents a silent per-sub color shift
+    /// when one channel's polynomial fit fails.
+    ///
+    /// Setup: 3-channel grey (0.5, 0.5, 0.5), 1×1 frame.
+    ///   ch0 sub coeff: nil   ← triggers all-or-nothing guard
+    ///   ch1 sub coeff: valid (const 0.0), ref coeff: valid (const 0.0)
+    ///   ch2 sub coeff: valid (const 0.0), ref coeff: valid (const 0.0)
+    /// With scale=1.5, the buggy version would scale ch1 and ch2 to 0.75 while leaving ch0
+    /// at 0.5 (passthrough) → color shift. With the fix, ch1 and ch2 must equal the
+    /// scale=1.0 output (passthrough when sub==ref==0 constant).
+    func testPartialChannelNilDisablesScalingEverywhere() {
+        // 1×1, 3-channel grey image
+        let a = img(1, 1, 3, [0.5, 0.5, 0.5])
+        // ch0 sub coeff is nil — triggers all-or-nothing scaling guard
+        let sub = Model(degree: 1, width: 1, height: 1,
+                        coeffPerChannel: [nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        let ref = Model(degree: 1, width: 1, height: 1,
+                        coeffPerChannel: [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+
+        let outWithScale = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.5)
+        let outWithoutScale = GradientLeveler.apply(a, subModel: sub, refModel: ref, scale: 1.0)
+
+        // With the fix: output must be byte-equal to scale=1.0 call (all channels).
+        // ch0 is passthrough in both (sub coeff nil). ch1/ch2 leveling still applies (but
+        // sub==ref==const 0 so leveling is a no-op here — the key check is they are NOT scaled).
+        XCTAssertEqual(outWithScale.pixels, outWithoutScale.pixels,
+                       "scale != 1 with any nil coeff must produce byte-identical output to scale=1 (all-or-nothing)")
+
+        // Confirm ch1 and ch2 are NOT at the naively-scaled value 0.75 (= 0.0 + (0.5-0.0)*1.5)
+        XCTAssertEqual(outWithScale.pixels[1], 0.5, accuracy: 1e-6,
+                       "ch1 must NOT be scaled when ch0 sub coeff is nil")
+        XCTAssertEqual(outWithScale.pixels[2], 0.5, accuracy: 1e-6,
+                       "ch2 must NOT be scaled when ch0 sub coeff is nil")
+    }
 }
 
 extension Float {
