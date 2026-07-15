@@ -95,6 +95,42 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertNotEqual(dir1, dir2)
     }
 
+    // MARK: - write-then-commit (P1-5)
+
+    func testStartSessionPersistFailureLeavesStateIdle() {
+        // Root under a file (not a directory) → createDirectory/persist fails.
+        let file = tmp.appendingPathComponent("not-a-dir")
+        try? Data("x".utf8).write(to: file)
+        let mgr = SessionManager(rootDirectory: file)   // rootDirectory is a regular file
+        XCTAssertThrowsError(try mgr.startSession(profile: profile))
+        XCTAssertEqual(mgr.state, .idle, "failed start must leave state idle")
+        XCTAssertNil(mgr.manifest, "failed start must not leave a manifest")
+        XCTAssertNil(mgr.sessionDirectory)
+    }
+
+    func testRecordSnapshotPersistFailureLeavesManifestUnchanged() throws {
+        let mgr = SessionManager(rootDirectory: tmp)
+        let dir = try mgr.startSession(profile: profile)
+        // Sabotage persistence: replace manifest.json's parent dir handle by removing the
+        // session directory so the atomic write fails.
+        try FileManager.default.removeItem(at: dir)
+        let rec = SnapshotRecord(index: 1, timestamp: Date(), sourceFile: "a", snapshotFile: "b",
+                                 estimatedIntegrationSeconds: 0, width: 1, height: 1,
+                                 mean: 0, median: 0, stddev: 0)
+        XCTAssertThrowsError(try mgr.recordSnapshot(rec))
+        XCTAssertEqual(mgr.acceptedCount, 0, "failed record must not append to the in-memory manifest")
+        XCTAssertEqual(mgr.state, .running)
+    }
+
+    func testEndSessionPersistFailureLeavesStateRunning() throws {
+        let mgr = SessionManager(rootDirectory: tmp)
+        let dir = try mgr.startSession(profile: profile)
+        try FileManager.default.removeItem(at: dir)   // sabotage the atomic write
+        XCTAssertThrowsError(try mgr.endSession())
+        XCTAssertEqual(mgr.state, .running, "failed end must not mark the session ended")
+        XCTAssertNil(mgr.manifest?.endTime, "failed end must not set endTime in memory")
+    }
+
     func testCaptionFormat() {
         XCTAssertEqual(IntegrationFormat.caption(seconds: 8040, frames: 402, subSeconds: 20),
                        "2h 14m · 402 × 20s")

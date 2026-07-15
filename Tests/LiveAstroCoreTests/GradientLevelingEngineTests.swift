@@ -86,8 +86,9 @@ final class GradientLevelingEngineTests: XCTestCase {
                 if let reg = eng.register(cfaFrame(stars: field, slope: 0.0), minRows: .max) {
                     let (img, mask) = eng.warp(reg, minRows: .max)
                     let lv = eng.levelingModels(image: img, mask: mask)
-                    eng.commit(image: img, mask: mask, frameWeight: reg.weight,
-                               leveling: lv, minRows: .max)
+                    let ws = eng.committedWeightAndScale(reg: reg, leveling: lv, channels: img.channels)
+                    eng.commit(image: img, mask: mask, frameWeight: ws.weight,
+                               scale: ws.scale, leveling: lv, minRows: .max)
                 }
             }
             return eng.currentStack()!.pixels
@@ -107,8 +108,9 @@ final class GradientLevelingEngineTests: XCTestCase {
                 if let reg = eng.register(cfaFrame(stars: field, slope: 0.30), minRows: .max) {
                     let (img, mask) = eng.warp(reg, minRows: .max)
                     let lv = eng.levelingModels(image: img, mask: mask)
-                    eng.commit(image: img, mask: mask, frameWeight: reg.weight,
-                               leveling: lv, minRows: .max)
+                    let ws = eng.committedWeightAndScale(reg: reg, leveling: lv, channels: img.channels)
+                    eng.commit(image: img, mask: mask, frameWeight: ws.weight,
+                               scale: ws.scale, leveling: lv, minRows: .max)
                 }
             }
             let m = eng.currentStack()!
@@ -132,7 +134,8 @@ final class GradientLevelingEngineTests: XCTestCase {
             let (img, mask) = eng.warp(reg, minRows: .max)
             let before = img.pixels
             let lv = eng.levelingModels(image: img, mask: mask)
-            eng.commit(image: img, mask: mask, frameWeight: reg.weight, leveling: lv, minRows: .max)
+            let ws = eng.committedWeightAndScale(reg: reg, leveling: lv, channels: img.channels)
+            eng.commit(image: img, mask: mask, frameWeight: ws.weight, scale: ws.scale, leveling: lv, minRows: .max)
             // the committed (leveled) frame ≈ the warped frame (flat vs flat → ~no change) at a mid sky pixel
             XCTAssertEqual(eng.currentStack()!.pixels[100*eng.currentStack()!.width + 5], before[100*img.width + 5], accuracy: 0.03)
         } else { XCTFail("register failed") }
@@ -185,8 +188,9 @@ final class GradientLevelingEngineTests: XCTestCase {
             if let reg = engOn.register(sub, minRows: .max) {
                 let (img, mask) = engOn.warp(reg, minRows: .max)
                 let lv = engOn.levelingModels(image: img, mask: mask)
-                engOn.commit(image: img, mask: mask, frameWeight: reg.weight,
-                             leveling: lv, minRows: .max)
+                let ws = engOn.committedWeightAndScale(reg: reg, leveling: lv, channels: img.channels)
+                engOn.commit(image: img, mask: mask, frameWeight: ws.weight,
+                             scale: ws.scale, leveling: lv, minRows: .max)
             }
         }
 
@@ -197,8 +201,9 @@ final class GradientLevelingEngineTests: XCTestCase {
             let sub = cfaFrameYGradient(stars: rotatedStars, ySlope: 0.30, w: w, h: h)
             if let reg = engOff.register(sub, minRows: .max) {
                 let (img, mask) = engOff.warp(reg, minRows: .max)
-                engOff.commit(image: img, mask: mask, frameWeight: reg.weight,
-                              leveling: nil, minRows: .max)
+                let ws = engOff.committedWeightAndScale(reg: reg, leveling: nil, channels: img.channels)
+                engOff.commit(image: img, mask: mask, frameWeight: ws.weight,
+                              scale: ws.scale, leveling: nil, minRows: .max)
             }
         }
 

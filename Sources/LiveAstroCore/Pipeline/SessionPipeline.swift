@@ -1,6 +1,13 @@
 import Foundation
 import CoreGraphics
 
+public enum SessionPipelineError: Error, Equatable {
+    /// The frame-consuming task did not acknowledge shutdown within the drain deadline,
+    /// even after cancellation. Finalizing would race a still-running consumer against the
+    /// accumulator/snapshots, so end() throws instead of writing a corrupt master.
+    case shutdownTimeout
+}
+
 /// Simple atomic boolean flag backed by NSLock (Foundation only).
 final class NSLock_Flag {
     private let lock = NSLock(); private var value = false
@@ -45,6 +52,9 @@ public final class SessionPipeline {
     private var recorder: SnapshotRecorder?
     private var consumeTask: Task<Void, Never>?
     private let consumeDone = DispatchSemaphore(value: 0)
+    /// Drain deadlines for end() (P1-3). Internal so tests can shrink them; production uses 10s/5s.
+    var drainPrimaryTimeout: DispatchTimeInterval = .seconds(10)
+    var drainGraceTimeout: DispatchTimeInterval = .seconds(5)
 
     /// Watcher mode: monitors a folder for new Siril stacks and processes each update.
     public init(watchFolder: URL, profile: SessionProfile, rootDirectory: URL,
@@ -124,6 +134,28 @@ public final class SessionPipeline {
 
     public func start() throws {
         let dir = try session.startSession(profile: profile)
+        // Transactional startup (P2-3): if anything after session creation throws (e.g. the
+        // source/watcher fails to start), roll back the just-created running session so a
+        // retry is clean (not blocked by alreadyRunning) and no stray dir stays marked running.
+        do {
+            try startSources(dir: dir)
+        } catch {
+            rollbackStartedSession(dir: dir)
+            throw error
+        }
+    }
+
+    /// Roll back a session that startSession() just created but that failed to fully start.
+    /// Ends it (so state leaves .running) and removes the just-created directory.
+    private func rollbackStartedSession(dir: URL) {
+        recorder = nil
+        consumeTask?.cancel()
+        consumeTask = nil
+        try? session.endSession()                       // leave .running so a retry is clean
+        try? FileManager.default.removeItem(at: dir)    // drop the orphan session dir
+    }
+
+    private func startSources(dir: URL) throws {
         recorder = SnapshotRecorder(sessionDirectory: dir)
 
         if let src = source, let eng = engine {
@@ -284,6 +316,29 @@ public final class SessionPipeline {
         return image.cropped(to: rect)
     }
 
+    /// Drain the frame-consuming task with a bounded wait. On the primary timeout the task is
+    /// CANCELLED and given a further grace period to acknowledge. If it STILL has not signalled,
+    /// throw SessionPipelineError.shutdownTimeout rather than proceeding to finalize — a
+    /// still-running consumer would race the accumulator/snapshots during finalization and could
+    /// write a corrupt master. The previous code discarded the wait result and finalized anyway.
+    private func drainConsumeTaskOrThrow() throws {
+        let primary = drainPrimaryTimeout, grace = drainGraceTimeout
+        guard let task = consumeTask else { return }
+        if consumeDone.wait(timeout: .now() + primary) == .success {
+            consumeTask = nil
+            return
+        }
+        // Timed out: stop the consumer cooperatively and wait a bounded grace period.
+        task.cancel()
+        if consumeDone.wait(timeout: .now() + grace) == .success {
+            consumeTask = nil
+            return
+        }
+        // Still not acknowledged — refuse to finalize a racing stack.
+        onLog?("Shutdown timed out: the frame consumer did not stop — refusing to finalize.")
+        throw SessionPipelineError.shutdownTimeout
+    }
+
     /// Ends the session and renders replay.mp4. Synchronous — call off the main thread.
     ///
     /// In native (importOnce) mode, drains any in-flight frame processing before finalizing.
@@ -302,18 +357,12 @@ public final class SessionPipeline {
             } else {
                 // Live source: the stream never ends by itself — stop it first, then drain.
                 source?.stop()
-                if consumeTask != nil {
-                    _ = consumeDone.wait(timeout: .now() + 10)
-                    consumeTask = nil
-                }
+                try drainConsumeTaskOrThrow()
             }
         } else {
             // Watcher mode: stop the watcher to terminate the updates stream, then drain.
             watcher?.stop()
-            if consumeTask != nil {
-                _ = consumeDone.wait(timeout: .now() + 10)
-                consumeTask = nil
-            }
+            try drainConsumeTaskOrThrow()
         }
         if let meta = sourceMetadata { session.fillMissingMetadata(from: meta) }
         try session.endSession()
