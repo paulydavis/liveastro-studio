@@ -4,10 +4,17 @@ import XCTest
 enum CrashArtifactError: Error, CustomStringConvertible {
     case helperNotFound(URL)
     case readyTimeout(String)
+    case killFailed(String, Int32)
+    case notKilledBySIGKILL(String, Process.TerminationReason, Int32)
     var description: String {
         switch self {
         case .helperNotFound(let u): return "faulthelper not found at \(u.path) (build products dir)"
         case .readyTimeout(let s): return "faulthelper never touched its READY flag: \(s)"
+        case .killFailed(let s, let err):
+            return "kill(SIGKILL) failed for scenario \(s): errno \(err)"
+        case .notKilledBySIGKILL(let s, let reason, let status):
+            return "faulthelper (scenario \(s)) did not die by SIGKILL: " +
+                   "terminationReason=\(reason == .uncaughtSignal ? "uncaughtSignal" : "exit"), status=\(status)"
         }
     }
 }
@@ -50,13 +57,30 @@ enum CrashArtifactBuilder {
         }
 
         // The helper has reached its coordinated point (flag touched). SIGKILL lands mid-state.
-        // NOTE (F3/review3): for `manifest-midwrite` the injected SessionManager.manifestWriter seam
-        // touches the flag only AFTER staging a new manifest version to a same-dir temp file (with
-        // the atomic rename/publish still pending), so this kill lands within an open write
-        // transaction (staged-but-unpublished data, or a subsequent iteration's staged write) — not
-        // on a pre-seeded manifest sitting idle before the first challenged write.
-        kill(process.processIdentifier, SIGKILL)
+        // NOTE (review4, supersedes the review3 note): for `manifest-midwrite` the injected
+        // SessionManager.manifestWriter seam stages the challenged version to a same-dir temp,
+        // touches the flag, and BLOCKS FOREVER (never publishes) — so this kill lands
+        // DETERMINISTICALLY between staging and publication of the challenged write: the staged
+        // temp is complete, closed, and unpublished; the previously published manifest is intact.
+        // (The seam exists because a block-point cannot be interposed inside production
+        // `Data(.atomic)`; the writer performs byte-identical staging steps, and the production
+        // path's crash-atomicity is separately covered by the APFS in-place cells.)
+        //
+        // Review4 hardening (ALL scenarios): the kill must SUCCEED and the helper must die BY
+        // SIGKILL — a helper that exited cleanly (or was reaped some other way) would yield an
+        // aftermath that is not a killed-process artifact at all. Foundation's Process reaps the
+        // child itself (never call waitpid here — it races Process's own child handling);
+        // terminationReason == .uncaughtSignal with terminationStatus == SIGKILL distinguishes
+        // death-by-signal-9 from any exit path.
+        guard kill(process.processIdentifier, SIGKILL) == 0 else {
+            throw CrashArtifactError.killFailed(scenario, errno)
+        }
         process.waitUntilExit()
+        guard process.terminationReason == .uncaughtSignal,
+              process.terminationStatus == SIGKILL else {
+            throw CrashArtifactError.notKilledBySIGKILL(scenario, process.terminationReason,
+                                                        process.terminationStatus)
+        }
         return aftermath
     }
 

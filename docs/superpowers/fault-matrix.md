@@ -83,7 +83,7 @@ privileged runner.
 | Scenario | Test | Assertion |
 |---|---|---|
 | `session-midframes` | TEST(`testCrash_sessionMidframes_manifestIntact3SnapshotsFreshStartClean`) | SIGKILL with 3 durable snapshots → manifest parses, 3 snapshots intact + readable, `end_time` nil (running is truthful); a fresh manager starts a sibling session cleanly |
-| `manifest-midwrite` | TEST(`testCrash_manifestMidwrite_manifestEitherCompleteNeverTorn`) | SIGKILL mid-rewrite → manifest is EITHER the previous complete version OR the new complete version (atomic write) — never torn; oracle clause 1 (parses) is the teeth |
+| `manifest-midwrite` | TEST(`testCrash_manifestMidwrite_killBetweenStageAndPublish_priorVersionIntact`) | SIGKILL lands DETERMINISTICALLY between staging and publication of a challenged write (the seam writer stages, flags, then blocks forever — never publishes; review4). Aftermath fully assertable: published manifest is EXACTLY the last pre-challenge version (count pinned to 123), the `.staged-<pid>` temp parses as the complete, closed, unpublished challenged version (count 124), oracle passes; the builder verifies death BY SIGKILL (uncaught signal 9) |
 | `relay-midcopy` | TEST(`testCrash_relayMidcopy_noGlobVisiblePartialFreshRelayHeals`) | SIGKILL mid-copy → dst has NO glob-visible partial (staged to a hidden `.<name>.relaytmp` / itemReplacement dir, only atomically renamed into place); a fresh relay over the same dirs completes the copy (heals), healed size == source size |
 
 ### Notes / justification — Task 3
@@ -104,15 +104,15 @@ privileged runner.
   killed-mid-state directory, satisfying the spec's "terminated helper process, not merely objects
   released in-process" rule. Two cells were hardened after an oracle-evasion hunt found they were
   killing an IDLE process (flag touched AFTER the op settled):
-  - `manifest-midwrite`: the helper pre-seeds a large (multi-MB) manifest, then LOOPS FOREVER
-    rewriting it through the injected `SessionManager.manifestWriter` seam — no sleeps, no block, no
-    per-iteration PNG encode (so the manifest write dominates the loop). The seam performs an explicit
-    staged atomic write (full bytes staged to a same-dir temp → readiness flag → rename to publish),
-    so the flag first appears only while staged-but-unpublished bytes exist on disk and the kill lands
-    within an open write transaction (or a later iteration's write cycle) — never on the idle
-    pre-seeded manifest. The atomic-publish guarantee is genuinely exercised: **whatever instant the
-    kill lands, the published manifest on disk is SOME complete version — never a torn/half-serialized
-    file.** (What is NOT guaranteed: WHICH version survives — the test asserts only that it parses.)
+  - `manifest-midwrite` (as hardened at review4 — see the review4 note below for the history): the
+    helper pre-seeds a large (multi-MB) manifest, performs a few NORMAL staged-atomic writes through
+    the injected `SessionManager.manifestWriter` seam (proving writes were flowing), then on the
+    CHALLENGED write stages the full new manifest bytes to a same-dir `.staged-<pid>` temp, touches
+    the readiness flag, and BLOCKS FOREVER — it never publishes. **The kill deterministically lands
+    between staging and publication of the challenged write; the aftermath proves the prior
+    published version survives intact** (exact pre-challenge snapshot count) beside the complete,
+    closed, unpublished staged temp (exact challenged count). This is a process-crash test, not a
+    power-loss test — no fsync/durability claim is made about the staged bytes.
     - **Platform note (mutation-check finding):** the prescribed mutation (switch `persist` from
       `.atomic` to `options: []`) does NOT tear on this macOS/APFS host — verified over 100+ SIGKILL
       samples at manifest sizes up to 300 MB, tear rate 0. `Data.write(options: [])` writes in-place
@@ -122,7 +122,9 @@ privileged runner.
       guarantee. The oracle's clause-1 (parse) TEETH are proven independently by
       `FaultKitTests.testOracleHasTeeth` (a truncated manifest fails clause 1). We keep `.atomic`
       because it is the portable guarantee (other filesystems / larger-than-one-syscall writes CAN
-      tear), and keep the mid-activity loop so the kill is genuinely mid-write rather than post-settle.
+      tear). (The mid-activity LOOP this note originally referred to was replaced at review4 by the
+      deterministic block-at-pre-publish design above — the kill now always lands mid-transaction
+      by construction, not by loop timing.)
   - `relay-midcopy`: see the seam justification below.
 - **SEAM JUSTIFICATION — `FrameRelay.onPrePublish` (required by the `relay-midcopy` cell).** The relay
   stages src → hidden `.<name>.relaytmp`, re-stats to verify the copy, then atomically renames it into
@@ -185,7 +187,9 @@ privileged runner.
   WHICH version survives — only that the published manifest is always some complete version, because
   publication happens solely via atomic rename of fully staged bytes. (A first cut set the flag
   before calling `write(.atomic)`, which left a preemption window between flag and write where the
-  kill overlapped no write at all — review3 P2 closed it with the staged writer.) **Production
+  kill overlapped no write at all — review3 P2 closed it with the staged writer. Review4 then made
+  the kill point fully deterministic: the challenged write now blocks forever pre-publish — see the
+  review4 note below.) **Production
   safety:** the seam defaults to `nil`; when nil, `persist` runs the identical `Data(.atomic)` write
   as before (byte-for-byte behavior, existing SessionManager tests unmodified and green). It is a
   coordination/injection point, not behavior. This is the SECOND (and final) pre-approved seam used
@@ -198,3 +202,28 @@ privileged runner.
   actor (safe); the relay-cell `onLog` counters (`heals`/`unreachable`/`retries`) run synchronously
   inside `copyOnce()` on the test thread (no cross-thread access, safe); the review2-added watcher
   helpers (`WatcherLogSink`, `FolderReplaceClock`) are lock-protected. No other unprotected collectors.
+
+### Notes / justification — Outside Review #4 (review4 fix wave)
+
+- **P2 — `manifest-midwrite` kill point made DETERMINISTIC (supersedes the review2/review3 loop).**
+  The review3 design touched the flag between stage and publish but then kept LOOPING; the builder's
+  polled SIGKILL (20 ms granularity) landed many cycles later, at a RANDOM loop phase — possibly the
+  re-encode gap between writes. "Lands inside an open write transaction" was a property of where the
+  flag FIRST appeared, not of where the kill actually landed. FIX: the seam writer performs a few
+  normal stage→publish cycles (writes provably flowing), then on the CHALLENGED write stages the full
+  new bytes to `.staged-<pid>`, touches the flag, and BLOCKS FOREVER — never publishing. The kill now
+  deterministically lands between staging and publication, and the cell asserts the exact aftermath:
+  published manifest == the last pre-challenge version (count 123), staged temp == the complete,
+  closed, unpublished challenged version (count 124), oracle green
+  (`testCrash_manifestMidwrite_killBetweenStageAndPublish_priorVersionIntact`). No durability (fsync)
+  claim is made about the staged bytes — this is a process-crash test, not a power-loss test. The
+  seam remains justified: a block-point cannot be interposed inside production `Data(.atomic)`; the
+  injected writer performs byte-identical staging steps, and the production path's crash-atomicity is
+  separately covered by the APFS in-place cells.
+- **P2 — CrashArtifactBuilder now VERIFIES the termination (all crash scenarios).**
+  `kill(pid, SIGKILL)` must return 0 (throws `killFailed` otherwise), and after
+  `Process.waitUntilExit()` the builder requires `terminationReason == .uncaughtSignal` with
+  `terminationStatus == SIGKILL` (throws `notKilledBySIGKILL` otherwise) — an artifact is only valid
+  if the helper died BY SIGKILL, never via a clean or errored exit. (Foundation's `Process` reaps the
+  child itself; the builder deliberately does NOT call `waitpid` — that would race Process's own
+  child handling.)

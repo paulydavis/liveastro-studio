@@ -467,37 +467,58 @@ final class FaultMatrixLifecycleTests: XCTestCase {
                                                expectedAcceptedCount: 0))
     }
 
-    /// Crash × manifest-midwrite: the helper is SIGKILLed while it loops rewriting the manifest with
-    /// a growing snapshot list. The manifest on disk is EITHER the previous complete version OR the
-    /// new complete version (atomic write guarantee) — never a torn/half-written file. Oracle
-    /// clause 1 (parses) is the teeth of this cell.
+    /// Crash × manifest-midwrite: the helper is SIGKILLed DETERMINISTICALLY between the staging and
+    /// the publication of a challenged manifest write (review4 P2). The helper does a few normal
+    /// seam writes (proving writes were flowing, not an idle pre-seeded manifest), then on the
+    /// challenged write it stages the full new manifest bytes to a same-dir `.staged-<pid>` temp,
+    /// touches the readiness flag, and BLOCKS FOREVER — it never publishes. The builder's SIGKILL
+    /// therefore always lands with the write transaction open: staged-but-unpublished new bytes on
+    /// disk, previously published manifest untouched. The aftermath is fully assertable:
+    ///   (a) published manifest.json parses and is EXACTLY the last pre-challenge version,
+    ///   (b) the `.staged-<pid>` temp exists and parses as the full challenged version
+    ///       (complete, closed, and unpublished — staging finished; publication never happened),
+    ///   (c) the session oracle passes over the aftermath.
+    /// The builder additionally verifies the helper died BY SIGKILL (uncaught signal 9), so the
+    /// artifact can never silently come from a clean exit.
     ///
-    /// F3 (review2) + review3 P2: the helper's `SessionManager.manifestWriter` seam performs an
-    /// explicit staged atomic write (stage full bytes to a same-dir temp → touch the readiness flag →
-    /// rename to publish), so the flag first appears only while staged-but-unpublished bytes exist on
-    /// disk. The builder's SIGKILL therefore lands inside an open write transaction (or a later
-    /// iteration's write cycle) — never on the idle pre-seeded manifest before any challenged write.
-    /// NOT guaranteed: which complete version survives; only that the published manifest always parses.
-    func testCrash_manifestMidwrite_manifestEitherCompleteNeverTorn() throws {
+    /// These counts mirror the constants in faulthelper's `manifest-midwrite` scenario:
+    /// 120 pre-seeded records + 3 normal seam writes = 123 published; the challenged (blocked,
+    /// never published) version carries one more record = 124 staged.
+    func testCrash_manifestMidwrite_killBetweenStageAndPublish_priorVersionIntact() throws {
+        let publishedCount = 123   // faulthelper: preSeedCount(120) + normalSeamWrites(3)
+        let stagedCount = 124      // the challenged write adds one record, staged but never published
+
         let fs = try TempFS("crash-midwrite"); defer { fs.tearDown() }
         let aftermath = try CrashArtifactBuilder.killedArtifact(scenario: "manifest-midwrite", in: fs)
         let sessionDir = try onlySessionDir(in: aftermath)
 
-        // Atomic-write guarantee: the manifest MUST parse as a whole SessionManifest — a torn file
-        // would fail here. (The staged write publishes only via rename of fully staged bytes — the
-        // same temp+rename Data(.atomic) performs — so a kill mid-write leaves the prior complete
-        // version published; at most an unpublished `.staged-*` temp is left beside it.)
+        // (a) The published manifest parses as a whole SessionManifest AND is exactly the last
+        // pre-challenge version — the kill landed inside the open transaction, so the challenged
+        // version must never have been published.
         let data = try Data(contentsOf: sessionDir.appendingPathComponent("manifest.json"))
         let manifest = try ManifestCoding.decoder().decode(SessionManifest.self, from: data)
-        // Either the pre-first-write empty list (0) or the first complete write (>=1) — never a
-        // partially-serialized array. Both are complete; we just assert it decoded.
-        XCTAssertGreaterThanOrEqual(manifest.snapshots.count, 0)
+        XCTAssertEqual(manifest.snapshots.count, publishedCount,
+                       "published manifest must be EXACTLY the last pre-challenge version")
         XCTAssertNil(manifest.endTime, "still running when killed")
 
+        // (b) The staged temp of the challenged write exists and contains the FULL new version —
+        // staging completed (complete, closed, unpublished), publication deterministically did not.
+        let entries = try FileManager.default.contentsOfDirectory(atPath: sessionDir.path)
+        let stagedNames = entries.filter { $0.hasPrefix("manifest.json.staged-") }
+        XCTAssertEqual(stagedNames.count, 1,
+                       "exactly one staged-but-unpublished manifest temp expected, got \(stagedNames)")
+        if let stagedName = stagedNames.first {
+            let stagedData = try Data(contentsOf: sessionDir.appendingPathComponent(stagedName))
+            let staged = try ManifestCoding.decoder().decode(SessionManifest.self, from: stagedData)
+            XCTAssertEqual(staged.snapshots.count, stagedCount,
+                           "staged temp must hold the full challenged version (staging completed)")
+        }
+
+        // (c) Oracle over the aftermath — published state is honest and internally consistent.
         assertSessionOracle(sessionRoot: sessionDir, log: [],
                             OracleExpectations(lossLogPattern: nil,
                                                laterFramesApplicable: false,
-                                               expectedAcceptedCount: nil))
+                                               expectedAcceptedCount: publishedCount))
     }
 
     /// Crash × relay-midcopy: the helper is SIGKILLed mid-copy. The destination contains NO

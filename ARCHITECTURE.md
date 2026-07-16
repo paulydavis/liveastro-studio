@@ -253,11 +253,14 @@ How the code holds it:
   copy-verification and the atomic rename; `relay-midcopy` cell) and
   `SessionManager.manifestWriter` (injectable manifest write, nil in
   production → the identical atomic write; `manifest-midwrite` cell). The
-  helper's injected writer stages the full bytes to a same-dir temp, sets the
-  readiness flag only after staging has begun, then renames to publish — so
-  the kill lands within an open write transaction (staged-but-unpublished
-  data, or a subsequent staged write). Not guaranteed: which version survives;
-  only that the published manifest is always some complete version.
+  helper's injected writer performs byte-identical staging steps (same-dir
+  temp + rename) and, on the challenged write, stages the full new bytes,
+  sets the readiness flag, then blocks forever — so the kill deterministically
+  lands between staging and publication of a challenged write; the aftermath
+  proves the prior published version survives intact, beside the complete,
+  closed, unpublished staged temp. (A block-point cannot be interposed inside
+  production `Data(.atomic)`; the production path's crash-atomicity is
+  separately covered by the APFS in-place cells.)
   Justifications live in fault-matrix.md next to their cells.
 
 ## 6. App / UI structure
