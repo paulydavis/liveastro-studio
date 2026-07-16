@@ -384,6 +384,14 @@ public final class OBSController: ObservableObject {
     /// 2): the epoch captured alongside the client identifies which session
     /// generated the error, so a stale client's death can never tear down a
     /// newer connection.
+    ///
+    /// Cold-review1 finding 3: whether the handshake was COMPLETE when the
+    /// request was issued is captured alongside the epoch. A request issued
+    /// mid-handshake (state `.connecting` — a scene-automation tick or a
+    /// stop racing a Go Live's connect) throws `.notConnected` from the
+    /// not-yet-identified client; that is NOT a liveness signal about an
+    /// established session, and pre-fix it converged anyway — teardown()
+    /// cancelled the in-flight connect. Such a request now fails alone.
     @discardableResult
     private func requestData(_ type: String, _ data: [String: Any]?) async -> [String: Any]? {
         guard let client else {
@@ -391,11 +399,13 @@ public final class OBSController: ObservableObject {
             return nil
         }
         let epoch = connectionEpoch
+        let issuedAgainstCompletedHandshake = state == .connected || state == .streaming
         do {
             return try await client.request(type, data: data)
         } catch {
             log("\(type) failed: \(error)")
-            handle(error: error, epoch: epoch)
+            handle(error: error, epoch: epoch,
+                   issuedAgainstCompletedHandshake: issuedAgainstCompletedHandshake)
             return nil
         }
     }
@@ -403,10 +413,19 @@ public final class OBSController: ObservableObject {
     /// Converge state on a dropped connection — the failed request is a
     /// liveness signal. Epoch-guarded (review8 item 2): only the client whose
     /// epoch generated the error may tear the session down; errors surfacing
-    /// from an already-superseded client touch nothing.
-    private func handle(error: Error, epoch: Int) {
+    /// from an already-superseded client touch nothing. Handshake-guarded
+    /// (cold-review1 finding 3): only a request issued against a COMPLETED
+    /// handshake carries liveness information — a mid-handshake
+    /// `.notConnected` says "not connected YET", and converging on it killed
+    /// the very connect it raced.
+    private func handle(error: Error, epoch: Int,
+                        issuedAgainstCompletedHandshake: Bool) {
         if case OBSClient.OBSError.notConnected = error {
             guard epoch == connectionEpoch else { return }
+            guard issuedAgainstCompletedHandshake else {
+                log("request issued mid-handshake failed — connect attempt unaffected")
+                return
+            }
             if state != .disconnected {
                 log("connection lost — converging to .disconnected")
                 teardown()

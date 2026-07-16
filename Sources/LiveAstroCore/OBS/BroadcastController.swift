@@ -177,7 +177,14 @@ public final class BroadcastController {
     var healthPollIntervalSeconds: Double = 2
 
     // Scene-automation runtime state (nil unless a session + automation is live).
-    private var sceneTimer: Timer?
+    /// Internal for tests (cold-review1 minor 5): the deinit-invalidation pin
+    /// needs to grab the timer before the controller is released.
+    /// `@ObservationIgnored` keeps it a plain stored property (no UI observes
+    /// it) so `nonisolated(unsafe)` genuinely applies; that in turn exists
+    /// ONLY so deinit (nonisolated by language rule) can invalidate it —
+    /// every live access is main-actor code in this class, and deinit has
+    /// exclusive access to the dying instance.
+    @ObservationIgnored nonisolated(unsafe) var sceneTimer: Timer?
     private var stall: StallDetector?
     /// True while we're showing `scopeSceneName` *because* of a detected stall,
     /// so the accepted-frame hook knows to switch back to the stack scene once.
@@ -200,6 +207,17 @@ public final class BroadcastController {
         // the broadcast state machine — both hooks fire on the main actor.
         obs.onOutputEvent = { [weak self] in self?.noteOBSStateMayHaveChanged() }
         obs.onConnectionLost = { [weak self] in self?.handleConnectionLoss() }
+    }
+
+    deinit {
+        // Cold-review1 minor 5: the repeating scene timer is retained by the
+        // main RunLoop — the timer holds only a weak self, so the controller
+        // deallocates fine, but WITHOUT this the timer itself leaked and kept
+        // firing forever when the controller was released without
+        // sessionDidEnd(). The controller is main-actor-owned, so
+        // deallocation runs on the main thread — the thread the timer was
+        // scheduled on, as invalidate() requires.
+        sceneTimer?.invalidate()
     }
 
     // MARK: - Session hooks (called by the app where the logic fired inline)

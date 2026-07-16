@@ -1329,6 +1329,63 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertEqual(h.controller.broadcastState, .stopUnconfirmed)
     }
 
+    // MARK: - cold-review1 FINDING 3: a request during an in-flight handshake
+    // must not kill the connect
+
+    /// COLD1 FINDING 3: any request issued while the handshake is in flight
+    /// (scene-automation tick, endBroadcast, retryStop during .connecting)
+    /// throws .notConnected from the pre-handshake client; pre-fix
+    /// handle(error:) passed its epoch guard (the epoch IS the in-flight
+    /// attempt's), saw .connecting, and ran full connection-loss convergence —
+    /// teardown() cancelled the connect task mid-handshake. Post-fix
+    /// convergence requires the erroring request to have been issued against a
+    /// COMPLETED handshake: the mid-handshake request fails alone (logged),
+    /// and the connect survives and completes.
+    func testMidHandshakeRequestFailureDoesNotKillConnect() async {
+        let h = await makeHarness(connect: false, requestTimeout: 10)
+        // Park the handshake: Hello arrives and Identify goes out, but the
+        // Identified reply is withheld (no responder installed yet).
+        h.mock.enqueueInbound(helloFrame())
+        let connectTask = Task { await h.controller.connectAndReconcile() }
+        await waitUntil { h.mock.sentFrames.contains { $0.contains("\"op\":1") } }
+        XCTAssertEqual(h.obs.state, .connecting)
+
+        // A request lands mid-handshake (the scene-automation tick shape:
+        // sceneTick → setSceneViaAutomation → obs.setScene → requestData).
+        await h.obs.setScene("Scope")
+        XCTAssertEqual(h.obs.state, .connecting,
+                       "a mid-handshake request failure must fail that request alone, never the connect")
+
+        // Complete the handshake: the connect survives and reconciles to .idle.
+        h.mock.replyToLastSent(h.server.responder())
+        h.mock.enqueueInbound(identifiedFrame)
+        let ok = await connectTask.value
+        XCTAssertTrue(ok, "the handshake must survive a mid-flight request failure")
+        await waitUntil { h.controller.broadcastState == .idle }
+    }
+
+    // MARK: - cold-review1 MINOR 5: releasing the controller invalidates the
+    // scene timer
+
+    /// The repeating scene timer is retained by the main RunLoop; the timer
+    /// holds only a weak controller reference, so the controller deallocates —
+    /// but pre-fix the TIMER leaked and kept firing forever when the
+    /// controller was released without sessionDidEnd(). deinit must
+    /// invalidate it.
+    func testDeinitInvalidatesSceneTimer() async {
+        var h: Harness? = await makeHarness(connect: false)
+        h!.controller.sceneAutomationOn = true
+        h!.controller.sessionDidStart(subExposureSeconds: 1)
+        guard let timer = h!.controller.sceneTimer else {
+            return XCTFail("scene automation must have installed its timer")
+        }
+        XCTAssertTrue(timer.isValid)
+
+        h = nil   // release the controller WITHOUT sessionDidEnd()
+        XCTAssertFalse(timer.isValid,
+                       "deinit must invalidate the RunLoop-retained scene timer")
+    }
+
     /// Boundary (c): while the orphan cleanup is awaiting OBS, .stopping is
     /// already reserved SYNCHRONOUSLY — a Go Live click during that await is
     /// rejected outright (no state change, no generation bump, no StartStream).
