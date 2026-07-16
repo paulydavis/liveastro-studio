@@ -537,6 +537,86 @@ final class FaultMatrixFileTests: XCTestCase {
             "F2: recreated same-name/size/mtime file must re-earn stability across a tick, not emit in the return tick (gap \(gap)s < ~one poll interval)")
     }
 
+    /// Watcher × recovery re-arm failure (F4, review2): when the watched folder returns but re-arming
+    /// the DispatchSource fails, the watcher must NOT claim recovery ("resuming") — it must log the
+    /// re-arm failure ONCE and retry on later polls, only logging "resuming" once the re-arm actually
+    /// succeeds. Before the fix, "resuming" was logged and folderMissing cleared BEFORE armSource(),
+    /// whose failure was silently swallowed → the watcher claimed recovery while its source was dead.
+    ///
+    /// Drive: recreate the returned folder at mode 000. `fileExists` reports the folder present (so the
+    /// return branch runs), but `open(O_EVTONLY)` inside armSource() fails with EACCES → a genuine
+    /// re-arm failure. Restoring 0o755 lets the next poll re-arm successfully. Chmod ineffective
+    /// (privileged runner) → skip with a diagnostic (never pass vacuously). PROXY for any transient
+    /// re-arm failure (network volume not yet remounted, fd exhaustion).
+    func testWatcher_recovery_rearmFailsNoResumingClaimThenSucceeds() async throws {
+        let fs = try TempFS("watch-rearm"); defer { fs.tearDown() }
+        let folder = try fs.dir("watched")
+        let watcher = StackFileWatcher(folder: folder, quietPeriod: 0.1, pollInterval: 0.3,
+                                       fileNamePrefix: "live_stack")
+        let logs = WatcherLogSink()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start(); defer { watcher.stop() }
+
+        // Baseline emit so we know the watcher is live.
+        try makeFITS(0.4, size: 32).write(to: folder.appendingPathComponent("live_stack.fit"))
+        let baselineEmit = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(baselineEmit, "baseline file emits")
+
+        // Disappear.
+        try Disruptor.removeDirectory(folder)
+        try await Task.sleep(nanoseconds: 700_000_000)
+        XCTAssertEqual(logs.count(containing: "watched folder disappeared"), 1, "disappearance logged once")
+
+        // Return the folder but at mode 000 so armSource()'s open(O_EVTONLY) fails while fileExists
+        // still reports the folder present. Verify the mode actually took (privileged runner defeats
+        // chmod → skip).
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o000)],
+                                              ofItemAtPath: folder.path)
+        fs.trackPermissionChange(at: folder)   // ensure teardown can restore + remove it
+        // Probe: open(O_EVTONLY) must actually fail now for this to exercise the re-arm-failure path.
+        let probeFD = open(folder.path, O_EVTONLY)
+        if probeFD >= 0 {
+            close(probeFD)
+            throw XCTSkip("open(O_EVTONLY) still succeeds on a 000 dir (privileged runner) — cannot drive re-arm failure")
+        }
+
+        // Let several polls hit the failing re-arm branch.
+        try await Task.sleep(nanoseconds: 1_100_000_000)   // ~3-4 poll ticks
+
+        // ORDERING GUARANTEE: no "resuming" was logged (the re-arm never succeeded), and the re-arm
+        // failure was logged exactly once (not per-tick spam).
+        XCTAssertEqual(logs.count(containing: "watched folder returned — resuming"), 0,
+                       "F4: must NOT claim 'resuming' while the re-arm is failing")
+        XCTAssertEqual(logs.count(containing: "re-arm failed"), 1,
+                       "F4: re-arm failure must be logged exactly once (retried quietly thereafter)")
+
+        // Restore write/search permission → the next poll re-arms successfully and NOW claims resuming.
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o755)],
+                                              ofItemAtPath: folder.path)
+        try await Task.sleep(nanoseconds: 700_000_000)
+        XCTAssertGreaterThanOrEqual(logs.count(containing: "watched folder returned — resuming"), 1,
+                                    "F4: 'resuming' must be logged once the re-arm actually succeeds")
+
+        // And the recovered watcher ingests a fresh file (proves the source/poll path is live).
+        try makeFITS(0.6, size: 32).write(to: folder.appendingPathComponent("live_stack2.fit"))
+        let recovered = await collector.waitForCount(2, timeout: 6)
+        XCTAssertTrue(recovered, "after a successful re-arm, a fresh file is ingested")
+    }
+
+    /// Thread-safe log sink for watcher tests (the watcher logs on its serial queue; the test reads
+    /// from its own thread) — lock-protected (F5 pattern).
+    private final class WatcherLogSink {
+        private let lock = NSLock()
+        private var lines: [String] = []
+        func append(_ s: String) { lock.lock(); lines.append(s); lock.unlock() }
+        func count(containing sub: String) -> Int {
+            lock.lock(); defer { lock.unlock() }
+            return lines.filter { $0.contains(sub) }.count
+        }
+    }
+
     /// Thread-safe timestamp collector for the folder-replacement stability test: the watcher's log
     /// fires on its serial queue while the test thread reads — lock-protect (F5 pattern).
     private final class FolderReplaceClock {
