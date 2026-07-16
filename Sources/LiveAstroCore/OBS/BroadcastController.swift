@@ -300,19 +300,7 @@ public final class BroadcastController {
                                                 confirmPollSeconds: confirmPollSeconds,
                                                 maxConfirmPolls: maxConfirmPolls)
             guard gen == broadcastGeneration else {
-                // Stale completion: NEVER mutate state (a newer attempt may own it).
-                // But if we just brought a stream up and no newer broadcast owns one
-                // (.idle/.stopping/.stopUnconfirmed), undo our own side effect so
-                // nothing keeps running behind the user's back.
-                if live {
-                    switch broadcastState {
-                    case .connecting, .live, .endingSession:
-                        break   // a newer broadcast owns the stream — leave it alone
-                    case .idle, .stopping, .stopUnconfirmed:
-                        await obs.stopBroadcast(confirmPollSeconds: confirmPollSeconds,
-                                                maxConfirmPolls: maxConfirmPolls)
-                    }
-                }
+                await discardStaleGoLive(live: live)
                 return
             }
             if live {
@@ -329,8 +317,47 @@ public final class BroadcastController {
                 }
                 startHealthPoll()
             } else {
-                deps.presentError("OBS started but the stream didn't go live — check OBS ▸ Settings ▸ Stream (YouTube server + key).")
-                broadcastState = .idle
+                // Review7 P1: startBroadcast no longer stops on a failed confirm —
+                // this CALLER owns cleanup, and only at the CURRENT generation
+                // (validated above). Confirmed-stop semantics: .idle only when OBS
+                // confirmed both outputs inactive; otherwise .stopUnconfirmed.
+                let confirmed = await obs.stopBroadcast(confirmPollSeconds: confirmPollSeconds,
+                                                        maxConfirmPolls: maxConfirmPolls)
+                guard gen == broadcastGeneration else { return }   // superseded mid-cleanup
+                if confirmed {
+                    deps.presentError("OBS started but the stream didn't go live — check OBS ▸ Settings ▸ Stream (YouTube server + key).")
+                    broadcastState = .idle
+                } else {
+                    settleAfterStop(confirmed: false)
+                }
+            }
+        }
+    }
+
+    /// Landing for a go-live completion that lost the generation race (review7
+    /// P1). NEVER sends StopStream while a newer broadcast is active or
+    /// connecting — that stop would kill the newer owner's stream (the exact
+    /// bug the internal StopStream-on-expiry in OBSController used to cause).
+    /// Only a stale SUCCESS with no newer owner may undo the stream it
+    /// started, and that stop must be CONFIRMED: an unconfirmed cleanup
+    /// escalates a (previously confirmed) .idle to .stopUnconfirmed honestly
+    /// rather than leaving a possibly-live OBS behind an idle UI.
+    private func discardStaleGoLive(live: Bool) async {
+        guard live else {
+            deps.log("OBS: stale go-live attempt discarded")
+            return
+        }
+        switch broadcastState {
+        case .connecting, .live, .endingSession:
+            deps.log("OBS: stale go-live attempt discarded — a newer broadcast owns the stream")
+        case .idle, .stopping, .stopUnconfirmed:
+            deps.log("OBS: stale go-live attempt discarded — stopping the stream it started")
+            let confirmed = await obs.stopBroadcast(confirmPollSeconds: confirmPollSeconds,
+                                                    maxConfirmPolls: maxConfirmPolls)
+            if !confirmed, broadcastState == .idle {
+                broadcastState = .stopUnconfirmed
+                deps.log("OBS: stale go-live cleanup stop not confirmed — OBS may still be live")
+                deps.presentError("OBS may still be live — check OBS, then Retry.")
             }
         }
     }
