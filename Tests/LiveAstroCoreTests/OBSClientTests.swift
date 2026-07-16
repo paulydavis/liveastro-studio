@@ -298,6 +298,68 @@ final class OBSClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    // MARK: - Socket hygiene on handshake failure (review10 finding 6)
+
+    /// A handshake that fails AFTER the socket opened must close that socket
+    /// before throwing — pre-fix the auth-required-but-missing-password path
+    /// (and every other post-connect failure) leaked the open connection.
+    func testHandshakeAuthRequiredWithoutPasswordClosesSocket() async {
+        let mock = MockOBSSocket()
+        let client = OBSClient(socket: mock)
+        mock.enqueueInbound(helloFrame(salt: "s", challenge: "c"))   // server demands auth
+
+        do {
+            try await client.connect(url: url, password: nil)
+            XCTFail("Expected .authFailed")
+        } catch OBSClient.OBSError.authFailed {
+            // expected
+        } catch {
+            XCTFail("Expected .authFailed, got \(error)")
+        }
+        XCTAssertEqual(mock.closeCount, 1,
+                       "a failed handshake must close the socket it opened")
+    }
+
+    /// A bad Identified reply (post-send failure path) also closes the socket.
+    func testHandshakeBadIdentifiedClosesSocket() async {
+        let mock = MockOBSSocket()
+        let client = OBSClient(socket: mock)
+        mock.enqueueInbound(helloFrame())
+        // Answer the Identify with a non-Identified frame.
+        mock.replyToLastSent { sent in
+            sent.contains("\"op\":1")
+                ? #"{"op":5,"d":{"eventType":"Nope","eventData":{}}}"# : nil
+        }
+
+        do {
+            try await client.connect(url: url, password: nil)
+            XCTFail("Expected .authFailed")
+        } catch OBSClient.OBSError.authFailed {
+            // expected
+        } catch {
+            XCTFail("Expected .authFailed, got \(error)")
+        }
+        XCTAssertEqual(mock.closeCount, 1)
+    }
+
+    /// N failed handshake retries → N closes, zero live sockets (the
+    /// auto-launch retry loop must not accumulate orphaned connections).
+    func testRepeatedHandshakeFailuresCloseEverySocket() async {
+        let mock = MockOBSSocket()
+        for n in 1...3 {
+            let client = OBSClient(socket: mock)
+            mock.enqueueInbound(helloFrame(salt: "s", challenge: "c"))
+            do {
+                try await client.connect(url: url, password: nil)
+                XCTFail("Expected a handshake failure")
+            } catch {
+                // any failure path — the socket must still be closed
+            }
+            XCTAssertEqual(mock.closeCount, n,
+                           "every failed handshake must close its socket")
+        }
+    }
+
     // MARK: - Cancellation (review8 item 1)
 
     /// A request whose task is cancelled BEFORE the request body runs resumes

@@ -142,6 +142,15 @@ public final class OBSController: ObservableObject {
         state = .connected
         subscribeToEvents(of: client, epoch: epoch)
         await seedState(epoch: epoch)
+        // Review10 finding 5 (SPLIT-SNAPSHOT/OWNERSHIP RACES): the connection
+        // may have DIED during the seed (a socket failure converges to
+        // .disconnected and bumps the epoch) — returning true unconditionally
+        // here reported success from a stale task over a dead session.
+        // Revalidate identity and liveness before claiming success.
+        guard epoch == connectionEpoch, self.client === client,
+              state == .connected || state == .streaming else {
+            return false
+        }
         return true
     }
 

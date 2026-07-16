@@ -406,6 +406,29 @@ final class OBSControllerTests: XCTestCase {
         controller.disconnect()
     }
 
+    /// review10 finding 5: connect() must not report success after the
+    /// connection already died. A seed-time socket failure converges the
+    /// controller to .disconnected (and bumps the epoch) while the connect
+    /// task is still running — pre-fix it returned true unconditionally after
+    /// seedState, handing the caller a "connected" that wasn't.
+    func testConnectReturnsFalseWhenSeedTimeSocketFailureKillsConnection() async {
+        let mock = MockOBSSocket()
+        let controller = makeController(mock)
+
+        mock.enqueueInbound(helloFrame())
+        mock.replyToLastSent { sent in
+            if sent.contains("\"op\":1") { return identifiedFrame }
+            guard sent.contains("\"op\":6") else { return nil }
+            // The socket dies the moment the first seed request goes out.
+            mock.finishWithError(OBSSocketError.notConnected)
+            return nil
+        }
+
+        let ok = await controller.connect(host: "localhost", port: 4455, password: nil)
+        XCTAssertFalse(ok, "connect must not report success after the connection died mid-seed")
+        XCTAssertEqual(controller.state, .disconnected)
+    }
+
     /// connect failure (bad handshake) returns false and leaves .disconnected.
     func testConnectFailureReturnsFalse() async {
         let mock = MockOBSSocket()
