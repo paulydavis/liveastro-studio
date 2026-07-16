@@ -209,13 +209,26 @@ public actor OBSClient {
                 do {
                     text = try await self.receiveFrame()
                 } catch {
-                    // Socket closed or errored: fail everything and stop.
-                    await self.failAll(error: OBSError.notConnected)
+                    // Deliberate disconnects cancel this loop BEFORE closing the
+                    // socket — their teardown owns the signalling. Only an
+                    // UNEXPECTED death may surface connection loss.
+                    if Task.isCancelled { return }
+                    await self.receiveLoopDied()
                     return
                 }
                 await self.handle(frame: text)
             }
         }
+    }
+
+    /// The receive loop died unexpectedly (socket closed or errored): fail all
+    /// pending requests and FINISH the events stream. The stream's finish IS
+    /// the connection-loss signal consumers rely on (review8 item 3 — pre-fix
+    /// the stream was never finished on receive-loop death, so downstream
+    /// state machines could not see the socket loss).
+    private func receiveLoopDied() {
+        failAll(error: OBSError.notConnected)   // also sets connected = false
+        eventContinuation.finish()
     }
 
     private func receiveFrame() async throws -> String {

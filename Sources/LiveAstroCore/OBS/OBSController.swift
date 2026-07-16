@@ -33,6 +33,19 @@ public final class OBSController: ObservableObject {
     /// Diagnostic log sink. Every swallowed error and lifecycle note is emitted here.
     public var onLog: ((String) -> Void)?
 
+    /// Fired on the main actor for every output-affecting OBS event
+    /// (StreamStateChanged / RecordStateChanged), AFTER the published state was
+    /// updated — the broadcast orchestrator's reconciliation trigger (review8
+    /// item 3).
+    public var onOutputEvent: (() -> Void)?
+
+    /// Fired on the main actor when the connection is lost UNEXPECTEDLY —
+    /// receive-loop death (surfaced by the client finishing its events stream)
+    /// or a request-error convergence — after this controller has already
+    /// converged to `.disconnected`. NEVER fired for a deliberate
+    /// `disconnect()` (review8 item 3).
+    public var onConnectionLost: (() -> Void)?
+
     // MARK: - Dependencies
 
     private let makeClient: (OBSSocket) -> OBSClient
@@ -374,6 +387,7 @@ public final class OBSController: ObservableObject {
                 log("connection lost — converging to .disconnected")
                 teardown()
                 state = .disconnected
+                onConnectionLost?()
             }
         }
     }
@@ -383,6 +397,13 @@ public final class OBSController: ObservableObject {
     /// Consume the client's event stream and keep published state live.
     /// Epoch-guarded (review8 item 2): once the session is superseded, this
     /// consumer stops applying the dead client's events entirely.
+    ///
+    /// The stream FINISHING is a signal (review8 item 3): the client finishes
+    /// it when its receive loop dies unexpectedly, so falling out of the loop
+    /// at the CURRENT epoch (not cancelled, not superseded) means the socket
+    /// is gone — converge to `.disconnected` and surface `onConnectionLost`.
+    /// Deliberate disconnects cancel this task and bump the epoch first, so
+    /// they can never reach the convergence.
     private func subscribeToEvents(of client: OBSClient, epoch: Int) {
         let events = client.events
         eventsTask = Task { [weak self] in
@@ -393,6 +414,12 @@ public final class OBSController: ObservableObject {
                 // apply(event:data:) is a same-actor synchronous call.
                 self.apply(event: event.type, data: event.data)
             }
+            guard let self, !Task.isCancelled else { return }
+            guard self.connectionEpoch == epoch else { return }
+            self.log("connection lost — converging to .disconnected")
+            self.teardown()
+            self.state = .disconnected
+            self.onConnectionLost?()
         }
     }
 
@@ -408,11 +435,13 @@ public final class OBSController: ObservableObject {
             if let active = data["outputActive"] as? Bool {
                 state = active ? .streaming : .connected
             }
+            onOutputEvent?()   // review8 item 3: reconcile broadcast state
 
         case "RecordStateChanged":
             if let active = data["outputActive"] as? Bool {
                 isRecording = active
             }
+            onOutputEvent?()   // review8 item 3: reconcile broadcast state
 
         case "SceneListChanged":
             // Scene set changed under us — re-fetch names.

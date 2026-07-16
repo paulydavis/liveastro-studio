@@ -689,6 +689,190 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertTrue(h.box.logs.contains { $0.contains("adopted the live broadcast") })
     }
 
+    // MARK: - review8 FIX 3: event-driven reconciliation (dirty-drain)
+
+    /// An EXTERNAL stream start while we claim .idle must reach the broadcast
+    /// state through the event path: the footer stops offering a Go Live that
+    /// would double-start, and the live broadcast is adopted (health poll and
+    /// all). Pre-fix output events never reached BroadcastController — only
+    /// the health poll did, and it only runs when already .live.
+    func testExternalStreamStartEventFromIdleAdoptsLive() async {
+        let h = await makeHarness()
+        h.server.streamActive = true   // OBS starts streaming on its own
+        h.mock.enqueueInbound(eventFrame(type: "StreamStateChanged",
+                                         data: ["outputActive": true]))
+
+        await waitUntil { h.controller.broadcastState == .live }
+        XCTAssertEqual(sent("StartStream", h.mock), 0, "adoption, not a double start")
+        XCTAssertTrue(h.box.logs.contains { $0.contains("adopted the live broadcast") })
+        await waitUntil { h.controller.streamHealth != nil }   // health poll running
+    }
+
+    /// An EXTERNAL record start while .idle violates the idle invariant
+    /// (both outputs must be confirmed inactive): the event drives the state
+    /// to .stopUnconfirmed, and Retry recovers.
+    func testExternalRecordStartEventFromIdleLandsStopUnconfirmed() async {
+        let h = await makeHarness()
+        h.server.recordActive = true   // recording started in OBS itself
+        h.mock.enqueueInbound(eventFrame(type: "RecordStateChanged",
+                                         data: ["outputActive": true]))
+
+        await waitUntil { h.controller.broadcastState == .stopUnconfirmed }
+        h.controller.retryStop()
+        await waitUntil { h.controller.broadcastState == .idle }
+        XCTAssertFalse(h.server.recordActive)
+    }
+
+    /// An external stop while .endingSession (deliberately live through the
+    /// replay render) must end the broadcast honestly instead of rendering
+    /// LIVE forever — and the later deferred stop no-ops cleanly.
+    func testExternalStopDuringEndingSessionLandsIdle() async {
+        let h = await makeHarness()
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        h.controller.sessionDidEnd()
+        XCTAssertEqual(h.controller.broadcastState, .endingSession)
+
+        h.server.streamActive = false      // stopped IN OBS during the replay render
+        await waitUntil { h.controller.broadcastState == .idle }
+        XCTAssertEqual(sent("StopStream", h.mock), 0)
+
+        h.controller.stopBroadcastAfterSessionEnd()   // replay finished later
+        await settle()
+        XCTAssertEqual(h.controller.broadcastState, .idle)
+        XCTAssertEqual(sent("StopStream", h.mock), 0, "nothing left to stop")
+    }
+
+    /// Socket loss from .idle → .unknown: with the control link gone the
+    /// confirmed idle is no longer confirmable; reconnect-and-reconcile stays
+    /// one click. Pre-fix the loss was invisible (state stayed a stale .idle
+    /// and obs.state a stale .connected until some request happened to fail).
+    func testSocketLossFromIdleLandsUnknown() async {
+        let h = await makeHarness()
+        h.mock.finishWithError(OBSSocketError.notConnected)
+
+        await waitUntil { h.controller.broadcastState == .unknown }
+        XCTAssertEqual(h.obs.state, .disconnected)
+        XCTAssertEqual(sent("StopStream", h.mock), 0)
+    }
+
+    /// Socket loss from .live → .stopUnconfirmed: OBS keeps streaming without
+    /// a control link (disconnect ≠ stop), so .live would be a lie and .idle a
+    /// worse one. Pre-fix the state stayed .live FOREVER (the health poll got
+    /// nil and just kept polling).
+    func testSocketLossFromLiveLandsStopUnconfirmed() async {
+        let h = await makeHarness()
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+
+        h.mock.finishWithError(OBSSocketError.notConnected)
+        await waitUntil { h.controller.broadcastState == .stopUnconfirmed }
+        XCTAssertNil(h.controller.streamHealth)
+        XCTAssertEqual(h.obs.state, .disconnected)
+        XCTAssertTrue(h.server.streamActive, "OBS really is still streaming")
+    }
+
+    /// Socket loss from .endingSession → .stopUnconfirmed (same honesty as
+    /// .live: the stream was deliberately up and is now unreachable).
+    func testSocketLossFromEndingSessionLandsStopUnconfirmed() async {
+        let h = await makeHarness()
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        h.controller.sessionDidEnd()
+        XCTAssertEqual(h.controller.broadcastState, .endingSession)
+
+        h.mock.finishWithError(OBSSocketError.notConnected)
+        await waitUntil { h.controller.broadcastState == .stopUnconfirmed }
+    }
+
+    /// Reviewer-specified drain regression: pass 1 is parked at its
+    /// recordStatus() query, a CONTRADICTORY output event lands mid-await
+    /// (the stream comes back), then the parked request resumes with the
+    /// stale answer. The drain must clear-and-recheck dirty in one
+    /// synchronous segment, run ANOTHER pass, and settle on the NEWEST OBS
+    /// state — never pass 1's stale snapshot.
+    func testDrainCoalescesContradictoryEventsToNewestState() async {
+        let h = await makeHarness(requestTimeout: 10)
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+
+        // Pass 1: external stop event; park the pass's GetRecordStatus.
+        h.server.streamActive = false
+        h.server.parkTypes = ["GetRecordStatus"]
+        h.mock.enqueueInbound(eventFrame(type: "StreamStateChanged",
+                                         data: ["outputActive": false]))
+        await waitUntil { h.server.parked.count == 1 }   // pass 1 mid-await
+
+        // Contradiction mid-await: the stream comes BACK (external restart).
+        h.server.streamActive = true
+        h.server.parkTypes = []
+        h.mock.enqueueInbound(eventFrame(type: "StreamStateChanged",
+                                         data: ["outputActive": true]))
+        await settle()
+        // Resume pass 1's parked record query with its (now stale) answer.
+        h.mock.enqueueInbound(responseFrame(requestId: h.server.parked[0].id, ok: true,
+                                            responseData: ["outputActive": false]))
+
+        await waitUntil { h.controller.broadcastState == .live }
+        await settle()
+        XCTAssertEqual(h.controller.broadcastState, .live,
+                       "the drain must settle on the NEWEST OBS state, not the stale snapshot")
+    }
+
+    /// App-caused-event rule: a stream-START event during .connecting (OBS
+    /// echoing OUR StartStream) must NOT steal ownership from the in-flight
+    /// start — its own confirm governs the transition.
+    func testStreamStartEventDuringConnectingDoesNotStealOwnership() async {
+        let h = await makeHarness(requestTimeout: 10)
+        h.controller.maxConfirmPolls = 1
+        h.server.parkTypes = ["GetStreamStatus"]
+        h.server.parkSkip = ["GetStreamStatus": 1]   // reconcile's query goes through
+        h.controller.goLive()
+        await waitUntil { h.server.parked.count == 1 }   // parked at the confirm poll
+        XCTAssertEqual(h.controller.broadcastState, .connecting)
+        let gen = h.controller.broadcastGeneration
+
+        h.mock.enqueueInbound(eventFrame(type: "StreamStateChanged",
+                                         data: ["outputActive": true]))
+        await settle()
+        XCTAssertEqual(h.controller.broadcastState, .connecting,
+                       "the in-flight start's own confirm governs — no adoption from .connecting")
+        XCTAssertEqual(h.controller.broadcastGeneration, gen)
+        XCTAssertFalse(h.box.logs.contains { $0.contains("adopted the live broadcast") })
+
+        // Resume the confirm; the start completes through its own machinery.
+        h.server.parkTypes = []
+        h.mock.enqueueInbound(responseFrame(requestId: h.server.parked[0].id, ok: true, responseData: [
+            "outputActive": true, "outputDuration": 1, "outputTotalFrames": 1,
+            "outputSkippedFrames": 0, "outputCongestion": 0]))
+        await waitUntil { h.controller.broadcastState == .live }
+    }
+
+    /// App-caused-event rule: a stream-STOP event during .stopping (OBS
+    /// echoing OUR StopStream) must NOT claim .idle before recording is also
+    /// confirmed inactive — the stop machinery owns the landing.
+    func testStreamStopEventDuringStoppingDoesNotClaimIdleBeforeRecordConfirmed() async {
+        let h = await makeHarness()
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        h.server.recordActive = true
+        h.server.recordReactsToRequests = false   // StopRecord never takes effect
+
+        h.controller.endBroadcast()
+        XCTAssertEqual(h.controller.broadcastState, .stopping)
+        h.mock.enqueueInbound(eventFrame(type: "StreamStateChanged",
+                                         data: ["outputActive": false]))
+
+        // Recording is still active: the only honest landing is .stopUnconfirmed.
+        await waitUntil { h.controller.broadcastState == .stopUnconfirmed }
+        await settle()
+        XCTAssertEqual(h.controller.broadcastState, .stopUnconfirmed)
+
+        h.server.recordReactsToRequests = true
+        h.controller.retryStop()
+        await waitUntil { h.controller.broadcastState == .idle }
+    }
+
     // MARK: - review8 FIX 2: manual connect reserves .connecting
 
     /// Manual Connect reserves .connecting for the WHOLE await: a Go Live click
