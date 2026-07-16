@@ -34,6 +34,28 @@ public final class StackFileWatcher {
     /// Gates the re-arm-failure log to fire once, not every tick, until the re-arm succeeds.
     private var rearmFailed = false
 
+    /// Filesystem identity (device + inode) of a node, used to detect an ATOMIC replacement of the
+    /// watched directory (P1, review3): rename(2) of another directory over the same path leaves
+    /// `fileExists` true throughout, but the path resolves to a different inode afterward.
+    private struct NodeIdentity: Equatable {
+        let dev: dev_t
+        let ino: ino_t
+    }
+
+    /// Identity of the directory the DispatchSource is currently armed on, captured via fstat(2)
+    /// on the armed fd in armSource(). nil while no source is armed.
+    private var armedIdentity: NodeIdentity?
+
+    /// True once we have logged that a NON-DIRECTORY node occupies the watched path (P2, review3).
+    /// Gates that log to fire once per occupation, not every poll tick, while we stay folderMissing.
+    private var nonDirectoryAtPathLogged = false
+
+    private static func nodeIdentity(atPath path: String) -> NodeIdentity? {
+        var st = stat()
+        guard stat(path, &st) == 0 else { return nil }
+        return NodeIdentity(dev: st.st_dev, ino: st.st_ino)
+    }
+
     /// Per-file state for stability + dedupe. Stability now tracks (size, mtime) so a
     /// preallocated-but-still-filling FITS (full size, advancing mtime) is not emitted early.
     private var lastSeenStat: [String: (size: Int, mtime: TimeInterval)] = [:]
@@ -74,7 +96,19 @@ public final class StackFileWatcher {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
                           userInfo: [NSLocalizedDescriptionKey: "cannot open \(folder.path)"])
         }
+        // Capture the armed node's identity (dev, ino) from the fd itself — this is exactly the
+        // inode the DispatchSource watches, so scan() can detect an atomic replacement (P1) — and
+        // require it to be a DIRECTORY (P2): open(O_EVTONLY) succeeds on a regular file, but a
+        // watcher armed on a file can never enumerate; refuse rather than claim recovery. The fd
+        // is not yet owned by a cancel handler here, so close it on the refusal path.
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else {
+            close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTDIR),
+                          userInfo: [NSLocalizedDescriptionKey: "not a directory: \(folder.path)"])
+        }
         folderFD = fd
+        armedIdentity = NodeIdentity(dev: st.st_dev, ino: st.st_ino)
         let src = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd, eventMask: [.write, .extend], queue: queue)
         // Kernel events can't be injected in tests; the poll fallback below
@@ -92,6 +126,7 @@ public final class StackFileWatcher {
         source?.cancel()
         source = nil
         folderFD = -1
+        armedIdentity = nil
     }
 
     public func stop() {
@@ -112,7 +147,15 @@ public final class StackFileWatcher {
         let fm = FileManager.default
 
         // --- Folder presence check (disappearance + return detection) ---
-        let folderExists = fm.fileExists(atPath: folder.path)
+        // P2 (review3): presence requires an actual DIRECTORY. fileExists(atPath:) accepts any
+        // node and open(O_EVTONLY) succeeds on a regular file, so a file sitting at the folder
+        // path would otherwise be "recovered" against (arming a source on a file and logging
+        // "resuming" while directory enumeration can never work). A non-directory node is treated
+        // as still-missing: stay folderMissing, no "resuming" claim, and log the impostor once
+        // (not every tick) so the degradation appears honestly.
+        var isDirectory: ObjCBool = false
+        let nodeExists = fm.fileExists(atPath: folder.path, isDirectory: &isDirectory)
+        let folderExists = nodeExists && isDirectory.boolValue
 
         if !folderExists {
             if !folderMissing {
@@ -129,8 +172,39 @@ public final class StackFileWatcher {
                 // disappear→return (a truly identical, already-emitted file is not re-emitted).
                 lastSeenStat.removeAll()
             }
+            if nodeExists {
+                // Something non-directory occupies the watched path. Log once per occupation
+                // (gated like folderMissing) — the poll keeps ticking and recovery waits for a
+                // real directory.
+                if !nonDirectoryAtPathLogged {
+                    nonDirectoryAtPathLogged = true
+                    onLog?("watched path exists but is not a directory — still waiting for a directory: \(folder.path)")
+                }
+            } else {
+                nonDirectoryAtPathLogged = false
+            }
             // While missing, keep the timer running (it will notice the return).
             return
+        }
+        nonDirectoryAtPathLogged = false
+
+        // P1 (review3): the folder can be REPLACED atomically (rename(2) of another directory over
+        // the same path) with NO missing interval — fileExists never reports false, but the
+        // DispatchSource is still attached to the OLD inode (events from the new directory reach us
+        // only via the poll fallback) and lastSeenStat still holds observations of files that no
+        // longer exist (a recreated same-name/size/coarse-mtime file would pass the two-tick
+        // stability gate on its first sighting). Compare the path's current (dev, ino) against the
+        // identity captured when the source was armed; on mismatch, treat it exactly like a
+        // disappear+return in one tick: log honestly, cancel the stale source, clear the pending
+        // stability observations (emitted digests RETAINED for dedup), and fall into the recovery
+        // branch below — which re-arms BEFORE claiming recovery and retries on later polls if the
+        // re-arm fails (mirrors the existing return path).
+        if !folderMissing, let armed = armedIdentity,
+           let current = Self.nodeIdentity(atPath: folder.path), current != armed {
+            onLog?("watched folder was replaced — re-arming: \(folder.path)")
+            cancelSource()
+            lastSeenStat.removeAll()
+            folderMissing = true
         }
 
         if folderMissing {

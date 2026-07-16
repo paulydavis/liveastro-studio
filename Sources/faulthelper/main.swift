@@ -12,11 +12,14 @@ import LiveAstroCore
 //
 // Scenarios:
 //   session-midframes <root> <flag>  begin a session, record 3 real snapshots, touch flag, block.
-//   manifest-midwrite <root> <flag>  begin a session, pre-seed a LARGE (multi-MB) manifest, touch
-//                                     flag, then LOOP FOREVER rewriting the manifest (tight loop, no
-//                                     sleeps, never blocks). The SIGKILL lands mid-loop — during or
-//                                     between atomic manifest writes. The .atomic guarantee: any kill
-//                                     point leaves a COMPLETE manifest version (never a torn file).
+//   manifest-midwrite <root> <flag>  begin a session, pre-seed a LARGE (multi-MB) manifest, then
+//                                     LOOP FOREVER rewriting it via an explicit staged atomic write
+//                                     (stage temp file in same dir → touch flag → rename to publish;
+//                                     tight loop, no sleeps, never blocks). The flag first appears
+//                                     only AFTER staged bytes are on disk with publication pending,
+//                                     so the builder's SIGKILL opens strictly inside an open write
+//                                     transaction. Guarantee under test: any kill point leaves a
+//                                     COMPLETE published manifest version (never a torn file).
 //   relay-midcopy <src> <dst> <flag> start a FrameRelay against a large source; the pre-approved
 //                                     onPrePublish sync hook touches the flag then blocks forever, so
 //                                     the SIGKILL lands GENUINELY between the staged copy and the
@@ -101,24 +104,42 @@ do {
         // Pre-seed 120 fat records → ~5 MB manifest. Only 120 (fast) intermediate writes.
         // The seam is NOT installed yet, so these use the default atomic write path.
         for idx in 0..<120 { try mgr.recordSnapshot(fatRecord(idx)) }
-        // F3 (review2): touch the readiness flag from INSIDE the manifest write, not before the rewrite
-        // loop. The previous code flagged BEFORE the loop, so a fast SIGKILL could land on the
-        // pre-seeded manifest before the first CHALLENGED write ever ran — a vacuous pass. Install the
-        // pre-approved manifestWriter seam so the flag is set only when a real atomic write is actually
-        // in progress: flag, THEN perform the same Data(.atomic) write the production path would. The
-        // builder waits for the flag, so its SIGKILL window provably overlaps persistence activity.
+        // F3 (review2) + review3 P2: the readiness flag must be touched from INSIDE an open write
+        // transaction. The previous seam impl did `touchFlag(); data.write(.atomic)` — but the flag
+        // preceded the write() call, so the builder's SIGKILL (which fires as soon as it sees the
+        // flag) could land while this process was preempted BETWEEN touchFlag and write(), i.e. with
+        // no write in flight at all — the "provably overlaps an in-flight write" claim was overstated.
+        // FIX: an EXPLICIT staged atomic write mirroring what Data(.atomic) does (temp file in the
+        // same directory + rename(2) to publish), with the flag set only AFTER staging has begun:
+        //   (a) write the full new manifest bytes to `<manifest>.staged-<pid>` (same dir),
+        //   (b) touchFlag — staged bytes durable, publication (rename) still pending,
+        //   (c) rename(staged, manifest) — the single atomic publish.
+        //
+        // GUARANTEED: the flag first appears only while staged-but-unpublished bytes exist on disk,
+        // so the earliest instant the builder can kill is strictly inside an open write transaction —
+        // the kill can never land before a challenged write has begun (no vacuous pass on the idle
+        // pre-seeded manifest), and every later iteration re-enters that transaction (stage→publish).
+        // NOT guaranteed: WHICH complete version survives (the previously published one, the newly
+        // published one, or a leftover unpublished `.staged-*` temp alongside a published version),
+        // nor the exact phase of a later cycle the kill lands in (staging, publish, or the brief
+        // re-encode between cycles). What the cell asserts is exactly what IS guaranteed: the
+        // PUBLISHED manifest.json is at every instant SOME complete version — it only ever changes
+        // via an atomic rename of fully staged bytes. A leftover `.staged-<pid>` temp after SIGKILL
+        // is the same aftermath a killed Data(.atomic) write can leave: never published, never read.
         mgr.manifestWriter = { data, url in
-            touchFlag(flag)                              // set only during an in-flight manifest write
-            try data.write(to: url, options: .atomic)    // the real production write (temp+rename)
+            let staged = url.path + ".staged-\(getpid())"
+            try data.write(to: URL(fileURLWithPath: staged))   // (a) stage the full bytes, same dir
+            touchFlag(flag)                                    // (b) transaction open: staged, unpublished
+            guard rename(staged, url.path) == 0 else {         // (c) atomic publish
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                              userInfo: [NSLocalizedDescriptionKey: "rename(\(staged)) failed"])
+            }
         }
         var i = 120
-        // Loop FOREVER rewriting the ~5 MB manifest — a tight loop with no sleeps, no blocking, and no
-        // per-iteration PNG encode, so the big atomic manifest write DOMINATES the loop (maximizing the
-        // fraction of wall time spent inside write()). Because the flag is touched at the TOP of every
-        // write, the kill lands MID-ACTIVITY on a genuine atomic write, so the guarantee is genuinely
-        // exercised: whatever instant the kill lands, the manifest on disk is SOME complete version,
-        // never a torn/half-serialized file. (What is NOT guaranteed: WHICH version survives — the
-        // test asserts only that it parses.)
+        // Loop FOREVER rewriting the ~5 MB manifest — a tight loop with no sleeps, no blocking, and
+        // no per-iteration PNG encode, so the big staged write + publish DOMINATES the loop. Whatever
+        // instant the kill lands, the published manifest on disk is SOME complete version, never a
+        // torn/half-serialized file. (The test asserts only that it parses.)
         while true {
             try mgr.recordSnapshot(fatRecord(i))
             i += 1

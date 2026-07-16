@@ -452,7 +452,8 @@ private struct OBSSection: View {
             SecureField("Password (empty if auth off)", text: $model.broadcast.obsPassword)
                 .disabled(connected)
                 .help("OBS WebSocket password — copy it from OBS → Tools → WebSocket Server Settings → Show Connect Info (it regenerates each time OBS restarts with auto-generate on).")
-            Toggle("Auto-launch OBS on session start", isOn: $model.broadcast.obsAutoLaunch)
+            Toggle("Auto-launch OBS on Go Live", isOn: $model.broadcast.obsAutoLaunch)
+                .help("When OBS is unreachable at Go Live, launch it in the background and retry the connection for up to 20 seconds. Session start and manual Connect never launch OBS.")
 
             // Scene selection, fed by the controller's live scene list.
             HStack {

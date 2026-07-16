@@ -31,7 +31,7 @@ final class EndToEndTests: XCTestCase {
                                        maxKeyframes: 10)
         let updateCount = NSLock() // simple counter guard
         var accepted = 0
-        pipeline.onUpdate = { _, _ in updateCount.lock(); accepted += 1; updateCount.unlock() }
+        pipeline.onUpdate = { _, _ in updateCount.withLock { accepted += 1 } }
         try pipeline.start()
 
         let stackURL = watchDir.appendingPathComponent("live_stack.fit")
@@ -48,11 +48,11 @@ final class EndToEndTests: XCTestCase {
             // Wait until the pipeline accepts this update before writing the next.
             let deadline = Date().addingTimeInterval(8)
             while Date() < deadline {
-                updateCount.lock(); let n = accepted; updateCount.unlock()
+                let n = updateCount.withLock { accepted }
                 if n >= k { break }
                 Thread.sleep(forTimeInterval: 0.1)
             }
-            updateCount.lock(); let n = accepted; updateCount.unlock()
+            let n = updateCount.withLock { accepted }
             XCTAssertGreaterThanOrEqual(n, k, "update \(k) never accepted")
         }
 
@@ -104,7 +104,7 @@ final class EndToEndTests: XCTestCase {
                                        maxKeyframes: 10)
         var accepted = 0
         let lock = NSLock()
-        pipeline.onUpdate = { _, _ in lock.lock(); accepted += 1; lock.unlock() }
+        pipeline.onUpdate = { _, _ in lock.withLock { accepted += 1 } }
         try pipeline.start()
 
         let stackURL = watchDir.appendingPathComponent("live_stack.fit")
@@ -117,7 +117,7 @@ final class EndToEndTests: XCTestCase {
             try data.write(to: stackURL)
             let deadline = Date().addingTimeInterval(8)
             while Date() < deadline {
-                lock.lock(); let n = accepted; lock.unlock()
+                let n = lock.withLock { accepted }
                 if n >= k { break }
                 Thread.sleep(forTimeInterval: 0.05)
             }

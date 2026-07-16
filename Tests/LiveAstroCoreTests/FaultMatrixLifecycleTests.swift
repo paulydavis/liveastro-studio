@@ -160,7 +160,7 @@ final class FaultMatrixLifecycleTests: XCTestCase {
                                        rootDirectory: sessions)
         var log: [String] = []
         let logLock = NSLock()
-        pipeline.onLog = { msg in logLock.lock(); log.append(msg); logLock.unlock() }
+        pipeline.onLog = { msg in logLock.withLock { log.append(msg) } }
 
         try pipeline.start()
         let dir = pipeline.session.sessionDirectory!
@@ -170,7 +170,7 @@ final class FaultMatrixLifecycleTests: XCTestCase {
         try Disruptor.removeDirectory(snaps)
         _ = try pipeline.end()   // drains the finite import fully (all saves fail into onLog)
 
-        logLock.lock(); let capturedAfterDrop = log; logLock.unlock()
+        let capturedAfterDrop = logLock.withLock { log }
         let joined = capturedAfterDrop.joined(separator: "\n")
         XCTAssertTrue(joined.contains("Skipped frame"),
                       "the PIPELINE must emit the production 'Skipped frame' log when the save fails:\n\(joined)")
@@ -187,7 +187,7 @@ final class FaultMatrixLifecycleTests: XCTestCase {
                                         rootDirectory: sessions)
         var healLog: [String] = []
         let healLock = NSLock()
-        pipeline2.onLog = { msg in healLock.lock(); healLog.append(msg); healLock.unlock() }
+        pipeline2.onLog = { msg in healLock.withLock { healLog.append(msg) } }
         try pipeline2.start()
         _ = try pipeline2.end()
         let healedDir = pipeline2.session.sessionDirectory!
@@ -256,7 +256,7 @@ final class FaultMatrixLifecycleTests: XCTestCase {
         // this test). frameFlood-cell pattern: thread-safe append behind a lock.
         var log: [String] = []
         let logLock = NSLock()
-        pipeline.onLog = { msg in logLock.lock(); log.append(msg); logLock.unlock() }
+        pipeline.onLog = { msg in logLock.withLock { log.append(msg) } }
         pipeline.drainPrimaryTimeout = .milliseconds(200)
         pipeline.drainGraceTimeout = .milliseconds(200)
         try pipeline.start()
@@ -279,7 +279,7 @@ final class FaultMatrixLifecycleTests: XCTestCase {
         XCTAssertNil(manifest.endTime, "wedged end must not set endTime")
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("master.fit").path),
                        "no master.fit may be finalized over a racing stack")
-        logLock.lock(); let captured = log; logLock.unlock()
+        let captured = logLock.withLock { log }
         XCTAssertTrue(captured.joined(separator: "\n").contains("refusing to finalize"),
                       "the PIPELINE must emit the production 'refusing to finalize' log on a wedged end")
         assertSessionOracle(sessionRoot: dir,
@@ -310,14 +310,14 @@ final class FaultMatrixLifecycleTests: XCTestCase {
                                        profile: profile("Flood"), rootDirectory: sessions)
         var log: [String] = []
         let logLock = NSLock()
-        pipeline.onLog = { msg in logLock.lock(); log.append(msg); logLock.unlock() }
+        pipeline.onLog = { msg in logLock.withLock { log.append(msg) } }
 
         try pipeline.start()
         _ = try pipeline.end()   // import path: end() drains the finite stream fully
 
         XCTAssertEqual(engine.acceptedCount, 2, "both valid frames accepted")
         XCTAssertEqual(engine.rejectedCount, 1, "exactly the hostile frame rejected")
-        logLock.lock(); let joined = log.joined(separator: "\n"); logLock.unlock()
+        let joined = logLock.withLock { log.joined(separator: "\n") }
         XCTAssertTrue(joined.range(of: "Rejected", options: .regularExpression) != nil,
                       "the rejected frame must appear honestly in the log:\n\(joined)")
 
@@ -472,19 +472,21 @@ final class FaultMatrixLifecycleTests: XCTestCase {
     /// new complete version (atomic write guarantee) — never a torn/half-written file. Oracle
     /// clause 1 (parses) is the teeth of this cell.
     ///
-    /// F3 (review2): the helper now touches its readiness flag from INSIDE the manifest write (via the
-    /// pre-approved `SessionManager.manifestWriter` seam: flag, then the real `Data(.atomic)` write),
-    /// NOT before the rewrite loop. Previously the flag preceded the loop, so a fast SIGKILL could land
-    /// on the pre-seeded manifest before the first challenged write — a vacuous pass. Now the kill
-    /// window provably overlaps an in-flight atomic write.
+    /// F3 (review2) + review3 P2: the helper's `SessionManager.manifestWriter` seam performs an
+    /// explicit staged atomic write (stage full bytes to a same-dir temp → touch the readiness flag →
+    /// rename to publish), so the flag first appears only while staged-but-unpublished bytes exist on
+    /// disk. The builder's SIGKILL therefore lands inside an open write transaction (or a later
+    /// iteration's write cycle) — never on the idle pre-seeded manifest before any challenged write.
+    /// NOT guaranteed: which complete version survives; only that the published manifest always parses.
     func testCrash_manifestMidwrite_manifestEitherCompleteNeverTorn() throws {
         let fs = try TempFS("crash-midwrite"); defer { fs.tearDown() }
         let aftermath = try CrashArtifactBuilder.killedArtifact(scenario: "manifest-midwrite", in: fs)
         let sessionDir = try onlySessionDir(in: aftermath)
 
         // Atomic-write guarantee: the manifest MUST parse as a whole SessionManifest — a torn file
-        // would fail here. (Data(...options: .atomic) writes temp+rename, so a kill mid-write leaves
-        // the prior complete version.)
+        // would fail here. (The staged write publishes only via rename of fully staged bytes — the
+        // same temp+rename Data(.atomic) performs — so a kill mid-write leaves the prior complete
+        // version published; at most an unpublished `.staged-*` temp is left beside it.)
         let data = try Data(contentsOf: sessionDir.appendingPathComponent("manifest.json"))
         let manifest = try ManifestCoding.decoder().decode(SessionManifest.self, from: data)
         // Either the pre-first-write empty list (0) or the first complete write (>=1) — never a
@@ -647,6 +649,6 @@ final class FaultMatrixLifecycleTests: XCTestCase {
 /// A tiny thread-safe integer used to gate cancellation deterministically.
 final class AtomicIntBox {
     private let lock = NSLock(); private var v = 0
-    var value: Int { lock.lock(); defer { lock.unlock() }; return v }
-    func increment() { lock.lock(); v += 1; lock.unlock() }
+    var value: Int { lock.withLock { v } }
+    func increment() { lock.withLock { v += 1 } }
 }

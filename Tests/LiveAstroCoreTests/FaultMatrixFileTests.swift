@@ -605,15 +605,154 @@ final class FaultMatrixFileTests: XCTestCase {
         XCTAssertTrue(recovered, "after a successful re-arm, a fresh file is ingested")
     }
 
+    /// Watcher × directory-replaced (P1, review3): the watched directory is ATOMICALLY swapped
+    /// (renamex_np(RENAME_SWAP) — a rename(2)-family replacement with NO missing interval, so
+    /// `fileExists` never reports false). Before the fix nothing noticed: the DispatchSource stayed
+    /// attached to the OLD inode and `lastSeenStat` stayed populated, so a same-name file in the
+    /// new directory engineered to match the vanished observation (same size, same mtime) passed
+    /// the two-tick stability gate on its very FIRST post-swap sighting — publishing a possibly
+    /// in-progress file, and the swap never appeared in the log (dishonest degradation).
+    ///
+    /// After the fix the watcher tracks the armed directory's (st_dev, st_ino); a poll that finds
+    /// the path present but with a different identity treats it exactly like a disappear+return in
+    /// one tick: logs "watched folder was replaced", cancels the stale source, clears pending
+    /// stability (emitted digests retained), and re-arms on the new inode BEFORE claiming recovery.
+    /// Assertions: (a) the replacement is logged; (b) the same-name/size/mtime file does NOT emit
+    /// in the detection tick — it re-earns stability across a poll (gap >= ~one poll interval) and
+    /// then emits; (c) a genuinely new file in the swapped-in directory is detected.
+    func testWatcher_folderAtomicallyReplaced_reArmsAndReEarnsStability() async throws {
+        let fs = try TempFS("watch-atomic-swap"); defer { fs.tearDown() }
+        let folder = try fs.dir("watched")
+        let pollInterval: TimeInterval = 0.4
+        let watcher = StackFileWatcher(folder: folder, quietPeriod: 0.1, pollInterval: pollInterval,
+                                       fileNamePrefix: "live_stack")
+        let logs = WatcherLogSink()
+        // Timestamp the replacement detection and the emit (F2 clock pattern) to prove the emit
+        // did NOT land in the same tick that detected the swap.
+        let clock = FolderReplaceClock()
+        watcher.onLog = { msg in
+            logs.append(msg)
+            if msg.contains("watched folder was replaced") { clock.markReturned() }
+        }
+        let collector = collect(watcher)
+        try watcher.start(); defer { watcher.stop() }
+
+        // Baseline: a complete FITS emits; its (size, mtime) become the last-seen observation.
+        let name = "live_stack.fit"
+        let url = folder.appendingPathComponent(name)
+        let baseline = makeFITS(0.4, size: 64)
+        try baseline.write(to: url)
+        let baselineEmit = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(baselineEmit, "baseline file emits")
+        let baselineMtime = try FileManager.default
+            .attributesOfItem(atPath: url.path)[.modificationDate] as! Date
+
+        // Stage a sibling directory (same volume) holding a SAME-name, SAME-size file whose mtime
+        // is forced to the baseline's — the exact coarse-mtime collision the finding calls out —
+        // but DIFFERENT content (different digest, so dedup cannot mask the stability gate).
+        let staged = fs.root.appendingPathComponent("staged-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: staged, withIntermediateDirectories: true)
+        let replacement = makeFITS(0.9, size: 64)
+        XCTAssertEqual(replacement.count, baseline.count, "arrange: replacement is the same size")
+        let stagedFile = staged.appendingPathComponent(name)
+        try replacement.write(to: stagedFile)
+        try FileManager.default.setAttributes([.modificationDate: baselineMtime],
+                                              ofItemAtPath: stagedFile.path)
+
+        // --- Disruption: ATOMIC swap — no missing interval at the watched path, new inode. ---
+        try Disruptor.atomicallySwapDirectory(at: folder, with: staged)
+        clock.markReplacementWritten()
+
+        // (a) The replacement must appear honestly in the log (poll-driven — generous window).
+        let replacedLogged = await logs.waitForCount(containing: "watched folder was replaced",
+                                                     atLeast: 1, timeout: 5)
+        XCTAssertTrue(replacedLogged,
+                      "P1: an atomic directory swap must be logged ('watched folder was replaced')")
+        // Recovery is only claimed after the re-arm succeeds (mirrors the return path).
+        let resumed = await logs.waitForCount(containing: "resuming", atLeast: 1, timeout: 5)
+        XCTAssertTrue(resumed, "P1: after the swap the watcher re-arms and claims recovery honestly")
+
+        // (b) The same-name/size/mtime file must re-earn stability: it emits, but NOT in the tick
+        // that detected the swap (gap from detection to emit >= ~one poll interval).
+        let emittedAfterStable = await collector.waitForCount(2, timeout: 6)
+        XCTAssertTrue(emittedAfterStable, "the swapped-in file must emit once it re-earns stability")
+        clock.markEmit()
+        let gap = clock.returnToEmitGap()
+        XCTAssertGreaterThanOrEqual(gap, pollInterval * 0.8,
+            "P1: a swapped-in same-name/size/mtime file must re-earn stability across a tick, not emit in the detection tick (gap \(gap)s < ~one poll interval)")
+
+        // (c) A genuinely NEW file created in the swapped-in directory is detected.
+        try makeFITS(0.7, size: 32).write(to: folder.appendingPathComponent("live_stack_new.fit"))
+        let newFileEmit = await collector.waitForCount(3, timeout: 6)
+        XCTAssertTrue(newFileEmit, "a new file in the swapped-in directory must be detected")
+    }
+
+    /// Watcher × regular-file-at-folder-path (P2, review3): after the watched folder disappears, a
+    /// REGULAR FILE created at the exact folder path must NOT be mistaken for recovery. Before the
+    /// fix, `fileExists(atPath:)` accepted any node and `open(O_EVTONLY)` succeeds on a regular
+    /// file, so the return path armed against the file and logged "resuming" while directory
+    /// enumeration could never work — a dishonest recovery claim. After the fix, recovery requires
+    /// an actual DIRECTORY at the path; a non-directory node is treated as still-missing (no
+    /// "resuming" claim, no per-tick log spam), and genuine recovery proceeds normally once a real
+    /// directory is back.
+    func testWatcher_regularFileAtFolderPath_notMistakenForRecovery() async throws {
+        let fs = try TempFS("watch-file-at-path"); defer { fs.tearDown() }
+        let folder = try fs.dir("watched")
+        let watcher = StackFileWatcher(folder: folder, quietPeriod: 0.1, pollInterval: 0.3,
+                                       fileNamePrefix: "live_stack")
+        let logs = WatcherLogSink()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start(); defer { watcher.stop() }
+
+        // Disappear — logged once.
+        try Disruptor.removeDirectory(folder)
+        let disappeared = await logs.waitForCount(containing: "watched folder disappeared",
+                                                  atLeast: 1, timeout: 5)
+        XCTAssertTrue(disappeared, "disappearance must be logged")
+
+        // A regular FILE now occupies the exact folder path. fileExists(atPath:) is true and
+        // open(O_EVTONLY) would succeed — but this is NOT a directory, so it is NOT recovery.
+        try Data("impostor — not a directory".utf8).write(to: folder)
+        // Fixed observation window across several poll ticks (~4-5 at 0.3 s) for the NEGATIVE
+        // assertions: no "resuming" claim, and no per-tick re-log of the disappearance.
+        try await Task.sleep(nanoseconds: 1_400_000_000)
+        XCTAssertEqual(logs.count(containing: "resuming"), 0,
+                       "P2: a regular file at the folder path must NOT be claimed as recovery ('resuming')")
+        XCTAssertEqual(logs.count(containing: "watched folder disappeared"), 1,
+                       "still exactly one disappearance log — no per-tick spam while the impostor sits there")
+
+        // Remove the impostor and recreate a REAL directory → normal recovery.
+        try Disruptor.deleteFile(folder)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let resumed = await logs.waitForCount(containing: "watched folder returned — resuming",
+                                              atLeast: 1, timeout: 5)
+        XCTAssertTrue(resumed, "genuine directory recreation must log 'resuming'")
+
+        // And a new file in the recovered directory is emitted (recovery is real, not just claimed).
+        try makeFITS(0.5, size: 32).write(to: folder.appendingPathComponent("live_stack.fit"))
+        let got = await collector.waitForCount(1, timeout: 6)
+        XCTAssertTrue(got, "a new file after genuine recovery must be emitted")
+    }
+
     /// Thread-safe log sink for watcher tests (the watcher logs on its serial queue; the test reads
     /// from its own thread) — lock-protected (F5 pattern).
     private final class WatcherLogSink {
         private let lock = NSLock()
         private var lines: [String] = []
-        func append(_ s: String) { lock.lock(); lines.append(s); lock.unlock() }
+        func append(_ s: String) { lock.withLock { lines.append(s) } }
         func count(containing sub: String) -> Int {
-            lock.lock(); defer { lock.unlock() }
-            return lines.filter { $0.contains(sub) }.count
+            lock.withLock { lines.filter { $0.contains(sub) }.count }
+        }
+        /// Poll until at least `n` lines containing `sub` have been logged (Collector.waitForCount
+        /// pattern) — no raw sleeps for correctness in poll-driven assertions.
+        func waitForCount(containing sub: String, atLeast n: Int, timeout: TimeInterval) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                if count(containing: sub) >= n { return true }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            return count(containing: sub) >= n
         }
     }
 
@@ -624,16 +763,17 @@ final class FaultMatrixFileTests: XCTestCase {
         private var returnedAt: Date?
         private var replacementAt: Date?
         private var emitAt: Date?
-        func markReturned() { lock.lock(); if returnedAt == nil { returnedAt = Date() }; lock.unlock() }
-        func markReplacementWritten() { lock.lock(); replacementAt = Date(); lock.unlock() }
-        func markEmit() { lock.lock(); if emitAt == nil { emitAt = Date() }; lock.unlock() }
+        func markReturned() { lock.withLock { if returnedAt == nil { returnedAt = Date() } } }
+        func markReplacementWritten() { lock.withLock { replacementAt = Date() } }
+        func markEmit() { lock.withLock { if emitAt == nil { emitAt = Date() } } }
         /// Seconds between the LATER of (folder-returned, replacement-written) and the emit. Using the
         /// later of the two avoids counting time before the replacement even existed on disk.
         func returnToEmitGap() -> TimeInterval {
-            lock.lock(); defer { lock.unlock() }
-            let start = max(returnedAt ?? .distantPast, replacementAt ?? .distantPast)
-            guard let emit = emitAt, start > .distantPast else { return 0 }
-            return emit.timeIntervalSince(start)
+            lock.withLock {
+                let start = max(returnedAt ?? .distantPast, replacementAt ?? .distantPast)
+                guard let emit = emitAt, start > .distantPast else { return 0 }
+                return emit.timeIntervalSince(start)
+            }
         }
     }
 

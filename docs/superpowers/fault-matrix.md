@@ -1,12 +1,14 @@
 # Fault Matrix — LiveAstro Studio
 
-Living document (spec `docs/superpowers/specs/2026-07-15-fault-injection-design.md`, §"The Fault Matrix").
+Living document (spec `docs/history/specs/2026-07-15-fault-injection-design.md`, §"The Fault Matrix").
 Updated in the same commit as its tests; a stale matrix is a review defect.
 
-**Seams: ONE of the two pre-approved seams is now in use.** The `FrameRelay.onPrePublish` sync hook
-(spec §Seams) is required by the `relay-midcopy` crash cell — the ONLY way to land a SIGKILL
-genuinely between the staged copy and the atomic publish (justification note below). The other
-pre-approved seam (injectable manifest writer) remains unimplemented (YAGNI — no cell requires it).
+**Seams: BOTH pre-approved seams are now in use, each required by one crash cell.** The
+`FrameRelay.onPrePublish` sync hook (spec §Seams) is required by the `relay-midcopy` cell — the ONLY
+way to land a SIGKILL genuinely between the staged copy and the atomic publish. The injectable
+`SessionManager.manifestWriter` (spec §Seams) is required by the `manifest-midwrite` cell — the ONLY
+way to guarantee the SIGKILL lands within an open manifest-write transaction (justification notes
+below). Both are production no-ops: nil by default, with the built-in behavior unchanged.
 
 ## How to add a row/cell
 
@@ -44,13 +46,14 @@ invalid replacement target · slow/hung consumer · crash-terminated (helper) ·
 | **FITS ingest** (`FITSReader.read`) | TEST(`testFITS_midWrite_readerRejectsHeaderOnlyAcceptsComplete`) — header-only intermediate throws `truncatedData`; complete file parses once | TEST(`testFITS_truncated_readerThrowsNoPartialImage`) — pixels cut at 60% → throws `truncatedData`, no partial image; TEST(`testFITS_truncated_watcherRejectsThenAcceptsComplete`) — via watcher: rejected then complete write ingests | N/A — the reader is a pure `Data`→image function; a file deleted before read simply never reaches `read`. Deletion-during-read is covered at the watcher boundary (`testWatcher_deletedMidRun_noCrashNextFileFine`) | N/A — reader takes bytes, not a directory; the containing-dir case is the watcher's (`testWatcher_dirRemoved_logsOnceAndResumesOnRecreate`) | N/A — `read` never writes; there is no destination at this boundary | TEST(`testFITS_invalidReplacement_directoryNamedFit`) — path `x.fit` is a directory: `Data(contentsOf:)` throws (no bytes); watcher skips it, a later real file still ingests | N/A — synchronous pure function, no consumer callback | N/A — reader is a reader; crash-mid-write applies to writers (T3 `faulthelper`) | N/A — no persistent reader state to recover |
 | **FrameRelay** | TEST(`testRelay_midWriteGrowing_neverPublishedUntilStable_noTempLitter`) — grown across ticks, never published until stable; temp never visible under glob | TEST(`testRelay_truncatedDest_healedOnceWithLog`) — pre-existing truncated dest healed exactly once, one `relay healed` log, then skipped | TEST(`testRelay_deletedMidRun_noPublishNoCrashPendingCleared`) — source deleted between ticks: no publish, no crash, pending entry cleared (recreate re-primes) | TEST(`testRelay_sourceDirRemoved_logsAndSurvivesThenResumes`) — source dir removed: logs `source unreachable`, keeps ticking, resumes on restore | PROXY(read-only dir ≈ ENOSPC/EIO) — `testRelay_readOnlyDest_copyFailsLoggedRetriedNoLitter` — staged copy fails, logged `retry next poll`, no temp litter, relays after restore | N/A — relay copies real files; "invalid replacement" (dir/symlink where a file is expected) is a reader/pruner concern, not the relay's copy path | N/A — relay has no consumer callback; it is a producer. Downstream slow-consumer is the pipeline row (T3) | PROXY→T3(`testCrash_relayMidcopy_noGlobVisiblePartialFreshRelayHeals`) — relay crash-mid-copy covered in T3 via `faulthelper` (partial `.relaytmp` aftermath): no glob-visible partial left in dst after SIGKILL | PROXY→T3(`testCrash_relayMidcopy_noGlobVisiblePartialFreshRelayHeals`) — restart against relay artifacts is T3: a fresh relay over the same src/dst heals (completes the copy, healed size == source size) |
 | **RelayPruner** | N/A — pruner acts on whole dated session dirs at rest; there is no growing/partial file to observe | N/A — pruner never reads file contents; a truncated file inside a session is irrelevant to age-based removal | N/A — a session dir deleted before prune simply isn't listed; `contentsOfDirectory` failure returns `[]` (best-effort) | N/A — the ROOT missing → `contentsOfDirectory` fails → returns `[]` (guarded, non-throwing); no separate test needed | PROXY(read-only dir ≈ undeletable/ENOSPC) — `testPruner_readOnlySessionDir_skippedBestEffortOthersRemoved` — read-only old session skipped best-effort (no throw), deletable sibling still removed | TEST(`testPruner_danglingSymlinkEntry_skippedUntouched`) — dangling symlink with a dated name: `isDirectory` false → skipped, left untouched; real old dir still pruned | N/A — pruner is synchronous, no consumer | N/A — pruner is a periodic sweep, not a writer; no crash-mid-write artifact | N/A — pruner is idempotent and stateless; nothing to recover |
-| **StackFileWatcher** | TEST(`testWatcher_midWriteGrowing_notEmittedUntilStable`) — preallocated + mtime-bumping file not emitted until stable, then exactly once | PROXY→existing — truncated FITS rejection is covered by the FITS row's `testFITS_truncated_watcherRejectsThenAcceptsComplete` and existing `StackFileWatcherTests.testIgnoresPartialFITSUntilComplete` (size < `minimumFileSize` gate) | TEST(`testWatcher_deletedMidRun_noCrashNextFileFine`) — file deleted after emit: no crash, no re-emit, a new file still ingests | TEST(`testWatcher_dirRemoved_logsOnceAndResumesOnRecreate`, `testWatcher_stopAfterDirRemoved_noCrash`) — folder removed mid-run: logs exactly once ("watched folder disappeared"), no spurious emit, no crash; folder recreated → same live watcher resumes (re-arms DispatchSource fd) and ingests a new FITS; stop() during missing window is idempotent. Full invariant including clause 6 (honest log) now met. FOUND-BUG #1 fixed. | N/A — the watcher only reads the watched folder; it never writes a destination | N/A(covered by FITS row) — a directory named `*.fit` in the watched folder is exercised in `testFITS_invalidReplacement_directoryNamedFit` (watcher skips, no emit) | N/A(here) — the slow/hung consumer is a downstream-of-watcher pipeline concern (drain-timeout), T3 row | N/A — watcher is a reader; crash-mid-write applies to the writer feeding it | N/A(here) — watcher holds only in-memory stat/digest state; recovery is a fresh `start()` (see dir-removed) |
+| **StackFileWatcher** | TEST(`testWatcher_midWriteGrowing_notEmittedUntilStable`) — preallocated + mtime-bumping file not emitted until stable, then exactly once | PROXY→existing — truncated FITS rejection is covered by the FITS row's `testFITS_truncated_watcherRejectsThenAcceptsComplete` and existing `StackFileWatcherTests.testIgnoresPartialFITSUntilComplete` (size < `minimumFileSize` gate) | TEST(`testWatcher_deletedMidRun_noCrashNextFileFine`) — file deleted after emit: no crash, no re-emit, a new file still ingests | TEST(`testWatcher_dirRemoved_logsOnceAndResumesOnRecreate`, `testWatcher_stopAfterDirRemoved_noCrash`) — folder removed mid-run: logs exactly once ("watched folder disappeared"), no spurious emit, no crash; folder recreated → same live watcher resumes (re-arms DispatchSource fd) and ingests a new FITS; stop() during missing window is idempotent. Full invariant including clause 6 (honest log) now met. FOUND-BUG #1 fixed. TEST(`testWatcher_folderAtomicallyReplaced_reArmsAndReEarnsStability`) — folder ATOMICALLY swapped (rename(2)-family `RENAME_SWAP`, no missing interval, review3 P1): detected via (st_dev, st_ino) identity mismatch against the armed fd, logged ("watched folder was replaced"), stale source cancelled and re-armed on the new inode BEFORE claiming recovery, pending stability cleared (same-name/size/mtime file re-earns stability across a tick; emitted digests retained for dedup), a genuinely new file in the swapped-in dir ingests | N/A — the watcher only reads the watched folder; it never writes a destination | TEST(`testWatcher_regularFileAtFolderPath_notMistakenForRecovery`) — a regular FILE at the exact watched-folder path (review3 P2): NOT recovery — `open(O_EVTONLY)` would succeed on it, but presence now requires an actual directory; no "resuming" claim while the impostor sits there (logged once, no per-tick spam), genuine directory recreation resumes and a new file ingests. A directory named `*.fit` INSIDE the folder remains covered by `testFITS_invalidReplacement_directoryNamedFit` (watcher skips, no emit) | N/A(here) — the slow/hung consumer is a downstream-of-watcher pipeline concern (drain-timeout), T3 row | N/A — watcher is a reader; crash-mid-write applies to the writer feeding it | N/A(here) — watcher holds only in-memory stat/digest state; recovery is a fresh `start()` (see dir-removed) |
 
 ### Notes / justification for proxies and gaps
 
 - **read-only ≈ ENOSPC/EIO**: chmod is a *proxy* for a full/failing destination. The real errno is
-  not claimed. The future path to genuine ENOSPC/EIO is the pre-approved injectable manifest writer
-  (spec §Seams), added only if a T3/T4 cell proves undrivable without it. Not needed for Task 2.
+  not claimed. The injectable manifest writer (spec §Seams) — since implemented at review2 for the
+  `manifest-midwrite` crash cell — is the future path to genuine ENOSPC/EIO injection, which no cell
+  claims yet. Not needed for Task 2.
 - **FIXED — StackFileWatcher directory-removed** (FOUND-BUG #1, resolved): `StackFileWatcher` now
   has a `public var onLog: ((String) -> Void)?` seam (mirrors `FrameRelay.onLog`) and a
   `folderMissing` flag so the disappearance is logged exactly once per event (not every tick).
@@ -93,19 +96,23 @@ privileged runner.
   objects. (T2 already found + fixed one real bug this way — FOUND-BUG #1, the watcher.)
 - **read-only ≈ ENOSPC/EIO** (SessionManager/SnapshotRecorder): chmod is a proxy for a full/failing
   volume. The real errno is not claimed. The pre-approved injectable manifest writer (spec §Seams)
-  is the future path to genuine ENOSPC/EIO — NOT added here: no T3 cell proved undrivable without it
-  (the read-only dir drives the atomic-write failure faithfully). YAGNI holds.
+  is the future path to genuine ENOSPC/EIO — NOT added at T3: no T3 cell proved undrivable without it
+  (the read-only dir drives the atomic-write failure faithfully). YAGNI held until review2, when the
+  `manifest-midwrite` crash cell proved undrivable without it (see the review2 note below).
 - **Crash cells use a genuine SIGKILL that lands MID-ACTIVITY.** `CrashArtifactBuilder` runs
   `faulthelper` to a coordinated readiness flag, then `kill(pid, SIGKILL)` — the aftermath is a real
   killed-mid-state directory, satisfying the spec's "terminated helper process, not merely objects
   released in-process" rule. Two cells were hardened after an oracle-evasion hunt found they were
   killing an IDLE process (flag touched AFTER the op settled):
-  - `manifest-midwrite`: the helper pre-seeds a large (~8 MB) manifest, touches the flag, then LOOPS
-    FOREVER rewriting that manifest — no sleeps, no block, no per-iteration PNG encode (so the manifest
-    write dominates the loop). The kill lands during/between writes, so the `.atomic` guarantee is
-    genuinely exercised: **whatever instant the kill lands, the manifest on disk is SOME complete
-    version — never a torn/half-serialized file.** (What is NOT guaranteed: WHICH version survives —
-    the test asserts only that it parses.)
+  - `manifest-midwrite`: the helper pre-seeds a large (multi-MB) manifest, then LOOPS FOREVER
+    rewriting it through the injected `SessionManager.manifestWriter` seam — no sleeps, no block, no
+    per-iteration PNG encode (so the manifest write dominates the loop). The seam performs an explicit
+    staged atomic write (full bytes staged to a same-dir temp → readiness flag → rename to publish),
+    so the flag first appears only while staged-but-unpublished bytes exist on disk and the kill lands
+    within an open write transaction (or a later iteration's write cycle) — never on the idle
+    pre-seeded manifest. The atomic-publish guarantee is genuinely exercised: **whatever instant the
+    kill lands, the published manifest on disk is SOME complete version — never a torn/half-serialized
+    file.** (What is NOT guaranteed: WHICH version survives — the test asserts only that it parses.)
     - **Platform note (mutation-check finding):** the prescribed mutation (switch `persist` from
       `.atomic` to `options: []`) does NOT tear on this macOS/APFS host — verified over 100+ SIGKILL
       samples at manifest sizes up to 300 MB, tear rate 0. `Data.write(options: [])` writes in-place
@@ -125,8 +132,9 @@ privileged runner.
   log kill fired BEFORE the staged copy even existed — the original evasion). The pre-approved
   `onPrePublish: (() -> Void)?` hook is invoked at exactly that one point; the helper sets it to
   `{ touchFlag(); blockForever() }`, so the builder's SIGKILL lands deterministically mid-copy. It is
-  a synchronization point, not behavior: production leaves it nil. This is the FIRST (and only) use of
-  a pre-approved seam across the whole pillar.
+  a synchronization point, not behavior: production leaves it nil. This was the FIRST use of a
+  pre-approved seam across the pillar (the second, `SessionManager.manifestWriter`, followed at
+  review2 — see below).
 
 ### Notes / justification — Task 4 (matrix completion audit)
 
@@ -170,8 +178,14 @@ privileged runner.
   a vacuous pass (the cell "passed" without any write being under the kill). Wall-clock timing cannot
   reliably force the kill into the write window (each atomic write completes in a few ms). The
   pre-approved injectable `manifestWriter: ((Data, URL) throws -> Void)?` is invoked at exactly the
-  persistence boundary; the helper sets it to `{ touchFlag(); write(.atomic) }`, so the builder's
-  SIGKILL — which waits for the flag — now provably overlaps an in-flight atomic write. **Production
+  persistence boundary; the helper's implementation is an explicit staged atomic write — stage the
+  full bytes to a same-dir temp, touch the flag only AFTER staging has begun, then rename to publish
+  — so the builder's SIGKILL, which waits for the flag, lands within an open write transaction
+  (staged-but-unpublished data, or a subsequent iteration's staged write). What is NOT guaranteed:
+  WHICH version survives — only that the published manifest is always some complete version, because
+  publication happens solely via atomic rename of fully staged bytes. (A first cut set the flag
+  before calling `write(.atomic)`, which left a preemption window between flag and write where the
+  kill overlapped no write at all — review3 P2 closed it with the staged writer.) **Production
   safety:** the seam defaults to `nil`; when nil, `persist` runs the identical `Data(.atomic)` write
   as before (byte-for-byte behavior, existing SessionManager tests unmodified and green). It is a
   coordination/injection point, not behavior. This is the SECOND (and final) pre-approved seam used
