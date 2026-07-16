@@ -288,7 +288,11 @@ public final class SessionPipeline {
             return
         }
         do {
-            let linear = try ImageLoader.load(url: update.url)
+            // Verified read (review5 item 1): the bytes decoded here are checked — on the ONE
+            // descriptor they are read from — against the identity (dev, ino, size, mtime ns,
+            // digest) the watcher validated on ITS pinned descriptor, so a file replaced between
+            // the watcher's validation and this read is skipped, never parsed.
+            let linear = try ImageLoader.load(url: update.url, expectedIdentity: update.identity)
             let cg = try displayCGImage(from: linear)
             let index = session.acceptedCount + 1
             let record = try recorder.save(
@@ -297,6 +301,9 @@ public final class SessionPipeline {
                 estimatedIntegrationSeconds: Double(index) * profile.subExposureSeconds)
             try session.recordSnapshot(record)
             onUpdate?(cg, record)
+        } catch let mismatch as FileIdentityMismatchError {
+            // A boundary failure may lose one frame, never the session; it appears honestly here.
+            onLog?("file changed between validation and read — skipping \(mismatch.fileName)")
         } catch {
             // Spec §7: skip bad updates, keep the last good frame on the broadcast.
             onLog?("Skipped update (\(update.url.lastPathComponent)): \(error)")

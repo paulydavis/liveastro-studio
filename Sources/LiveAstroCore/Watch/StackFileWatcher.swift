@@ -1,9 +1,141 @@
 import Foundation
 import CryptoKit
 
+/// Identity of the exact file VERSION the watcher validated, captured with fstat(2) on the
+/// watcher's pinned per-file descriptor (review5 item 1): (dev, ino) name the inode, (size,
+/// mtime at nanosecond precision) pin the content version, and `digest` (when present) is the
+/// watcher's content digest over the same descriptor. Consumers use `read(url:verifying:)` to
+/// refuse a file that was replaced between the watcher's validation and their own read.
+public struct FileIdentity: Equatable, Sendable {
+    public let dev: Int64
+    public let ino: UInt64
+    public let size: Int
+    /// st_mtimespec at full nanosecond precision — both producer and consumer derive these from
+    /// the same fstat fields so equality is exact, never Date/TimeInterval-rounded.
+    public let mtimeSec: Int64
+    public let mtimeNsec: Int64
+    /// SHA-256 over size + first/last 64 KB (the watcher's dedup digest). nil when the producer
+    /// did not compute one (e.g. a bare stability observation); consumers recompute it over the
+    /// bytes they actually loaded and compare — strict content-version validation.
+    public let digest: String?
+
+    public init(dev: Int64, ino: UInt64, size: Int, mtimeSec: Int64, mtimeNsec: Int64,
+                digest: String? = nil) {
+        self.dev = dev
+        self.ino = ino
+        self.size = size
+        self.mtimeSec = mtimeSec
+        self.mtimeNsec = mtimeNsec
+        self.digest = digest
+    }
+
+    init(stat st: Darwin.stat, digest: String? = nil) {
+        self.init(dev: Int64(st.st_dev), ino: UInt64(st.st_ino), size: Int(st.st_size),
+                  mtimeSec: Int64(st.st_mtimespec.tv_sec), mtimeNsec: Int64(st.st_mtimespec.tv_nsec),
+                  digest: digest)
+    }
+
+    /// True when `st` describes the same inode and content version (digest not considered —
+    /// a stat cannot know it; digest validation happens over the loaded bytes).
+    func matches(stat st: Darwin.stat) -> Bool {
+        dev == Int64(st.st_dev) && ino == UInt64(st.st_ino) && size == Int(st.st_size)
+            && mtimeSec == Int64(st.st_mtimespec.tv_sec) && mtimeNsec == Int64(st.st_mtimespec.tv_nsec)
+    }
+
+    /// The same stat identity annotated with a computed content digest.
+    func withDigest(_ digest: String) -> FileIdentity {
+        FileIdentity(dev: dev, ino: ino, size: size, mtimeSec: mtimeSec, mtimeNsec: mtimeNsec,
+                     digest: digest)
+    }
+
+    /// Identity currently at `url` (stat by path; digest not computed). Consumer/test convenience.
+    public static func capture(url: URL) -> FileIdentity? {
+        var st = Darwin.stat()
+        guard stat(url.path, &st) == 0 else { return nil }
+        return FileIdentity(stat: st)
+    }
+
+    /// Read `url`'s ENTIRE contents from ONE opened descriptor, verifying THAT descriptor's own
+    /// fstat (dev, ino, size, mtime ns) against `expected` before reading, and — when `expected`
+    /// carries a digest — recomputing the digest over the bytes actually read and comparing.
+    /// This is the consumer end of the watcher's single-descriptor chain: stat, completeness,
+    /// digest (watcher) and the consumed bytes (here) all refer to the same file identity, or
+    /// `FileIdentityMismatchError` is thrown and the caller skips the frame honestly.
+    /// `expected == nil` → plain path read, unchanged legacy behavior for producers that carry
+    /// no identity.
+    public static func read(url: URL, verifying expected: FileIdentity?) throws -> Data {
+        guard let expected else { return try Data(contentsOf: url) }
+        let fh = try FileHandle(forReadingFrom: url)
+        defer { try? fh.close() }
+        var st = Darwin.stat()
+        guard fstat(fh.fileDescriptor, &st) == 0, expected.matches(stat: st) else {
+            throw FileIdentityMismatchError(fileName: url.lastPathComponent)
+        }
+        // Read from the verified descriptor — never a separate reopen by path.
+        let data = try fh.readToEnd() ?? Data()
+        if let want = expected.digest, contentDigest(data: data) != want {
+            throw FileIdentityMismatchError(fileName: url.lastPathComponent)
+        }
+        return data
+    }
+
+    // MARK: Content digest (shared producer/consumer definition)
+    //
+    // Cheap content identity: SHA-256 over size + first/last 64 KB. Two forms that MUST agree
+    // byte-for-byte (pinned by testContentDigest_handleAndDataFormsAgree): the handle form streams
+    // head/tail chunks so the watcher never loads whole files; the data form hashes bytes a
+    // consumer already has in hand.
+
+    static let digestChunk = 65_536
+
+    /// Digest over in-memory bytes (consumer side — the bytes were just loaded anyway).
+    public static func contentDigest(data: Data) -> String {
+        var hasher = SHA256()
+        hasher.update(data: Data("\(data.count)".utf8))
+        hasher.update(data: data.prefix(digestChunk))
+        if data.count > 2 * digestChunk {
+            hasher.update(data: data.suffix(digestChunk))
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Digest over an open descriptor (producer side — seeks, never loads the whole file).
+    /// Returns nil when the handle cannot be read/seeked — the caller must skip the file
+    /// rather than emit (a random digest would defeat dedupe and yield repeats).
+    static func contentDigest(handle: FileHandle, size: Int) -> String? {
+        guard (try? handle.seek(toOffset: 0)) != nil else { return nil }
+        var hasher = SHA256()
+        hasher.update(data: Data("\(size)".utf8))
+        if let head = try? handle.read(upToCount: digestChunk) { hasher.update(data: head) }
+        if size > 2 * digestChunk {
+            try? handle.seek(toOffset: UInt64(size - digestChunk))
+            if let tail = try? handle.read(upToCount: digestChunk) { hasher.update(data: tail) }
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// A file no longer matches the identity its producer validated — the consumer must skip the
+/// frame (honest log, never the session) rather than decode a replaced/truncated file.
+public struct FileIdentityMismatchError: Error, CustomStringConvertible, Equatable {
+    public let fileName: String
+    public init(fileName: String) { self.fileName = fileName }
+    public var description: String { "file changed between validation and read (\(fileName))" }
+}
+
 public struct StackUpdate: Equatable, Sendable {
     public let url: URL
     public let fileSize: Int
+    /// Identity (incl. content digest) of the exact file version the watcher validated —
+    /// captured from the watcher's pinned per-file descriptor. nil when the producer cannot
+    /// supply one (compat); consumers then read by path, unchanged.
+    public let identity: FileIdentity?
+
+    public init(url: URL, fileSize: Int, identity: FileIdentity? = nil) {
+        self.url = url
+        self.fileSize = fileSize
+        self.identity = identity
+    }
 }
 
 /// Watches a folder for completed writes of stack images.
@@ -93,9 +225,12 @@ public final class StackFileWatcher {
         return names
     }
 
-    /// Per-file state for stability + dedupe. Stability now tracks (size, mtime) so a
-    /// preallocated-but-still-filling FITS (full size, advancing mtime) is not emitted early.
-    private var lastSeenStat: [String: (size: Int, mtime: TimeInterval)] = [:]
+    /// Per-file state for stability + dedupe. Stability tracks the FULL file identity
+    /// (dev, ino, size, mtime at ns precision — digest nil at this stage) so a
+    /// preallocated-but-still-filling FITS (full size, advancing mtime) is not emitted early,
+    /// and a same-name REPLACEMENT (new inode) re-earns stability even when its (size, mtime)
+    /// happen to match the old file's last observation.
+    private var lastSeenStat: [String: FileIdentity] = [:]
     private var lastEmittedDigest: [String: String] = [:]
 
     private let fileNamePrefix: String?
@@ -238,10 +373,7 @@ public final class StackFileWatcher {
         // re-arm fails (mirrors the existing return path).
         if !folderMissing, let armed = armedIdentity,
            let current = Self.nodeIdentity(atPath: folder.path), current != armed {
-            onLog?("watched folder was replaced — re-arming: \(folder.path)")
-            cancelSource()
-            lastSeenStat.removeAll()
-            folderMissing = true
+            handleFolderReplaced()
         }
 
         if folderMissing {
@@ -283,68 +415,106 @@ public final class StackFileWatcher {
             guard isFITS || ImageLoader.bitmapExtensions.contains(ext) else { continue }
 
             let url = folder.appendingPathComponent(name)
-            // fd-relative per-file stat (fstatat does not consume folderFD) — the stability
-            // observation is taken from the same pinned directory the enumeration saw.
-            var st = Darwin.stat()
-            guard fstatat(folderFD, name, &st, 0) == 0 else { continue }
-            let size = Int(st.st_size)
-            guard size > 0 else { continue }
-            let mtime = TimeInterval(st.st_mtimespec.tv_sec)
-                      + TimeInterval(st.st_mtimespec.tv_nsec) / 1_000_000_000
-            let stat = (size: size, mtime: mtime)
+
+            // ONE pinned descriptor per candidate file (review5 item 1). Everything the WATCHER
+            // DECIDES with — the (size, mtime) stability observation via fstat(fd), the FITS
+            // header + header-declared-size completeness check, the content digest, and the
+            // identity attached to the emitted update — comes from THIS descriptor, opened
+            // fd-relative to the pinned directory (never by path) BEFORE any stat. A swap
+            // landing after the open can therefore never mix observations of two different
+            // files (previously the OLD inode's size gated the completeness of a truncated NEW
+            // replacement read by path). openat failure (ENOENT — the entry vanished since
+            // enumeration; ELOOP — a symlinked entry, refused by O_NOFOLLOW) skips the file
+            // this tick, exactly like a failed stat before.
+            guard let handle = Self.openFile(directoryFD: folderFD, name: name) else { continue }
+            // Exactly-once close on every path out of this iteration: this explicit close pairs
+            // with closeOnDealloc as a backstop (FileHandle tracks closed state — no double close).
+            defer { try? handle.close() }
+
+            guard let observed = Self.statFile(handle), observed.size > 0 else { continue }
 
             let previous = lastSeenStat[name]
-            lastSeenStat[name] = stat
+            lastSeenStat[name] = observed
 
-            // Stability gate (P1-2): require (size, mtime) unchanged across two consecutive
-            // scans for BOTH file kinds. A writer that preallocates the full declared size and
-            // then fills pixels in place satisfies size>=declared on the first sighting; the
-            // stability requirement holds it back until the in-place writes stop.
-            guard previous?.size == stat.size, previous?.mtime == stat.mtime else { continue }
+            // Stability gate (P1-2): require the identity (dev, ino, size, mtime ns) unchanged
+            // across two consecutive scans for BOTH file kinds. A writer that preallocates the
+            // full declared size and then fills pixels in place satisfies size>=declared on the
+            // first sighting; the stability requirement holds it back until the in-place writes
+            // stop. A same-name replacement (new inode) re-earns stability from scratch.
+            guard previous == observed else { continue }
 
-            // HONEST NOTE (review4 P2): the CONTENT reads below (FITS header + digest) remain
-            // PATH-based (FileHandle(forReadingFrom:)). The structural fd-relative fix above closes
-            // the STATE-consistency hole (old lastSeenStat applied to new-directory files); a swap
-            // racing a content read can at worst read a different file's bytes, which the existing
-            // stability + digest gates already protect against (an unstable or changed file is
-            // held back / re-observed on the next scan, and dedup is digest-keyed).
             if isFITS {
-                // Bulletproof completeness: header declares exact expected data length (spec §5.2).
-                // Combined with the stability gate above, this rejects both truncated files
-                // (size<declared) and preallocated-but-unfilled files (stable check).
-                guard let head = try? readHead(url: url, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
+                // Bulletproof completeness: header declares exact expected data length (spec §5.2),
+                // and BOTH sides of the comparison come from the pinned descriptor — the header
+                // bytes and the fstat size describe the same inode. Combined with the stability
+                // gate above, this rejects both truncated files (size<declared) and
+                // preallocated-but-unfilled files (stable check).
+                guard let head = try? Self.readHead(handle, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
                       let header = try? FITSReader.readHeader(head),
-                      size >= header.minimumFileSize else { continue }
+                      observed.size >= header.minimumFileSize else { continue }
             }
 
-            guard let digest = contentDigest(url: url, size: size) else { continue }
+            guard let digest = FileIdentity.contentDigest(handle: handle, size: observed.size)
+            else { continue }
             guard lastEmittedDigest[name] != digest else { continue }
+
+            // Yield-time revalidation (review5 item 1): the emitted URL is still a PATH the
+            // consumer resolves later, so before publishing, re-check that the watched path still
+            // resolves to the directory this scan pinned. If it was swapped mid-scan, do NOT emit
+            // a path that now names a different directory's file — trigger the same replacement
+            // handling as the top-of-scan check (the next tick re-arms and rescans) and stop.
+            // The residual consumer-side race (path re-resolved at read time) is closed by the
+            // identity carried on the update: consumers verify (dev, ino, size, mtime, digest)
+            // on THEIR OWN descriptor via FileIdentity.read(url:verifying:) before decoding.
+            guard let armed = armedIdentity, Self.nodeIdentity(atPath: folder.path) == armed else {
+                handleFolderReplaced()
+                return
+            }
             lastEmittedDigest[name] = digest
-            continuation.yield(StackUpdate(url: url, fileSize: size))
+            continuation.yield(StackUpdate(
+                url: url, fileSize: observed.size,
+                identity: observed.withDigest(digest)))
         }
     }
 
-    private func readHead(url: URL, bytes: Int) throws -> Data {
-        let fh = try FileHandle(forReadingFrom: url)
-        defer { try? fh.close() }
+    /// Mid-tick folder replacement handling — shared by the top-of-scan identity check and the
+    /// yield-time revalidation: log honestly, drop the stale source, clear PENDING stability
+    /// observations (emitted digests RETAINED for dedup), and mark missing so the next tick
+    /// re-arms via the recovery branch.
+    private func handleFolderReplaced() {
+        onLog?("watched folder was replaced — re-arming: \(folder.path)")
+        cancelSource()
+        lastSeenStat.removeAll()
+        folderMissing = true
+    }
+
+    /// Open ONE read descriptor for a directory entry, resolved RELATIVE to the pinned directory
+    /// fd — never by path (review5 item 1). O_NOFOLLOW refuses symlinked entries. Returns nil on
+    /// any open failure (the caller skips the file this tick). The returned FileHandle OWNS the
+    /// descriptor (closeOnDealloc), so close happens exactly once on every path.
+    ///
+    /// Internal (not private) so the structural single-descriptor property is directly
+    /// unit-testable (see testOpenFile_pinnedDirectoryFDReadsOldFileAcrossAtomicSwap).
+    static func openFile(directoryFD: Int32, name: String) -> FileHandle? {
+        let fd = openat(directoryFD, name, O_RDONLY | O_NOFOLLOW)
+        guard fd >= 0 else { return nil }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    }
+
+    /// fstat(2) the open descriptor — size + mtime for the stability gate, (dev, ino) for the
+    /// emitted identity. Internal for the same testability reason as `openFile`.
+    static func statFile(_ handle: FileHandle) -> FileIdentity? {
+        var st = Darwin.stat()
+        guard fstat(handle.fileDescriptor, &st) == 0 else { return nil }
+        return FileIdentity(stat: st)
+    }
+
+    /// Read the header prefix from the pinned per-file descriptor (seeks to 0 first — the
+    /// descriptor is reused across the header and digest reads).
+    private static func readHead(_ handle: FileHandle, bytes: Int) throws -> Data {
+        try handle.seek(toOffset: 0)
         // FileHandle.read returning nil is a framework-level anomaly; the empty-Data
         // fallback yields a truncated-header skip in scan(), which is safe.
-        return try fh.read(upToCount: bytes) ?? Data()
-    }
-
-    /// Cheap content identity: SHA256 over size + first/last 64 KB.
-    /// Returns nil when the file cannot be opened — the caller must skip the file
-    /// rather than emit (a random digest would defeat dedupe and yield repeats).
-    private func contentDigest(url: URL, size: Int) -> String? {
-        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? fh.close() }
-        var hasher = SHA256()
-        hasher.update(data: Data("\(size)".utf8))
-        if let head = try? fh.read(upToCount: 65536) { hasher.update(data: head) }
-        if size > 131_072 {
-            try? fh.seek(toOffset: UInt64(size - 65536))
-            if let tail = try? fh.read(upToCount: 65536) { hasher.update(data: tail) }
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return try handle.read(upToCount: bytes) ?? Data()
     }
 }

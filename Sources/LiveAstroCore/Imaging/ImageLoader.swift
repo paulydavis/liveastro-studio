@@ -11,14 +11,36 @@ public enum ImageLoader {
     public static let fitsExtensions: Set<String> = ["fit", "fits", "fts"]
     public static let bitmapExtensions: Set<String> = ["png", "jpg", "jpeg", "tif", "tiff"]
 
-    public static func load(url: URL) throws -> AstroImage {
+    /// Load an image, optionally verifying `expectedIdentity` (review5 item 1). When an identity
+    /// is supplied the file is opened ONCE, that descriptor's fstat is compared against the
+    /// identity the watcher validated, the bytes are read from that same descriptor (with a
+    /// content-digest re-check), and the image is DECODED FROM THOSE BYTES — never a fresh
+    /// path-open. A replaced/truncated file throws `FileIdentityMismatchError`; callers skip the
+    /// frame with an honest log. `expectedIdentity == nil` is the legacy path-based behavior,
+    /// unchanged.
+    public static func load(url: URL, expectedIdentity: FileIdentity? = nil) throws -> AstroImage {
         let ext = url.pathExtension.lowercased()
         if fitsExtensions.contains(ext) {
-            let fits = try FITSReader.read(try Data(contentsOf: url, options: .alwaysMapped))
+            let data: Data
+            if expectedIdentity != nil {
+                data = try FileIdentity.read(url: url, verifying: expectedIdentity)
+            } else {
+                data = try Data(contentsOf: url, options: .alwaysMapped)
+            }
+            let fits = try FITSReader.read(data)
             return AstroImage(width: fits.width, height: fits.height, channels: fits.channels,
                               pixels: fits.pixels, sourceIsLinear: true)
         }
-        if bitmapExtensions.contains(ext) { return try loadBitmap(url: url) }
+        if bitmapExtensions.contains(ext) {
+            if expectedIdentity != nil {
+                let data = try FileIdentity.read(url: url, verifying: expectedIdentity)
+                guard let src = CGImageSourceCreateWithData(data as CFData, nil) else {
+                    throw ImageLoaderError.decodeFailed("cannot open \(url.lastPathComponent)")
+                }
+                return try decodeBitmap(source: src, name: url.lastPathComponent)
+            }
+            return try loadBitmap(url: url)
+        }
         throw ImageLoaderError.unsupportedFormat(ext)
     }
 
@@ -26,6 +48,10 @@ public enum ImageLoader {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             throw ImageLoaderError.decodeFailed("cannot open \(url.lastPathComponent)")
         }
+        return try decodeBitmap(source: src, name: url.lastPathComponent)
+    }
+
+    private static func decodeBitmap(source src: CGImageSource, name: String) throws -> AstroImage {
         // Thumbnail-with-transform applies EXIF orientation; max dimension huge = full size.
         let opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -33,7 +59,7 @@ public enum ImageLoader {
             kCGImageSourceThumbnailMaxPixelSize: 20_000,
         ]
         guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else {
-            throw ImageLoaderError.decodeFailed("cannot decode \(url.lastPathComponent)")
+            throw ImageLoaderError.decodeFailed("cannot decode \(name)")
         }
         let w = cg.width, h = cg.height
         var rgba = [UInt8](repeating: 0, count: w * h * 4)
