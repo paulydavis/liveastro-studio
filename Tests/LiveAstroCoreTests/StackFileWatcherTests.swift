@@ -296,11 +296,118 @@ final class StackFileWatcherTests: XCTestCase {
     /// quietPeriod is ALSO the digest-stability separation requirement, so tests must
     /// advance the clock past it to confirm a pending digest.
     private func makeManualWatcher(policy: StackFileWatcher.DigestPolicy,
-                                   clock: ManualClock) throws -> StackFileWatcher {
+                                   clock: ManualClock,
+                                   prefix: String? = nil) throws -> StackFileWatcher {
         let w = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
-                                 digestPolicy: policy)
+                                 fileNamePrefix: prefix, digestPolicy: policy)
         w.monotonicNowNanos = { clock.now() }
         return w
+    }
+
+    // MARK: - review9 item 1: hybrid per-entry policy (numbered stacker revisions)
+
+    /// Review9 item 1 (red-first, the counter arithmetic proves both halves): under
+    /// `.mutableStackerOutput` every matching file was re-hashed on EVERY stable scan —
+    /// with Siril 1.4+'s numbered revisions (live_stack_00001.fit …) accumulating, 1000
+    /// × 50 MB revisions meant 50 GB hashed per 2 s scan, starving new updates. Numbered
+    /// revisions are written once and never rewritten, so after their CONFIRMED first
+    /// emission they must use the identity fast-path (digest computations FLAT), while
+    /// the CLASSIC in-place fixed-name file keeps re-hashing each stable scan by design:
+    /// with one classic + three numbered files emitted, k further scans must add
+    /// EXACTLY k digest computations (classic only), not 4k.
+    func testMutablePolicy_numberedRevisionsFlatAfterEmission_classicStillRehashes() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        for i in 1...3 {
+            try makeFITS(Float(i) * 0.1)
+                .write(to: tmp.appendingPathComponent("live_stack_0000\(i).fit"))
+        }
+        watcher.scanNow()                     // sighting — stat recorded, nothing hashed
+        watcher.scanNow()                     // stable → 4 digests → all 4 pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                     // 4 digests confirm the pendings → 4 emissions
+        let got = await collector.waitForCount(4, timeout: 2)
+        XCTAssertTrue(got, "arrange: classic + 3 numbered revisions all emit")
+        let hashesAfterEmit = watcher.digestComputations
+        XCTAssertEqual(hashesAfterEmit, 8,
+                       "arrange: 4 pending digests + 4 confirming digests, nothing else")
+
+        for _ in 0..<3 { clock.advance(seconds: 3601); watcher.scanNow() }
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit + 3,
+                       "exactly ONE hash per further scan: the classic in-place file still " +
+                       "re-hashes, all emitted numbered revisions stay FLAT")
+        let items = await collector.items
+        XCTAssertEqual(items.count, 4, "no re-emissions during the flat scans")
+    }
+
+    /// Review9 item 1, the pre-emission half: a numbered revision may be written
+    /// NON-ATOMICALLY before publication, so it must NOT ride the raw
+    /// `.immutableAfterPublish` branch (which has no content gate). Its FIRST emission
+    /// earns stat stability AND the two-observation digest-stability gate exactly like
+    /// the classic file — a single stable sighting of a new numbered file must not emit.
+    /// Post-emission trust is the ONLY divergence point.
+    func testMutablePolicy_newNumberedRevision_firstEmissionStillPassesDigestGate() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.7).write(to: tmp.appendingPathComponent("live_stack_00004.fit"))
+        watcher.scanNow()                     // first sighting — stat recorded only
+        watcher.scanNow()                     // stable → digest PENDING, must not emit
+        let single = await collector.waitForCount(1, timeout: 0.3)
+        XCTAssertFalse(single,
+                       "a single stable sighting of a new numbered revision must not emit " +
+                       "(the digest gate applies to its first emission)")
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                     // same digest after the quiet period → emits
+        let got = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(got, "the confirmed first emission goes through")
+        // …and only THEN does the identity fast-path take over.
+        let hashesAfterEmit = watcher.digestComputations
+        clock.advance(seconds: 3601)
+        watcher.scanNow()
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit,
+                       "post-confirmation the numbered revision is never re-hashed")
+    }
+
+    // MARK: - review9 item 2: deterministic emission ordering
+
+    /// Review9 item 2 (red-first): enumerateDirectory returns raw readdir order (POSIX-
+    /// undefined), so several revisions accumulating during a reconnect could emit
+    /// _00010 → _00002 → _00009, visually regressing the replay. Candidates must be
+    /// sorted with the SAME parser that classifies them: numbered revisions in NUMERIC
+    /// order via digit-STRING comparison (length, then lexicographic) — the 30-digit
+    /// suffix must classify and sort identically, never overflow an Int conversion into
+    /// a different path. Files are created in deliberately scrambled order.
+    func testNumberedRevisions_scrambledCreationOrder_emitInNumericOrder() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let collector = collect(watcher)
+        try watcher.start()
+        let thirtyDigits = String(repeating: "0", count: 28) + "11"   // numerically 11
+        let creationOrder = ["live_stack_00010.fit", "live_stack_\(thirtyDigits).fit",
+                             "live_stack_00002.fit", "live_stack_00009.fit"]
+        for (i, name) in creationOrder.enumerated() {
+            try makeFITS(Float(i + 1) * 0.1).write(to: tmp.appendingPathComponent(name))
+        }
+        watcher.scanNow()                     // sighting
+        watcher.scanNow()                     // stable → pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                     // confirmed → all emit, in candidate order
+        let got = await collector.waitForCount(4, timeout: 2)
+        XCTAssertTrue(got, "arrange: all four revisions emit")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00002.fit", "live_stack_00009.fit",
+                        "live_stack_00010.fit", "live_stack_\(thirtyDigits).fit"],
+                       "emissions must arrive in NUMERIC revision order regardless of " +
+                       "creation/readdir order (30-digit suffix sorts numerically too)")
     }
 
     /// Review8 finding 1 (red-first): stat stability is satisfied while an in-place

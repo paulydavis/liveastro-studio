@@ -329,6 +329,60 @@ public final class StackFileWatcher {
     private let fileNamePrefix: String?
     private let digestPolicy: DigestPolicy
 
+    // MARK: Numbered-revision parser (review9 items 1+2)
+    //
+    // The SINGLE source of truth for both CLASSIFYING a numbered stacker revision
+    // (`<prefix>_(\d+).<ext>` — Siril 1.4+ writes live_stack_00001.fit, live_stack_00002.fit, …
+    // once each and never rewrites them) and ORDERING candidates. Anchored
+    // `^<escapedPrefix>_(\d+)\.<ext>$` semantics: the user-supplied prefix is DATA, not
+    // pattern (escaped), the whole match is case-insensitive (mirroring the prefix filter in
+    // scan()), and the extension must belong to the supported image sets. The captured
+    // revision stays a DIGIT STRING with numeric-aware comparison (length, then
+    // lexicographic) — never an Int conversion, so a 30-digit suffix classifies and sorts
+    // identically instead of overflowing into a different path.
+
+    /// Compiled once per watcher from the configured prefix; nil when no prefix is set
+    /// (no prefix → no revision series to recognize; every candidate is non-numbered).
+    private let revisionRegex: NSRegularExpression?
+
+    /// The digit-string revision of `name` when it is a numbered revision of the configured
+    /// prefix (supported image extension required); nil for everything else — including the
+    /// classic fixed-name file (`live_stack.fit`) and near-misses like
+    /// `live_stack_extra_00001.fit`, which conservatively keep full mutable-policy re-hashing.
+    private func revisionSuffix(of name: String) -> String? {
+        guard let regex = revisionRegex else { return nil }
+        let range = NSRange(name.startIndex..., in: name)
+        guard let m = regex.firstMatch(in: name, options: [], range: range),
+              let digitsRange = Range(m.range(at: 1), in: name),
+              let extRange = Range(m.range(at: 2), in: name) else { return nil }
+        let ext = name[extRange].lowercased()
+        guard ImageLoader.fitsExtensions.contains(ext) || ImageLoader.bitmapExtensions.contains(ext)
+        else { return nil }
+        return String(name[digitsRange])
+    }
+
+    /// Numeric order for digit strings without Int conversion: a shorter digit string is a
+    /// smaller number; equal lengths compare lexicographically.
+    private static func digitStringLess(_ a: String, _ b: String) -> Bool {
+        a.count != b.count ? a.count < b.count : a < b
+    }
+
+    /// Deterministic candidate order (review9 item 2): readdir order is POSIX-undefined, and
+    /// several revisions accumulating during a reconnect must replay in NUMERIC order — not
+    /// _00010 → _00008 → _00009, which visually regresses the replay. Numbered revisions sort
+    /// numerically (digit-string compare, full-name tiebreak); non-numbered names sort
+    /// lexicographically and BEFORE the revision series. Ties are impossible (names are
+    /// unique + full-name tiebreak), so this is a total order — no reliance on sort stability.
+    private static func orderedBefore(_ a: (name: String, revision: String?),
+                                      _ b: (name: String, revision: String?)) -> Bool {
+        switch (a.revision, b.revision) {
+        case let (ra?, rb?): return ra == rb ? a.name < b.name : digitStringLess(ra, rb)
+        case (nil, nil):     return a.name < b.name
+        case (nil, .some):   return true
+        case (.some, nil):   return false
+        }
+    }
+
     private static let maxHeaderBlocks = 32  // generous ceiling; real headers are 1-10 blocks
 
     public init(folder: URL, quietPeriod: TimeInterval = 0.5, pollInterval: TimeInterval = 2.0,
@@ -339,6 +393,16 @@ public final class StackFileWatcher {
         self.pollInterval = pollInterval
         self.fileNamePrefix = fileNamePrefix
         self.digestPolicy = digestPolicy
+        if let prefix = fileNamePrefix, !prefix.isEmpty {
+            let escaped = NSRegularExpression.escapedPattern(for: prefix)
+            // The pattern is built from escaped data + fixed syntax; it cannot fail to
+            // compile, but a nil regex would only mean "no numbered revisions recognized" —
+            // strictly more conservative (full re-hash), never wrong.
+            self.revisionRegex = try? NSRegularExpression(
+                pattern: "^\(escaped)_([0-9]+)\\.([^.]+)$", options: [.caseInsensitive])
+        } else {
+            self.revisionRegex = nil
+        }
         var cont: AsyncStream<StackUpdate>.Continuation!
         self.updates = AsyncStream { cont = $0 }
         self.continuation = cont
@@ -510,7 +574,12 @@ public final class StackFileWatcher {
         // armed (folderFD < 0, i.e. a failed re-arm while folderMissing), there is nothing safe to
         // enumerate — skip this tick; the poll timer retries the re-arm on the next tick.
         guard folderFD >= 0, let names = Self.enumerateDirectory(fd: folderFD) else { return }
-        for name in names {
+        // Review9 item 2: process candidates in a deterministic order (numbered revisions
+        // numerically, everything else lexicographically — see orderedBefore). The revision
+        // suffix is parsed ONCE per name here and reused for the per-entry policy below.
+        let candidates = names.map { (name: $0, revision: revisionSuffix(of: $0)) }
+            .sorted(by: Self.orderedBefore)
+        for (name, revision) in candidates {
             guard !name.hasPrefix("."), !name.lowercased().hasSuffix(".tmp") else { continue }
             if let prefix = fileNamePrefix, !prefix.isEmpty,
                !name.lowercased().hasPrefix(prefix.lowercased()) { continue }
@@ -540,16 +609,27 @@ public final class StackFileWatcher {
             let previous = lastSeenStat[name]
             lastSeenStat[name] = observed
 
-            // Review7 P2 (identity-gated hashing): under `.immutableAfterPublish`
-            // this exact published version — same (dev, ino, size, mtime-ns) as
-            // the emission that produced `lastEmittedDigest[name]` — was already
-            // emitted, so skip ALL content work: one fstat per poll instead of a
-            // full-file SHA-256 (native relay folders accumulate every sub; at
-            // 1000 subs the unconditional rehash burned tens of seconds per 2 s
-            // scan). `.mutableStackerOutput` (Siril's in-place live_stack.fit)
-            // never takes this shortcut: a coarse/cached-filesystem rewrite can
+            // Review7 P2 (identity-gated hashing): this exact published version — same
+            // (dev, ino, size, mtime-ns) as the emission that produced
+            // `lastEmittedDigest[name]` — was already emitted, so when the file is
+            // trusted immutable AFTER emission, skip ALL content work: one fstat per
+            // poll instead of a full-file SHA-256. That trust holds for every file
+            // under `.immutableAfterPublish` (native relay folders accumulate every
+            // sub; at 1000 subs the unconditional rehash burned tens of seconds per
+            // 2 s scan), and — review9 item 1 — for NUMBERED REVISIONS under
+            // `.mutableStackerOutput` (Siril 1.4+ writes live_stack_00001.fit once
+            // and never rewrites it; without the fast-path, 1000 × 50 MB accumulated
+            // revisions meant 50 GB hashed per 2 s scan, starving new updates).
+            // Numbered revisions may be written NON-ATOMICALLY before publication,
+            // so pre-emission they take the full mutable path — stat stability AND
+            // the two-observation digest gate below — and only their CONFIRMED first
+            // emission arms this shortcut: post-emission trust is the single
+            // divergence point. The CLASSIC in-place fixed-name file (revision nil)
+            // never takes the shortcut: a coarse/cached-filesystem rewrite can
             // collide the whole identity, and only the digest sees the change.
-            if digestPolicy == .immutableAfterPublish,
+            let identityTrustedAfterEmission =
+                digestPolicy == .immutableAfterPublish || revision != nil
+            if identityTrustedAfterEmission,
                lastEmittedIdentity[name] == observed { continue }
 
             // Stability gate (P1-2): require the identity (dev, ino, size, mtime ns) unchanged
