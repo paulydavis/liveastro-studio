@@ -1157,6 +1157,66 @@ final class BroadcastControllerTests: XCTestCase {
         await waitUntil { h.controller.broadcastState == .unknown }
     }
 
+    // MARK: - review11 FINDING 2 (P2): connection loss during .connecting
+    // must not be discarded
+
+    /// Loss mid-manual-connect: the reconcile is parked at its recording
+    /// read when the socket dies. Pre-fix handleConnectionLoss ignored loss
+    /// during .connecting (no generation bump), so the attempt's own stale
+    /// completion landed the conclusion — and in the .live-shaped flavor a
+    /// status answer already in flight could land .live over a dead link,
+    /// where the health poll reads nil forever with no event link left to
+    /// correct it. Post-fix the loss bumps the generation (every in-flight
+    /// completion of the attempt is stale) and lands the honest loss-map
+    /// state synchronously: nothing was issued → .unknown.
+    func testConnectionLossDuringManualConnectLandsUnknown() async {
+        let h = await makeHarness(connect: false, requestTimeout: 10)
+        // Seed's GetRecordStatus goes through; the reconcile's parks.
+        h.server.parkTypes = ["GetRecordStatus"]
+        h.server.parkSkip = ["GetRecordStatus": 1]
+        h.mock.enqueueInbound(helloFrame())
+        h.mock.replyToLastSent(h.server.responder())
+
+        let connectTask = Task { await h.controller.connectAndReconcile() }
+        await waitUntil { h.server.parked.count == 1 }   // reconcile mid-snapshot
+        XCTAssertEqual(h.controller.broadcastState, .connecting)
+
+        h.mock.finishWithError(OBSSocketError.notConnected)   // the link dies
+        _ = await connectTask.value
+
+        await waitUntil { h.controller.broadcastState == .unknown }
+        await settle()
+        XCTAssertEqual(h.controller.broadcastState, .unknown,
+                       "loss during a connect that issued nothing lands .unknown — never the parked attempt's stale conclusion")
+        XCTAssertEqual(h.obs.state, .disconnected)
+        XCTAssertTrue(h.box.logs.contains { $0.contains("control link lost during the connect attempt") },
+                      "the loss must be recorded honestly, not discarded")
+    }
+
+    /// Loss mid-goLive-bring-up (StartStream already issued, confirm poll
+    /// parked): the loss must land the possibly-issued map (.stopUnconfirmed
+    /// with an honest log) — NEVER .live, and never a state owned by a
+    /// completion whose link is dead.
+    func testConnectionLossDuringGoLiveBringUpLandsStopUnconfirmed() async {
+        let h = await makeHarness(requestTimeout: 10)
+        h.controller.maxConfirmPolls = 1
+        h.server.parkTypes = ["GetStreamStatus"]
+        h.server.parkSkip = ["GetStreamStatus": 1]   // reconcile's query goes through
+        h.controller.goLive()
+        await waitUntil { h.server.parked.count == 1 }   // parked at the confirm poll
+        XCTAssertEqual(h.controller.broadcastState, .connecting)
+        XCTAssertEqual(sent("StartStream", h.mock), 1, "StartStream WAS issued")
+
+        h.mock.finishWithError(OBSSocketError.notConnected)   // the link dies
+        await waitUntil { h.controller.broadcastState == .stopUnconfirmed }
+        await settle()
+        XCTAssertEqual(h.controller.broadcastState, .stopUnconfirmed,
+                       "an issued StartStream behind a dead link is only ever .stopUnconfirmed — never .live, never .idle")
+        XCTAssertNil(h.controller.streamHealth)
+        XCTAssertTrue(h.box.logs.contains { $0.contains("control link lost during the broadcast bring-up") },
+                      "the loss must be recorded honestly, not discarded")
+    }
+
     // MARK: - cold-review1 FINDING 1: the CURRENT-generation possibly-issued
     // cleanup must own itself — a UI cancellation must never fabricate .idle
 

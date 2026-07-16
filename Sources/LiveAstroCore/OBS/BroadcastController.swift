@@ -1027,8 +1027,7 @@ public final class BroadcastController {
     ///   reconnect-and-reconcile stays one click.
     /// - `.live` / `.endingSession` / `.stopping` → `.stopUnconfirmed`: OBS
     ///   keeps streaming without a control link (disconnect ≠ stop).
-    /// - `.connecting`: leave — the in-flight bring-up's own requests fail and
-    ///   its machinery settles honestly.
+    /// - `.connecting` (review11 finding 2): NOT ignored — see the branch.
     /// - `.unknown` / `.stopUnconfirmed`: already honest, unchanged.
     private func handleConnectionLoss() {
         // Review10 SPLIT-SNAPSHOT primitive: connection loss is an output
@@ -1046,7 +1045,31 @@ public final class BroadcastController {
             streamHealth = nil
             broadcastState = .stopUnconfirmed
             deps.log("OBS: control link lost while the broadcast was active — OBS may still be live (disconnect ≠ stop). Reconnect and Retry to stop it, or stop it in OBS.")
-        case .connecting, .unknown, .stopUnconfirmed:
+        case .connecting:
+            // Review11 finding 2: loss during a connect attempt must NOT be
+            // discarded. A status answer already routed back to the attempt
+            // could otherwise land .live over a dead link (the attempt's
+            // generation was never bumped), leaving a health poll that reads
+            // nil forever with no event link left to correct it. Bump the
+            // generation — every in-flight completion of the attempt is
+            // stale from this instant (each .live-setting site re-checks the
+            // generation in the same synchronous segment as its mutation) —
+            // and land the attempt honestly NOW, per the possibly-issued
+            // rules: an app-issued StartStream in flight can only settle
+            // .stopUnconfirmed; with nothing issued, the origin's loss-map
+            // landing (.unknown; .stopUnconfirmed if a stop was already owed).
+            broadcastGeneration += 1
+            goLiveTask?.cancel(); goLiveTask = nil
+            healthPollTask?.cancel(); healthPollTask = nil
+            streamHealth = nil
+            if appStartInFlight {
+                broadcastState = .stopUnconfirmed
+                deps.log("OBS: control link lost during the broadcast bring-up — StartStream may have been issued; OBS may be live (disconnect ≠ stop). Reconnect and Retry to stop it, or check OBS.")
+            } else {
+                broadcastState = connectingOrigin == .stopUnconfirmed ? .stopUnconfirmed : .unknown
+                deps.log("OBS: control link lost during the connect attempt — OBS state unknown until the next connect")
+            }
+        case .unknown, .stopUnconfirmed:
             break
         }
     }
