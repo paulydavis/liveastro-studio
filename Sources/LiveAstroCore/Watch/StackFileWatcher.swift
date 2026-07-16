@@ -14,7 +14,8 @@ public struct FileIdentity: Equatable, Sendable {
     /// the same fstat fields so equality is exact, never Date/TimeInterval-rounded.
     public let mtimeSec: Int64
     public let mtimeNsec: Int64
-    /// SHA-256 over size + first/last 64 KB (the watcher's dedup digest). nil when the producer
+    /// FULL-FILE streaming SHA-256 over size + every byte (the watcher's dedup digest — review6
+    /// finding 2: the former head/tail sample missed middle-only changes). nil when the producer
     /// did not compute one (e.g. a bare stability observation); consumers recompute it over the
     /// bytes they actually loaded and compare — strict content-version validation.
     public let digest: String?
@@ -90,10 +91,14 @@ public struct FileIdentity: Equatable, Sendable {
 
     // MARK: Content digest (shared producer/consumer definition)
     //
-    // Cheap content identity: SHA-256 over size + first/last 64 KB. Two forms that MUST agree
-    // byte-for-byte (pinned by testContentDigest_handleAndDataFormsAgree): the handle form streams
-    // head/tail chunks so the watcher never loads whole files; the data form hashes bytes a
-    // consumer already has in hand.
+    // Strict content identity (review6 finding 2): FULL-FILE streaming SHA-256 over size + every
+    // byte. The former head/tail sample let a middle-only change pass consumer validation AND be
+    // wrongly deduped by the watcher — and for 64–128 KB files the tail was not hashed at all.
+    // Two forms that MUST agree byte-for-byte (pinned by
+    // testContentDigest_handleAndDataFormsAgree): the handle form streams 64 KB chunks so the
+    // watcher never loads whole files; the data form hashes bytes a consumer already has in hand.
+    // The size prefix is retained (redundant with full content, but keeps digests distinct from
+    // any bare-SHA-256 use and both forms trivially aligned).
 
     static let digestChunk = 65_536
 
@@ -101,24 +106,23 @@ public struct FileIdentity: Equatable, Sendable {
     public static func contentDigest(data: Data) -> String {
         var hasher = SHA256()
         hasher.update(data: Data("\(data.count)".utf8))
-        hasher.update(data: data.prefix(digestChunk))
-        if data.count > 2 * digestChunk {
-            hasher.update(data: data.suffix(digestChunk))
-        }
+        hasher.update(data: data)
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Digest over an open descriptor (producer side — seeks, never loads the whole file).
-    /// Returns nil when the handle cannot be read/seeked — the caller must skip the file
-    /// rather than emit (a random digest would defeat dedupe and yield repeats).
+    /// Digest over an open descriptor (producer side — streams 64 KB chunks to EOF, never loads
+    /// the whole file). Returns nil when the handle cannot be read/seeked — the caller must skip
+    /// the file rather than emit (a wrong digest would defeat dedupe and yield repeats).
     static func contentDigest(handle: FileHandle, size: Int) -> String? {
         guard (try? handle.seek(toOffset: 0)) != nil else { return nil }
         var hasher = SHA256()
         hasher.update(data: Data("\(size)".utf8))
-        if let head = try? handle.read(upToCount: digestChunk) { hasher.update(data: head) }
-        if size > 2 * digestChunk {
-            try? handle.seek(toOffset: UInt64(size - digestChunk))
-            if let tail = try? handle.read(upToCount: digestChunk) { hasher.update(data: tail) }
+        while true {
+            let chunk: Data?
+            do { chunk = try handle.read(upToCount: digestChunk) }
+            catch { return nil }                        // read failure → skip the file
+            guard let chunk, !chunk.isEmpty else { break }   // nil or empty → EOF
+            hasher.update(data: chunk)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
