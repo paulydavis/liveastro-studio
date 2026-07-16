@@ -1,19 +1,17 @@
 import Foundation
 import LiveAstroCore
 
-/// The seam between `AppModel` and its extracted controllers.
+/// The seam between `AppModel` and its three extracted controllers.
 ///
 /// Controllers never hold a reference to `AppModel` (no retain cycles, and they
 /// stay unit-testable with captured closures). Instead `AppModel` constructs one
 /// `AppSurface` — a bundle of closures over its cross-cutting UI state — and
 /// hands it to each controller. This mirrors LiveAstroCore's own `onLog` idiom.
-///
-/// Only the T1 (`BroadcastController`) fields are wired today. The T2/T3 fields
-/// are declared now, defaulted to no-ops, so later stages add controllers
-/// without re-touching this type's shape.
+/// All optional fields default to no-ops so a controller's test harness only
+/// supplies the closures it exercises.
 struct AppSurface {
 
-    // MARK: Cross-cutting UI state (used by T1)
+    // MARK: Cross-cutting UI state
 
     /// Appends a line to `AppModel.log` (main-actor).
     let log: (String) -> Void
@@ -28,7 +26,7 @@ struct AppSurface {
     /// reading the gate through the seam without a back-reference.
     let isImporting: () -> Bool
 
-    // MARK: T2 — LiveSourceController seam (declared, unused until T2)
+    // MARK: LiveSourceController seam
 
     /// Applies an auto-detected capture profile onto the session draft.
     var applyDetectedProfile: ((DetectedProfile) -> Void)?
@@ -46,7 +44,7 @@ struct AppSurface {
     /// Persists current settings.
     var saveSettings: (() -> Void)?
 
-    // MARK: T3 — ImportController seam
+    // MARK: ImportController seam
 
     /// Builds a stacking engine from the current stacker settings — the import
     /// path stacks natively, so it needs the same engine `startSession` uses.

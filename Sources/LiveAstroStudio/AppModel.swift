@@ -2,6 +2,14 @@ import SwiftUI
 import AppKit
 import LiveAstroCore
 
+/// Coordination hub for LiveAstro Studio.
+///
+/// Owns the three extracted controllers (`broadcast`, `liveSource`, `importer`) via
+/// `AppSurface`-backed composition; each controller is reference-free (no back-pointer
+/// to `AppModel`). Retains: session lifecycle (`startSession` / `wireCallbacks` /
+/// `endSession`), settings persistence (`loadSettings` / `saveSettings`), the session
+/// profile draft (form fields bound to `ControlView`), and shared UI state (`log`,
+/// `errorMessage`, `isRunning`, `latestImage/Record`, counts, `zoomPan`, tabs).
 @Observable
 @MainActor
 final class AppModel {
