@@ -202,30 +202,56 @@ public final class OBSController: ObservableObject {
         return false
     }
 
+    /// Outcome of `startBroadcast` (review8 item 1) — a Bool hid the issuance
+    /// boundary, so a cancelled start whose StartStream WAS sent got no cleanup.
+    public enum StartOutcome: Equatable {
+        /// Cancellation was CONFIRMED to have occurred before the StartStream
+        /// send was enqueued — nothing was issued, there is nothing to undo.
+        case notIssued
+        /// StartStream was (or may have been) issued but going live was never
+        /// confirmed: cancelled mid-request, confirm polls expired, or status
+        /// unavailable. OBS may be live — the caller owes a confirmed cleanup.
+        case issuedUnconfirmed
+        /// GetStreamStatus confirmed outputActive — the broadcast is up.
+        case confirmedLive
+    }
+
     /// Deliberate broadcast: switch to `scene` (if given), start the stream, and
-    /// confirm it went live by polling GetStreamStatus. Returns true once
-    /// outputActive is confirmed; false when the polls expire or status is
-    /// unavailable — and on failure this sends NOTHING further. The CALLER owns
-    /// cleanup policy (review7 P1: an internal StopStream-on-expiry here fired
-    /// BEFORE the caller's generation check could run, so a stale attempt's
-    /// cleanup could kill a newer broadcast's stream).
+    /// confirm it went live by polling GetStreamStatus. The issuance boundary is
+    /// CONSERVATIVE (review8 item 1): `.notIssued` is returned ONLY when
+    /// cancellation is confirmed before the StartStream send was enqueued
+    /// (`Task.isCancelled` checked immediately before issuing it; the client's
+    /// request is itself cancellation-aware and never enqueues a send for a
+    /// task already cancelled). Once the send has begun — or its status is
+    /// ambiguous — the result is `.issuedUnconfirmed`, and on that outcome this
+    /// method sends NOTHING further: the CALLER owns cleanup policy (review7
+    /// P1: an internal StopStream-on-expiry here fired BEFORE the caller's
+    /// generation check could run, so a stale attempt's cleanup could kill a
+    /// newer broadcast's stream).
     /// At least one confirmation poll is always performed (maxConfirmPolls is floored to 1).
     @discardableResult
     public func startBroadcast(scene: String?, confirmPollSeconds: Double = 1.0,
-                               maxConfirmPolls: Int = 5) async -> Bool {
+                               maxConfirmPolls: Int = 5) async -> StartOutcome {
         if let scene, !scene.isEmpty { await setScene(scene) }
+        // The issuance boundary: a cancellation observed HERE is confirmed to
+        // precede the StartStream send. (A cancel that lands after this check
+        // races the send and must be treated as possibly-issued.)
+        if Task.isCancelled {
+            log("start cancelled before StartStream was issued")
+            return .notIssued
+        }
         await startStream()
         for i in 0..<max(1, maxConfirmPolls) {
             if let h = await streamStatus(), h.active {
                 log("broadcast live")
-                return true
+                return .confirmedLive
             }
             if i < maxConfirmPolls - 1, confirmPollSeconds > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(confirmPollSeconds * 1_000_000_000))
             }
         }
         log("stream did not go active — check OBS ▸ Settings ▸ Stream")
-        return false
+        return .issuedUnconfirmed
     }
 
     /// Stop a broadcast: stop the stream, turn recording off, and CONFIRM both

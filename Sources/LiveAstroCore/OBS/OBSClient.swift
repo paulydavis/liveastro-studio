@@ -111,7 +111,14 @@ public actor OBSClient {
 
     /// Send an op-6 request and await its op-7 response. Returns `responseData`
     /// on success; throws `.requestFailed` on `ok == false`, `.timeout` after
-    /// `requestTimeout`, or `.notConnected` if the client is/gets disconnected.
+    /// `requestTimeout`, `.notConnected` if the client is/gets disconnected, or
+    /// `CancellationError` when the calling task is cancelled.
+    ///
+    /// Cancellation-aware (review8 item 1): a caller cancelled BEFORE the send
+    /// is enqueued resumes immediately with `CancellationError` and the frame is
+    /// guaranteed NOT sent; a caller cancelled after the send is in flight also
+    /// resumes with `CancellationError`, but the frame may have reached OBS —
+    /// callers must treat that outcome as "possibly issued".
     public func request(_ type: String, data: [String: Any]?) async throws -> [String: Any] {
         guard connected else { throw OBSError.notConnected }
 
@@ -126,7 +133,35 @@ public actor OBSClient {
         }
 
         defer { timeoutTask.cancel() }
-        return try await withCheckedThrowingContinuation { continuation in
+        return try await withTaskCancellationHandler {
+            try await awaitResponse(id: id, frame: frame)
+        } onCancel: {
+            // Runs outside actor isolation — hop back in to resolve the pending
+            // entry. If the entry isn't registered yet (cancel-before-
+            // registration race), this no-ops and awaitResponse's own
+            // Task.isCancelled check resumes the continuation instead.
+            Task { [weak self] in
+                await self?.failPending(id: id, error: CancellationError())
+            }
+        }
+    }
+
+    /// Register the continuation and enqueue the send, both under actor
+    /// isolation in ONE synchronous segment.
+    ///
+    /// Cancel-BEFORE-registration race, handled explicitly: the cancellation
+    /// handler may have fired before this body runs (it only spawns an actor
+    /// hop, which cannot interleave mid-segment). `Task.isCancelled` is
+    /// monotonic, so checking it here catches every such cancel — the request
+    /// resumes with `CancellationError` immediately (never waits out the
+    /// timeout) and, critically, the send is NEVER enqueued: cancellation
+    /// observed before this check is a confirmed not-sent.
+    private func awaitResponse(id: String, frame: String) async throws -> [String: Any] {
+        try await withCheckedThrowingContinuation { continuation in
+            if Task.isCancelled {
+                continuation.resume(throwing: CancellationError())
+                return
+            }
             pending[id] = continuation
             // Send inside a child Task so we stay non-suspending here; if the
             // send fails, resolve the continuation with .notConnected.

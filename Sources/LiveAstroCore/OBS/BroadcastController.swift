@@ -399,14 +399,15 @@ public final class BroadcastController {
                 break   // genuinely nothing running — proceed with the bring-up
             }
             let scene = stackSceneName.isEmpty ? nil : stackSceneName
-            let live = await obs.startBroadcast(scene: scene,
-                                                confirmPollSeconds: confirmPollSeconds,
-                                                maxConfirmPolls: maxConfirmPolls)
+            let outcome = await obs.startBroadcast(scene: scene,
+                                                   confirmPollSeconds: confirmPollSeconds,
+                                                   maxConfirmPolls: maxConfirmPolls)
             guard gen == broadcastGeneration else {
-                await discardStaleGoLive(live: live)
+                settleStaleStart(outcome: outcome)
                 return
             }
-            if live {
+            switch outcome {
+            case .confirmedLive:
                 broadcastState = .live
                 // Review6 P2: "Record while streaming" — start recording only after
                 // the stream is confirmed up. A recording failure never fails the
@@ -431,7 +432,7 @@ public final class BroadcastController {
                     }
                 }
                 startHealthPoll()
-            } else {
+            case .issuedUnconfirmed:
                 // Review7 P1: startBroadcast no longer stops on a failed confirm —
                 // this CALLER owns cleanup, and only at the CURRENT generation
                 // (validated above). Confirmed-stop semantics: .idle only when OBS
@@ -445,23 +446,84 @@ public final class BroadcastController {
                 } else {
                     settleAfterStop(confirmed: false)
                 }
+            case .notIssued:
+                // Nothing was issued (cancellation confirmed before StartStream
+                // was enqueued): return to the origin state honestly — a
+                // confirmed .idle stays confirmed; from .unknown stay .unknown.
+                deps.log("OBS: go-live cancelled before anything was issued")
+                broadcastState = origin
             }
         }
     }
 
     /// Landing for a go-live completion that lost the generation race (review7
-    /// P1). NEVER sends StopStream while a newer broadcast is active or
-    /// connecting — that stop would kill the newer owner's stream (the exact
-    /// bug the internal StopStream-on-expiry in OBSController used to cause).
-    /// Only a stale SUCCESS with no newer owner may undo the stream it
-    /// started, and that stop must be CONFIRMED: an unconfirmed cleanup
-    /// escalates a (previously confirmed) .idle to .stopUnconfirmed honestly
-    /// rather than leaving a possibly-live OBS behind an idle UI.
-    private func discardStaleGoLive(live: Bool) async {
-        guard live else {
-            deps.log("OBS: stale go-live attempt discarded")
-            return
+    /// P1, extended by review8 item 1 for the outcome-typed boundary):
+    /// - `.notIssued`: cancellation was confirmed BEFORE StartStream was
+    ///   enqueued — nothing to undo, log and leave every state alone.
+    /// - `.confirmedLive`: the existing stale-success rules (never stop past a
+    ///   newer active owner; a no-owner orphan gets a CONFIRMED cleanup or an
+    ///   honest `.stopUnconfirmed`).
+    /// - `.issuedUnconfirmed`: StartStream may have been issued and nothing has
+    ///   confirmed the result. If a newer owner is active its machinery
+    ///   governs; with NO newer owner, `.stopping` is reserved SYNCHRONOUSLY
+    ///   before any await (goLive guards on .idle/.unknown, so a new Go Live
+    ///   cannot begin while the orphan cleanup is awaiting OBS) and the cleanup
+    ///   settles `.idle` only on confirmation, else `.stopUnconfirmed`.
+    /// Invariant: anything that MAY have issued StartStream never settles
+    /// `.idle` without a confirmed cleanup.
+    ///
+    /// Synchronous ON PURPOSE: the caller is usually a CANCELLED task (that's
+    /// why its start went stale), and cancellation-aware requests issued from
+    /// it would resolve instantly without ever sending StopStream. All state
+    /// reservations happen in this synchronous segment; the cleanup awaits run
+    /// in a fresh unstructured task that does not inherit the cancellation.
+    private func settleStaleStart(outcome: OBSController.StartOutcome) {
+        switch outcome {
+        case .notIssued:
+            deps.log("OBS: stale go-live attempt discarded — nothing was issued")
+
+        case .confirmedLive:
+            discardStaleGoLive()
+
+        case .issuedUnconfirmed:
+            switch broadcastState {
+            case .connecting, .live, .endingSession:
+                // A newer broadcast owner is active: its own confirm/stop
+                // machinery governs the stream — never stop past it.
+                deps.log("OBS: stale go-live attempt discarded — a newer broadcast owns the stream")
+            case .unknown, .idle, .stopping, .stopUnconfirmed:
+                // No newer owner: the possibly-issued StartStream is an orphan
+                // only we can clean up. Take ownership SYNCHRONOUSLY (generation
+                // bump + .stopping reservation happen before any await, so a
+                // new Go Live is rejected while the cleanup is in flight).
+                deps.log("OBS: stale go-live attempt discarded — StartStream may have been issued; stopping and confirming")
+                broadcastGeneration += 1
+                let gen = broadcastGeneration
+                broadcastState = .stopping
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let confirmed = await self.obs.stopBroadcast(
+                        confirmPollSeconds: self.confirmPollSeconds,
+                        maxConfirmPolls: self.maxConfirmPolls)
+                    guard gen == self.broadcastGeneration else { return }   // superseded mid-cleanup
+                    self.settleAfterStop(confirmed: confirmed)
+                }
+            }
         }
+    }
+
+    /// Stale-SUCCESS landing (review7 P1). NEVER sends StopStream while a
+    /// newer broadcast is active or connecting — that stop would kill the
+    /// newer owner's stream (the exact bug the internal StopStream-on-expiry
+    /// in OBSController used to cause). Only a stale success with no newer
+    /// owner may undo the stream it started, and that stop must be CONFIRMED:
+    /// an unconfirmed cleanup escalates a (previously confirmed) .idle to
+    /// .stopUnconfirmed honestly rather than leaving a possibly-live OBS
+    /// behind an idle UI. (Review8: with the cancellation-aware client a stale
+    /// SUCCESS needs the confirm response to beat the cancel — rare but real —
+    /// so this path is kept; the cleanup runs in a fresh task for the same
+    /// reason as `settleStaleStart`.)
+    private func discardStaleGoLive() {
         switch broadcastState {
         case .connecting, .live, .endingSession, .unknown:
             // .unknown: OBS state is unconfirmed — a stop could kill a stream we
@@ -469,12 +531,16 @@ public final class BroadcastController {
             deps.log("OBS: stale go-live attempt discarded — a newer broadcast owns the stream")
         case .idle, .stopping, .stopUnconfirmed:
             deps.log("OBS: stale go-live attempt discarded — stopping the stream it started")
-            let confirmed = await obs.stopBroadcast(confirmPollSeconds: confirmPollSeconds,
-                                                    maxConfirmPolls: maxConfirmPolls)
-            if !confirmed, broadcastState == .idle {
-                broadcastState = .stopUnconfirmed
-                deps.log("OBS: stale go-live cleanup stop not confirmed — OBS may still be live")
-                deps.presentError("OBS may still be live — check OBS, then Retry.")
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let confirmed = await self.obs.stopBroadcast(
+                    confirmPollSeconds: self.confirmPollSeconds,
+                    maxConfirmPolls: self.maxConfirmPolls)
+                if !confirmed, self.broadcastState == .idle {
+                    self.broadcastState = .stopUnconfirmed
+                    self.deps.log("OBS: stale go-live cleanup stop not confirmed — OBS may still be live")
+                    self.deps.presentError("OBS may still be live — check OBS, then Retry.")
+                }
             }
         }
     }

@@ -271,8 +271,8 @@ final class OBSControllerTests: XCTestCase {
 
     func testStartBroadcastSendsSceneThenStreamAndConfirmsActive() async throws {
         let (controller, mock) = try await makeConnectedController(streamStatusActive: true)
-        let ok = await controller.startBroadcast(scene: "Stack", confirmPollSeconds: 0, maxConfirmPolls: 3)
-        XCTAssertTrue(ok)
+        let outcome = await controller.startBroadcast(scene: "Stack", confirmPollSeconds: 0, maxConfirmPolls: 3)
+        XCTAssertEqual(outcome, .confirmedLive)
         let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
                                    .map { requestType(fromSent: $0) }
         XCTAssertTrue(types.contains("SetCurrentProgramScene"))
@@ -294,20 +294,40 @@ final class OBSControllerTests: XCTestCase {
         controller.disconnect()
     }
 
-    func testStartBroadcastNeverActiveReturnsFalseAndSendsNoStop() async throws {
+    func testStartBroadcastNeverActiveReturnsIssuedUnconfirmedAndSendsNoStop() async throws {
         // GetStreamStatus always reports outputActive:false → give up, return
-        // false, and send NOTHING further. Review7 P1: the CALLER owns cleanup —
-        // an internal StopStream-on-expiry here fired before the caller's
-        // generation check could run, so a stale attempt could kill a newer
-        // broadcast's stream.
+        // .issuedUnconfirmed (review8: StartStream WAS sent, so the boundary is
+        // "issued but never confirmed"), and send NOTHING further. Review7 P1:
+        // the CALLER owns cleanup — an internal StopStream-on-expiry here fired
+        // before the caller's generation check could run, so a stale attempt
+        // could kill a newer broadcast's stream.
         let (controller, mock) = try await makeConnectedController(streamStatusActive: false)
-        let ok = await controller.startBroadcast(scene: "Stack", confirmPollSeconds: 0, maxConfirmPolls: 3)
-        XCTAssertFalse(ok)
+        let outcome = await controller.startBroadcast(scene: "Stack", confirmPollSeconds: 0, maxConfirmPolls: 3)
+        XCTAssertEqual(outcome, .issuedUnconfirmed)
         let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
                                    .map { requestType(fromSent: $0) }
         XCTAssertTrue(types.contains("StartStream"))
         XCTAssertFalse(types.contains("StopStream"),
                        "startBroadcast must not stop on failure — the caller owns cleanup")
+        controller.disconnect()
+    }
+
+    /// Review8 item 1: a startBroadcast whose task is already cancelled at the
+    /// issuance boundary returns .notIssued and sends NO StartStream — the
+    /// conservative boundary's only "confirmed not sent" case.
+    func testStartBroadcastCancelledBeforeIssuanceReturnsNotIssued() async throws {
+        let (controller, mock) = try await makeConnectedController(streamStatusActive: false)
+        let task = Task { await controller.startBroadcast(scene: nil as String?,
+                                                          confirmPollSeconds: 0,
+                                                          maxConfirmPolls: 1) }
+        task.cancel()   // before the body runs — we're on the same actor
+        let outcome = await task.value
+        XCTAssertEqual(outcome, .notIssued)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
+                                   .map { requestType(fromSent: $0) }
+        XCTAssertFalse(types.contains("StartStream"),
+                       "a .notIssued outcome guarantees StartStream was never sent")
         controller.disconnect()
     }
 

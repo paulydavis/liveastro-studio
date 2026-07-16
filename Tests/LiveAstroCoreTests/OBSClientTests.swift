@@ -276,6 +276,60 @@ final class OBSClientTests: XCTestCase {
         }
     }
 
+    // MARK: - Cancellation (review8 item 1)
+
+    /// A request whose task is cancelled BEFORE the request body runs resumes
+    /// immediately with CancellationError and sends NOTHING — the cancel-before-
+    /// continuation-registration race must not wait out the timeout.
+    func testRequestCancelledBeforeStartResolvesImmediatelyAndSendsNothing() async throws {
+        let mock = MockOBSSocket()
+        let client = OBSClient(socket: mock, requestTimeout: 10)
+        try await connect(client, mock)
+        mock.replyToLastSent(nil)
+        let sentBefore = mock.sentFrames.count
+
+        let task = Task { try await client.request("GetVersion", data: nil) }
+        task.cancel()   // before the request body ever runs
+
+        let started = Date()
+        do {
+            _ = try await task.value
+            XCTFail("Expected CancellationError")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "got \(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2,
+                          "a pre-cancelled request must not wait for the 10 s timeout")
+        // The send must never have been enqueued — cancellation was confirmed
+        // before the issuance boundary.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(mock.sentFrames.count, sentBefore,
+                       "a request cancelled before enqueue must send no frame")
+    }
+
+    /// A request cancelled while in flight (sent, unanswered) resumes promptly
+    /// with CancellationError instead of hanging until the timeout.
+    func testRequestCancelledInFlightResolvesPromptly() async throws {
+        let mock = MockOBSSocket()
+        let client = OBSClient(socket: mock, requestTimeout: 10)
+        try await connect(client, mock)
+        mock.replyToLastSent(nil)   // never answer
+
+        let task = Task { try await client.request("GetVersion", data: nil) }
+        try await waitUntil { await mock.sentFrames.filter { $0.contains("\"op\":6") }.count == 1 }
+
+        let started = Date()
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected CancellationError")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "got \(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2,
+                          "an in-flight cancel must resolve promptly, not at the timeout")
+    }
+
     // MARK: - Helpers
 
     /// Poll an async predicate until true or a deadline; fail the test on timeout.
