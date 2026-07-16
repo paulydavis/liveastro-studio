@@ -69,9 +69,28 @@ public actor OBSClient {
     /// Perform the obs-websocket handshake: receive Hello, send Identify
     /// (with auth computed from the Hello challenge when a password is supplied
     /// and the server requires it), and wait for Identified.
+    ///
+    /// Review10 finding 6 (SPLIT-SNAPSHOT/OWNERSHIP RACES — ownership half):
+    /// once `socket.connect` has opened a connection, this method OWNS it.
+    /// Every post-connect failure path (bad Hello, auth required but missing,
+    /// send failure, bad Identified) closes the socket before throwing —
+    /// pre-fix the failed handshakes leaked the open connection, and the
+    /// auto-launch retry loop accumulated orphaned sockets.
     public func connect(url: URL, password: String?) async throws {
         try await socket.connect(url: url)
+        do {
+            try await performHandshake(password: password)
+        } catch {
+            socket.close()   // single exit for every post-connect failure
+            throw error
+        }
+        connected = true
+        startReceiveLoop()
+    }
 
+    /// The handshake proper — factored out so `connect` can guarantee the
+    /// opened socket is closed on ANY failure path (review10 finding 6).
+    private func performHandshake(password: String?) async throws {
         // 1. Hello (op 0).
         let helloText = try await socket.receive()
         guard case .hello(let hello)? = OBSMessage.parse(helloText) else {
@@ -102,9 +121,6 @@ public actor OBSClient {
         guard case .identified? = OBSMessage.parse(identifiedText) else {
             throw OBSError.authFailed
         }
-
-        connected = true
-        startReceiveLoop()
     }
 
     // MARK: - Request

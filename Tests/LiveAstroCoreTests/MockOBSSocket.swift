@@ -52,6 +52,10 @@ final class MockOBSSocket: OBSSocket {
     /// All frames passed to `send(_:)`, in order.
     private(set) var sentFrames: [String] = []
 
+    /// Number of `close()` calls observed (review10 finding 6: every failed
+    /// post-connect handshake must close the socket it opened).
+    private(set) var closeCount = 0
+
     // MARK: - Private
 
     private let queue = InboundQueue()
@@ -79,6 +83,7 @@ final class MockOBSSocket: OBSSocket {
     }
 
     func close() {
+        closeCount += 1
         Task { await queue.finish(throwing: CancellationError()) }
     }
 

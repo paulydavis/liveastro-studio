@@ -290,6 +290,65 @@ final class FaultMatrixLifecycleTests: XCTestCase {
         consumer.releaseNow()   // let the wedged task exit so the process ends cleanly
     }
 
+    /// Cold1 I1 (red-first: pre-fix end() parked on an UNBOUNDED consumeDone.wait() on the
+    /// finite branch — this test's expectation TIMES OUT and FAILS rather than hanging the
+    /// suite): a finite import whose consumer wedges (models a stalled SMB read pinning the
+    /// import pull) must not pin end() forever. The finite drain uses the same two-stage
+    /// bounded machinery as the live branch, made PROGRESS-AWARE: a healthy import drains
+    /// completely (frames keep committing), and only a no-progress window of
+    /// drainPrimaryTimeout triggers cancel (cursor stopped via the cancelImport machinery)
+    /// + grace → shutdownTimeout. A hung blocking read cannot be interrupted mid-syscall —
+    /// the bound is on OUR wait; the task is cancelled and abandoned honestly, and
+    /// finalization is refused (no end_time, no master.fit).
+    func testPipelineEnd_finiteImportStalled_boundedThrowsShutdownTimeout() throws {
+        let fs = try TempFS("pipe-finite-stall"); defer { fs.tearDown() }
+        let sessions = try fs.dir("sessions")
+        let good1 = Self.starField(name: "sub_000.fit", dx: 0, dy: 0)
+        let good2 = Self.starField(name: "sub_001.fit", dx: 1.1, dy: -0.9)
+        let pipeline = SessionPipeline(
+            nativeSource: FaultMatrixLifecycleTests.ArrayFrameSource([good1, good2]),
+            engine: StackEngine(), profile: profile("FiniteStall"), rootDirectory: sessions)
+        let consumer = SlowConsumer()
+        pipeline.onUpdate = { _, _ in consumer.wedge() }   // frame 1 wedges the import consumer
+        var log: [String] = []
+        let logLock = NSLock()
+        pipeline.onLog = { msg in logLock.withLock { log.append(msg) } }
+        pipeline.drainPrimaryTimeout = .milliseconds(200)
+        pipeline.drainGraceTimeout = .milliseconds(200)
+        try pipeline.start()
+        XCTAssertEqual(consumer.entered.wait(timeout: .now() + 5), .success,
+                       "consumer must reach the wedge point")
+
+        // end() off-thread behind an expectation: pre-fix it never returned, and the
+        // expectation fails at its own timeout instead of wedging the suite.
+        let returned = expectation(description: "end() returns within the bounded drain")
+        let errBox = CapturedErrorBox()
+        Thread.detachNewThread {
+            do { _ = try pipeline.end() } catch { errBox.set(error) }
+            returned.fulfill()
+        }
+        wait(for: [returned], timeout: 10)
+        XCTAssertEqual(errBox.value as? SessionPipelineError, .shutdownTimeout,
+                       "a stalled finite drain must refuse to finalize with shutdownTimeout")
+
+        // No finalization happened: end_time never stamped, no master.fit written.
+        let dir = pipeline.session.sessionDirectory!
+        let manifest = try ManifestCoding.decoder()
+            .decode(SessionManifest.self,
+                    from: Data(contentsOf: dir.appendingPathComponent("manifest.json")))
+        XCTAssertNil(manifest.endTime, "a stalled end must not stamp end_time")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("master.fit").path),
+            "no master.fit may be finalized over a stalled import")
+        let captured = logLock.withLock { log }
+        XCTAssertTrue(captured.joined(separator: "\n").contains("refusing to finalize"),
+                      "the stall must appear honestly in the log — got \(captured)")
+        // Release the wedge (twice: a second in-flight commit may wedge after the first)
+        // so the abandoned task exits and the process ends cleanly.
+        consumer.releaseNow()
+        consumer.releaseNow()
+    }
+
     /// Pipeline mid-session × frame flood + one hostile file: a mixed stream (valid, truncated,
     /// valid) through the import path → exactly the truncated one is rejected+logged and both valids
     /// are accepted (invariant: lose a frame, never the session). Oracle: manifest lists exactly the
@@ -672,4 +731,11 @@ final class AtomicIntBox {
     private let lock = NSLock(); private var v = 0
     var value: Int { lock.withLock { v } }
     func increment() { lock.withLock { v += 1 } }
+}
+
+/// Lock-guarded capture of an error thrown on another thread (cold1 I1 cell).
+final class CapturedErrorBox: @unchecked Sendable {
+    private let lock = NSLock(); private var err: Error?
+    func set(_ e: Error) { lock.withLock { err = e } }
+    var value: Error? { lock.withLock { err } }
 }

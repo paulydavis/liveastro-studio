@@ -484,7 +484,12 @@ private struct OBSSection: View {
                     // the link comes up the controller RECONCILES broadcastState with
                     // OBS's actual stream/record state (review7: an already-streaming
                     // OBS is adopted, never offered a double-starting Go Live).
+                    // Cold-review1 finding 2: the enable-state mirrors the
+                    // controller's entry guard — Connect is only legal when no
+                    // broadcast machinery owns the session (the guard also no-ops
+                    // defensively, so a stale render can't slip a reconnect in).
                     Button("Connect") { model.broadcast.beginConnectAndReconcile() }
+                        .disabled(!model.broadcast.connectAllowed)
                 }
             }
 

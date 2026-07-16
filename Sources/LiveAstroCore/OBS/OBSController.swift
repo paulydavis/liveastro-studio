@@ -142,6 +142,15 @@ public final class OBSController: ObservableObject {
         state = .connected
         subscribeToEvents(of: client, epoch: epoch)
         await seedState(epoch: epoch)
+        // Review10 finding 5 (SPLIT-SNAPSHOT/OWNERSHIP RACES): the connection
+        // may have DIED during the seed (a socket failure converges to
+        // .disconnected and bumps the epoch) — returning true unconditionally
+        // here reported success from a stale task over a dead session.
+        // Revalidate identity and liveness before claiming success.
+        guard epoch == connectionEpoch, self.client === client,
+              state == .connected || state == .streaming else {
+            return false
+        }
         return true
     }
 
@@ -333,16 +342,31 @@ public final class OBSController: ObservableObject {
     /// no client, or an unconfirmed stop — the caller must then treat OBS as
     /// possibly still live (review6 P1: no idle-despite-unknown-remote-state).
     /// At least one confirmation poll is always performed.
+    ///
+    /// Review10 finding 1 (SPLIT-SNAPSHOT/OWNERSHIP RACES): the confirmation
+    /// here is assembled from TWO sequential status reads — a stream RESTART
+    /// landing between them would be invisible to the second read and the
+    /// stale pair would confirm a stop over a live stream. When the caller
+    /// supplies `outputEventGeneration` (BroadcastController's output-event
+    /// counter), each poll captures it BEFORE its first read and revalidates
+    /// AFTER its last: a torn snapshot discards the conclusion and re-reads
+    /// (bounded by `maxConfirmPolls`); exhaustion returns `false` — the caller
+    /// settles `.stopUnconfirmed`, never `.idle`, from a torn confirmation.
     @discardableResult
     public func stopBroadcast(confirmPollSeconds: Double = 1.0,
-                              maxConfirmPolls: Int = 5) async -> Bool {
+                              maxConfirmPolls: Int = 5,
+                              outputEventGeneration: (() -> Int)? = nil) async -> Bool {
         await stopStream()
         await setRecording(false)
         for i in 0..<max(1, maxConfirmPolls) {
+            let snapshot = outputEventGeneration?()   // capture before the first read
             if let stream = await streamStatus(), !stream.active,
                let recording = await recordStatus(), !recording {
-                log("broadcast confirmed stopped")
-                return true
+                if snapshot == outputEventGeneration?() {   // revalidate after the last
+                    log("broadcast confirmed stopped")
+                    return true
+                }
+                log("output event landed mid-confirmation — snapshot torn, re-reading")
             }
             if i < maxConfirmPolls - 1, confirmPollSeconds > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(confirmPollSeconds * 1_000_000_000))
@@ -360,6 +384,14 @@ public final class OBSController: ObservableObject {
     /// 2): the epoch captured alongside the client identifies which session
     /// generated the error, so a stale client's death can never tear down a
     /// newer connection.
+    ///
+    /// Cold-review1 finding 3: whether the handshake was COMPLETE when the
+    /// request was issued is captured alongside the epoch. A request issued
+    /// mid-handshake (state `.connecting` — a scene-automation tick or a
+    /// stop racing a Go Live's connect) throws `.notConnected` from the
+    /// not-yet-identified client; that is NOT a liveness signal about an
+    /// established session, and pre-fix it converged anyway — teardown()
+    /// cancelled the in-flight connect. Such a request now fails alone.
     @discardableResult
     private func requestData(_ type: String, _ data: [String: Any]?) async -> [String: Any]? {
         guard let client else {
@@ -367,11 +399,13 @@ public final class OBSController: ObservableObject {
             return nil
         }
         let epoch = connectionEpoch
+        let issuedAgainstCompletedHandshake = state == .connected || state == .streaming
         do {
             return try await client.request(type, data: data)
         } catch {
             log("\(type) failed: \(error)")
-            handle(error: error, epoch: epoch)
+            handle(error: error, epoch: epoch,
+                   issuedAgainstCompletedHandshake: issuedAgainstCompletedHandshake)
             return nil
         }
     }
@@ -379,10 +413,19 @@ public final class OBSController: ObservableObject {
     /// Converge state on a dropped connection — the failed request is a
     /// liveness signal. Epoch-guarded (review8 item 2): only the client whose
     /// epoch generated the error may tear the session down; errors surfacing
-    /// from an already-superseded client touch nothing.
-    private func handle(error: Error, epoch: Int) {
+    /// from an already-superseded client touch nothing. Handshake-guarded
+    /// (cold-review1 finding 3): only a request issued against a COMPLETED
+    /// handshake carries liveness information — a mid-handshake
+    /// `.notConnected` says "not connected YET", and converging on it killed
+    /// the very connect it raced.
+    private func handle(error: Error, epoch: Int,
+                        issuedAgainstCompletedHandshake: Bool) {
         if case OBSClient.OBSError.notConnected = error {
             guard epoch == connectionEpoch else { return }
+            guard issuedAgainstCompletedHandshake else {
+                log("request issued mid-handshake failed — connect attempt unaffected")
+                return
+            }
             if state != .disconnected {
                 log("connection lost — converging to .disconnected")
                 teardown()
