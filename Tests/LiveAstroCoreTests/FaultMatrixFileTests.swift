@@ -687,6 +687,54 @@ final class FaultMatrixFileTests: XCTestCase {
         XCTAssertTrue(newFileEmit, "a new file in the swapped-in directory must be detected")
     }
 
+    /// Watcher × regular-file-at-folder-path (P2, review3): after the watched folder disappears, a
+    /// REGULAR FILE created at the exact folder path must NOT be mistaken for recovery. Before the
+    /// fix, `fileExists(atPath:)` accepted any node and `open(O_EVTONLY)` succeeds on a regular
+    /// file, so the return path armed against the file and logged "resuming" while directory
+    /// enumeration could never work — a dishonest recovery claim. After the fix, recovery requires
+    /// an actual DIRECTORY at the path; a non-directory node is treated as still-missing (no
+    /// "resuming" claim, no per-tick log spam), and genuine recovery proceeds normally once a real
+    /// directory is back.
+    func testWatcher_regularFileAtFolderPath_notMistakenForRecovery() async throws {
+        let fs = try TempFS("watch-file-at-path"); defer { fs.tearDown() }
+        let folder = try fs.dir("watched")
+        let watcher = StackFileWatcher(folder: folder, quietPeriod: 0.1, pollInterval: 0.3,
+                                       fileNamePrefix: "live_stack")
+        let logs = WatcherLogSink()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start(); defer { watcher.stop() }
+
+        // Disappear — logged once.
+        try Disruptor.removeDirectory(folder)
+        let disappeared = await logs.waitForCount(containing: "watched folder disappeared",
+                                                  atLeast: 1, timeout: 5)
+        XCTAssertTrue(disappeared, "disappearance must be logged")
+
+        // A regular FILE now occupies the exact folder path. fileExists(atPath:) is true and
+        // open(O_EVTONLY) would succeed — but this is NOT a directory, so it is NOT recovery.
+        try Data("impostor — not a directory".utf8).write(to: folder)
+        // Fixed observation window across several poll ticks (~4-5 at 0.3 s) for the NEGATIVE
+        // assertions: no "resuming" claim, and no per-tick re-log of the disappearance.
+        try await Task.sleep(nanoseconds: 1_400_000_000)
+        XCTAssertEqual(logs.count(containing: "resuming"), 0,
+                       "P2: a regular file at the folder path must NOT be claimed as recovery ('resuming')")
+        XCTAssertEqual(logs.count(containing: "watched folder disappeared"), 1,
+                       "still exactly one disappearance log — no per-tick spam while the impostor sits there")
+
+        // Remove the impostor and recreate a REAL directory → normal recovery.
+        try Disruptor.deleteFile(folder)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let resumed = await logs.waitForCount(containing: "watched folder returned — resuming",
+                                              atLeast: 1, timeout: 5)
+        XCTAssertTrue(resumed, "genuine directory recreation must log 'resuming'")
+
+        // And a new file in the recovered directory is emitted (recovery is real, not just claimed).
+        try makeFITS(0.5, size: 32).write(to: folder.appendingPathComponent("live_stack.fit"))
+        let got = await collector.waitForCount(1, timeout: 6)
+        XCTAssertTrue(got, "a new file after genuine recovery must be emitted")
+    }
+
     /// Thread-safe log sink for watcher tests (the watcher logs on its serial queue; the test reads
     /// from its own thread) — lock-protected (F5 pattern).
     private final class WatcherLogSink {
