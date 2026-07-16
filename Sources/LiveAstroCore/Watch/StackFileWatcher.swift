@@ -174,7 +174,12 @@ public final class StackFileWatcher {
         /// filesystem timestamps can leave (dev, ino, size, mtime-ns) identical
         /// across a real content change, so every stable sighting is fully
         /// re-hashed (exactly the pre-review7 strictness) and dedup happens on
-        /// the digest alone.
+        /// the digest alone. A NEW digest additionally passes the
+        /// digest-stability gate (review8 finding 1): it is emitted only after
+        /// the SAME digest is observed again at least `quietPeriod` of
+        /// monotonic time later — one extra poll tick of latency per
+        /// live_stack update, in exchange for not publishing a mid-rewrite
+        /// pause's temporary A/B hybrid.
         case mutableStackerOutput
     }
 
@@ -186,6 +191,9 @@ public final class StackFileWatcher {
 
     private let folder: URL
     private let quietPeriod: TimeInterval
+    /// `quietPeriod` in nanoseconds — the digest-stability gate's minimum monotonic
+    /// separation between the two observations of a new digest (review8 finding 1).
+    private var quietPeriodNanos: UInt64 { UInt64((quietPeriod * 1_000_000_000).rounded()) }
     private let pollInterval: TimeInterval
     private let queue = DispatchQueue(label: "liveastro.watcher")
     private var continuation: AsyncStream<StackUpdate>.Continuation!
@@ -268,6 +276,21 @@ public final class StackFileWatcher {
     /// happen to match the old file's last observation.
     private var lastSeenStat: [String: FileIdentity] = [:]
     private var lastEmittedDigest: [String: String] = [:]
+
+    /// Digest-stability gate state (review8 finding 1, `.mutableStackerOutput`
+    /// only): a NEW digest observed on a stat-stable file, the stat identity it
+    /// was observed under, and WHEN it was first observed (monotonic ns). The
+    /// digest is emitted only once a later scan observes the SAME digest under
+    /// the SAME stat identity at least `quietPeriod` later — the two-tick stat
+    /// philosophy mirrored at the content level. The gate restarts whenever the
+    /// digest changes, the stat identity changes, or the folder generation
+    /// changes (disappear/replace/re-arm — cleared with the pending stat map).
+    private struct PendingContent {
+        let digest: String
+        let identity: FileIdentity
+        let firstObservedNanos: UInt64
+    }
+    private var pendingContent: [String: PendingContent] = [:]
     /// Stat identity (digest nil) of the version whose digest currently sits in
     /// `lastEmittedDigest[name]` (review7 P2). Under `.immutableAfterPublish`,
     /// a candidate whose observed identity equals this entry skips ALL content
@@ -282,6 +305,21 @@ public final class StackFileWatcher {
     /// `.mutableStackerOutput`. Mutated on the internal serial queue; tests
     /// read it only after quiescent waits.
     internal private(set) var digestComputations: Int = 0
+
+    /// Monotonic now, in nanoseconds (review8 finding 1). DispatchTime rides
+    /// CLOCK_UPTIME_RAW — never wall-adjusted, never goes backwards — which is
+    /// what the digest-stability gate's separation requirement needs (Date/
+    /// wall-clock can jump). Injectable for tests ONLY: a manual clock lets the
+    /// quiet-period separation be exercised without wall-clock sleeps. Read on
+    /// the internal serial queue; tests install it before start().
+    internal var monotonicNowNanos: () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+
+    /// Run ONE synchronous scan on the watcher's serial queue (test seam, same
+    /// internal-for-testability rationale as `enumerateDirectory`/`openFile`).
+    /// Tests park the debounce and poll timer on huge intervals and call this
+    /// to choreograph exact scan sequences deterministically. Production code
+    /// never calls it.
+    internal func scanNow() { queue.sync { scan() } }
 
     private let fileNamePrefix: String?
     private let digestPolicy: DigestPolicy
@@ -396,6 +434,9 @@ public final class StackFileWatcher {
                 // stability across ticks. The emitted-digest map is RETAINED so dedup survives a
                 // disappear→return (a truly identical, already-emitted file is not re-emitted).
                 lastSeenStat.removeAll()
+                // Review8 finding 1: pending content observations belong to the folder
+                // generation they were made in — the gate restarts after a return.
+                pendingContent.removeAll()
             }
             if nodeExists {
                 // Something non-directory occupies the watched path. Log once per occupation
@@ -506,7 +547,13 @@ public final class StackFileWatcher {
             // full declared size and then fills pixels in place satisfies size>=declared on the
             // first sighting; the stability requirement holds it back until the in-place writes
             // stop. A same-name replacement (new inode) re-earns stability from scratch.
-            guard previous == observed else { continue }
+            guard previous == observed else {
+                // Review8 finding 1: a stat-identity change restarts the digest-stability
+                // gate — a pending content observation is only meaningful under the exact
+                // identity it was observed with.
+                pendingContent[name] = nil
+                continue
+            }
 
             if isFITS {
                 // Bulletproof completeness: header declares exact expected data length (spec §5.2),
@@ -532,6 +579,9 @@ public final class StackFileWatcher {
             guard let finalStat = Self.statFile(handle) else { continue }
             guard finalStat == observed else {
                 lastSeenStat[name] = finalStat
+                // Review8 finding 1: the identity moved mid-scan — restart the
+                // digest-stability gate along with stat stability.
+                pendingContent[name] = nil
                 continue
             }
 
@@ -540,7 +590,45 @@ public final class StackFileWatcher {
                 // rewrite of the same bytes): record the new identity as the
                 // emitted version so `.immutableAfterPublish` stops re-hashing it.
                 lastEmittedIdentity[name] = observed
+                // Review8 finding 1: an already-emitted digest supersedes any pending
+                // observation — the file settled back onto known content, and the
+                // pending digest was never observed long enough to count.
+                pendingContent[name] = nil
                 continue
+            }
+
+            // Digest-stability gate (review8 finding 1, `.mutableStackerOutput` only).
+            // Stat stability cannot see an in-place rewriter that PAUSES mid-rewrite:
+            // the size is unchanged and a coarse or restored mtime can collide, so the
+            // digest just computed may describe a temporary A/B hybrid — and consumer-
+            // side digest verification would then faithfully verify that exact hybrid,
+            // because it proves byte identity, not producer completeness. Mirror the
+            // two-tick stat philosophy at the content level: a NEW digest is emitted
+            // only after the SAME digest is observed again, under the SAME stat
+            // identity, at least `quietPeriod` of MONOTONIC time later. The elapsed-
+            // time requirement matters because the event debounce and the poll timer
+            // share this queue: two scans can land almost back-to-back, and two
+            // near-simultaneous sightings prove nothing. A DIFFERENT digest replaces
+            // the pending one (still unemitted); a stat-identity change or a folder-
+            // generation change restarts the gate. Honestly: passing this gate proves
+            // only that the content remained unchanged for the quiet period — it does
+            // NOT prove the producer's transaction ended; producer-side atomic
+            // snapshots are the only absolute guarantee. Cost: one extra poll tick of
+            // latency per live_stack update. `.immutableAfterPublish` is unchanged —
+            // its files are immutable once published by policy, and the identity gate
+            // above already governs them.
+            if digestPolicy == .mutableStackerOutput {
+                let now = monotonicNowNanos()
+                if let pending = pendingContent[name], pending.digest == digest,
+                   pending.identity == observed {
+                    guard now >= pending.firstObservedNanos,
+                          now - pending.firstObservedNanos >= quietPeriodNanos else { continue }
+                    pendingContent[name] = nil
+                } else {
+                    pendingContent[name] = PendingContent(digest: digest, identity: observed,
+                                                          firstObservedNanos: now)
+                    continue
+                }
             }
 
             // Yield-time revalidation (review5 item 1): the emitted URL is still a PATH the
@@ -571,6 +659,8 @@ public final class StackFileWatcher {
         onLog?("watched folder was replaced — re-arming: \(folder.path)")
         cancelSource()
         lastSeenStat.removeAll()
+        // Review8 finding 1: the digest-stability gate restarts with the folder generation.
+        pendingContent.removeAll()
         folderMissing = true
     }
 

@@ -164,13 +164,16 @@ final class StackFileWatcherTests: XCTestCase {
     }
 
     /// Mutate ONE interior byte of `url` in place (same size), then restore the file's
-    /// mtime to `identity`'s ns-exact value — a manufactured identity collision.
+    /// mtime to `identity`'s ns-exact value — a manufactured identity collision. `byte`
+    /// selects the content version (review8: tests distinguish a mid-rewrite hybrid from
+    /// the finished rewrite by writing different bytes at the same offset).
     private func mutateInteriorPreservingIdentity(_ url: URL, byteFromEnd: Int,
-                                                  identity: FileIdentity) throws {
+                                                  identity: FileIdentity,
+                                                  byte: UInt8 = 0xAB) throws {
         let fh = try FileHandle(forWritingTo: url)
         let size = try fh.seekToEnd()
         try fh.seek(toOffset: size - UInt64(byteFromEnd))
-        fh.write(Data([0xAB]))
+        fh.write(Data([byte]))
         try fh.close()
         setMtime(url, sec: identity.mtimeSec, nsec: identity.mtimeNsec)
         XCTAssertEqual(FileIdentity.capture(url: url), identity,
@@ -221,7 +224,10 @@ final class StackFileWatcherTests: XCTestCase {
     /// deterministically. utimensat stands in for the REAL-WORLD case identity-gating
     /// cannot see: coarse or cached filesystem timestamps letting an in-place rewrite land
     /// on the identical mtime. The MUTABLE policy must still re-hash the stable file and
-    /// EMIT the changed digest — the content update is never lost.
+    /// EMIT the changed digest — the content update is never lost. Review8 finding 1 adds
+    /// the digest-stability gate on top: the changed digest must be observed on TWO
+    /// separated scans before it emits, so the emission lands one poll tick later — the
+    /// intent (the stat-identical content change IS eventually emitted) is unchanged.
     func testMutablePolicy_identityCollisionStillEmitsChangedContent() async throws {
         watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.2,
                                    digestPolicy: .mutableStackerOutput)
@@ -266,6 +272,128 @@ final class StackFileWatcherTests: XCTestCase {
                        "identity collision is skipped by design under the immutable policy")
         XCTAssertEqual(watcher.digestComputations, hashesAfterEmit,
                        "no re-hash either — that is the entire point of the policy")
+    }
+
+    // MARK: - review8 finding 1: digest-stability gate (mutable policy)
+
+    /// Lock-protected manual monotonic clock injected through the watcher's
+    /// `monotonicNowNanos` seam: tests advance it explicitly, so the gate's quiet-period
+    /// separation requirement is exercised with ZERO wall-clock sleeps — the debounce and
+    /// poll timer are parked on huge intervals and scans are driven one at a time through
+    /// scanNow(). (The watcher reads the clock on its serial queue while the test thread
+    /// advances it — lock-protect, F5 pattern.)
+    private final class ManualClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var nanos: UInt64 = 1_000_000_000
+        func now() -> UInt64 { lock.withLock { nanos } }
+        func advance(seconds: TimeInterval) {
+            lock.withLock { nanos += UInt64(seconds * 1_000_000_000) }
+        }
+    }
+
+    /// A manually-driven watcher: debounce and poll parked on huge intervals (nothing runs
+    /// except explicit scanNow() calls) with an injected manual monotonic clock. The huge
+    /// quietPeriod is ALSO the digest-stability separation requirement, so tests must
+    /// advance the clock past it to confirm a pending digest.
+    private func makeManualWatcher(policy: StackFileWatcher.DigestPolicy,
+                                   clock: ManualClock) throws -> StackFileWatcher {
+        let w = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
+                                 digestPolicy: policy)
+        w.monotonicNowNanos = { clock.now() }
+        return w
+    }
+
+    /// Review8 finding 1 (red-first): stat stability is satisfied while an in-place
+    /// rewriter PAUSES mid-rewrite (size unchanged, mtime coarse/restored), so pre-fix the
+    /// watcher hashed the temporary A/B hybrid and emitted it immediately — and the
+    /// consumer then correctly verified that exact hybrid, because digest verification
+    /// proves byte identity, not producer completeness. The digest-stability gate must
+    /// hold a NEW digest as pending and emit only when the SAME digest is observed again
+    /// at least `quietPeriod` of MONOTONIC time later; a DIFFERENT digest on a later scan
+    /// replaces the pending one, still unemitted. The unfinished hybrid's digest must
+    /// never be emitted.
+    func testMutablePolicy_midRewritePause_hybridNeverEmitted() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let collector = collect(watcher)
+        try watcher.start()
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        try makeFITS(0.25, size: 16).write(to: url)
+        watcher.scanNow()                       // sighting — records stat
+        watcher.scanNow()                       // stable → digest A becomes pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // A confirmed after the quiet period → emits
+        let gotA = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(gotA, "version A emits")
+
+        let emitted = FileIdentity.capture(url: url)!
+        // Mid-rewrite pause: interior bytes hold the A/B hybrid H; the identity
+        // (size, mtime-ns) collides with the emitted version, so stat stability is
+        // already satisfied — pre-fix, this scan emitted H.
+        try mutateInteriorPreservingIdentity(url, byteFromEnd: 64, identity: emitted, byte: 0xAB)
+        let hybridDigest = FileIdentity.contentDigest(data: try Data(contentsOf: url))
+        watcher.scanNow()                       // H observed ONCE → pending, must NOT emit
+        let hybridEmitted = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(hybridEmitted,
+                       "a single sighting of a new digest must not emit (mid-rewrite pause)")
+
+        // The rewrite finishes: final version B, identity restored again (worst case).
+        try mutateInteriorPreservingIdentity(url, byteFromEnd: 64, identity: emitted, byte: 0xCD)
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // B ≠ pending H → pending replaced, no emit
+        let replacedEmitted = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(replacedEmitted,
+                       "a digest different from the pending one replaces it — H is never emitted")
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // B confirmed after the quiet period → emits
+        let gotB = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(gotB, "the finished rewrite emits")
+        let items = await collector.items
+        XCTAssertEqual(items.count, 2)
+        XCTAssertEqual(items[1].identity?.digest,
+                       FileIdentity.contentDigest(data: try Data(contentsOf: url)),
+                       "the second emission is the FINISHED rewrite")
+        XCTAssertFalse(items.contains { $0.identity?.digest == hybridDigest },
+                       "the unfinished hybrid's digest must never be emitted")
+    }
+
+    /// Review8 finding 1, confirmation path: a stat-identical rewrite (utimensat identity
+    /// collision) is emitted only on a SECOND sighting of the same digest separated by at
+    /// least `quietPeriod` of MONOTONIC time — near-back-to-back scans (the event debounce
+    /// and the poll timer share the serial queue) must NOT count as separated
+    /// observations. Exactly one emission for B; the content change is never lost.
+    func testMutablePolicy_sameDigestTwice_requiresQuietPeriodSeparation() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let collector = collect(watcher)
+        try watcher.start()
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        try makeFITS(0.25, size: 16).write(to: url)
+        watcher.scanNow()                       // sighting
+        watcher.scanNow()                       // stable → digest A pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // A confirmed → emits
+        let gotA = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(gotA, "version A emits")
+
+        let emitted = FileIdentity.capture(url: url)!
+        try mutateInteriorPreservingIdentity(url, byteFromEnd: 64, identity: emitted)
+        watcher.scanNow()                       // B observed once → pending
+        let firstSighting = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(firstSighting, "the first sighting of B must not emit")
+        watcher.scanNow()                       // same digest, ~zero monotonic separation
+        let backToBack = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(backToBack,
+                       "back-to-back scans are not separated observations — no emit before the quiet period")
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // same digest, separation satisfied → emits
+        let gotB = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(gotB,
+                      "B emits once its digest is observed unchanged across the quiet period")
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // already-emitted digest → dedup
+        let reEmitted = await collector.waitForCount(3, timeout: 0.3)
+        XCTAssertFalse(reEmitted, "B emits exactly once")
     }
 
     /// Review4 P2 (mid-scan TOCTOU): the structural property of fd-relative enumeration, tested
