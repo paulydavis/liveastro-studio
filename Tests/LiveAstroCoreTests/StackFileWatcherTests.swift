@@ -545,9 +545,14 @@ final class StackFileWatcherTests: XCTestCase {
     /// proves byte identity, not producer completeness. The digest-stability gate must
     /// hold a NEW digest as pending and emit only when the SAME digest is observed again
     /// at least `quietPeriod` of MONOTONIC time later; a DIFFERENT digest on a later scan
-    /// replaces the pending one, still unemitted. The unfinished hybrid's digest must
-    /// never be emitted.
-    func testMutablePolicy_midRewritePause_hybridNeverEmitted() async throws {
+    /// replaces the pending one, still unemitted.
+    ///
+    /// Review9 item 5 (honest scope): this proves the SHORT-pause case only — the pause
+    /// here does NOT span both gate observations (the rewrite finishes before the pending
+    /// hybrid could be confirmed). A writer that pauses on the hybrid through BOTH
+    /// observations DOES emit it — see
+    /// testMutablePolicy_pauseSpansBothObservations_hybridEmits_acceptedBoundary.
+    func testMutablePolicy_midRewritePause_shorterThanQuietPeriod_hybridNotEmitted() async throws {
         let clock = ManualClock()
         watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
         let collector = collect(watcher)
@@ -590,6 +595,42 @@ final class StackFileWatcherTests: XCTestCase {
                        "the second emission is the FINISHED rewrite")
         XCTAssertFalse(items.contains { $0.identity?.digest == hybridDigest },
                        "the unfinished hybrid's digest must never be emitted")
+    }
+
+    /// Review9 item 5 — the ACCEPTED DESIGN BOUNDARY, documented as behavior: a writer
+    /// that pauses on hybrid H through BOTH digest-gate observations EMITS H. The gate
+    /// proves only that the content remained unchanged for the quiet period; it cannot
+    /// prove the producer's transaction ended — from the watcher's side, a long pause on
+    /// a hybrid is indistinguishable from a finished write, and no amount of polling can
+    /// tell them apart. Only PRODUCER-SIDE atomic publication (write to a temp name, then
+    /// rename into place) is absolute. This test pins the limit honestly so a future
+    /// change that silently widens or narrows it fails loudly.
+    func testMutablePolicy_pauseSpansBothObservations_hybridEmits_acceptedBoundary() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let collector = collect(watcher)
+        try watcher.start()
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        try makeFITS(0.25, size: 16).write(to: url)
+        watcher.scanNow()                       // sighting
+        watcher.scanNow()                       // stable → digest A pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // A confirmed → emits
+        let gotA = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(gotA, "arrange: version A emits")
+
+        // The writer pauses on hybrid H — and stays paused across BOTH observations.
+        let emitted = FileIdentity.capture(url: url)!
+        try mutateInteriorPreservingIdentity(url, byteFromEnd: 64, identity: emitted, byte: 0xAB)
+        let hybridDigest = FileIdentity.contentDigest(data: try Data(contentsOf: url))
+        watcher.scanNow()                       // H observed once → pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // H observed AGAIN, quiet period elapsed → emits
+        let gotH = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(gotH, "the long-paused hybrid IS emitted — the accepted boundary")
+        let items = await collector.items
+        XCTAssertEqual(items.last?.identity?.digest, hybridDigest,
+                       "and the emitted digest is the hybrid's — this is the documented limit")
     }
 
     /// Review8 finding 1, confirmation path: a stat-identical rewrite (utimensat identity

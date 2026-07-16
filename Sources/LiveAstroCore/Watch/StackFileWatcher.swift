@@ -340,10 +340,16 @@ public final class StackFileWatcher {
 
     /// Count of full content digests computed by this watcher (review7 P2) —
     /// test-visible so the hashing cost model is pinned: flat after emission
-    /// under `.immutableAfterPublish`, growing per stable scan under
-    /// `.mutableStackerOutput`. Mutated on the internal serial queue; tests
-    /// read it only after quiescent waits.
-    internal private(set) var digestComputations: Int = 0
+    /// under `.immutableAfterPublish` (and for emitted numbered revisions under
+    /// `.mutableStackerOutput`), growing per stable scan for the classic
+    /// in-place file. Mutated only on the internal serial queue; the storage is
+    /// private and exposed through the queue-synchronized snapshot below.
+    private var _digestComputations: Int = 0
+    /// Queue-synchronized snapshot of `_digestComputations` (review9 item 6):
+    /// tests may read it while the repeating timers are live — the read hops
+    /// through the reentrancy-safe sync, so it never races the queue-confined
+    /// writes in scan().
+    internal var digestComputations: Int { onQueueSync { _digestComputations } }
 
     /// Monotonic now, in nanoseconds (review8 finding 1). DispatchTime rides
     /// CLOCK_UPTIME_RAW — never wall-adjusted, never goes backwards — which is
@@ -731,7 +737,7 @@ public final class StackFileWatcher {
                       observed.size >= header.minimumFileSize else { continue }
             }
 
-            digestComputations += 1
+            _digestComputations += 1
             guard let digest = FileIdentity.contentDigest(handle: handle, size: observed.size)
             else { continue }
 
@@ -775,13 +781,18 @@ public final class StackFileWatcher {
             // share this queue: two scans can land almost back-to-back, and two
             // near-simultaneous sightings prove nothing. A DIFFERENT digest replaces
             // the pending one (still unemitted); a stat-identity change or a folder-
-            // generation change restarts the gate. Honestly: passing this gate proves
-            // only that the content remained unchanged for the quiet period — it does
-            // NOT prove the producer's transaction ended; producer-side atomic
-            // snapshots are the only absolute guarantee. Cost: one extra poll tick of
-            // latency per live_stack update. `.immutableAfterPublish` is unchanged —
-            // its files are immutable once published by policy, and the identity gate
-            // above already governs them.
+            // generation change restarts the gate. THE ACCEPTED DESIGN BOUNDARY
+            // (review9 item 5): passing this gate proves only that the content
+            // remained unchanged for the quiet period — it does NOT prove the
+            // producer's transaction ended. A writer that pauses on a hybrid through
+            // BOTH observations therefore EMITS that hybrid: from this side of the
+            // filesystem a long pause is indistinguishable from a finished write, and
+            // no polling scheme can tell them apart. Only PRODUCER-SIDE atomic
+            // publication (temp name + rename into place) is absolute. Pinned by
+            // testMutablePolicy_pauseSpansBothObservations_hybridEmits_acceptedBoundary.
+            // Cost: one extra poll tick of latency per live_stack update.
+            // `.immutableAfterPublish` is unchanged — its files are immutable once
+            // published by policy, and the identity gate above already governs them.
             if digestPolicy == .mutableStackerOutput {
                 let now = monotonicNowNanos()
                 if let pending = pendingContent[name], pending.digest == digest,
