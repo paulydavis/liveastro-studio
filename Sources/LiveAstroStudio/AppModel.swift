@@ -395,9 +395,13 @@ final class AppModel {
         // Stop the relay (if any) immediately — before the pipeline drains.
         liveSource.stopRelay()
 
-        // Scene automation stops immediately, live broadcast state resets, and the
-        // deliberate end-of-session OBS stop is issued — all in the controller, at
-        // the same point the inline logic fired.
+        // Immediate part only: scene automation stops and live broadcast state
+        // resets at the click. The OBS stream/record stop is deferred to
+        // stopBroadcastAfterSessionEnd() below — strictly after p.end() returns
+        // or throws — matching the README: "End Session runs the replay
+        // generation first, then — and only then — stops the OBS stream and
+        // recording" (review4 P2: previously the stop Task fired here, racing
+        // the detached replay task).
         broadcast.sessionDidEnd()
 
         Task.detached { [weak self] in
@@ -417,6 +421,10 @@ final class AppModel {
                 self.importer.isGeneratingReplay = false
                 self.pipeline = nil
                 self.sessionEnd = Date()
+                // Common completion (success OR replay failure): only now stop
+                // the OBS stream/recording — a failed replay must still stop
+                // the stream, so this lives here, not on the success path.
+                self.broadcast.stopBroadcastAfterSessionEnd()
             }
         }
     }

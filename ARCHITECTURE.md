@@ -333,8 +333,9 @@ stall-based **scene automation** — a 15 s timer checks a `StallDetector`
 (threshold `max(3×subExposure, 90 s)`); on stall it switches to the scope scene
 once, on the next accepted frame back to the stack scene; an operator-initiated
 scene change pauses automation until the next stall/resume boundary. End
-Session is the **only** place the stream is stopped; quit/crash deliberately
-leaves an OBS broadcast running.
+Session is the **only** place the stream is stopped — and only after replay
+generation completes or fails (scene automation stops immediately at the
+click); quit/crash deliberately leaves an OBS broadcast running.
 
 ## 8. Key design decisions
 

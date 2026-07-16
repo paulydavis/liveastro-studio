@@ -6,9 +6,11 @@ import LiveAstroCore
 /// automation — the self-contained cluster extracted verbatim from `AppModel`
 /// (T1 of the AppModel decomposition). Holds no `AppModel` reference: all
 /// cross-cutting UI writes (log, error, session-running gate) flow through the
-/// injected `AppSurface`. `AppModel` drives the three session hooks
+/// injected `AppSurface`. `AppModel` drives the session hooks
 /// (`sessionDidStart` / `sessionDidEnd` / `frameAccepted`) at the exact points
-/// the moved logic used to run inline.
+/// the moved logic used to run inline, plus the deferred
+/// `stopBroadcastAfterSessionEnd()` once replay generation has completed or
+/// failed (review4 P2 — replay first, then stop the stream).
 @MainActor
 @Observable
 final class BroadcastController {
@@ -75,17 +77,18 @@ final class BroadcastController {
         startSceneAutomation(subExposureSeconds: subExposureSeconds)
     }
 
-    /// Session end: stop scene automation, reset any live broadcast state, and
-    /// issue the deliberate end-of-session OBS stop. Was the stopSceneAutomation
-    /// call + the broadcast-state reset + the deferred stopStream block in
-    /// endSession.
+    /// Session end, IMMEDIATE part: stop scene automation and reset any live
+    /// broadcast state — runs at the End Session click, so automation never
+    /// stays active during a (possibly long) replay render. The OBS
+    /// stream/record stop is NOT here: AppModel calls
+    /// `stopBroadcastAfterSessionEnd()` only after replay generation completes
+    /// or fails (review4 P2 — the README promises "replay first, then — and
+    /// only then — stop the stream", and now the code matches).
     func sessionDidEnd() {
-        // Scene automation stops immediately; the OBS stream/record stop is
-        // deferred until AFTER the pipeline end/replay flow below.
         stopSceneAutomation()
 
         // If a broadcast is live, reset its state so the UI returns to idle.
-        // The deliberate stopStream below acts as the safety net.
+        // The deliberate stopBroadcastAfterSessionEnd() acts as the safety net.
         if broadcastState == .live || broadcastState == .connecting {
             goLiveTask?.cancel()
             goLiveTask = nil
@@ -94,10 +97,14 @@ final class BroadcastController {
             streamHealth = nil
             broadcastState = .idle
         }
+    }
 
-        // Deliberate end-of-session stop — the ONLY place we ask OBS to stop the
-        // stream. App quit / abort paths never call this. Runs after the pipeline
-        // end() is kicked off above; ordering vs. replay generation is immaterial.
+    /// Session end, DEFERRED part: the deliberate end-of-session stop — the
+    /// ONLY place we ask OBS to stop the stream. Called by AppModel strictly
+    /// AFTER the pipeline's end()/replay generation returned or threw (a
+    /// replay failure still stops the stream). App quit / abort / crash paths
+    /// never call this — an accidental quit must never kill the broadcast.
+    func stopBroadcastAfterSessionEnd() {
         Task { [weak self] in
             guard let self else { return }
             await self.obs.stopStream()
