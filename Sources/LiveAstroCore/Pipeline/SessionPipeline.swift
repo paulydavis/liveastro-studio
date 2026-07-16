@@ -321,6 +321,19 @@ public final class SessionPipeline {
         }
     }
 
+    /// DispatchTimeInterval → seconds, for handing the drain budget to the watcher's
+    /// bounded stop (review10 item 3). `.never` and unknown cases map to infinity.
+    private static func seconds(_ interval: DispatchTimeInterval) -> TimeInterval {
+        switch interval {
+        case .seconds(let s):       return TimeInterval(s)
+        case .milliseconds(let ms): return TimeInterval(ms) / 1_000
+        case .microseconds(let us): return TimeInterval(us) / 1_000_000
+        case .nanoseconds(let ns):  return TimeInterval(ns) / 1_000_000_000
+        case .never:                return .infinity
+        @unknown default:           return .infinity
+        }
+    }
+
     /// Crop the master to its covered region (a copy). Returns the image
     /// unchanged when coverage is unavailable, the rect is nil, the rect is the
     /// full frame, or the crop would remove more than ~40% of the area.
@@ -344,10 +357,13 @@ public final class SessionPipeline {
     /// throw SessionPipelineError.shutdownTimeout rather than proceeding to finalize — a
     /// still-running consumer would race the accumulator/snapshots during finalization and could
     /// write a corrupt master. The previous code discarded the wait result and finalized anyway.
-    private func drainConsumeTaskOrThrow() throws {
-        let primary = drainPrimaryTimeout, grace = drainGraceTimeout
+    /// `primaryDeadline` (review10 item 3) lets the watcher path charge its bounded
+    /// watcher-stop against the SAME primary budget: stop + drain together never exceed
+    /// drainPrimaryTimeout (+ grace). nil → the full primary budget from now (native paths).
+    private func drainConsumeTaskOrThrow(primaryDeadline: DispatchTime? = nil) throws {
+        let grace = drainGraceTimeout
         guard let task = consumeTask else { return }
-        if consumeDone.wait(timeout: .now() + primary) == .success {
+        if consumeDone.wait(timeout: primaryDeadline ?? .now() + drainPrimaryTimeout) == .success {
             consumeTask = nil
             return
         }
@@ -386,8 +402,13 @@ public final class SessionPipeline {
             }
         } else {
             // Watcher mode: stop the watcher to terminate the updates stream, then drain.
-            watcher?.stop()
-            try drainConsumeTaskOrThrow()
+            // Review10 item 3: the watcher stop is itself BOUNDED and shares the primary
+            // drain budget — a scan stalled on a dead share can no longer pin end()
+            // outside the documented primary+grace timeout. The deadline is captured
+            // before the stop so stop-time is charged against the same budget.
+            let primaryDeadline = DispatchTime.now() + drainPrimaryTimeout
+            watcher?.stop(timeout: Self.seconds(drainPrimaryTimeout))
+            try drainConsumeTaskOrThrow(primaryDeadline: primaryDeadline)
         }
         if let meta = sourceMetadata { session.fillMissingMetadata(from: meta) }
         guard let dir = session.sessionDirectory else {

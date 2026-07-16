@@ -988,6 +988,78 @@ final class StackFileWatcherTests: XCTestCase {
                        "fast-path re-established by the dedup branch")
     }
 
+    // MARK: - review10 item 3: bounded stop behind a stalled scan
+
+    /// Review10 item 3 (pre-fix this test HANGS: stop() queue.sync'd behind the stalled
+    /// scan and never returned — a liveness bug, so red-first is the hang itself): a scan
+    /// stalled mid-file — modeled by parking the injected monotonic-clock read that sits
+    /// between the digest and the emission, consistent with the existing seams — must not
+    /// pin stop(). stop(timeout:) returns within its bound, logs the honest timeout line,
+    /// and the abandoned scan observes the stop flag at its next check and exits WITHOUT
+    /// emitting, with teardown following once the queue yields.
+    func testStop_boundedBehindStalledScan_logsTimeout_noEmissionAfterStop() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        watcher.scanNow()                    // sighting
+        watcher.scanNow()                    // stable → pending digest observation
+        clock.advance(seconds: 3601)         // the NEXT scan would confirm the gate and EMIT
+
+        // Stall that scan at its monotonic-clock read — after the hash, immediately
+        // before the gate confirms and the emission would fire.
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let stalledOnce = NSLock_Flag()
+        watcher.monotonicNowNanos = {
+            if !stalledOnce.isSet {
+                stalledOnce.set()
+                entered.signal()
+                release.wait()               // the scan is now wedged on the watcher queue
+            }
+            return clock.now()
+        }
+        let w = watcher!
+        let scanDone = DispatchSemaphore(value: 0)
+        Thread.detachNewThread { w.scanNow(); scanDone.signal() }
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success,
+                       "arrange: the scan is parked mid-file, pre-emission")
+
+        // stop() must return within its bound even though the queue is wedged…
+        let t0 = DispatchTime.now()
+        w.stop(timeout: 0.3)
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        XCTAssertLessThan(elapsed, 3.0, "stop() must be bounded behind a stalled scan")
+        XCTAssertTrue(logs.all.contains { $0.contains("watcher stop timed out behind a stalled read") },
+                      "…and must log the timeout honestly — got \(logs.all)")
+
+        // …and once the stall clears, the abandoned scan exits without emitting.
+        release.signal()
+        XCTAssertEqual(scanDone.wait(timeout: .now() + 5), .success,
+                       "the abandoned scan must yield once the stall clears")
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let items = await collector.items
+        XCTAssertTrue(items.isEmpty, "nothing may be emitted after stop()")
+    }
+
+    /// Review10 item 3, normal path: stop() on an idle watcher stays clean and prompt —
+    /// no timeout line, terminal state honored (post-stop scans no-op).
+    func testStop_idleWatcher_promptCleanNoTimeoutLog() throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600)
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        try watcher.start()
+        let t0 = DispatchTime.now()
+        watcher.stop()
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        XCTAssertLessThan(elapsed, 1.0, "an idle stop must be prompt")
+        XCTAssertTrue(logs.all.isEmpty, "no timeout line on the clean path — got \(logs.all)")
+        watcher.scanNow()   // terminal state: post-stop scan is a no-op (no crash, no emit)
+    }
+
     // MARK: - review10 item 7: hostile public timing values
 
     /// Review10 item 7 (red-first: the pre-fix run TRAPPED in quietPeriodNanos'

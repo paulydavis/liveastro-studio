@@ -112,12 +112,17 @@ public struct FileIdentity: Equatable, Sendable {
 
     /// Digest over an open descriptor (producer side — streams 64 KB chunks to EOF, never loads
     /// the whole file). Returns nil when the handle cannot be read/seeked — the caller must skip
-    /// the file rather than emit (a wrong digest would defeat dedupe and yield repeats).
-    static func contentDigest(handle: FileHandle, size: Int) -> String? {
+    /// the file rather than emit (a wrong digest would defeat dedupe and yield repeats) — or
+    /// when `shouldAbort` reports true between chunks (review10 item 3: a bounded stop() must
+    /// not wait behind a full-file hash stalled on a dead share; an aborted digest is
+    /// skip-this-tick semantics, never a wrong digest).
+    static func contentDigest(handle: FileHandle, size: Int,
+                              shouldAbort: (() -> Bool)? = nil) -> String? {
         guard (try? handle.seek(toOffset: 0)) != nil else { return nil }
         var hasher = SHA256()
         hasher.update(data: Data("\(size)".utf8))
         while true {
+            if shouldAbort?() == true { return nil }    // bounded-stop abort between chunks
             let chunk: Data?
             do { chunk = try handle.read(upToCount: digestChunk) }
             catch { return nil }                        // read failure → skip the file
@@ -226,6 +231,14 @@ public final class StackFileWatcher {
     /// A FAILED initial start leaves the watcher in `.initial` — retryable.
     private enum LifecycleState { case initial, running, stopped }
     private var state: LifecycleState = .initial
+
+    /// Review10 item 3: one-way stop request, set by stop() BEFORE any queue hop and
+    /// therefore visible to an IN-FLIGHT scan immediately (state itself is queue-confined
+    /// and only flips to .stopped when the queued teardown runs — which a stalled scan
+    /// delays). The scan polls this at per-file boundaries, between 64 KB digest chunks
+    /// (via the shouldAbort closure), and immediately before yielding, so a stop landing
+    /// mid-scan aborts the scan without emitting even while `state` still reads .running.
+    private let stopRequested = NSLock_Flag()
 
     /// Identifies the watcher queue for reentrancy detection (value set in init).
     private let queueKey = DispatchSpecificKey<Bool>()
@@ -584,19 +597,48 @@ public final class StackFileWatcher {
         armedIdentity = nil
     }
 
-    public func stop() {
-        onQueueSync {
-            guard state != .stopped else { return }   // idempotent
-            // Terminal state FIRST (review9 item 4): any reentrant callback fired during
-            // the teardown below observes .stopped immediately and no-ops — no re-arm, no
-            // emit, no re-scheduled scan.
-            state = .stopped
-            debounceWork?.cancel(); debounceWork = nil
-            // The fd is closed by the source's cancel handler, never here (see armSource()).
-            cancelSource()
-            pollTimer?.cancel(); pollTimer = nil
-            continuation.finish()
+    /// Stop the watcher with a BOUNDED wait (review10 item 3). The teardown itself stays
+    /// queue-confined, but stop() no longer parks unboundedly behind an in-flight scan: a
+    /// full-file hash stalled on a dead network share used to pin queue.sync — and
+    /// SessionPipeline.end() behind it — indefinitely, outside every promised timeout.
+    /// `stopRequested` is set FIRST (an atomic the scan polls at per-file boundaries,
+    /// between digest chunks, and before yielding — it aborts without emitting), then the
+    /// queue-confined teardown is enqueued and awaited up to `timeout` seconds. On expiry
+    /// stop() logs honestly and returns: the descriptors still close via the sources'
+    /// cancel/deinit paths once the abandoned scan yields, that scan observes the stop flag
+    /// at its next check and exits without emitting, and the queued teardown then runs.
+    /// The timeout log line is the ONE onLog delivery made from the caller's thread rather
+    /// than the watcher queue — on this path the queue is, by definition, stalled.
+    public func stop(timeout: TimeInterval = 5.0) {
+        stopRequested.set()
+        // Reentrant call (an onLog handler running ON the watcher queue invoking stop()):
+        // run the teardown inline — waiting for our own queue would deadlock.
+        if DispatchQueue.getSpecific(key: queueKey) == true {
+            teardown()
+            return
         }
+        let done = DispatchSemaphore(value: 0)
+        queue.async { [weak self] in
+            self?.teardown()
+            done.signal()
+        }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            onLog?("watcher stop timed out behind a stalled read — abandoning the scan; descriptors close via cancel handlers")
+        }
+    }
+
+    /// Queue-confined terminal teardown (the body of the pre-review10 stop()).
+    private func teardown() {
+        guard state != .stopped else { return }   // idempotent
+        // Terminal state FIRST (review9 item 4): any reentrant callback fired during
+        // the teardown below observes .stopped immediately and no-ops — no re-arm, no
+        // emit, no re-scheduled scan.
+        state = .stopped
+        debounceWork?.cancel(); debounceWork = nil
+        // The fd is closed by the source's cancel handler, never here (see armSource()).
+        cancelSource()
+        pollTimer?.cancel(); pollTimer = nil
+        continuation.finish()
     }
 
     private func scheduleScan() {
@@ -609,8 +651,10 @@ public final class StackFileWatcher {
 
     private func scan() {
         // Review9 item 4: a scan parked across stop() (debounced work, a queued poll tick,
-        // a test-seam replay) must observe the terminal state and no-op — never re-arm or emit.
-        guard state == .running else { return }
+        // a test-seam replay) must observe the terminal state and no-op — never re-arm or
+        // emit. Review10 item 3: the atomic stop flag covers the window where stop()'s
+        // teardown is still queued behind earlier work and `state` has not flipped yet.
+        guard state == .running, !stopRequested.isSet else { return }
         let fm = FileManager.default
 
         // --- Folder presence check (disappearance + return detection) ---
@@ -738,6 +782,9 @@ public final class StackFileWatcher {
         // but is not allowed to EMIT this scan (see the pre-emission check below).
         var holdRevisionsAbove = false
         for (name, revision) in candidates {
+            // Review10 item 3: a stop() waiting out its bounded deadline sees this scan
+            // yield at the next per-file boundary — never park behind the rest of the folder.
+            if stopRequested.isSet { return }
             guard !name.hasPrefix("."), !name.lowercased().hasSuffix(".tmp") else { continue }
             if let prefix = fileNamePrefix, !prefix.isEmpty,
                !name.lowercased().hasPrefix(prefix.lowercased()) { continue }
@@ -843,8 +890,14 @@ public final class StackFileWatcher {
             }
 
             _digestComputations += 1
-            guard let digest = FileIdentity.contentDigest(handle: handle, size: observed.size)
+            // Review10 item 3: the streaming hash checks the stop flag between 64 KB
+            // chunks, so a stop() never waits behind a full-file read stalled on a dead
+            // share. An aborted digest is a stop, not an invalidity — return outright.
+            let stopFlag = stopRequested
+            guard let digest = FileIdentity.contentDigest(handle: handle, size: observed.size,
+                                                          shouldAbort: { stopFlag.isSet })
             else {
+                if stopRequested.isSet { return }                  // review10 item 3: aborted by stop()
                 clearPendingEvidence(for: name)                    // review10 item 2
                 if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
                 continue
@@ -950,7 +1003,9 @@ public final class StackFileWatcher {
             }
             // Review9 item 4: nothing may be emitted after stop() — a reentrant stop from an
             // onLog callback earlier in this scan lands here as a terminal-state no-op.
-            guard state == .running else { return }
+            // Review10 item 3: the atomic flag covers a stop() from ANOTHER thread whose
+            // teardown is still queued behind this very scan (state not yet .stopped).
+            guard state == .running, !stopRequested.isSet else { return }
             pendingContent[name] = nil          // the emission consumes the gate evidence
             lastEmittedDigest[name] = digest
             lastEmittedIdentity[name] = observed
