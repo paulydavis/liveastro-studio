@@ -988,6 +988,35 @@ final class StackFileWatcherTests: XCTestCase {
                        "fast-path re-established by the dedup branch")
     }
 
+    // MARK: - review10 item 7: hostile public timing values
+
+    /// Review10 item 7 (red-first: the pre-fix run TRAPPED in quietPeriodNanos'
+    /// UInt64 conversion — a process crash, not a failure): quietPeriod/pollInterval are
+    /// public Doubles feeding UInt64 monotonic conversion and DispatchTime arithmetic, so
+    /// negative/NaN/infinite/huge values crashed the watcher. They must be sanitized at
+    /// init — non-finite → the documented default, finite clamped into [0.01 s, 3600 s] —
+    /// and the watcher must then run its normal gates and emit.
+    func testHostileTimingValues_sanitizedAtInit_watcherStillEmits() async throws {
+        for (i, bad) in [-1.0, Double.nan, .infinity, 1e30].enumerated() {
+            let folder = tmp.appendingPathComponent("hostile-\(i)", isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let clock = ManualClock()
+            let w = StackFileWatcher(folder: folder, quietPeriod: bad, pollInterval: bad,
+                                     digestPolicy: .mutableStackerOutput)
+            w.monotonicNowNanos = { clock.now() }
+            defer { w.stop() }
+            let collector = collect(w)
+            try w.start()                  // pre-fix: NaN/∞ pollInterval crashed timer math
+            try makeFITS(0.5).write(to: folder.appendingPathComponent("live_stack.fit"))
+            w.scanNow()                    // sighting
+            w.scanNow()                    // stable → digest gate (pre-fix: trap on quietPeriodNanos)
+            clock.advance(seconds: 3601)   // covers every clamped/defaulted quiet period
+            w.scanNow()                    // confirmed → emits
+            let got = await collector.waitForCount(1, timeout: 5)
+            XCTAssertTrue(got, "watcher with sanitized timing (\(bad)) must emit normally")
+        }
+    }
+
     /// Review4 P2 (mid-scan TOCTOU): the structural property of fd-relative enumeration, tested
     /// DETERMINISTICALLY with no timing. `scan()` validates the armed directory's (dev, ino) once,
     /// then enumerates — previously BY PATH, so a swap landing between the identity check and the

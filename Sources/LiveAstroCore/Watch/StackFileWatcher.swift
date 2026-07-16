@@ -470,12 +470,25 @@ public final class StackFileWatcher {
 
     private static let maxHeaderBlocks = 32  // generous ceiling; real headers are 1-10 blocks
 
+    /// Review10 item 7: `quietPeriod`/`pollInterval` are public Doubles that feed an
+    /// unchecked UInt64 conversion (`quietPeriodNanos`) and DispatchTime arithmetic — a
+    /// negative, NaN, infinite, or huge value trapped there at scan/schedule time. Sanitize
+    /// at the construction boundary instead: non-finite values take the documented default;
+    /// finite values clamp into [0.01 s, 3600 s].
+    private static func sanitizedInterval(_ value: TimeInterval,
+                                          default def: TimeInterval) -> TimeInterval {
+        guard value.isFinite else { return def }
+        return min(max(value, 0.01), 3600)
+    }
+
     public init(folder: URL, quietPeriod: TimeInterval = 0.5, pollInterval: TimeInterval = 2.0,
                 fileNamePrefix: String? = nil,
                 digestPolicy: DigestPolicy = .mutableStackerOutput) {
         self.folder = folder
-        self.quietPeriod = quietPeriod
-        self.pollInterval = pollInterval
+        // Review10 item 7: hostile timing values are clamped/defaulted, never trusted into
+        // UInt64/DispatchTime conversions (see sanitizedInterval).
+        self.quietPeriod = Self.sanitizedInterval(quietPeriod, default: 0.5)
+        self.pollInterval = Self.sanitizedInterval(pollInterval, default: 2.0)
         self.fileNamePrefix = fileNamePrefix
         self.digestPolicy = digestPolicy
         if let prefix = fileNamePrefix, !prefix.isEmpty {
