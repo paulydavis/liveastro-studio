@@ -118,10 +118,12 @@ There are two entry points:
 **Import Subs… (batch import from acquired files)**
 
 1. In the Control window, set the source mode to **Raw subs folder (native stacking)**.
-2. Fill in the session profile (target and exposure are auto-detected from the
-   newest sub's FITS header), then click **Import Subs…** and choose the folder
-   containing your `.fit` files. The import starts immediately — no Start
-   Session needed (and it refuses to start while a live session is running).
+2. Click **Import Subs…** and choose the folder containing your `.fit` files.
+   Choosing the folder starts the import immediately — no Start Session needed
+   (and it refuses to start while a live session is running). Target and
+   exposure are auto-detected from the newest sub's FITS header and overwrite
+   the profile fields when readable; fill in the rest of the profile before
+   importing if you want it in the session record.
    The engine imports each file in chronological order: calibration (if
    configured) → RCD debayer → star registration → gradient leveling →
    σ-clip → quality-weighted stack. A progress bar shows N / total with
