@@ -1386,6 +1386,71 @@ final class BroadcastControllerTests: XCTestCase {
                        "deinit must invalidate the RunLoop-retained scene timer")
     }
 
+    // MARK: - review11 FINDING 1 (P1): a cancelled Go Live's in-flight
+    // StartStream SEND can neither land behind a confirmed idle nor be
+    // overtaken by the cleanup's StopStream
+
+    /// The reviewer's repro, ordering half: StartStream's SEND is parked in
+    /// the socket (frame in flight, not on the wire), the bring-up is
+    /// cancelled, and the orphan cleanup runs. The cleanup's StopStream must
+    /// NOT transmit while the ambiguous StartStream is unresolved (outbound
+    /// FIFO — otherwise OBS receives Start AFTER Stop and streams behind a
+    /// confirmed-stopped state); once the Start send resolves, the Stop
+    /// follows it in order and the settlement is honest.
+    func testCleanupStopNeverOvertakesParkedStartStreamSend() async {
+        let h = await makeHarness(requestTimeout: 10)
+        h.mock.parkSendsMatching = { $0.contains("StartStream") }
+        h.controller.goLive()
+        await waitUntil { h.mock.parkedSendCount == 1 }
+        XCTAssertEqual(sent("StartStream", h.mock), 0, "the frame is parked, not on the wire")
+
+        // Cancel the bring-up: the possibly-delivered StartStream owes a
+        // confirmed cleanup, and that cleanup must queue BEHIND the Start.
+        h.controller.sessionDidEnd()
+        await waitUntil { h.controller.broadcastState == .stopping }
+        await settle()
+        XCTAssertEqual(sent("StopStream", h.mock), 0,
+                       "StopStream must not transmit while the StartStream send is unresolved")
+
+        // The Start finally reaches the wire (OBS starts late), then the
+        // Stop follows IN ORDER, undoes it, and the stop confirms.
+        h.mock.releaseParkedSends()
+        await waitUntil { h.controller.broadcastState == .idle }
+        let types = sentTypes(h.mock)
+        XCTAssertLessThan(types.firstIndex(of: "StartStream")!,
+                          types.firstIndex(of: "StopStream")!,
+                          "the Stop must transmit AFTER the ambiguous Start")
+        XCTAssertFalse(h.server.streamActive, "the late Start was undone by the ordered Stop")
+    }
+
+    /// The reviewer's repro, settlement half: the ambiguous Start send NEVER
+    /// resolves within the request-timeout bound, so the cleanup's requests
+    /// (queued behind it) all expire — delivery order is unprovable and the
+    /// only honest settlement is .stopUnconfirmed, never a confirmed .idle.
+    /// Pre-fix the cleanup's StopStream jumped the queue, "confirmed" a stop
+    /// against an OBS that had never seen the Start, settled .idle — and the
+    /// delayed Start then started a stream behind the confirmed idle.
+    func testUnresolvedStartStreamSendSettlesStopUnconfirmedNeverIdle() async {
+        let h = await makeHarness(requestTimeout: 0.2)
+        h.mock.parkSendsMatching = { $0.contains("StartStream") }
+        h.controller.goLive()
+        await waitUntil { h.mock.parkedSendCount == 1 }
+
+        h.controller.sessionDidEnd()   // cancels the bring-up; cleanup owes a stop
+        await waitUntil({ h.controller.broadcastState == .stopUnconfirmed }, timeout: 5)
+        XCTAssertEqual(sent("StopStream", h.mock), 0,
+                       "the Stop frame must never reach the wire before the ambiguous Start")
+        XCTAssertTrue(h.box.errors.contains { $0.contains("may still be live") })
+
+        // The Start delivers late after all: OBS goes live — and the settled
+        // .stopUnconfirmed was the honest claim (never idle-over-live).
+        h.mock.releaseParkedSends()
+        await settle()
+        XCTAssertNotEqual(h.controller.broadcastState, .idle,
+                          "a possibly-delivered Start must never sit behind a confirmed idle")
+        XCTAssertTrue(h.server.streamActive, "OBS really did start late")
+    }
+
     /// Boundary (c): while the orphan cleanup is awaiting OBS, .stopping is
     /// already reserved SYNCHRONOUSLY — a Go Live click during that await is
     /// rejected outright (no state change, no generation bump, no StartStream).

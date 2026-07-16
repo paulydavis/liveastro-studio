@@ -40,6 +40,29 @@ public actor OBSClient {
     /// Pending request continuations keyed by the requestId (UUID string) we sent.
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
 
+    /// The TRACKED send task of each pending request (review11 finding 1 —
+    /// P1). Pre-fix the send lived in an untracked Task: a request resolved
+    /// by timeout/cancellation left its send alive, and the frame could hit
+    /// OBS arbitrarily late — a StartStream landing AFTER cleanup had
+    /// confirmed OBS idle. Every resolution path (`failPending`, `failAll`,
+    /// disconnect teardown) now cancels the tracked send: a send that has
+    /// not yet reached `socket.send` when the cancel is observed is
+    /// CONFIRMED never sent. A send already inside `socket.send` cannot be
+    /// retracted (URLSession offers no mid-transmission abort guarantee) —
+    /// that residual window stays "possibly issued" for callers, and the
+    /// send CHAIN below guarantees no later frame can overtake it.
+    private var sendTasks: [String: Task<Void, Never>] = [:]
+
+    /// Tail of the outbound send chain (review11 finding 1, ordering half):
+    /// every request send awaits the previous send task's completion before
+    /// touching the socket, so outbound frames keep ISSUE order end to end
+    /// regardless of transport internals. A cleanup StopStream can never
+    /// overtake an earlier, still-unresolved StartStream — "Start delivered
+    /// after Stop" is structurally impossible; if the ambiguous send never
+    /// resolves, the queued stop times out and the caller settles
+    /// `.stopUnconfirmed` (never a confirmed idle over an unprovable order).
+    private var sendChainTail: Task<Void, Never>?
+
     // MARK: - Events
 
     private nonisolated let eventStream: AsyncStream<(type: String, data: [String: Any])>
@@ -135,6 +158,13 @@ public actor OBSClient {
     /// guaranteed NOT sent; a caller cancelled after the send is in flight also
     /// resumes with `CancellationError`, but the frame may have reached OBS —
     /// callers must treat that outcome as "possibly issued".
+    ///
+    /// Review11 finding 1 tightens the enqueued-but-late window: a request
+    /// that resolves (timeout/cancel/disconnect) while its send is still
+    /// QUEUED — not yet inside `socket.send` — cancels that send, so the
+    /// frame is confirmed never sent. Only a send already in the socket
+    /// remains "possibly issued", and the outbound chain guarantees no later
+    /// frame (e.g. a cleanup StopStream) is transmitted before it.
     public func request(_ type: String, data: [String: Any]?) async throws -> [String: Any] {
         guard connected else { throw OBSError.notConnected }
 
@@ -179,38 +209,44 @@ public actor OBSClient {
                 return
             }
             pending[id] = continuation
-            // Send inside a child Task so we stay non-suspending here; if the
-            // send fails, resolve the continuation with .notConnected.
-            Task { [weak self] in
-                do {
-                    try await self?.sendFrame(frame)
-                } catch {
-                    await self?.failPending(id: id, error: OBSError.notConnected)
-                }
+            // The send runs in a TRACKED child task (review11 finding 1),
+            // chained behind the previous send so outbound order matches
+            // issue order, and cancellable by every resolution path.
+            let previous = sendChainTail
+            let send = Task { [weak self] in
+                await previous?.value          // FIFO: never overtake an earlier send
+                await self?.performSend(id: id, frame: frame)
             }
+            sendTasks[id] = send
+            sendChainTail = send
         }
     }
 
-    private func sendFrame(_ frame: String) async throws {
-        try await socket.send(frame)
+    /// Body of a tracked send. Runs under actor isolation, so the
+    /// cancellation check is strictly ordered against `failPending`/
+    /// `failAll`: a request resolved before this segment runs observes
+    /// `Task.isCancelled` here and the frame is CONFIRMED never sent. Past
+    /// this check the frame is in the socket and can no longer be retracted
+    /// — the caller-visible "possibly issued" window.
+    private func performSend(id: String, frame: String) async {
+        defer { sendTasks[id] = nil }
+        guard !Task.isCancelled else { return }
+        do {
+            try await socket.send(frame)
+        } catch {
+            failPending(id: id, error: OBSError.notConnected)
+        }
     }
 
     // MARK: - Disconnect
 
-    /// Close the socket, cancel the receive loop, fail all pending requests with
-    /// `.notConnected`, and finish the events stream.
+    /// Close the socket, cancel the receive loop, fail all pending requests
+    /// (cancelling their tracked sends — review11 finding 1), and finish the
+    /// events stream.
     public func disconnect() {
-        connected = false
         receiveLoop?.cancel()
         receiveLoop = nil
-
-        // Fail every in-flight request.
-        let inflight = pending
-        pending.removeAll()
-        for (_, continuation) in inflight {
-            continuation.resume(throwing: OBSError.notConnected)
-        }
-
+        failAll(error: OBSError.notConnected)   // also sets connected = false
         eventContinuation.finish()
         socket.close()
     }
@@ -278,14 +314,20 @@ public actor OBSClient {
     // MARK: - Pending resolution helpers
 
     /// Resolve a single pending request with an error, if it is still pending.
+    /// Review11 finding 1: resolving a request CANCELS its tracked send —
+    /// if the frame has not reached `socket.send` yet, it never will.
     private func failPending(id: String, error: Error) {
+        if let send = sendTasks.removeValue(forKey: id) { send.cancel() }
         guard let continuation = pending.removeValue(forKey: id) else { return }
         continuation.resume(throwing: error)
     }
 
-    /// Fail every pending request (used when the socket dies).
+    /// Fail every pending request and cancel every tracked send (used when
+    /// the socket dies and by disconnect teardown — review11 finding 1).
     private func failAll(error: Error) {
         connected = false
+        for (_, send) in sendTasks { send.cancel() }
+        sendTasks.removeAll()
         let inflight = pending
         pending.removeAll()
         for (_, continuation) in inflight {

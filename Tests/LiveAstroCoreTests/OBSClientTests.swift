@@ -414,6 +414,85 @@ final class OBSClientTests: XCTestCase {
                           "an in-flight cancel must resolve promptly, not at the timeout")
     }
 
+    // MARK: - Tracked sends + outbound ordering (review11 finding 1)
+
+    /// The send of a request resolved by CANCELLATION before its frame
+    /// reached the socket must never transmit. Pre-fix the send lived in an
+    /// UNTRACKED Task: the caller's cancellation resolved the continuation,
+    /// but the frame still hit the socket arbitrarily late. The scheduling
+    /// is made deterministic by parking an EARLIER send in the socket —
+    /// outbound sends are FIFO, so the second request's frame is provably
+    /// still queued (not in the socket) when the cancel lands.
+    func testCancelledRequestQueuedBehindParkedSendNeverTransmits() async throws {
+        let mock = MockOBSSocket()
+        let client = OBSClient(socket: mock, requestTimeout: 10)
+        try await connect(client, mock)
+        mock.replyToLastSent(nil)
+
+        // Request A: its send parks inside the socket (in flight).
+        mock.parkSendsMatching = { $0.contains("First") }
+        let taskA = Task { try await client.request("First", data: nil) }
+        try await waitUntil { mock.parkedSendCount == 1 }
+
+        // Request B: issued while A's send is in flight — B's frame must not
+        // overtake A's (outbound FIFO), so it is still queued, not sent.
+        let taskB = Task { try await client.request("Second", data: nil) }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(mock.sentFrames.contains { $0.contains("Second") },
+                       "a later send must never overtake an earlier in-flight send")
+
+        // Cancel B while its send is still queued: confirmed never-sent.
+        taskB.cancel()
+        do {
+            _ = try await taskB.value
+            XCTFail("Expected CancellationError")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "got \(error)")
+        }
+
+        // Release A's send: A transmits; B's cancelled send must NOT follow.
+        mock.releaseParkedSends()
+        try await waitUntil { mock.sentFrames.contains { $0.contains("First") } }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(mock.sentFrames.contains { $0.contains("Second") },
+                       "a request cancelled before its send reached the socket must never transmit")
+
+        taskA.cancel()
+        _ = try? await taskA.value
+        await client.disconnect()
+    }
+
+    /// Timeout flavor: a request whose send is still queued behind an
+    /// in-flight send when the timeout fires must never transmit either —
+    /// every resolution path cancels the tracked send.
+    func testTimedOutRequestQueuedBehindParkedSendNeverTransmits() async throws {
+        let mock = MockOBSSocket()
+        let client = OBSClient(socket: mock, requestTimeout: 0.1)
+        try await connect(client, mock)
+        mock.replyToLastSent(nil)
+
+        mock.parkSendsMatching = { $0.contains("First") }
+        let taskA = Task { try await client.request("First", data: nil) }
+        try await waitUntil { mock.parkedSendCount == 1 }
+
+        let taskB = Task { try await client.request("Second", data: nil) }
+        do {
+            _ = try await taskB.value
+            XCTFail("Expected .timeout")
+        } catch OBSClient.OBSError.timeout {
+            // expected — resolved by the timeout while the send was queued
+        }
+
+        mock.releaseParkedSends()
+        try await waitUntil { mock.sentFrames.contains { $0.contains("First") } }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(mock.sentFrames.contains { $0.contains("Second") },
+                       "a timed-out request's queued send must never transmit")
+
+        _ = try? await taskA.value
+        await client.disconnect()
+    }
+
     // MARK: - Helpers
 
     /// Poll an async predicate until true or a deadline; fail the test on timeout.
