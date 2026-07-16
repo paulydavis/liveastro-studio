@@ -560,13 +560,34 @@ public final class BroadcastController {
                 // this CALLER owns cleanup, and only at the CURRENT generation
                 // (validated above). Confirmed-stop semantics: .idle only when OBS
                 // confirmed both outputs inactive; otherwise .stopUnconfirmed.
-                let confirmed = await confirmedStop()
-                guard gen == broadcastGeneration else { return }   // superseded mid-cleanup
-                if confirmed {
-                    deps.presentError("OBS started but the stream didn't go live — check OBS ▸ Settings ▸ Stream (YouTube server + key).")
-                    broadcastState = .idle
-                } else {
-                    settleAfterStop(confirmed: false)
+                //
+                // Cold-review1 finding 1: the cleanup must own itself the way the
+                // STALE paths do. Pre-fix it awaited confirmedStop() INSIDE this
+                // (UI-cancellable) goLiveTask with state still .connecting —
+                // Disconnect or sessionDidEnd cancelled the cleanup instantly
+                // (the client's requests are cancellation-aware) and their
+                // teardownLanding reclaimed the origin (.idle): an issued,
+                // never-confirmed-stopped StartStream behind a "confirmed idle".
+                // Mirror settleStaleStart: reserve .stopping SYNCHRONOUSLY
+                // (generation bump — goLive is guarded, and both cancellers now
+                // land honestly: disconnect's .stopping branch escalates to
+                // .stopUnconfirmed; sessionDidEnd's .stopping branch leaves the
+                // cleanup alone) and run the confirmed stop in a fresh
+                // unstructured task that no UI cancellation reaches.
+                broadcastGeneration += 1
+                let cleanupGen = broadcastGeneration
+                broadcastState = .stopping
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let confirmed = await self.confirmedStop()
+                    guard cleanupGen == self.broadcastGeneration else { return }   // superseded mid-cleanup
+                    if confirmed {
+                        self.deps.presentError("OBS started but the stream didn't go live — check OBS ▸ Settings ▸ Stream (YouTube server + key).")
+                        self.broadcastState = .idle
+                        self.runDeferredReconcileIfNeeded()
+                    } else {
+                        self.settleAfterStop(confirmed: false)
+                    }
                 }
             case .notIssued:
                 // Nothing was issued (cancellation confirmed before StartStream
@@ -681,7 +702,27 @@ public final class BroadcastController {
     /// inactive; otherwise `.stopUnconfirmed` with Retry.
     public func endBroadcast() {
         switch broadcastState {
-        case .live, .connecting, .endingSession: break
+        case .live, .endingSession: break
+        case .connecting:
+            // Cold-review1 minor 4: with NO app-issued StartStream in flight,
+            // a .connecting attempt provably issued nothing — StartStream is
+            // only sent inside obs.startBroadcast, whose in-flight window is
+            // exactly `appStartInFlight` (a settled outcome leaves .connecting
+            // in the same synchronous segment). Aborting the attempt lands the
+            // honest teardown mapping of its ORIGIN — never a "OBS may still
+            // be live" claim about a stream that was never started. With a
+            // start possibly issued, fall through to the confirmed stop
+            // (finding 1 composition: possibly-issued → confirmed cleanup /
+            // .stopUnconfirmed; provably-not-issued → origin).
+            guard appStartInFlight else {
+                broadcastGeneration += 1
+                goLiveTask?.cancel(); goLiveTask = nil
+                healthPollTask?.cancel(); healthPollTask = nil
+                streamHealth = nil
+                broadcastState = teardownLanding(from: connectingOrigin)
+                deps.log("OBS: broadcast attempt aborted — nothing was started")
+                return
+            }
         case .unknown, .idle, .stopping, .stopUnconfirmed: return
         }
         broadcastGeneration += 1
