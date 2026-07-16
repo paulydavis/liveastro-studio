@@ -689,6 +689,41 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertTrue(h.box.logs.contains { $0.contains("adopted the live broadcast") })
     }
 
+    // MARK: - review8 FIX 2: manual connect reserves .connecting
+
+    /// Manual Connect reserves .connecting for the WHOLE await: a Go Live click
+    /// while the connect/seed/reconcile is in flight is rejected outright.
+    /// Pre-fix connectAndReconcile awaited without reserving anything, so
+    /// goLive raced it (and connectOBS treated the client's .connecting state
+    /// as connected, starting a broadcast through a half-open link).
+    func testManualConnectReservesConnectingAndBlocksGoLive() async {
+        let h = await makeHarness(connect: false, requestTimeout: 10)
+        h.server.parkTypes = ["GetSceneList"]     // park the seed inside obs.connect
+        h.mock.enqueueInbound(helloFrame())
+        h.mock.replyToLastSent(h.server.responder())
+
+        let connectTask = Task { await h.controller.connectAndReconcile() }
+        await waitUntil { h.server.parked.count == 1 }
+        XCTAssertEqual(h.controller.broadcastState, .connecting,
+                       "manual Connect must reserve .connecting for its whole await")
+
+        // Go Live during the await must be rejected — nothing sent, no takeover.
+        h.controller.goLive()
+        await settle()
+        XCTAssertEqual(sent("StartStream", h.mock), 0,
+                       "goLive must not race a manual connect")
+        XCTAssertEqual(h.controller.broadcastState, .connecting)
+
+        // Resume the seed: the connect completes and reconciles to .idle.
+        h.server.parkTypes = []
+        h.mock.enqueueInbound(responseFrame(requestId: h.server.parked[0].id, ok: true, responseData: [
+            "currentProgramSceneName": "Stack",
+            "scenes": [["sceneName": "Stack"]]]))
+        let ok = await connectTask.value
+        XCTAssertTrue(ok)
+        await waitUntil { h.controller.broadcastState == .idle }
+    }
+
     // MARK: - review8 FIX 1: outcome-typed start, conservative issuance boundary
 
     /// Boundary (a): a Go Live cancelled BEFORE StartStream was enqueued issues

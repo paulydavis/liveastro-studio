@@ -344,6 +344,68 @@ final class OBSControllerTests: XCTestCase {
         controller.disconnect()
     }
 
+    // MARK: - review8 item 2: connect coalescing + epoch guarding
+
+    /// Two rapid connects coalesce onto ONE in-flight attempt: a single
+    /// handshake (one Identify), both callers get the same successful result.
+    /// Pre-fix the second connect() tore down the first mid-handshake.
+    func testConcurrentConnectsCoalesceToOneHandshake() async {
+        let mock = MockOBSSocket()
+        let controller = makeController(mock)
+        mock.enqueueInbound(helloFrame())
+        mock.replyToLastSent(sessionResponder())
+
+        async let first = controller.connect(host: "localhost", port: 4455, password: nil)
+        async let second = controller.connect(host: "localhost", port: 4455, password: nil)
+        let (a, b) = await (first, second)
+
+        XCTAssertTrue(a)
+        XCTAssertTrue(b, "the second caller must await the same attempt's result")
+        let identifies = mock.sentFrames.filter { $0.contains("\"op\":1") }.count
+        XCTAssertEqual(identifies, 1, "two rapid connects must coalesce into one handshake")
+        XCTAssertEqual(controller.state, .connected)
+        controller.disconnect()
+    }
+
+    /// A request error surfacing from a STALE client (its socket died after a
+    /// reconnect already established a new session) must not tear down the
+    /// newer connection — only the client whose epoch generated the error may
+    /// converge state.
+    func testStaleRequestErrorDoesNotTearDownNewerConnection() async {
+        let mock1 = MockOBSSocket()
+        var current = mock1
+        let controller = OBSController(
+            makeClient: { OBSClient(socket: $0, requestTimeout: 10) },
+            makeSocket: { current })
+
+        _ = await connect(controller, mock1)
+        XCTAssertEqual(controller.state, .connected)
+
+        // Park a status request on the OLD client: no reply ever comes; the
+        // request will fail with .notConnected once the old client dies.
+        mock1.replyToLastSent { _ in nil }
+        let sentBefore = mock1.sentFrames.count
+        let parked = Task { await controller.streamStatus() }
+        await waitUntil { mock1.sentFrames.count == sentBefore + 1 }
+
+        // Reconnect: the prologue teardown kills the old client, whose parked
+        // request now fails — AFTER the new session is (being) established.
+        let mock2 = MockOBSSocket()
+        current = mock2
+        mock2.enqueueInbound(helloFrame())
+        mock2.replyToLastSent(sessionResponder(scenes: ["X"], currentScene: "X"))
+        let ok = await controller.connect(host: "localhost", port: 4455, password: nil)
+        XCTAssertTrue(ok, "the reconnect itself must succeed")
+
+        let stale = await parked.value
+        XCTAssertNil(stale, "the old client's request fails, returning nil")
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(controller.state, .connected,
+                       "a stale client's request error must not tear down the newer connection")
+        XCTAssertEqual(controller.sceneNames, ["X"], "the new session's seed is intact")
+        controller.disconnect()
+    }
+
     /// connect failure (bad handshake) returns false and leaves .disconnected.
     func testConnectFailureReturnsFalse() async {
         let mock = MockOBSSocket()

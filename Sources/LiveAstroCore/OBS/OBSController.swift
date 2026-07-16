@@ -42,6 +42,18 @@ public final class OBSController: ObservableObject {
     /// Task consuming `client.events`. Cancelled on disconnect / before a new connect.
     private var eventsTask: Task<Void, Never>?
 
+    /// Monotonic connection identity (review8 item 2): bumped at every connect
+    /// start and every disconnect/teardown. Every async consumer of a client —
+    /// the connect completion AND failure paths, `seedState`, request-error
+    /// convergence, and the event consumer — captures the epoch of the client
+    /// it talks to and, after every await, touches NOTHING when the epoch has
+    /// moved on: only the client whose epoch generated a signal may mutate
+    /// published state or tear the session down.
+    private(set) var connectionEpoch = 0
+    /// The one in-flight connect attempt (review8 item 2): a second caller
+    /// awaits this task's result instead of starting a competing handshake.
+    private var connectTask: Task<Bool, Never>?
+
     // MARK: - Init
 
     public init(makeClient: @escaping (OBSSocket) -> OBSClient = { OBSClient(socket: $0) },
@@ -55,9 +67,16 @@ public final class OBSController: ObservableObject {
     /// Open a connection to `ws://host:port`, perform the handshake, and seed
     /// scene/stream/record state. Returns `true` on success. On failure the
     /// controller returns to `.disconnected` and logs the reason.
+    ///
+    /// Coalescing (review8 item 2): concurrent connect attempts share ONE
+    /// in-flight task — a second caller awaits the first attempt's result
+    /// instead of tearing it down mid-handshake and starting a competitor.
     @discardableResult
     public func connect(host: String, port: Int, password: String?) async -> Bool {
-        // Tear down any prior session first (idempotent reconnect).
+        if let task = connectTask { return await task.value }
+
+        // Tear down any prior session first (idempotent reconnect). This bumps
+        // the epoch, so every consumer of the old client goes stale.
         teardown()
 
         guard let url = URL(string: "ws://\(host):\(port)") else {
@@ -66,24 +85,50 @@ public final class OBSController: ObservableObject {
             return false
         }
 
+        connectionEpoch += 1                 // connect start
+        let epoch = connectionEpoch
         state = .connecting
         let socket = makeSocket()
         let client = makeClient(socket)
         self.client = client
 
+        let task = Task { @MainActor [weak self] () -> Bool in
+            guard let self else { return false }
+            return await self.performConnect(client: client, url: url,
+                                             password: password, epoch: epoch)
+        }
+        connectTask = task
+        let ok = await task.value
+        // Epoch-guarded clear: never nil out a NEWER attempt's slot from a
+        // superseded completion.
+        if epoch == connectionEpoch { connectTask = nil }
+        return ok
+    }
+
+    /// The awaited half of `connect` — handshake, event subscription, seeding.
+    /// Every landing past an await is epoch-guarded: a teardown/reconnect that
+    /// happened mid-handshake owns the published state, and this (now stale)
+    /// attempt touches nothing beyond closing its own orphaned client.
+    private func performConnect(client: OBSClient, url: URL,
+                                password: String?, epoch: Int) async -> Bool {
         do {
             try await client.connect(url: url, password: password)
         } catch {
             log("connect failed: \(error)")
+            guard epoch == connectionEpoch else { return false }   // superseded: touch nothing
             self.client = nil
             state = .disconnected
             return false
         }
-
+        guard epoch == connectionEpoch else {
+            // Superseded mid-handshake: close the orphaned client quietly.
+            Task { await client.disconnect() }
+            return false
+        }
         // Handshake succeeded. Start listening for events, then seed state.
         state = .connected
-        subscribeToEvents(of: client)
-        await seedState()
+        subscribeToEvents(of: client, epoch: epoch)
+        await seedState(epoch: epoch)
         return true
     }
 
@@ -95,7 +140,12 @@ public final class OBSController: ObservableObject {
     }
 
     /// Cancel the events task and disconnect the client without touching `state`.
+    /// Bumps the epoch (review8 item 2): every in-flight consumer of the old
+    /// client — including a mid-handshake connect — is stale from this instant.
     private func teardown() {
+        connectionEpoch += 1
+        connectTask?.cancel()
+        connectTask = nil
         eventsTask?.cancel()
         eventsTask = nil
         if let client {
@@ -108,18 +158,25 @@ public final class OBSController: ObservableObject {
 
     /// Query GetSceneList / GetStreamStatus / GetRecordStatus and populate the
     /// published state. Any failure moves us to `.disconnected` (the connection
-    /// probably dropped) via `handle(error:)`.
-    private func seedState() async {
+    /// probably dropped) via `handle(error:epoch:)`. Every mutation is
+    /// epoch-guarded: a reconnect mid-seed means these answers describe a dead
+    /// session, so they must not overwrite the new one's state.
+    private func seedState(epoch: Int) async {
         await refreshScenes()
+        guard epoch == connectionEpoch else { return }
 
-        if let stream = await requestData("GetStreamStatus", nil),
-           let active = stream["outputActive"] as? Bool,
-           state != .disconnected {
-            state = active ? .streaming : .connected
+        if let stream = await requestData("GetStreamStatus", nil) {
+            guard epoch == connectionEpoch else { return }
+            if let active = stream["outputActive"] as? Bool, state != .disconnected {
+                state = active ? .streaming : .connected
+            }
         }
-        if let record = await requestData("GetRecordStatus", nil),
-           let active = record["outputActive"] as? Bool {
-            isRecording = active
+        guard epoch == connectionEpoch else { return }
+        if let record = await requestData("GetRecordStatus", nil) {
+            guard epoch == connectionEpoch else { return }
+            if let active = record["outputActive"] as? Bool {
+                isRecording = active
+            }
         }
     }
 
@@ -127,7 +184,9 @@ public final class OBSController: ObservableObject {
 
     /// Fetch the scene list and current program scene.
     public func refreshScenes() async {
+        let epoch = connectionEpoch
         guard let data = await requestData("GetSceneList", nil) else { return }
+        guard epoch == connectionEpoch else { return }   // answered by a dead session
 
         if let scenes = data["scenes"] as? [[String: Any]] {
             // OBS returns scenes top-of-list first; UI convention lists them in
@@ -283,29 +342,34 @@ public final class OBSController: ObservableObject {
     // MARK: - Request plumbing
 
     /// Issue a request; on success return its responseData, on failure log and
-    /// return nil. `.notConnected` failures converge state to `.disconnected`
-    /// (the socket died and the client won't push a signal — see design note).
+    /// return nil. `.notConnected` failures converge state to `.disconnected`,
+    /// but ONLY when the failing client is still the current one (review8 item
+    /// 2): the epoch captured alongside the client identifies which session
+    /// generated the error, so a stale client's death can never tear down a
+    /// newer connection.
     @discardableResult
     private func requestData(_ type: String, _ data: [String: Any]?) async -> [String: Any]? {
         guard let client else {
             log("\(type): not connected")
             return nil
         }
+        let epoch = connectionEpoch
         do {
             return try await client.request(type, data: data)
         } catch {
             log("\(type) failed: \(error)")
-            handle(error: error)
+            handle(error: error, epoch: epoch)
             return nil
         }
     }
 
-    /// Converge state on a dropped connection. The client's `events` stream is
-    /// NOT finished when its receive loop dies (Task 5 forward-note), so we
-    /// detect the drop here — the failed request is our liveness signal — and
-    /// tear down so the UI doesn't hang in `.streaming`/`.connected`.
-    private func handle(error: Error) {
+    /// Converge state on a dropped connection — the failed request is a
+    /// liveness signal. Epoch-guarded (review8 item 2): only the client whose
+    /// epoch generated the error may tear the session down; errors surfacing
+    /// from an already-superseded client touch nothing.
+    private func handle(error: Error, epoch: Int) {
         if case OBSClient.OBSError.notConnected = error {
+            guard epoch == connectionEpoch else { return }
             if state != .disconnected {
                 log("connection lost — converging to .disconnected")
                 teardown()
@@ -317,14 +381,17 @@ public final class OBSController: ObservableObject {
     // MARK: - Events
 
     /// Consume the client's event stream and keep published state live.
-    private func subscribeToEvents(of client: OBSClient) {
+    /// Epoch-guarded (review8 item 2): once the session is superseded, this
+    /// consumer stops applying the dead client's events entirely.
+    private func subscribeToEvents(of client: OBSClient, epoch: Int) {
         let events = client.events
         eventsTask = Task { [weak self] in
             for await event in events {
-                if Task.isCancelled { return }
+                guard let self, !Task.isCancelled else { return }
+                guard self.connectionEpoch == epoch else { return }
                 // Task {} inherits this controller's main-actor isolation, so
                 // apply(event:data:) is a same-actor synchronous call.
-                self?.apply(event: event.type, data: event.data)
+                self.apply(event: event.type, data: event.data)
             }
         }
     }

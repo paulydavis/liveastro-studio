@@ -255,8 +255,14 @@ public final class BroadcastController {
 
     /// Connect to OBS, requesting an app-side launch if needed. Returns whether
     /// connected. Does NOT start any stream — broadcasting is deliberate (goLive()).
+    ///
+    /// Review8 item 2: the OBS client's `.connecting` state is NOT connected —
+    /// only a completed handshake counts. `obs.connect` coalesces onto any
+    /// in-flight attempt and returns its ACTUAL outcome, so awaiting it here
+    /// never reports success from a half-open client (whose seed/reconcile
+    /// queries would fail and tear down the connection being established).
     private func connectOBS() async -> Bool {
-        guard obs.state == .disconnected else { return true }  // already connected
+        if obs.state == .connected || obs.state == .streaming { return true }
 
         var connected = await obs.connect(host: obsHost, port: obsPort,
                                           password: obsPassword.isEmpty ? nil : obsPassword)
@@ -272,11 +278,13 @@ public final class BroadcastController {
                 do {
                     try await Task.sleep(nanoseconds: UInt64(launchRetryDelaySeconds * 1_000_000_000))
                 } catch { return false }
-                if obs.state == .disconnected {
+                if obs.state == .connected || obs.state == .streaming {
+                    connected = true    // someone else's attempt completed
+                } else {
+                    // .disconnected starts a fresh attempt; .connecting coalesces
+                    // onto the in-flight one — either way the result is real.
                     connected = await obs.connect(host: obsHost, port: obsPort,
                                                   password: obsPassword.isEmpty ? nil : obsPassword)
-                } else {
-                    connected = obs.state != .disconnected
                 }
             }
         }
@@ -342,20 +350,57 @@ public final class BroadcastController {
         return .bothInactive
     }
 
+    /// Manual Connect, SYNCHRONOUS entry (review8 item 2 — mirrors goLive()'s
+    /// shape): reserves `.connecting` and bumps the generation AT the click,
+    /// so a Go Live during the connect/seed/reconcile await is rejected by its
+    /// own state guard and every in-flight completion is stale from this
+    /// instant. Then launches the connect+reconcile task. ControlView's
+    /// Connect button calls this directly — no Task wrapper at the call site.
+    public func beginConnectAndReconcile() {
+        guard broadcastState != .connecting else { return }   // one attempt at a time
+        broadcastGeneration += 1
+        let gen = broadcastGeneration
+        let origin = broadcastState
+        broadcastState = .connecting
+        Task { @MainActor [weak self] in
+            await self?.runConnectAndReconcile(gen: gen, origin: origin)
+        }
+    }
+
     /// Manual Connect (review7 P1): bring the control link up (NEVER launching
     /// OBS — that is a Go Live-only affordance) and reconcile `broadcastState`
     /// with OBS's actual output state, so connecting to an already-streaming
     /// OBS adopts the broadcast instead of offering a Go Live that would
     /// double-start it. Returns whether the control link connected.
+    ///
+    /// Awaitable variant of `beginConnectAndReconcile()` (used by tests and
+    /// programmatic callers). The reservation is identical and happens before
+    /// this function's first await.
     @discardableResult
     public func connectAndReconcile() async -> Bool {
+        guard broadcastState != .connecting else {
+            return obs.state == .connected || obs.state == .streaming
+        }
+        broadcastGeneration += 1
+        let gen = broadcastGeneration
+        let origin = broadcastState
+        broadcastState = .connecting
+        return await runConnectAndReconcile(gen: gen, origin: origin)
+    }
+
+    /// The awaited half of manual Connect. Runs under the generation captured
+    /// at the click; a failed connect restores the origin state honestly
+    /// (nothing was confirmed, so nothing new is claimed).
+    @discardableResult
+    private func runConnectAndReconcile(gen: Int, origin: BroadcastState) async -> Bool {
         let connected = await obs.connect(host: obsHost, port: obsPort,
                                           password: obsPassword.isEmpty ? nil : obsPassword)
-        guard connected else { return false }
-        // Reality takes over from whatever was in flight (mirror of the other
-        // user-initiated entry points): bump, then reconcile under the new token.
-        broadcastGeneration += 1
-        if await reconcile(gen: broadcastGeneration) == .bothInactive {
+        guard gen == broadcastGeneration else { return connected }   // superseded: owner governs
+        guard connected else {
+            broadcastState = origin
+            return false
+        }
+        if await reconcile(gen: gen) == .bothInactive {
             broadcastState = .idle   // now genuinely confirmed
         }
         return true
