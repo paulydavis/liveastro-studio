@@ -57,6 +57,18 @@ enum Disruptor {
         try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: false)
     }
 
+    /// Atomically SWAP the directory at `target` with the directory at `replacement` in a single
+    /// `renamex_np(RENAME_SWAP)` syscall — the target path NEVER has a missing interval
+    /// (`fileExists` never reports false), but after the call it is a DIFFERENT inode.
+    /// Models a writer that rebuilds its output directory aside and rename()s it into place.
+    static func atomicallySwapDirectory(at target: URL, with replacement: URL) throws {
+        guard renamex_np(replacement.path, target.path, UInt32(RENAME_SWAP)) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                          userInfo: [NSLocalizedDescriptionKey:
+                                     "renamex_np(RENAME_SWAP) \(replacement.path) <-> \(target.path)"])
+        }
+    }
+
     /// Replace a path with a symlink pointing at a non-existent target (dangling symlink) —
     /// stat/open of the final path fails with ENOENT while the link entry itself exists.
     static func replaceWithDanglingSymlink(_ url: URL) throws {
