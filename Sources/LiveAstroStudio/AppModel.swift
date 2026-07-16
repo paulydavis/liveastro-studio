@@ -55,8 +55,6 @@ final class AppModel {
         }
     }
     var isRunning = false
-    var isImporting = false
-    var isProcessing = false
     /// Accepted frames this session; updated only in .nativeStack mode
     /// (watcher mode reads 0 — use latestRecord?.index instead).
     var acceptedCount = 0
@@ -67,7 +65,6 @@ final class AppModel {
     var sessionEnd: Date?
     var log: [String] = []
     var replayURL: URL?
-    var isGeneratingReplay = false
     var processorBackend: ProcessorBackend = .none
     var displayAdjustments = DisplayAdjustments.neutral
     private(set) var lastSessionDirectory: URL?
@@ -101,10 +98,15 @@ final class AppModel {
     /// (`$model.liveSource.relayRetentionDays`).
     var liveSource: LiveSourceController!
 
-    var importProcessed = 0
-    var importTotal = 0
+    /// Import + post-processing cluster (T3 extraction): one-shot batch import and
+    /// its progress/cancel state, plus the replay-regenerate and GraXpert-master
+    /// actions over a finished session directory. Same IUO init-order rationale as
+    /// `broadcast`/`liveSource` above — assigned exactly once early in `init` (its
+    /// `AppSurface` closures capture `self`, so it can't be a stored `let`), never
+    /// reassigned; `var` only so SwiftUI can bind through it.
+    var importer: ImportController!
+
     private var pipeline: SessionPipeline?
-    private var importPipeline: SessionPipeline?
 
     init() {
         // Build the seam bundle and the Broadcast controller first. The closures
@@ -122,13 +124,38 @@ final class AppModel {
             log: { [weak self] message in MainActor.assumeIsolated { self?.log.append(message) } },
             presentError: { [weak self] message in MainActor.assumeIsolated { self?.errorMessage = message } },
             isSessionRunning: { [weak self] in MainActor.assumeIsolated { self?.isRunning ?? false } },
-            isImporting: { [weak self] in MainActor.assumeIsolated { self?.isImporting ?? false } },
+            isImporting: { [weak self] in MainActor.assumeIsolated { self?.importer.isImporting ?? false } },
             applyDetectedProfile: { [weak self] p in MainActor.assumeIsolated { self?.applyDetectedProfile(p) } },
             currentTargetName: { [weak self] in MainActor.assumeIsolated { self?.targetName ?? "" } },
             resetZoomPan: { [weak self] in MainActor.assumeIsolated { self?.zoomPan = .fit } },
             selectLiveTab: { [weak self] in MainActor.assumeIsolated { self?.selectedTab = .live } },
             startSession: { [weak self] in MainActor.assumeIsolated { self?.startSession() } },
             saveSettings: { [weak self] in MainActor.assumeIsolated { self?.saveSettings() } }))
+
+        // Import + post-processing cluster: the shared log/error/session-running
+        // seam plus the T3 reads the moved bodies need (stacker engine,
+        // calibration, draft fields, profile, root, processor backend), the
+        // session-shared callback wiring, and the count/result publishers. Result
+        // URLs stay on AppModel; the two setters publish them.
+        importer = ImportController(surface: AppSurface(
+            log: { [weak self] message in MainActor.assumeIsolated { self?.log.append(message) } },
+            presentError: { [weak self] message in MainActor.assumeIsolated { self?.errorMessage = message } },
+            isSessionRunning: { [weak self] in MainActor.assumeIsolated { self?.isRunning ?? false } },
+            applyDetectedProfile: { [weak self] p in MainActor.assumeIsolated { self?.applyDetectedProfile(p) } },
+            saveSettings: { [weak self] in MainActor.assumeIsolated { self?.saveSettings() } },
+            makeStackEngine: { [weak self] in MainActor.assumeIsolated { self!.makeStackEngine() } },
+            currentCalibration: { [weak self] in MainActor.assumeIsolated { self!.calibration } },
+            currentNeutralizeBackground: { [weak self] in MainActor.assumeIsolated { self?.neutralizeBackground ?? false } },
+            currentFileNamePrefix: { [weak self] in MainActor.assumeIsolated { self?.fileNamePrefix ?? "" } },
+            currentLiveAstroRoot: { [weak self] in MainActor.assumeIsolated { self!.liveAstroRoot } },
+            currentProfile: { [weak self] in MainActor.assumeIsolated { self!.profile } },
+            currentProcessorBackend: { [weak self] in MainActor.assumeIsolated { self?.processorBackend ?? .none } },
+            wireImportCallbacks: { [weak self] pipeline, onAnyFrame in
+                MainActor.assumeIsolated { self?.wireCallbacks(to: pipeline, onAnyFrame: onAnyFrame) } },
+            setAcceptedRejectedCounts: { [weak self] accepted, rejected in
+                MainActor.assumeIsolated { self?.acceptedCount = accepted; self?.rejectedCount = rejected } },
+            setReplayURL: { [weak self] url in MainActor.assumeIsolated { self?.replayURL = url } },
+            setLastSessionDirectory: { [weak self] url in MainActor.assumeIsolated { self?.lastSessionDirectory = url } }))
         loadSettings()
 
         // Save settings and stop the relay when the app is about to terminate.
@@ -258,7 +285,7 @@ final class AppModel {
     func startSession() {
         saveSettings()
         guard !isRunning else { return }
-        guard !isImporting else { errorMessage = "Finish the import before starting a session."; return }
+        guard !importer.isImporting else { errorMessage = "Finish the import before starting a session."; return }
         guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return }
         zoomPan = .fit
         let root = liveAstroRoot
@@ -345,154 +372,16 @@ final class AppModel {
 
     /// Reseeds the stacking engine reference frame (native mode only).
     func reseedReference() {
-        guard isRunning && sourceMode == .nativeStack && !isGeneratingReplay else { return }
+        guard isRunning && sourceMode == .nativeStack && !importer.isGeneratingReplay else { return }
         pipeline?.reseed()
         log.append("reference reseeded")
-    }
-
-    /// Imports raw FITS subs from `folder` as a one-shot batch.
-    /// Runs start()+end() off the main thread; end() drains the finite import stream.
-    /// Not unit-testable: needs a detached task and a real folder; the
-    /// zero-match path is covered via noMatchMessage(prefix:).
-    func importSubs(from folder: URL) {
-        saveSettings()
-        guard !isRunning else { errorMessage = "End the session before importing."; return }
-        guard !isImporting else { return }
-        // Reflect the imported subs' actual target/exposure in the profile + Live
-        // overlay instead of showing stale form values from a prior session (matches
-        // the live/auto-detect paths, which fill these from the newest sub's header).
-        if let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder) {
-            if let object = meta.object, !object.isEmpty { targetName = object }
-            if let exp = meta.exposureSeconds, exp > 0 { subExposureText = String(format: "%g", exp) }
-            saveSettings()
-        }
-        let source = FolderFrameSource(folder: folder, mode: .importOnce,
-                                        fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
-        let engine = makeStackEngine()
-        let (importCalibrator, importCalWarnings) = CalibrationLoader.makeCalibrator(
-            dark: calibration.darkPath.map { URL(fileURLWithPath: $0) },
-            flat: calibration.flatPath.map { URL(fileURLWithPath: $0) })
-        importCalWarnings.forEach { log.append("⚠ \($0)") }
-        CalibrationStore.save(calibration, to: .standard)
-        let importPipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
-                                              rootDirectory: liveAstroRoot,
-                                              neutralizeBackground: neutralizeBackground,
-                                              calibrator: importCalibrator)
-        importPipeline.onImportProgress = { [weak self] processed, total, accepted, rejected in
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {
-                    self?.importProcessed = processed; self?.importTotal = total
-                    self?.acceptedCount = accepted; self?.rejectedCount = rejected
-                }
-            }
-        }
-        self.importPipeline = importPipeline
-        // Counts every frame the source produced (accepted or rejected); it stays at zero
-        // only when nothing in the folder matched the prefix at all. The pipeline callbacks
-        // fire synchronously on the consume task, which end() drains before returning.
-        let matchedFrames = AtomicCounter()
-        wireCallbacks(to: importPipeline, onAnyFrame: { matchedFrames.increment() })
-        importProcessed = 0
-        importTotal = 0
-        isImporting = true
-        log.append("Importing subs from \(folder.path)…")
-        let prefix = fileNamePrefix
-        Task.detached { [weak self] in
-            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
-            do {
-                try importPipeline.start()
-                let url = try importPipeline.end()
-                await MainActor.run {
-                    if matchedFrames.value == 0 {
-                        self.errorMessage = AppModel.noMatchMessage(prefix: prefix)
-                    } else {
-                        self.replayURL = url
-                        self.lastSessionDirectory = url.deletingLastPathComponent()
-                        self.log.append("Import complete. Replay: \(url.path)")
-                    }
-                    self.isImporting = false
-                }
-            } catch {
-                await MainActor.run {
-                    // A zero-match import may also surface as a downstream failure
-                    // (nothing to render) — prefer the actionable message.
-                    self.errorMessage = matchedFrames.value == 0
-                        ? AppModel.noMatchMessage(prefix: prefix)
-                        : "Import failed: \(error)"
-                    self.isImporting = false
-                }
-            }
-        }
-    }
-
-    func cancelImport() { importPipeline?.cancelImport() }
-
-    /// User-facing message for an import that matched zero files.
-    private nonisolated static func noMatchMessage(prefix: String) -> String {
-        prefix.isEmpty
-            ? "No .fit files found in the chosen folder."
-            : "No .fit files matching prefix '\(prefix)' in the chosen folder."
-    }
-
-    func regenerateReplay(sessionDirectory: URL) {
-        guard !isRunning && !isGeneratingReplay else { return }
-        isGeneratingReplay = true
-        log.append("Regenerating replay for \(sessionDirectory.lastPathComponent)…")
-        Task.detached { [weak self] in
-            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
-            do {
-                let url = try ReplayService.regenerate(sessionDirectory: sessionDirectory)
-                await MainActor.run {
-                    self.replayURL = url
-                    self.log.append("Replay ready: \(url.lastPathComponent)")
-                }
-            } catch {
-                await MainActor.run { self.errorMessage = "Regenerate failed: \(error)" }
-            }
-            await MainActor.run { self.isGeneratingReplay = false }
-        }
-    }
-
-    func processMaster(sessionDirectory: URL) {
-        guard !isProcessing, !isImporting, !isRunning else { return }
-        guard processorBackend == .graxpert, let exe = GraXpertProcessor.defaultExecutable() else {
-            errorMessage = "GraXpert not found — install it from graxpert.com"; return
-        }
-        let master = sessionDirectory.appendingPathComponent("master.fit")
-        guard FileManager.default.fileExists(atPath: master.path) else {
-            errorMessage = "No master.fit in this session — post-processing needs a natively-stacked master (Raw subs mode)."
-            return
-        }
-        isProcessing = true
-        log.append("Processing master with GraXpert…")
-        Task.detached { [weak self] in
-            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
-            do {
-                let out = sessionDirectory.appendingPathComponent("master_processed.fit")
-                let proc = GraXpertProcessor(executable: exe)
-                // process() runs synchronously within this task, so the strong `self`
-                // let is safely captured by the progress callback for its duration.
-                try proc.process(masterURL: master, outputURL: out) { m in
-                    Task { @MainActor in self.log.append(m) }
-                }
-                await MainActor.run {
-                    self.isProcessing = false
-                    self.log.append("Processed → \(out.lastPathComponent)")
-                }
-            } catch {
-                await MainActor.run {
-                    self.isProcessing = false
-                    self.errorMessage = "Processing failed: \(error)"
-                }
-            }
-        }
     }
 
     func endSession() {
         saveSettings()
         guard let p = pipeline else { return }
-        guard !isGeneratingReplay else { return }
-        isGeneratingReplay = true
+        guard !importer.isGeneratingReplay else { return }
+        importer.isGeneratingReplay = true
         log.append("Ending session — generating replay…")
 
         // Stop the relay (if any) immediately — before the pipeline drains.
@@ -517,7 +406,7 @@ final class AppModel {
             }
             await MainActor.run {
                 self.isRunning = false
-                self.isGeneratingReplay = false
+                self.importer.isGeneratingReplay = false
                 self.pipeline = nil
                 self.sessionEnd = Date()
             }

@@ -1,4 +1,5 @@
 import Foundation
+import LiveAstroCore
 
 /// The seam between `AppModel` and its extracted controllers.
 ///
@@ -21,9 +22,10 @@ struct AppSurface {
     /// Reads `AppModel.isRunning` — a cross-domain gate the controller must not
     /// store as a back-reference.
     let isSessionRunning: () -> Bool
-    /// Reads `AppModel.isImporting` — a cross-domain gate the start*Live paths
-    /// check today. Import state moves to ImportController in T3, at which point
-    /// this closure is removed and the controller reads it from that seam. // T3 removes
+    /// Reads `isImporting` — a cross-domain gate the start*Live paths check.
+    /// Import state now lives on `ImportController` (T3); `AppModel` backs this
+    /// closure with `importer.isImporting`, so `LiveSourceController` keeps
+    /// reading the gate through the seam without a back-reference.
     let isImporting: () -> Bool
 
     // MARK: T2 — LiveSourceController seam (declared, unused until T2)
@@ -44,7 +46,32 @@ struct AppSurface {
     /// Persists current settings.
     var saveSettings: (() -> Void)?
 
-    // MARK: T3 — ImportController seam (declared, unused until T3)
+    // MARK: T3 — ImportController seam
+
+    /// Builds a stacking engine from the current stacker settings — the import
+    /// path stacks natively, so it needs the same engine `startSession` uses.
+    var makeStackEngine: (() -> StackEngine)?
+    /// Reads the current calibration selection (dark/flat paths) for the import
+    /// calibrator; import saves it back to the standard store like the live path.
+    var currentCalibration: (() -> CalibrationSelection)?
+    /// Reads the current `neutralizeBackground` draft flag.
+    var currentNeutralizeBackground: (() -> Bool)?
+    /// Reads the current `fileNamePrefix` draft field (drives the folder glob and
+    /// the zero-match message).
+    var currentFileNamePrefix: (() -> String)?
+    /// Reads the session-output root (`AppModel.liveAstroRoot`).
+    var currentLiveAstroRoot: (() -> URL)?
+    /// Reads the current session profile draft.
+    var currentProfile: (() -> SessionProfile)?
+    /// Reads the selected post-processor backend (GraXpert gate in processMaster).
+    var currentProcessorBackend: (() -> ProcessorBackend)?
+    /// Wires the shared pipeline callbacks (`onUpdate`/`onRejected`/`onLog`) — the
+    /// same session-shared wiring `startSession` uses; stays on `AppModel` because
+    /// it writes cross-cutting session state (`latestImage`, counts, log).
+    var wireImportCallbacks: ((SessionPipeline, @escaping () -> Void) -> Void)?
+    /// Publishes the running accepted/rejected counts (import progress writes the
+    /// same cross-cutting counters the live path does).
+    var setAcceptedRejectedCounts: ((Int, Int) -> Void)?
 
     /// Publishes the generated replay URL.
     var setReplayURL: ((URL) -> Void)?
@@ -61,6 +88,15 @@ struct AppSurface {
          selectLiveTab: (() -> Void)? = nil,
          startSession: (() -> Void)? = nil,
          saveSettings: (() -> Void)? = nil,
+         makeStackEngine: (() -> StackEngine)? = nil,
+         currentCalibration: (() -> CalibrationSelection)? = nil,
+         currentNeutralizeBackground: (() -> Bool)? = nil,
+         currentFileNamePrefix: (() -> String)? = nil,
+         currentLiveAstroRoot: (() -> URL)? = nil,
+         currentProfile: (() -> SessionProfile)? = nil,
+         currentProcessorBackend: (() -> ProcessorBackend)? = nil,
+         wireImportCallbacks: ((SessionPipeline, @escaping () -> Void) -> Void)? = nil,
+         setAcceptedRejectedCounts: ((Int, Int) -> Void)? = nil,
          setReplayURL: ((URL) -> Void)? = nil,
          setLastSessionDirectory: ((URL) -> Void)? = nil) {
         self.log = log
@@ -73,6 +109,15 @@ struct AppSurface {
         self.selectLiveTab = selectLiveTab
         self.startSession = startSession
         self.saveSettings = saveSettings
+        self.makeStackEngine = makeStackEngine
+        self.currentCalibration = currentCalibration
+        self.currentNeutralizeBackground = currentNeutralizeBackground
+        self.currentFileNamePrefix = currentFileNamePrefix
+        self.currentLiveAstroRoot = currentLiveAstroRoot
+        self.currentProfile = currentProfile
+        self.currentProcessorBackend = currentProcessorBackend
+        self.wireImportCallbacks = wireImportCallbacks
+        self.setAcceptedRejectedCounts = setAcceptedRejectedCounts
         self.setReplayURL = setReplayURL
         self.setLastSessionDirectory = setLastSessionDirectory
     }

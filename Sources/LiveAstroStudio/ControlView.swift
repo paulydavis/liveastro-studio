@@ -54,7 +54,7 @@ struct ControlView: View {
                             }
                         }
                         .pickerStyle(.segmented)
-                        .disabled(model.isRunning || model.isImporting)
+                        .disabled(model.isRunning || model.importer.isImporting)
                         .help("Seestar Live displays Siril's live_stack.fit directly; Raw subs stacks individual exposures natively using LiveAstro's built-in stacker.")
 
                         HStack {
@@ -62,28 +62,28 @@ struct ControlView: View {
                                 .lineLimit(1).truncationMode(.middle)
                             Spacer()
                             Button("Choose…") { pickFolder() }
-                                .disabled(model.isRunning || model.isImporting)
+                                .disabled(model.isRunning || model.importer.isImporting)
                                 .help("Choose the folder to watch for incoming FITS subs or the Seestar relay folder.")
                         }
                         TextField("File prefix (empty = any; e.g. Light_ for native subs)",
                                   text: $model.fileNamePrefix)
-                            .disabled(model.isRunning || model.isImporting)
+                            .disabled(model.isRunning || model.importer.isImporting)
                             .help("Only process files whose name starts with this prefix; leave empty to accept all FITS files in the watch folder.")
                         helpToggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground,
                                    help: "Apply a per-channel background neutralization pass after stacking to correct OSC white balance drift.")
-                            .disabled(model.isRunning || model.isImporting)
+                            .disabled(model.isRunning || model.importer.isImporting)
                         helpToggle("Reject outliers (σ-clip)", isOn: $model.rejectionEnabled,
                                    help: "Drop satellite / plane / cosmic-ray streaks by clamping pixels that deviate from the per-pixel stack statistics (winsorized κ-σ). On by default.")
-                            .disabled(model.isRunning || model.isImporting)
+                            .disabled(model.isRunning || model.importer.isImporting)
                         helpToggle("Weight frames by quality", isOn: $model.frameWeightingEnabled,
                                    help: "Give sharper, lower-noise subs more influence in the stack (star count + background noise). Turn off for an equal-weight stack.")
-                            .disabled(model.isRunning || model.isImporting)
+                            .disabled(model.isRunning || model.importer.isImporting)
                         helpToggle("Match sky background", isOn: $model.backgroundNormalizationEnabled,
                                    help: "Level each sub's sky gradient to the reference before stacking, so a drifting light-pollution ramp or moonrise gradient doesn't leave a residual gradient the master can't remove. Low-order per channel; off for an unadjusted stack.")
-                            .disabled(model.isRunning || model.isImporting)
+                            .disabled(model.isRunning || model.importer.isImporting)
                         helpToggle("Match transparency", isOn: $model.scaleNormalizationEnabled,
                                    help: "Scale each sub's signal to the reference brightness using matched star fluxes, so haze or thin cloud doesn't dim the master. Off for an unadjusted stack. Requires Match sky background (scaling pivots about the matched background).")
-                            .disabled(model.isRunning || model.isImporting)
+                            .disabled(model.isRunning || model.importer.isImporting)
                         HStack(spacing: 6) {
                             Text("Keep relay sessions")
                             InfoButton(text: "Live sessions stage incoming subs in ~/LiveAstro/relay. Sessions older than this are deleted automatically when a new session starts — they are copies; originals stay on the Seestar/rig. Off disables pruning.")
@@ -98,7 +98,7 @@ struct ControlView: View {
                             .pickerStyle(.segmented)
                             .labelsHidden()
                             .frame(maxWidth: 300)
-                            .disabled(model.isRunning || model.isImporting)
+                            .disabled(model.isRunning || model.importer.isImporting)
                         }
                         HStack(spacing: 6) {
                             Text("Debayer")
@@ -111,7 +111,7 @@ struct ControlView: View {
                             .pickerStyle(.segmented)
                             .labelsHidden()
                             .frame(maxWidth: 220)
-                            .disabled(model.isRunning || model.isImporting)
+                            .disabled(model.isRunning || model.importer.isImporting)
                         }
                         if model.rejectionEnabled {
                             Picker("Strength", selection: $model.rejectionStrength) {
@@ -120,7 +120,7 @@ struct ControlView: View {
                                 Text("High").tag(RejectionStrength.high)
                             }
                             .pickerStyle(.segmented)
-                            .disabled(model.isRunning || model.isImporting)
+                            .disabled(model.isRunning || model.importer.isImporting)
                             .help("Higher = safer (rejects less); lower = more aggressive. Medium (κ=3) is the validated default.")
                         }
                         Picker("Post-process", selection: $model.processorBackend) {
@@ -128,7 +128,7 @@ struct ControlView: View {
                             Text("GraXpert").tag(ProcessorBackend.graxpert)
                         }
                         .pickerStyle(.segmented)
-                        .disabled(model.isRunning || model.isImporting || model.isProcessing)
+                        .disabled(model.isRunning || model.importer.isImporting || model.importer.isProcessing)
                         .help("After stacking, optionally run GraXpert (background extraction + denoise) to write master_processed.fit next to the raw master. Requires GraXpert installed.")
                     }
                     if model.sourceMode == .nativeStack {
@@ -225,28 +225,28 @@ struct ControlView: View {
                 HStack {
                     if model.isRunning {
                         Button("End Session", role: .destructive) { model.endSession() }
-                            .disabled(model.isGeneratingReplay)
+                            .disabled(model.importer.isGeneratingReplay)
                     } else {
                         Button("Start Session") { model.startSession() }
                             .buttonStyle(.borderedProminent)
-                            .disabled(model.isImporting)
+                            .disabled(model.importer.isImporting)
                     }
                     Spacer()
                     Button {
                         model.liveSource.startSeestarLive()
                     } label: { Label("Start Seestar", systemImage: "dot.radiowaves.left.and.right") }
                     .help("Auto-detect the mounted Seestar folder, start relaying its 10s subs, and begin native stacking — one tap.")
-                    .disabled(model.isRunning || model.isImporting || model.liveSource.isDetecting)
+                    .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
                     Button {
                         model.liveSource.startASIAIRLive()
                     } label: { Label("Start ASIAIR", systemImage: "camera.aperture") }
                     .help("Auto-detect the ASIAIR's Autorun/Light folder, relay its subs, and begin native stacking — one tap.")
-                    .disabled(model.isRunning || model.isImporting || model.liveSource.isDetecting)
+                    .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
                     Button("Choose Folder…") { pickWatchFolderLive() }
                         .help("Live-stack subs from any folder your rig writes to (NINA / ASI camera / any incoming-subs folder) — session-scoped from the moment you start.")
-                        .disabled(model.isRunning || model.isImporting || model.liveSource.isDetecting)
+                        .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
                     Button("Import Subs…") { pickImportFolder() }
-                        .disabled(model.isRunning || model.isImporting)
+                        .disabled(model.isRunning || model.importer.isImporting)
                         .help("Select a folder of previously captured FITS subs to stack offline, with progress tracking and Cancel support.")
                 }
                 // Go Live / End Broadcast — decoupled from session start.
@@ -279,22 +279,22 @@ struct ControlView: View {
                             .help("Replace the alignment reference frame with the latest accepted sub so subsequent subs align to it.")
                     }
                 }
-                if model.isImporting {
+                if model.importer.isImporting {
                     VStack(spacing: 4) {
-                        ProgressView(value: Double(model.importProcessed),
-                                     total: Double(max(model.importTotal, 1)))
+                        ProgressView(value: Double(model.importer.importProcessed),
+                                     total: Double(max(model.importer.importTotal, 1)))
                         HStack {
-                            Text("\(model.importProcessed) / \(model.importTotal)")
+                            Text("\(model.importer.importProcessed) / \(model.importer.importTotal)")
                             Spacer()
                             Text("✓ \(model.acceptedCount)  ✗ \(model.rejectedCount)").foregroundStyle(.secondary)
-                            Button("Cancel", role: .cancel) { model.cancelImport() }
+                            Button("Cancel", role: .cancel) { model.importer.cancelImport() }
                         }.font(.caption)
                     }.padding(.horizontal)
                 }
                 if !model.isRunning {
                     HStack {
                         Button("Regenerate Replay…") { pickSessionDirectory() }
-                            .disabled(model.isGeneratingReplay)
+                            .disabled(model.importer.isGeneratingReplay)
                         if let url = model.replayURL {
                             Spacer()
                             Button("Reveal Replay in Finder") {
@@ -304,15 +304,15 @@ struct ControlView: View {
                     }
                 }
                 if model.processorBackend == .graxpert, model.sourceMode == .nativeStack, let dir = model.lastSessionDirectory {
-                    Button(model.isProcessing ? "Processing…" : "Process master") {
-                        model.processMaster(sessionDirectory: dir)
+                    Button(model.importer.isProcessing ? "Processing…" : "Process master") {
+                        model.importer.processMaster(sessionDirectory: dir)
                     }
-                    .disabled(model.isProcessing || GraXpertProcessor.defaultExecutable() == nil)
+                    .disabled(model.importer.isProcessing || GraXpertProcessor.defaultExecutable() == nil)
                     .help(GraXpertProcessor.defaultExecutable() == nil
                           ? "GraXpert not found — install from graxpert.com"
                           : "Run GraXpert on the last stacked master → master_processed.fit")
                 }
-                if model.isGeneratingReplay { ProgressView("Rendering replay…") }
+                if model.importer.isGeneratingReplay { ProgressView("Rendering replay…") }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
@@ -360,7 +360,7 @@ struct ControlView: View {
         let panel = makeDirectoryPanel(title: "Choose Subs Folder",
                                        message: "Select a folder containing raw FITS subs to import")
         if panel.runModal() == .OK, let url = panel.url {
-            model.importSubs(from: url)
+            model.importer.importSubs(from: url)
         }
     }
 
@@ -372,7 +372,7 @@ struct ControlView: View {
             panel.directoryURL = liveAstro
         }
         if panel.runModal() == .OK, let url = panel.url {
-            model.regenerateReplay(sessionDirectory: url)
+            model.importer.regenerateReplay(sessionDirectory: url)
         }
     }
 }
