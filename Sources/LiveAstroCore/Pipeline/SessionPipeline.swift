@@ -75,6 +75,18 @@ public final class SessionPipeline {
     private var sourceMetadata: SourceMetadata?
     private var lastAutoReseedCount = 0
 
+    // MARK: Import progress ticks (cold1 I1)
+    //
+    // The finite drain's deadline is PROGRESS-AWARE (see drainFiniteImportOrThrow): the
+    // app calls end() right after start() to run the whole import, so the primary budget
+    // bounds the time since the LAST finalized frame, never the import as a whole. One
+    // tick per finalized frame (committed or rejected), lock-guarded because end() reads
+    // it from the caller's thread while the consumer task writes it.
+    private let progressLock = NSLock()
+    private var progressTicks = 0
+    private func noteFrameProgress() { progressLock.withLock { progressTicks += 1 } }
+    private var progressSnapshot: Int { progressLock.withLock { progressTicks } }
+
     private let adjLock = NSLock()
     private var _displayAdjustments = DisplayAdjustments.neutral
     /// Display-path adjustments. Read once per render; lock-guarded because the
@@ -169,6 +181,7 @@ public final class SessionPipeline {
     /// Called serially by BatchImporter in completion order. Callback deliveries inside are
     /// reentrancy-guarded (review10 item 4).
     private func finalizeCommitted(index: Int, sourceName: String, timestamp: Date, metadata: SourceMetadata?, engine: StackEngine) {
+        noteFrameProgress()   // cold1 I1: a finalized frame is drain progress
         withCallbackDelivery {
             if sourceMetadata == nil, let m = metadata { sourceMetadata = m }
             processedCount += 1
@@ -192,6 +205,7 @@ public final class SessionPipeline {
     }
 
     private func finalizeRejected(sourceName: String, engine: StackEngine) {
+        noteFrameProgress()   // cold1 I1: a finalized frame is drain progress
         withCallbackDelivery {
             processedCount += 1
             onRejected?(.noTransform, sourceName)
@@ -448,6 +462,43 @@ public final class SessionPipeline {
         throw SessionPipelineError.shutdownTimeout
     }
 
+    /// Cold1 I1: bounded drain for the FINITE import branch. The previous code waited on
+    /// `consumeDone` with NO deadline, so one stalled read inside the import pull (a dead
+    /// SMB share) pinned end() forever, outside every promised timeout. Unlike the live/
+    /// watcher drains the deadline here is PROGRESS-AWARE: a healthy import must still
+    /// drain COMPLETELY (the app calls end() right after start() to run the whole import),
+    /// so `drainPrimaryTimeout` bounds the time since the LAST finalized frame — as long
+    /// as frames keep landing, the wait continues. Once a full primary window passes with
+    /// zero progress, the import is cancelled (cancelImport(): the source cursor stops
+    /// feeding AND the importer's isCancelled flag flips) plus the task itself, and given
+    /// `drainGraceTimeout` to acknowledge; a cancel that lands finalizes the partial-but-
+    /// honest session exactly like a user cancelImport(). If even the grace expires,
+    /// throw shutdownTimeout rather than finalize over a still-running consumer. A hung
+    /// BLOCKING read cannot be interrupted mid-syscall — the bound is on OUR wait; the
+    /// task is cancelled and abandoned honestly (consistent with the watcher-mode
+    /// contract).
+    private func drainFiniteImportOrThrow() throws {
+        guard let task = consumeTask else { return }
+        var lastProgress = progressSnapshot
+        while true {
+            if consumeDone.wait(timeout: .now() + drainPrimaryTimeout) == .success {
+                consumeTask = nil
+                return
+            }
+            let now = progressSnapshot
+            if now != lastProgress { lastProgress = now; continue }   // progressing — keep draining
+            break                                                     // a full window, no progress
+        }
+        cancelImport()
+        task.cancel()
+        if consumeDone.wait(timeout: .now() + drainGraceTimeout) == .success {
+            consumeTask = nil
+            return
+        }
+        onLog?("Shutdown timed out: the import stalled with no progress — refusing to finalize.")
+        throw SessionPipelineError.shutdownTimeout
+    }
+
     /// Ends the session and renders replay.mp4. Synchronous — call off the main thread,
     /// and NEVER from inside one of this pipeline's callbacks (onUpdate / onLog /
     /// onRejected / onImportProgress): those are delivered synchronously on the
@@ -466,17 +517,24 @@ public final class SessionPipeline {
         guard !isInsideCallbackDelivery else { throw SessionPipelineError.reentrantEnd }
         if source != nil {
             if source?.isFinite ?? false {
-                // Import: the stream ends on its own; drain it completely (a long import
-                // takes as long as it takes — end() runs off the main thread).
-                if consumeTask != nil {
-                    consumeDone.wait()
-                    consumeTask = nil
-                }
+                // Import: the stream ends on its own; drain it completely while frames
+                // keep landing, but BOUNDED (cold1 I1): a stalled read triggers
+                // cancel + grace → shutdownTimeout instead of pinning end() forever.
+                try drainFiniteImportOrThrow()
                 source?.stop()
             } else {
                 // Live source: the stream never ends by itself — stop it first, then drain.
-                source?.stop()
-                try drainConsumeTaskOrThrow()
+                // Cold1 M1: the source's own bounded stop (FolderFrameSource → inner
+                // watcher, previously an un-budgeted 5 s default ON TOP of the drain) is
+                // charged against the SAME primary budget, mirroring the watcher-mode
+                // branch below: stop + drain together never exceed primary (+ grace).
+                let primaryDeadline = DispatchTime.now() + drainPrimaryTimeout
+                if let folderSource = source as? FolderFrameSource {
+                    folderSource.stop(timeout: Self.seconds(drainPrimaryTimeout))
+                } else {
+                    source?.stop()
+                }
+                try drainConsumeTaskOrThrow(primaryDeadline: primaryDeadline)
             }
         } else {
             // Watcher mode: stop the watcher to terminate the updates stream, then drain.

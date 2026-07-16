@@ -92,12 +92,26 @@ public final class FolderFrameSource: FrameSource {
         }
     }
 
-    public func stop() {
+    /// Protocol stop: bounded by the inner watcher's own 5 s default.
+    public func stop() { stop(timeout: 5.0) }
+
+    /// Bounded stop (cold1 M1): `timeout` caps the inner watcher's stop so a caller with
+    /// an overall shutdown budget (SessionPipeline.end() charges this against its primary
+    /// drain deadline) is never pinned behind the watcher default ON TOP of its own drain.
+    public func stop(timeout: TimeInterval) {
+        stopSeamLock.withLock { _lastStopTimeout = timeout }
         importCursor?.stop()
-        watcher?.stop()
+        watcher?.stop(timeout: timeout)
         liveTask?.cancel()
         continuation?.finish()
     }
+
+    /// Test seam (cold1 M1): the timeout the most recent stop() ran with — pins the
+    /// budget plumbing without wall-clock assertions. Lock-guarded: stop() may come from
+    /// any thread.
+    private let stopSeamLock = NSLock()
+    private var _lastStopTimeout: TimeInterval?
+    internal var lastStopTimeout: TimeInterval? { stopSeamLock.withLock { _lastStopTimeout } }
 
     /// Lazily-advanced sorted file list for import mode. Thread-safe: pulls come from the
     /// consumer's task, stop() may come from another thread.

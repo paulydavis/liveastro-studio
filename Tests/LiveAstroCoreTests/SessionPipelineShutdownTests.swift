@@ -171,6 +171,36 @@ final class SessionPipelineShutdownTests: XCTestCase {
                       "deinit must stop the live source — pre-fix it ran forever")
     }
 
+    /// Cold1 M1: on the native-live path end() used to call source.stop() UN-budgeted —
+    /// FolderFrameSource.stop → inner watcher stop with its 5 s default — BEFORE the
+    /// primary+grace drain, so end() could exceed the documented budget by the whole
+    /// watcher stop. The source stop's timeout must be threaded from the SAME primary
+    /// budget the watcher-mode branch charges. Plumbing assertion (not wall-clock): the
+    /// stop is invoked with the budgeted timeout, not its default.
+    func testEndLiveFolderSource_stopTimeoutChargedAgainstDrainBudget() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let watch = sandbox.appendingPathComponent("watch")
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: watch, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "Budget", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let source = FolderFrameSource(folder: watch, mode: .live)
+        let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
+                                       profile: profile, rootDirectory: sessions)
+        pipeline.drainPrimaryTimeout = .milliseconds(700)
+        try pipeline.start()
+        // Empty session: the replay render may legitimately throw — the budget plumbing
+        // is the assertion here, and stop() runs before any finalization.
+        _ = try? pipeline.end()
+        XCTAssertEqual(source.lastStopTimeout ?? -1, 0.7, accuracy: 1e-6,
+                       "the live-source stop must run with the drain budget, not its 5 s default")
+    }
+
     /// A source that throws on start(), and can be flipped to succeed on a retry.
     final class FlakyStartSource: FrameSource {
         let frames: AsyncStream<RawFrame>
