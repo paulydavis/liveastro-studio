@@ -333,16 +333,31 @@ public final class OBSController: ObservableObject {
     /// no client, or an unconfirmed stop — the caller must then treat OBS as
     /// possibly still live (review6 P1: no idle-despite-unknown-remote-state).
     /// At least one confirmation poll is always performed.
+    ///
+    /// Review10 finding 1 (SPLIT-SNAPSHOT/OWNERSHIP RACES): the confirmation
+    /// here is assembled from TWO sequential status reads — a stream RESTART
+    /// landing between them would be invisible to the second read and the
+    /// stale pair would confirm a stop over a live stream. When the caller
+    /// supplies `outputEventGeneration` (BroadcastController's output-event
+    /// counter), each poll captures it BEFORE its first read and revalidates
+    /// AFTER its last: a torn snapshot discards the conclusion and re-reads
+    /// (bounded by `maxConfirmPolls`); exhaustion returns `false` — the caller
+    /// settles `.stopUnconfirmed`, never `.idle`, from a torn confirmation.
     @discardableResult
     public func stopBroadcast(confirmPollSeconds: Double = 1.0,
-                              maxConfirmPolls: Int = 5) async -> Bool {
+                              maxConfirmPolls: Int = 5,
+                              outputEventGeneration: (() -> Int)? = nil) async -> Bool {
         await stopStream()
         await setRecording(false)
         for i in 0..<max(1, maxConfirmPolls) {
+            let snapshot = outputEventGeneration?()   // capture before the first read
             if let stream = await streamStatus(), !stream.active,
                let recording = await recordStatus(), !recording {
-                log("broadcast confirmed stopped")
-                return true
+                if snapshot == outputEventGeneration?() {   // revalidate after the last
+                    log("broadcast confirmed stopped")
+                    return true
+                }
+                log("output event landed mid-confirmation — snapshot torn, re-reading")
             }
             if i < maxConfirmPolls - 1, confirmPollSeconds > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(confirmPollSeconds * 1_000_000_000))

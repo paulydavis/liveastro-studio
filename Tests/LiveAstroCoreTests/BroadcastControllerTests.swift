@@ -979,6 +979,127 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertTrue(h.box.errors.contains { $0.contains("may still be live") })
     }
 
+    // MARK: - review10 findings 1-4: split-snapshot / ownership races
+
+    /// FINDING 1 (P1): the stop confirmation reads stream then recording
+    /// SEPARATELY — a stream restart landing between the two reads tears the
+    /// snapshot. Pre-fix the drain's ".stopping ignores events" rule dropped
+    /// the restart, then the stale two-read conclusion settled a confirmed
+    /// .idle over a LIVE stream. Post-fix the torn snapshot is discarded
+    /// (output-event generation moved), the confirmation cannot confirm, and
+    /// the post-settlement pass adopts the restart honestly.
+    func testStopConfirmationTornByStreamRestartNeverSettlesIdle() async {
+        let h = await makeHarness(requestTimeout: 10)
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+
+        // Park the stop confirmation's RECORDING read: the confirm's stream
+        // read (inactive after StopStream took effect) goes through, then the
+        // snapshot is parked mid-assembly.
+        h.server.parkTypes = ["GetRecordStatus"]
+        h.controller.endBroadcast()
+        await waitUntil { h.server.parked.count == 1 }
+        XCTAssertEqual(h.controller.broadcastState, .stopping)
+
+        // The stream RESTARTS between the two reads (external restart in OBS).
+        h.server.streamActive = true
+        h.mock.enqueueInbound(eventFrame(type: "StreamStateChanged",
+                                         data: ["outputActive": true]))
+        await settle()
+
+        // Resume the parked recording read with its (stale-snapshot) answer.
+        h.server.parkTypes = []
+        h.mock.enqueueInbound(responseFrame(requestId: h.server.parked[0].id, ok: true,
+                                            responseData: ["outputActive": false]))
+
+        // Must NOT settle .idle over the restarted stream: the torn snapshot
+        // re-reads, fails to confirm, and the restart is adopted.
+        await waitUntil { h.controller.broadcastState == .live }
+        XCTAssertEqual(h.controller.broadcastState, .live)
+        XCTAssertTrue(h.server.streamActive, "OBS really is live")
+        XCTAssertTrue(h.box.logs.contains { $0.contains("adopted the live broadcast") })
+    }
+
+    /// FINDING 2 (P1): connect-time reconcile has the same split-snapshot
+    /// hole — it reads stream-off, an EXTERNAL stream starts while the
+    /// recording read is parked, then the stale conclusion claims a confirmed
+    /// .idle over a live stream (pre-fix the drain also blanket-ignored all
+    /// events during .connecting, so nothing ever corrected it). Post-fix the
+    /// external stream-started event invalidates the snapshot / reconciles:
+    /// the landing is .live, never .idle.
+    func testManualConnectTornByExternalStreamStartNeverClaimsIdle() async {
+        let h = await makeHarness(connect: false, requestTimeout: 10)
+        // Seed's GetRecordStatus goes through; the reconcile's parks.
+        h.server.parkTypes = ["GetRecordStatus"]
+        h.server.parkSkip = ["GetRecordStatus": 1]
+        h.mock.enqueueInbound(helloFrame())
+        h.mock.replyToLastSent(h.server.responder())
+
+        let connectTask = Task { await h.controller.connectAndReconcile() }
+        await waitUntil { h.server.parked.count == 1 }   // reconcile mid-snapshot
+        XCTAssertEqual(h.controller.broadcastState, .connecting)
+
+        // External stream start while the recording read is parked. No
+        // app-issued StartStream is in flight — this event must reconcile.
+        h.server.streamActive = true
+        h.mock.enqueueInbound(eventFrame(type: "StreamStateChanged",
+                                         data: ["outputActive": true]))
+        await settle()
+
+        // Resume the parked recording read with its stale answer.
+        h.server.parkTypes = []
+        h.mock.enqueueInbound(responseFrame(requestId: h.server.parked[0].id, ok: true,
+                                            responseData: ["outputActive": false]))
+
+        let ok = await connectTask.value
+        XCTAssertTrue(ok, "the control link itself did connect")
+        await waitUntil { h.controller.broadcastState == .live }
+        XCTAssertEqual(h.controller.broadcastState, .live,
+                       "a torn reconcile snapshot must never claim .idle over a live stream")
+        XCTAssertEqual(sent("StartStream", h.mock), 0, "adoption, never a double start")
+    }
+
+    /// FINDING 3 (P1): the stale CONFIRMED-start cleanup awaited StopStream
+    /// without synchronously reserving ownership — state stayed .idle during
+    /// the await, a new Go Live could begin, and the stale cleanup then killed
+    /// it. Post-fix the cleanup mirrors the .issuedUnconfirmed path exactly:
+    /// generation bump + .stopping reservation BEFORE any await.
+    func testStaleConfirmedCleanupReservesOwnershipBeforeAwait() async {
+        let h = await makeHarness(requestTimeout: 10)
+        h.server.streamActive = true          // the zombie a stale start left up
+        h.server.parkTypes = ["StopStream"]   // park the cleanup mid-await
+
+        h.controller.discardStaleGoLive()
+        XCTAssertEqual(h.controller.broadcastState, .stopping,
+                       "ownership must be reserved SYNCHRONOUSLY before the cleanup awaits")
+        await waitUntil { h.server.parked.count == 1 }
+
+        // A Go Live during the cleanup await must be rejected outright.
+        let genBefore = h.controller.broadcastGeneration
+        h.controller.goLive()
+        XCTAssertEqual(h.controller.broadcastState, .stopping)
+        XCTAssertEqual(h.controller.broadcastGeneration, genBefore)
+        await settle()
+        XCTAssertEqual(sent("StartStream", h.mock), 0)
+
+        // Resume the cleanup stop (parked requests bypass the server model, so
+        // flip the modeled state as OBS honoring it); it confirms → .idle.
+        h.server.parkTypes = []
+        h.server.streamActive = false
+        h.mock.enqueueInbound(responseFrame(requestId: h.server.parked[0].id, ok: true))
+        await waitUntil { h.controller.broadcastState == .idle }
+        XCTAssertEqual(sent("StopStream", h.mock), 1)
+
+        // The NEXT broadcast survives — nothing stale is left to kill it.
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        await settle()
+        XCTAssertEqual(h.controller.broadcastState, .live)
+        XCTAssertTrue(h.server.streamActive)
+        XCTAssertEqual(sent("StopStream", h.mock), 1, "exactly one StopStream total")
+    }
+
+
     /// Boundary (c): while the orphan cleanup is awaiting OBS, .stopping is
     /// already reserved SYNCHRONOUSLY — a Go Live click during that await is
     /// rejected outright (no state change, no generation bump, no StartStream).
