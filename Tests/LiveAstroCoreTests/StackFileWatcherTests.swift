@@ -237,9 +237,9 @@ final class StackFileWatcherTests: XCTestCase {
 
     /// The producer (handle-streaming) and consumer (in-memory Data) digest forms must agree
     /// byte-for-byte, or consumer-side digest validation would reject every valid frame.
-    /// Covers both branches: small file (head only) and > 128 KB (head + tail chunks).
+    /// Covers sub-chunk, multi-chunk-with-remainder, and exact-chunk-boundary sizes.
     func testContentDigest_handleAndDataFormsAgree() throws {
-        for size in [1_000, 200_000] {
+        for size in [1_000, 100_000, 131_072, 200_000] {
             let data = Data((0..<size).map { UInt8(truncatingIfNeeded: $0 &* 31) })
             let url = tmp.appendingPathComponent("digest-\(size).bin")
             try data.write(to: url)
@@ -249,6 +249,86 @@ final class StackFileWatcherTests: XCTestCase {
                            FileIdentity.contentDigest(data: data),
                            "handle and data digest forms diverged for size \(size)")
         }
+    }
+
+    /// Review6 finding 2 — the digest must be a FULL-FILE content identity. The old head/tail
+    /// sample missed any middle-only change, and for 64–128 KB files it hashed no tail at all.
+    /// A same-size blob differing in ONE byte past the first 64 KB must digest differently, in
+    /// BOTH forms. 100_000 bytes pins the 64–128 KB regression window specifically; 200_000
+    /// pins the between-head-and-tail window of the old > 128 KB branch.
+    func testContentDigest_middleOnlyMutationChangesDigest() throws {
+        for size in [100_000, 200_000] {
+            let data = Data((0..<size).map { UInt8(truncatingIfNeeded: $0 &* 31) })
+            var mutated = data
+            mutated[80_000] ^= 0xFF   // past the 64 KB head, before any 64 KB tail
+            XCTAssertNotEqual(FileIdentity.contentDigest(data: data),
+                              FileIdentity.contentDigest(data: mutated),
+                              "a middle-only mutation must change the digest (size \(size))")
+            let url = tmp.appendingPathComponent("digest-mid-\(size).bin")
+            try mutated.write(to: url)
+            let fh = try FileHandle(forReadingFrom: url)
+            defer { try? fh.close() }
+            XCTAssertEqual(FileIdentity.contentDigest(handle: fh, size: size),
+                           FileIdentity.contentDigest(data: mutated),
+                           "handle form must agree on the mutated bytes (size \(size))")
+        }
+    }
+
+    /// Review6 finding 2, consumer side — a middle-only in-place mutation must fail digest
+    /// validation even when the stat fields are captured FRESH (post-mutation), i.e. the digest
+    /// alone must catch it. Under the head/tail-sample digest a 100 KB file's middle bytes were
+    /// never hashed, so this read incorrectly succeeded.
+    func testReadVerifying_middleOnlyMutationRefusedByDigest() throws {
+        let size = 100_000
+        let original = Data((0..<size).map { UInt8(truncatingIfNeeded: $0 &* 31) })
+        let url = tmp.appendingPathComponent("mid-mutation.bin")
+        try original.write(to: url)
+        let originalDigest = FileIdentity.contentDigest(data: original)
+
+        // Mutate ONE middle byte in place — same size.
+        let fh = try FileHandle(forWritingTo: url)
+        try fh.seek(toOffset: 80_000)
+        try fh.write(contentsOf: Data([original[80_000] ^ 0xFF]))
+        try fh.close()
+
+        // Fresh stat (matches the mutated file) + the ORIGINAL content's digest: only the digest
+        // stands between the consumer and the wrong bytes.
+        let expected = try XCTUnwrap(FileIdentity.capture(url: url)).withDigest(originalDigest)
+        XCTAssertThrowsError(try FileIdentity.read(url: url, verifying: expected)) {
+            XCTAssertTrue($0 is FileIdentityMismatchError,
+                          "full-file digest validation must refuse a middle-only mutation")
+        }
+    }
+
+    /// Review6 finding 2, watcher side — a middle-only same-size change must NOT be suppressed
+    /// by the digest-keyed dedup. A ~106 KB FITS (inside the 64–128 KB regression window) is
+    /// emitted, then ONE pixel byte past the 64 KB head is flipped in place; after re-earning
+    /// stability the file must emit AGAIN. Under the head/tail sample the digest was unchanged
+    /// and the update was wrongly deduped.
+    func testWatcher_middleOnlyChangeEmitsAgain_notDeduped() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.3)
+        let collector = collect(watcher)
+        try watcher.start()
+        let data = makeFITS(0.5, size: 160)   // 2880 header + 160*160*4 data ≈ 106 KB
+        XCTAssertTrue(data.count > 65_536 && data.count < 131_072,
+                      "arrange: file must sit in the 64–128 KB window (got \(data.count))")
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        try data.write(to: url)
+        let got = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(got, "arrange: initial emission")
+
+        // Flip one byte at offset 80,000 — inside the pixel data, past the 64 KB head, same size.
+        let fh = try FileHandle(forWritingTo: url)
+        try fh.seek(toOffset: 80_000)
+        try fh.write(contentsOf: Data([data[80_000] ^ 0xFF]))
+        try fh.close()
+
+        let reEmitted = await collector.waitForCount(2, timeout: 5)
+        XCTAssertTrue(reEmitted, "a middle-only content change must re-emit, not be deduped")
+        let items = await collector.items
+        guard items.count >= 2 else { return }   // already failed above; don't trap on items[1]
+        XCTAssertNotEqual(items[0].identity?.digest, items[1].identity?.digest,
+                          "the two emissions must carry different content digests")
     }
 
     /// Emitted updates must carry the identity of the exact file version the watcher validated
@@ -327,5 +407,30 @@ final class StackFileWatcherTests: XCTestCase {
         }
         // nil identity → legacy read, no verification.
         XCTAssertEqual(try FileIdentity.read(url: url, verifying: nil), data)
+    }
+
+    /// Review6 finding 1 — identity revalidation around the verified read. Deterministic half:
+    /// the file is mutated IN PLACE (same inode — unlike the rename-replacement test above)
+    /// between capturing the identity and calling read; the fstat check must reject it. The
+    /// post-read revalidation branch (a writer active DURING readToEnd) cannot be reached
+    /// deterministically without an injectable read seam, which is not wanted — it is the same
+    /// 4-line fstat+matches check exercised here, applied to the same descriptor after the read.
+    func testReadVerifying_inPlaceMutationAfterCaptureRejected() throws {
+        let data = makeFITS(0.4)
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        try data.write(to: url)
+        let identity = try XCTUnwrap(FileIdentity.capture(url: url))
+            .withDigest(FileIdentity.contentDigest(data: data))
+
+        // Mutate in place: append one byte — same dev/ino, changed size (and mtime).
+        let fh = try FileHandle(forWritingTo: url)
+        try fh.seekToEnd()
+        try fh.write(contentsOf: Data([0xFF]))
+        try fh.close()
+
+        XCTAssertThrowsError(try FileIdentity.read(url: url, verifying: identity)) {
+            XCTAssertTrue($0 is FileIdentityMismatchError,
+                          "an in-place mutation after validation must be refused by the fstat check")
+        }
     }
 }

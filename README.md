@@ -81,9 +81,15 @@ progress. Broadcasting is deliberate: starting a session never starts a stream.
   to the **Stack scene** once. If you change the program scene by hand, automation
   detects the override and pauses until the next stall/resume boundary.
 - **End Session** runs the replay generation first, then — and only then — stops
-  the OBS stream and recording. This is the **only** place the stream is stopped:
-  quitting or force-quitting the app deliberately leaves the OBS stream alive so a
-  crash or accidental quit never kills your broadcast.
+  the OBS stream and recording. While the replay renders, the footer shows
+  "Ending broadcast…" with live stream health, and **End Broadcast** stays
+  available as an operator override if you need the stream down immediately.
+  The stream is stopped only by these deliberate actions (End Session's deferred
+  stop, or End Broadcast): quitting or force-quitting the app deliberately
+  leaves the OBS stream alive so a crash or accidental quit never kills your
+  broadcast. Every stop is confirmed against OBS — if OBS can't confirm the
+  stream and recording actually stopped, the app says "OBS may still be live"
+  and offers Retry instead of pretending it's idle.
 
 **Manual validation checklist**
 

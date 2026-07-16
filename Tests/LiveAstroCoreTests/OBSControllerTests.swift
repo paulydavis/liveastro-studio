@@ -23,7 +23,7 @@ final class OBSControllerTests: XCTestCase {
         streaming: Bool = false,
         recording: Bool = false
     ) -> (String) -> String? {
-        return { [self] sent in
+        return { sent in
             // Identify → Identified.
             if sent.contains("\"op\":1") { return identifiedFrame }
             guard sent.contains("\"op\":6") else { return nil }
@@ -51,47 +51,9 @@ final class OBSControllerTests: XCTestCase {
         }
     }
 
-    private let identifiedFrame = #"{"op":2,"d":{"negotiatedRpcVersion":1}}"#
-
-    private func responseFrame(requestId: String,
-                               requestType: String = "X",
-                               ok: Bool,
-                               code: Int = 100,
-                               responseData: [String: Any] = [:]) -> String {
-        let d: [String: Any] = [
-            "requestId": requestId,
-            "requestType": requestType,
-            "requestStatus": ["result": ok, "code": code],
-            "responseData": responseData
-        ]
-        return json(["op": 7, "d": d])
-    }
-
-    private func helloFrame() -> String {
-        json(["op": 0, "d": ["rpcVersion": 1]])
-    }
-
-    private func eventFrame(type: String, data: [String: Any]) -> String {
-        json(["op": 5, "d": ["eventType": type, "eventData": data]])
-    }
-
-    private func json(_ obj: [String: Any]) -> String {
-        let data = try! JSONSerialization.data(withJSONObject: obj)
-        return String(data: data, encoding: .utf8)!
-    }
-
-    private func requestId(fromSent frame: String) -> String {
-        field(frame, "requestId")
-    }
-    private func requestType(fromSent frame: String) -> String {
-        field(frame, "requestType")
-    }
-    private func field(_ frame: String, _ key: String) -> String {
-        let obj = try! JSONSerialization.jsonObject(
-            with: frame.data(using: .utf8)!) as! [String: Any]
-        let d = obj["d"] as! [String: Any]
-        return d[key] as! String
-    }
+    // Frame builders/inspectors (identifiedFrame, helloFrame, responseFrame,
+    // eventFrame, requestId/requestType(fromSent:)) and waitUntil live in
+    // OBSTestScripting.swift, shared with BroadcastControllerTests.
 
     // MARK: - Controller factory
 
@@ -116,19 +78,6 @@ final class OBSControllerTests: XCTestCase {
             scenes: scenes, currentScene: currentScene,
             streaming: streaming, recording: recording))
         return await controller.connect(host: "localhost", port: 4455, password: nil)
-    }
-
-    /// Poll a MainActor predicate until true or deadline.
-    private func waitUntil(_ predicate: () -> Bool,
-                           timeout: TimeInterval = 2,
-                           file: StaticString = #filePath,
-                           line: UInt = #line) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if predicate() { return }
-            try? await Task.sleep(nanoseconds: 2_000_000)
-        }
-        XCTFail("waitUntil timed out", file: file, line: line)
     }
 
     // MARK: - Tests
@@ -170,7 +119,7 @@ final class OBSControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .connected)
 
         // When StartStream is sent, also push a StreamStateChanged(active) event.
-        mock.replyToLastSent { [self] sent in
+        mock.replyToLastSent { sent in
             guard sent.contains("\"op\":6") else { return nil }
             let id = requestId(fromSent: sent)
             let type = requestType(fromSent: sent)
@@ -283,7 +232,7 @@ final class OBSControllerTests: XCTestCase {
         let controller = makeController(mock)
 
         mock.enqueueInbound(helloFrame())
-        mock.replyToLastSent { [self] sent in
+        mock.replyToLastSent { sent in
             // Identify → Identified
             if sent.contains("\"op\":1") { return identifiedFrame }
             guard sent.contains("\"op\":6") else { return nil }
@@ -358,8 +307,12 @@ final class OBSControllerTests: XCTestCase {
     }
 
     func testStopBroadcastSendsStopStream() async throws {
+        // streamStatusActive stays true, so the stop is (deliberately) never
+        // confirmed here — confirm with 1 instant poll; this test only pins
+        // that StopStream is sent. Confirmation semantics are pinned in
+        // BroadcastControllerTests.
         let (controller, mock) = try await makeConnectedController(streamStatusActive: true)
-        await controller.stopBroadcast()
+        await controller.stopBroadcast(confirmPollSeconds: 0, maxConfirmPolls: 1)
         let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
                                    .map { requestType(fromSent: $0) }
         XCTAssertTrue(types.contains("StopStream"))
