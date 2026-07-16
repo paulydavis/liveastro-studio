@@ -13,6 +13,16 @@ public final class SessionManager {
     public private(set) var sessionDirectory: URL?
     private let rootDirectory: URL
 
+    /// Injectable manifest-write seam (F3 / spec §Seams — the SECOND pre-approved seam).
+    /// PRODUCTION LEAVES THIS nil: `persist` then uses the built-in atomic write path
+    /// (`Data(.atomic)` = temp+rename), byte-identical to the pre-seam behavior. It exists ONLY so
+    /// the `manifest-midwrite` crash cell can wrap the real atomic write with a coordination point
+    /// (touch a readiness flag, THEN perform the write) — proving the SIGKILL window provably overlaps
+    /// persistence activity rather than landing on a pre-seeded manifest before any challenged write.
+    /// When set, the closure is responsible for performing the actual durable write of `data` to `url`
+    /// (the helper's implementation delegates to the same `Data(.atomic)` write after flagging).
+    public var manifestWriter: ((Data, URL) throws -> Void)?
+
     public init(rootDirectory: URL) { self.rootDirectory = rootDirectory }
 
     public var acceptedCount: Int { manifest?.snapshots.count ?? 0 }
@@ -106,6 +116,12 @@ public final class SessionManager {
     /// before committing it to in-memory state (write-then-commit — see startSession/record/end).
     private func persist(_ m: SessionManifest, to dir: URL) throws {
         let data = try ManifestCoding.encoder().encode(m)
-        try data.write(to: dir.appendingPathComponent("manifest.json"), options: .atomic)
+        let url = dir.appendingPathComponent("manifest.json")
+        // Seam (F3): production has no injected writer → the default atomic write runs, unchanged.
+        if let writer = manifestWriter {
+            try writer(data, url)
+        } else {
+            try data.write(to: url, options: .atomic)
+        }
     }
 }

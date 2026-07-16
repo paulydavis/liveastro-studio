@@ -99,15 +99,26 @@ do {
                            mean: seedRec.mean, median: seedRec.median, stddev: seedRec.stddev)
         }
         // Pre-seed 120 fat records → ~5 MB manifest. Only 120 (fast) intermediate writes.
+        // The seam is NOT installed yet, so these use the default atomic write path.
         for idx in 0..<120 { try mgr.recordSnapshot(fatRecord(idx)) }
-        touchFlag(flag)   // coordinated point: manifest is large + live → the builder may SIGKILL now
+        // F3 (review2): touch the readiness flag from INSIDE the manifest write, not before the rewrite
+        // loop. The previous code flagged BEFORE the loop, so a fast SIGKILL could land on the
+        // pre-seeded manifest before the first CHALLENGED write ever ran — a vacuous pass. Install the
+        // pre-approved manifestWriter seam so the flag is set only when a real atomic write is actually
+        // in progress: flag, THEN perform the same Data(.atomic) write the production path would. The
+        // builder waits for the flag, so its SIGKILL window provably overlaps persistence activity.
+        mgr.manifestWriter = { data, url in
+            touchFlag(flag)                              // set only during an in-flight manifest write
+            try data.write(to: url, options: .atomic)    // the real production write (temp+rename)
+        }
         var i = 120
         // Loop FOREVER rewriting the ~5 MB manifest — a tight loop with no sleeps, no blocking, and no
         // per-iteration PNG encode, so the big atomic manifest write DOMINATES the loop (maximizing the
-        // fraction of wall time spent inside write()). The kill lands MID-ACTIVITY, so the .atomic
-        // guarantee is genuinely exercised: whatever instant the kill lands, the manifest on disk is
-        // SOME complete version, never a torn/half-serialized file. (What is NOT guaranteed: WHICH
-        // version survives — the test asserts only that it parses.)
+        // fraction of wall time spent inside write()). Because the flag is touched at the TOP of every
+        // write, the kill lands MID-ACTIVITY on a genuine atomic write, so the guarantee is genuinely
+        // exercised: whatever instant the kill lands, the manifest on disk is SOME complete version,
+        // never a torn/half-serialized file. (What is NOT guaranteed: WHICH version survives — the
+        // test asserts only that it parses.)
         while true {
             try mgr.recordSnapshot(fatRecord(i))
             i += 1

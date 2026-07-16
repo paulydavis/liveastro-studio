@@ -49,7 +49,10 @@ enum CrashArtifactBuilder {
             _ = tick.wait(timeout: .now() + 0.02)   // short bounded wait; loop re-checks the flag
         }
 
-        // The helper is now blocked at its coordinated point. SIGKILL lands mid-state.
+        // The helper has reached its coordinated point (flag touched). SIGKILL lands mid-state.
+        // NOTE (F3): for `manifest-midwrite` the flag is touched from INSIDE a manifest write (via the
+        // injected SessionManager.manifestWriter seam), so this kill provably overlaps an in-flight
+        // atomic write — not a pre-seeded manifest sitting idle before the first challenged write.
         kill(process.processIdentifier, SIGKILL)
         process.waitUntilExit()
         return aftermath

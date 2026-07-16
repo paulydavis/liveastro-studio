@@ -471,6 +471,12 @@ final class FaultMatrixLifecycleTests: XCTestCase {
     /// a growing snapshot list. The manifest on disk is EITHER the previous complete version OR the
     /// new complete version (atomic write guarantee) — never a torn/half-written file. Oracle
     /// clause 1 (parses) is the teeth of this cell.
+    ///
+    /// F3 (review2): the helper now touches its readiness flag from INSIDE the manifest write (via the
+    /// pre-approved `SessionManager.manifestWriter` seam: flag, then the real `Data(.atomic)` write),
+    /// NOT before the rewrite loop. Previously the flag preceded the loop, so a fast SIGKILL could land
+    /// on the pre-seeded manifest before the first challenged write — a vacuous pass. Now the kill
+    /// window provably overlaps an in-flight atomic write.
     func testCrash_manifestMidwrite_manifestEitherCompleteNeverTorn() throws {
         let fs = try TempFS("crash-midwrite"); defer { fs.tearDown() }
         let aftermath = try CrashArtifactBuilder.killedArtifact(scenario: "manifest-midwrite", in: fs)
