@@ -72,9 +72,10 @@ public final class FolderFrameSource: FrameSource {
             self.watcher = w
             try w.start()
             let continuation = self.continuation!
+            let log = onLog
             liveTask = Task.detached {
                 for await update in w.updates {
-                    if let frame = try? FolderFrameSource.loadRawFrame(url: update.url) {
+                    if let frame = FolderFrameSource.frame(for: update, log: log) {
                         continuation.yield(frame)
                     }
                 }
@@ -154,9 +155,29 @@ public final class FolderFrameSource: FrameSource {
         }
     }
 
-    /// Shared FITS → RawFrame loader (also used by tests).
-    public static func loadRawFrame(url: URL) throws -> RawFrame {
-        let data = try Data(contentsOf: url)
+    /// Load one watcher-emitted update into a RawFrame, enforcing the identity the watcher
+    /// captured on its pinned per-file descriptor (review5 item 1). Returns nil when the frame
+    /// must be skipped: an identity mismatch (the file changed between the watcher's validation
+    /// and this read — logged honestly; a boundary failure may lose one frame, never the
+    /// session) or an unreadable/undecodable file (pre-existing silent-skip behavior).
+    /// Internal seam so the skip-vs-deliver decision is deterministically unit-testable.
+    static func frame(for update: StackUpdate, log: ((String) -> Void)?) -> RawFrame? {
+        do {
+            return try loadRawFrame(url: update.url, expectedIdentity: update.identity)
+        } catch let mismatch as FileIdentityMismatchError {
+            log?("file changed between validation and read — skipping \(mismatch.fileName)")
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
+    /// Shared FITS → RawFrame loader (also used by tests). When `expectedIdentity` is supplied,
+    /// the file is opened once, fstat-verified against the identity on THAT descriptor, read
+    /// from the same descriptor (with a content-digest re-check), and decoded FROM THOSE BYTES
+    /// (`FileIdentityMismatchError` on mismatch). nil identity = plain path read, unchanged.
+    public static func loadRawFrame(url: URL, expectedIdentity: FileIdentity? = nil) throws -> RawFrame {
+        let data = try FileIdentity.read(url: url, verifying: expectedIdentity)
         let header = try FITSReader.readHeader(data)
         let bayerPattern = BayerPattern(headerValue: header.bayerPattern)
         let bottomUp = header.bottomUp

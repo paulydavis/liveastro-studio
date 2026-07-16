@@ -40,6 +40,16 @@ enum CrashArtifactBuilder {
         process.standardError = FileHandle.nullDevice
         try process.run()
 
+        // Guaranteed cleanup on EVERY error path from here on (review5 P3): the helper blocks
+        // forever by design, so any throw that leaves it running would leak a child into the
+        // test run — and the old readiness-timeout path only sent SIGTERM without reaping.
+        // A defer cannot be bypassed by any of the throws below: on an error exit it force-kills
+        // (SIGKILL, errors ignored — the helper never handles it away) any still-running child
+        // and reaps it via waitUntilExit(). The success path is unchanged (it has already
+        // SIGKILLed, reaped, and verified death-by-signal before `completed` is set).
+        var completed = false
+        defer { if !completed { forceKillAndReap(process) } }
+
         // Readiness detection across a process boundary: poll the flag with a short
         // DispatchSemaphore-timed loop. This is readiness detection (waiting for the helper to
         // REACH its coordinated point), NOT race synchronization — the spec explicitly permits it.
@@ -50,7 +60,7 @@ enum CrashArtifactBuilder {
                 throw CrashArtifactError.readyTimeout("helper exited before signaling ready (scenario \(scenario))")
             }
             if Date() >= deadline {
-                process.terminate()
+                // Cleanup (SIGKILL + reap) happens in the defer above — no terminate-and-leak.
                 throw CrashArtifactError.readyTimeout("no flag within 30s (scenario \(scenario))")
             }
             _ = tick.wait(timeout: .now() + 0.02)   // short bounded wait; loop re-checks the flag
@@ -81,7 +91,20 @@ enum CrashArtifactBuilder {
             throw CrashArtifactError.notKilledBySIGKILL(scenario, process.terminationReason,
                                                         process.terminationStatus)
         }
+        completed = true
         return aftermath
+    }
+
+    /// Error-path cleanup (review5 P3): force-kill any still-running helper (SIGKILL — errors
+    /// deliberately ignored; a failed kill of an already-dead child is fine) and REAP it via
+    /// Process's own waitUntilExit (never raw waitpid — it races Foundation's child handling).
+    /// Idempotent for already-exited children: the kill is skipped and waitUntilExit returns
+    /// immediately once Foundation has observed the exit.
+    private static func forceKillAndReap(_ process: Process) {
+        if process.isRunning {
+            _ = kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
     }
 
     /// Locate the `faulthelper` executable. Under `swift test` (and Xcode), SPM places the built
