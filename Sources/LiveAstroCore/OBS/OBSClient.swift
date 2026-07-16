@@ -255,8 +255,12 @@ public actor OBSClient {
 
     private func startReceiveLoop() {
         receiveLoop = Task { [weak self] in
-            guard let self else { return }
             while !Task.isCancelled {
+                // Per-ITERATION weak rebind (review11 finding 4 discipline):
+                // no strong self is pinned for the loop's lifetime — only for
+                // the in-flight receive/handle calls, which retain the actor
+                // regardless. An abandoned client is released between frames.
+                guard let self else { return }
                 let text: String
                 do {
                     text = try await self.receiveFrame()

@@ -1511,6 +1511,34 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertTrue(h.server.streamActive, "OBS really did start late")
     }
 
+    // MARK: - review11 FINDING 4 (P2): a live controller must not retain itself
+
+    /// The health poll's task strongly captured self in an effectively
+    /// infinite loop: dropping a LIVE controller never reached deinit — the
+    /// controller, the OBS graph and the poll ran forever. Post-fix the poll
+    /// re-derives self from a weak reference EVERY iteration: dropping the
+    /// last owner deallocates the controller, deinit cancels the stored
+    /// tasks, and the poll exits.
+    func testDroppingLiveControllerDeinitsAndStopsHealthPoll() async {
+        var h: Harness? = await makeHarness()
+        h!.controller.goLive()
+        await waitUntil { h!.controller.broadcastState == .live }
+        await waitUntil { h!.controller.streamHealth != nil }   // the poll is running
+
+        weak var controller = h!.controller
+        let mock = h!.mock
+        h = nil   // drop the only strong reference while LIVE
+
+        await waitUntil { controller == nil }   // pre-fix: self-retained forever
+
+        // The poll must actually stop once the controller is gone.
+        await settle()
+        let polls = sent("GetStreamStatus", mock)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(sent("GetStreamStatus", mock), polls,
+                       "the health poll must exit once the controller is gone")
+    }
+
     /// Boundary (c): while the orphan cleanup is awaiting OBS, .stopping is
     /// already reserved SYNCHRONOUSLY — a Go Live click during that await is
     /// rejected outright (no state change, no generation bump, no StartStream).

@@ -102,7 +102,12 @@ public final class BroadcastController {
     }
     public private(set) var broadcastState: BroadcastState = .unknown
     public private(set) var streamHealth: StreamHealth?
-    private var healthPollTask: Task<Void, Never>?
+    /// `nonisolated(unsafe)` for the same deinit reason as `sceneTimer`
+    /// (review11 finding 4): deinit — nonisolated by language rule — cancels
+    /// the stored poll task so one parked in its sleep ends promptly instead
+    /// of at its next wake. Every live access is main-actor code in this
+    /// class, and deinit has exclusive access to the dying instance.
+    @ObservationIgnored nonisolated(unsafe) private var healthPollTask: Task<Void, Never>?
     private var goLiveTask: Task<Void, Never>?
 
     // MARK: Generations (review6 P1/P2 — stale async completions must not mutate state)
@@ -218,6 +223,15 @@ public final class BroadcastController {
         // deallocation runs on the main thread — the thread the timer was
         // scheduled on, as invalidate() requires.
         sceneTimer?.invalidate()
+        // Review11 finding 4: the health poll and reconcile drain hold self
+        // only weakly (per-iteration rebind), so deinit IS reachable while
+        // they run — cancel them here so they end promptly rather than at
+        // their next wake against a dead weak self. goLiveTask and the stop/
+        // cleanup tasks need no deinit handling: they retain self strongly
+        // for their (bounded) settlement, so deinit cannot run while one is
+        // alive.
+        healthPollTask?.cancel()
+        reconcileDrainTask?.cancel()
     }
 
     // MARK: - Session hooks (called by the app where the logic fired inline)
@@ -858,7 +872,8 @@ public final class BroadcastController {
     /// inactive detection) sets it; ONE drain task serializes every
     /// reconciliation pass so there is a single reconciliation authority.
     private var reconcileDirty = false
-    private var reconcileDrainTask: Task<Void, Never>?
+    /// `nonisolated(unsafe)` for deinit cancellation — see `healthPollTask`.
+    @ObservationIgnored nonisolated(unsafe) private var reconcileDrainTask: Task<Void, Never>?
 
     /// Note that OBS's output state may have changed. The drain invariant:
     /// an event sets `dirty = true` (and spawns the drain task if none is
@@ -876,8 +891,11 @@ public final class BroadcastController {
         reconcileDirty = true
         guard reconcileDrainTask == nil else { return }
         reconcileDrainTask = Task { @MainActor [weak self] in
-            guard let self else { return }
             while true {
+                // Review11 finding 4 sweep: per-ITERATION weak rebind — the
+                // strong self lives for one pass, never the loop's lifetime,
+                // so an abandoned controller is released and the drain exits.
+                guard let self else { return }
                 self.reconcileDirty = false        // cleared immediately before the pass
                 await self.reconcilePass()
                 // ONE synchronous segment: the final dirty check and the
@@ -1129,28 +1147,44 @@ public final class BroadcastController {
     private func startHealthPoll() {
         healthPollTask?.cancel()
         let gen = broadcastGeneration
-        healthPollTask = Task { @MainActor in
-            // Poll through .endingSession too (review5 P2): the stream is deliberately still
-            // live while the replay renders, so health keeps reporting truth until the stop.
-            while !Task.isCancelled && gen == broadcastGeneration
-                    && (broadcastState == .live || broadcastState == .endingSession) {
-                let health = await obs.streamStatus()
-                guard gen == broadcastGeneration,
-                      broadcastState == .live || broadcastState == .endingSession else { return }
-                if let health, !health.active {
-                    // OBS CONFIRMED the stream inactive while we claim it live —
-                    // an external stop. Review8 item 3: don't transition HERE;
-                    // route the detection into the SAME serialized reconcile
-                    // authority that handles output events. The drain settles
-                    // (.idle only with recording also confirmed inactive) and
-                    // its generation bump ends this poll.
-                    noteOBSStateMayHaveChanged()
-                } else {
-                    streamHealth = health
-                }
-                try? await Task.sleep(nanoseconds: UInt64(healthPollIntervalSeconds * 1_000_000_000))
+        healthPollTask = Task { @MainActor [weak self] in
+            // Review11 finding 4: self is re-derived from the WEAK reference
+            // every iteration — never a guard-let outside the loop, which
+            // would pin the controller for the loop's whole lifetime and
+            // recreate the self-retain cycle (a dropped live controller then
+            // never deinits and polls forever). No strong self is held
+            // across the sleep, so an abandoned controller deallocates and
+            // the next wake exits on the nil weak self.
+            while !Task.isCancelled {
+                guard let interval = await self?.healthPollTick(gen: gen) else { return }
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             }
         }
+    }
+
+    /// One health-poll iteration. Polls through `.endingSession` too
+    /// (review5 P2): the stream is deliberately still live while the replay
+    /// renders, so health keeps reporting truth until the stop. Returns the
+    /// sleep interval before the next iteration, or nil when the poll must
+    /// end (stale generation, or the state left .live/.endingSession).
+    private func healthPollTick(gen: Int) async -> Double? {
+        guard gen == broadcastGeneration,
+              broadcastState == .live || broadcastState == .endingSession else { return nil }
+        let health = await obs.streamStatus()
+        guard gen == broadcastGeneration,
+              broadcastState == .live || broadcastState == .endingSession else { return nil }
+        if let health, !health.active {
+            // OBS CONFIRMED the stream inactive while we claim it live —
+            // an external stop. Review8 item 3: don't transition HERE;
+            // route the detection into the SAME serialized reconcile
+            // authority that handles output events. The drain settles
+            // (.idle only with recording also confirmed inactive) and
+            // its generation bump ends this poll.
+            noteOBSStateMayHaveChanged()
+        } else {
+            streamHealth = health
+        }
+        return healthPollIntervalSeconds
     }
 
     // MARK: - Scene automation
