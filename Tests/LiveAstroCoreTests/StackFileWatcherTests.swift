@@ -150,6 +150,124 @@ final class StackFileWatcherTests: XCTestCase {
         XCTAssertTrue(items.isEmpty)
     }
 
+    // MARK: - review7 P2: identity-gated hashing (digest policy)
+
+    /// Restore a file's mtime with utimensat(2) at NANOSECOND precision (atime untouched).
+    /// This is how the collision tests manufacture an identity (dev, ino, size, mtime-ns)
+    /// EXACTLY equal to a previously observed version, deterministically on any filesystem.
+    private func setMtime(_ url: URL, sec: Int64, nsec: Int64,
+                          file: StaticString = #filePath, line: UInt = #line) {
+        var times = [timespec(tv_sec: 0, tv_nsec: Int(UTIME_OMIT)),
+                     timespec(tv_sec: time_t(sec), tv_nsec: Int(nsec))]
+        XCTAssertEqual(utimensat(AT_FDCWD, url.path, &times, 0), 0,
+                       "utimensat must succeed", file: file, line: line)
+    }
+
+    /// Mutate ONE interior byte of `url` in place (same size), then restore the file's
+    /// mtime to `identity`'s ns-exact value — a manufactured identity collision.
+    private func mutateInteriorPreservingIdentity(_ url: URL, byteFromEnd: Int,
+                                                  identity: FileIdentity) throws {
+        let fh = try FileHandle(forWritingTo: url)
+        let size = try fh.seekToEnd()
+        try fh.seek(toOffset: size - UInt64(byteFromEnd))
+        fh.write(Data([0xAB]))
+        try fh.close()
+        setMtime(url, sec: identity.mtimeSec, nsec: identity.mtimeNsec)
+        XCTAssertEqual(FileIdentity.capture(url: url), identity,
+                       "the manufactured identity collision must actually collide")
+    }
+
+    /// Review7 P2 (the O(1) win, red-first): under `.immutableAfterPublish` an emitted
+    /// file whose identity never changes must not be re-hashed on ANY later scan — one
+    /// fstat per poll. Pre-fix the digest counter grew on every scan.
+    func testImmutablePolicy_noRehashWhileIdentityUnchanged() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.2,
+                                   digestPolicy: .immutableAfterPublish)
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("sub_001.fit"))
+        let got = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(got)
+        let after = watcher.digestComputations
+        XCTAssertGreaterThan(after, 0, "the emission itself must have hashed")
+        try await Task.sleep(nanoseconds: 1_500_000_000)   // ≥5 further polls
+        XCTAssertEqual(watcher.digestComputations, after,
+                       "an emitted, identity-unchanged file must never be re-hashed")
+        let items = await collector.items
+        XCTAssertEqual(items.count, 1)
+    }
+
+    /// Review7 P2 counterpart: the default `.mutableStackerOutput` (Siril path) keeps
+    /// re-hashing every stable scan BY DESIGN — identity is not trusted for in-place
+    /// rewriters — while digest-keyed dedup still suppresses re-emission.
+    func testMutablePolicy_rehashesEveryStableScanByDesign() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.2)
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        let got = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(got)
+        let after = watcher.digestComputations
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        XCTAssertGreaterThan(watcher.digestComputations, after,
+                             "the mutable policy must keep re-hashing stable scans")
+        let items = await collector.items
+        XCTAssertEqual(items.count, 1, "identical content must still dedup on the digest")
+    }
+
+    /// Reviewer-specified regression (review7 P2): interior bytes change IN PLACE and the
+    /// ORIGINAL mtime is restored ns-exact with utimensat(2) — an identity collision
+    /// (dev, ino, size, mtime-ns all equal the emitted version) manufactured
+    /// deterministically. utimensat stands in for the REAL-WORLD case identity-gating
+    /// cannot see: coarse or cached filesystem timestamps letting an in-place rewrite land
+    /// on the identical mtime. The MUTABLE policy must still re-hash the stable file and
+    /// EMIT the changed digest — the content update is never lost.
+    func testMutablePolicy_identityCollisionStillEmitsChangedContent() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.2,
+                                   digestPolicy: .mutableStackerOutput)
+        let collector = collect(watcher)
+        try watcher.start()
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        try makeFITS(0.25, size: 16).write(to: url)
+        let got = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(got)
+
+        let emitted = FileIdentity.capture(url: url)!
+        try mutateInteriorPreservingIdentity(url, byteFromEnd: 64, identity: emitted)
+
+        let reEmitted = await collector.waitForCount(2, timeout: 5)
+        XCTAssertTrue(reEmitted, "the mutable policy must re-hash and emit the changed content")
+        let items = await collector.items
+        XCTAssertNotEqual(items[0].identity?.digest, items[1].identity?.digest,
+                          "the two emissions must carry different content digests")
+    }
+
+    /// The immutable policy legitimately SKIPS the same manufactured collision: identity
+    /// unchanged = presumed immutable is the documented policy trade (native relay subs
+    /// are written once and never touched) — the flat digest counter above is the win
+    /// this trade buys.
+    func testImmutablePolicy_identityCollisionSkippedByDesign() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.2,
+                                   digestPolicy: .immutableAfterPublish)
+        let collector = collect(watcher)
+        try watcher.start()
+        let url = tmp.appendingPathComponent("sub_001.fit")
+        try makeFITS(0.25, size: 16).write(to: url)
+        let got = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(got)
+        let hashesAfterEmit = watcher.digestComputations
+
+        let emitted = FileIdentity.capture(url: url)!
+        try mutateInteriorPreservingIdentity(url, byteFromEnd: 64, identity: emitted)
+
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        let items = await collector.items
+        XCTAssertEqual(items.count, 1,
+                       "identity collision is skipped by design under the immutable policy")
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit,
+                       "no re-hash either — that is the entire point of the policy")
+    }
+
     /// Review4 P2 (mid-scan TOCTOU): the structural property of fd-relative enumeration, tested
     /// DETERMINISTICALLY with no timing. `scan()` validates the armed directory's (dev, ino) once,
     /// then enumerates — previously BY PATH, so a swap landing between the identity check and the

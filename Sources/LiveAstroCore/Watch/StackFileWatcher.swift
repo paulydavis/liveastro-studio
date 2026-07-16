@@ -155,6 +155,29 @@ public struct StackUpdate: Equatable, Sendable {
 /// Siril rewrites live_stack.fit in place, so this is modification-watching with
 /// write-completion checks, not new-file detection (spec §5.2).
 public final class StackFileWatcher {
+
+    /// How the watcher treats content hashing for files it has ALREADY emitted
+    /// (review7 P2). Chosen by the CONSTRUCTING code path — never user
+    /// configuration — because the right policy is a property of the producer
+    /// writing the folder.
+    public enum DigestPolicy: Sendable {
+        /// Files are immutable once published (native relay folders: every sub
+        /// is written once and never touched again). An already-emitted
+        /// identity (dev, ino, size, mtime-ns) is trusted to imply unchanged
+        /// content and is NEVER re-hashed — each poll costs one fstat per file
+        /// instead of a full SHA-256 of every file in the folder (at 1000
+        /// accumulated subs the old full rehash burned tens of seconds of
+        /// hashing per 2 s scan).
+        case immutableAfterPublish
+        /// The producer rewrites its output in place (Siril's live_stack.fit).
+        /// Identity is NOT trusted to imply unchanged content: coarse or cached
+        /// filesystem timestamps can leave (dev, ino, size, mtime-ns) identical
+        /// across a real content change, so every stable sighting is fully
+        /// re-hashed (exactly the pre-review7 strictness) and dedup happens on
+        /// the digest alone.
+        case mutableStackerOutput
+    }
+
     public let updates: AsyncStream<StackUpdate>
 
     /// Logging seam (mirrors FrameRelay.onLog). Called on the internal serial queue;
@@ -245,17 +268,34 @@ public final class StackFileWatcher {
     /// happen to match the old file's last observation.
     private var lastSeenStat: [String: FileIdentity] = [:]
     private var lastEmittedDigest: [String: String] = [:]
+    /// Stat identity (digest nil) of the version whose digest currently sits in
+    /// `lastEmittedDigest[name]` (review7 P2). Under `.immutableAfterPublish`,
+    /// a candidate whose observed identity equals this entry skips ALL content
+    /// work. Retained across folder disappear/replace exactly like
+    /// `lastEmittedDigest` (dedup survives a disappear→return; only the PENDING
+    /// stability observations are cleared).
+    private var lastEmittedIdentity: [String: FileIdentity] = [:]
+
+    /// Count of full content digests computed by this watcher (review7 P2) —
+    /// test-visible so the hashing cost model is pinned: flat after emission
+    /// under `.immutableAfterPublish`, growing per stable scan under
+    /// `.mutableStackerOutput`. Mutated on the internal serial queue; tests
+    /// read it only after quiescent waits.
+    internal private(set) var digestComputations: Int = 0
 
     private let fileNamePrefix: String?
+    private let digestPolicy: DigestPolicy
 
     private static let maxHeaderBlocks = 32  // generous ceiling; real headers are 1-10 blocks
 
     public init(folder: URL, quietPeriod: TimeInterval = 0.5, pollInterval: TimeInterval = 2.0,
-                fileNamePrefix: String? = nil) {
+                fileNamePrefix: String? = nil,
+                digestPolicy: DigestPolicy = .mutableStackerOutput) {
         self.folder = folder
         self.quietPeriod = quietPeriod
         self.pollInterval = pollInterval
         self.fileNamePrefix = fileNamePrefix
+        self.digestPolicy = digestPolicy
         var cont: AsyncStream<StackUpdate>.Continuation!
         self.updates = AsyncStream { cont = $0 }
         self.continuation = cont
@@ -449,6 +489,18 @@ public final class StackFileWatcher {
             let previous = lastSeenStat[name]
             lastSeenStat[name] = observed
 
+            // Review7 P2 (identity-gated hashing): under `.immutableAfterPublish`
+            // this exact published version — same (dev, ino, size, mtime-ns) as
+            // the emission that produced `lastEmittedDigest[name]` — was already
+            // emitted, so skip ALL content work: one fstat per poll instead of a
+            // full-file SHA-256 (native relay folders accumulate every sub; at
+            // 1000 subs the unconditional rehash burned tens of seconds per 2 s
+            // scan). `.mutableStackerOutput` (Siril's in-place live_stack.fit)
+            // never takes this shortcut: a coarse/cached-filesystem rewrite can
+            // collide the whole identity, and only the digest sees the change.
+            if digestPolicy == .immutableAfterPublish,
+               lastEmittedIdentity[name] == observed { continue }
+
             // Stability gate (P1-2): require the identity (dev, ino, size, mtime ns) unchanged
             // across two consecutive scans for BOTH file kinds. A writer that preallocates the
             // full declared size and then fills pixels in place satisfies size>=declared on the
@@ -467,6 +519,7 @@ public final class StackFileWatcher {
                       observed.size >= header.minimumFileSize else { continue }
             }
 
+            digestComputations += 1
             guard let digest = FileIdentity.contentDigest(handle: handle, size: observed.size)
             else { continue }
 
@@ -482,7 +535,13 @@ public final class StackFileWatcher {
                 continue
             }
 
-            guard lastEmittedDigest[name] != digest else { continue }
+            guard lastEmittedDigest[name] != digest else {
+                // Identical content re-published under a NEW identity (in-place
+                // rewrite of the same bytes): record the new identity as the
+                // emitted version so `.immutableAfterPublish` stops re-hashing it.
+                lastEmittedIdentity[name] = observed
+                continue
+            }
 
             // Yield-time revalidation (review5 item 1): the emitted URL is still a PATH the
             // consumer resolves later, so before publishing, re-check that the watched path still
@@ -497,6 +556,7 @@ public final class StackFileWatcher {
                 return
             }
             lastEmittedDigest[name] = digest
+            lastEmittedIdentity[name] = observed
             continuation.yield(StackUpdate(
                 url: url, fileSize: observed.size,
                 identity: observed.withDigest(digest)))
