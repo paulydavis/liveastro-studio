@@ -1270,6 +1270,65 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertTrue(h.box.errors.contains { $0.contains("may still be live") })
     }
 
+    // MARK: - cold-review1 FINDING 2: manual Connect from rich states +
+    // honest failure landing
+
+    /// COLD1 FINDING 2a: beginConnectAndReconcile from .live must NO-OP.
+    /// Pre-fix the entry had no state guard beyond != .connecting — it bumped
+    /// the generation (killing the health poll's ownership), tore down the
+    /// WORKING control session via obs.connect's teardown prologue, and on
+    /// reconnect failure restored .live verbatim over a dead link (frozen
+    /// health, no events, unreachable heal).
+    func testManualConnectFromLiveNoOpsAndKeepsSessionAlive() async {
+        let h = await makeHarness()
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        let gen = h.controller.broadcastGeneration
+
+        h.controller.beginConnectAndReconcile()
+        await settle()
+        XCTAssertEqual(h.controller.broadcastState, .live, "connect from .live must no-op")
+        XCTAssertEqual(h.controller.broadcastGeneration, gen,
+                       "no generation bump — the health poll keeps its ownership")
+        XCTAssertTrue(h.obs.state == .connected || h.obs.state == .streaming,
+                      "the WORKING control session must not be torn down (got \(h.obs.state))")
+        XCTAssertTrue(h.box.logs.contains { $0.contains("not reconnecting") })
+        await waitUntil { h.controller.streamHealth != nil }   // health poll alive
+    }
+
+    /// COLD1 FINDING 2b: a FAILED reconnect from a previously confirmed .idle
+    /// lands .unknown, never the origin verbatim — obs.connect tore down
+    /// whatever link existed and the reconnect failed, so the old confirmation
+    /// is no longer confirmable (the reviewer's own connection-loss map:
+    /// .idle → .unknown). Pre-fix it restored .idle over a dead link.
+    func testFailedReconnectFromIdleLandsUnknown() async {
+        let h = await makeHarness()                     // confirmed .idle, connected
+        h.controller.disconnect()                       // deliberate; .idle retained
+        XCTAssertEqual(h.controller.broadcastState, .idle)
+        h.mock.finishWithError(OBSSocketError.notConnected)   // reconnects fail fast
+
+        let ok = await h.controller.connectAndReconcile()
+        XCTAssertFalse(ok)
+        XCTAssertEqual(h.controller.broadcastState, .unknown,
+                       "a failed reconnect must not restore a confirmed .idle over a dead link")
+    }
+
+    /// COLD1 FINDING 2b (honest-origin flavor): a failed reconnect from
+    /// .stopUnconfirmed stays .stopUnconfirmed — already honest, and its own
+    /// machinery (retryStop) reconnects for itself.
+    func testFailedReconnectFromStopUnconfirmedStaysStopUnconfirmed() async {
+        let h = await makeHarness()
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        h.controller.disconnect()                       // strands the live stream
+        XCTAssertEqual(h.controller.broadcastState, .stopUnconfirmed)
+        h.mock.finishWithError(OBSSocketError.notConnected)
+
+        let ok = await h.controller.connectAndReconcile()
+        XCTAssertFalse(ok)
+        XCTAssertEqual(h.controller.broadcastState, .stopUnconfirmed)
+    }
+
     /// Boundary (c): while the orphan cleanup is awaiting OBS, .stopping is
     /// already reserved SYNCHRONOUSLY — a Go Live click during that await is
     /// rejected outright (no state change, no generation bump, no StartStream).

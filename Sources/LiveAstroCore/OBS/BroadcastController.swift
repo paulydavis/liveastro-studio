@@ -418,14 +418,36 @@ public final class BroadcastController {
         return .unconfirmed
     }
 
+    /// Whether manual Connect is currently legal (cold-review1 finding 2).
+    /// Only states with NO live broadcast machinery may start a reconnect:
+    /// from `.live`/`.endingSession` the health poll + event stream own truth
+    /// over a WORKING session, and from `.stopping` an in-flight stop owns its
+    /// settlement — a reconnect would bump the generation (orphaning the
+    /// owner) and tear the working control session down. ControlView's
+    /// Connect button mirrors this for its enable-state.
+    public var connectAllowed: Bool {
+        switch broadcastState {
+        case .unknown, .idle, .stopUnconfirmed: return true
+        case .connecting, .live, .endingSession, .stopping: return false
+        }
+    }
+
     /// Manual Connect, SYNCHRONOUS entry (review8 item 2 — mirrors goLive()'s
     /// shape): reserves `.connecting` and bumps the generation AT the click,
     /// so a Go Live during the connect/seed/reconcile await is rejected by its
     /// own state guard and every in-flight completion is stale from this
     /// instant. Then launches the connect+reconcile task. ControlView's
     /// Connect button calls this directly — no Task wrapper at the call site.
+    ///
+    /// Cold-review1 finding 2: entry is guarded to {.unknown, .idle,
+    /// .stopUnconfirmed} — from a rich state this no-ops with an honest log
+    /// instead of killing the working session's machinery.
     public func beginConnectAndReconcile() {
         guard broadcastState != .connecting else { return }   // one attempt at a time
+        guard connectAllowed else {
+            deps.log("OBS: already connected/stopping — not reconnecting")
+            return
+        }
         broadcastGeneration += 1
         let gen = broadcastGeneration
         let origin = broadcastState
@@ -450,6 +472,11 @@ public final class BroadcastController {
         guard broadcastState != .connecting else {
             return obs.state == .connected || obs.state == .streaming
         }
+        // Cold-review1 finding 2: same entry guard as the synchronous entry.
+        guard connectAllowed else {
+            deps.log("OBS: already connected/stopping — not reconnecting")
+            return obs.state == .connected || obs.state == .streaming
+        }
         broadcastGeneration += 1
         let gen = broadcastGeneration
         let origin = broadcastState
@@ -459,15 +486,31 @@ public final class BroadcastController {
     }
 
     /// The awaited half of manual Connect. Runs under the generation captured
-    /// at the click; a failed connect restores the origin state honestly
-    /// (nothing was confirmed, so nothing new is claimed).
+    /// at the click.
+    ///
+    /// Failure landing (cold-review1 finding 2): `obs.connect` tore down
+    /// whatever link existed and the reconnect FAILED, so no origin whose
+    /// claim depended on that link may be restored verbatim. With the entry
+    /// guard the only origins here are `.unknown`, `.idle` and
+    /// `.stopUnconfirmed`:
+    /// - `.unknown` → `.unknown` (nothing was ever claimed);
+    /// - `.idle` → `.unknown` — the confirmation predates the (now dead)
+    ///   link, so it is no longer confirmable (the reviewer's own
+    ///   connection-loss map: loss from `.idle` lands `.unknown`);
+    /// - `.stopUnconfirmed` → `.stopUnconfirmed` (already honest; retryStop
+    ///   reconnects for itself).
+    /// The invariant: a failure never lands a state whose machinery (health
+    /// poll, stop ownership, confirmed-idle claim) is dead.
     @discardableResult
     private func runConnectAndReconcile(gen: Int, origin: BroadcastState) async -> Bool {
         let connected = await obs.connect(host: obsHost, port: obsPort,
                                           password: obsPassword.isEmpty ? nil : obsPassword)
         guard gen == broadcastGeneration else { return connected }   // superseded: owner governs
         guard connected else {
-            broadcastState = origin
+            broadcastState = origin == .stopUnconfirmed ? .stopUnconfirmed : .unknown
+            if origin == .idle {
+                deps.log("OBS: reconnect failed — the confirmed idle is no longer confirmable")
+            }
             return false
         }
         if await reconcile(gen: gen) == .bothInactive {
