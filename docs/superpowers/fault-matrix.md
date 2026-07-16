@@ -147,3 +147,17 @@ privileged runner.
   **15 file-boundary** (`FaultMatrixFileTests`), **10 lifecycle** (`FaultMatrixLifecycleTests`, of
   which 3 are the crash-terminated `faulthelper` cells), and **5 FaultKit self-tests**
   (`FaultKitTests`). 0 blank cells. Every cell TEST, N/A, or PROXY.
+
+### Notes / justification — Outside Review #2 (review2 fix wave)
+
+- **F1 — SessionPipeline end × master-write-fails (new cell).** The `end()` finalizer's last
+  failure-prone durable artifact is the native `master.fit` write. Before the fix, `endSession()`
+  (the commit point that stamps `end_time`) ran BEFORE the master write, so a failed master write
+  left a manifest claiming an ended session with no persisted master — exactly the oracle clause-5
+  dishonest state. FIXED by reordering: master.fit is written FIRST, `endSession()` only after the
+  durable artifact lands. This adds a **read-only-destination / invalid-target-analog** cell to the
+  SessionPipeline row: TEST(`testPipelineEnd_masterWriteFails_noEndTimeStampedClause5Honest`) —
+  a DIRECTORY pre-placed at the master.fit path forces `Data.write` to throw; `end()` surfaces the
+  failure, the manifest keeps `end_time` nil (still running = truthful), and the oracle passes
+  clause 5 honestly (the ended-claim clause is exempt when `end_time` is nil). This is the regression
+  proof for review2 finding F1.
