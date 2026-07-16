@@ -265,6 +265,17 @@ struct ControlView: View {
                                     .foregroundStyle(.red).font(.caption)
                             }
                         }
+                    case .endingSession:
+                        // Review5 P2: the stream deliberately stays live until the replay
+                        // finishes — don't offer Go Live, and keep showing live health truth.
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("Ending broadcast…")
+                            if let h = model.broadcast.streamHealth {
+                                Text("● LIVE · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
+                                    .foregroundStyle(.red).font(.caption)
+                            }
+                        }
                     case .stopping:
                         HStack { ProgressView().controlSize(.small); Text("Stopping…") }
                     }

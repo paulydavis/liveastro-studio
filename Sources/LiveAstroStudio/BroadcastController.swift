@@ -37,7 +37,12 @@ final class BroadcastController {
     var scopeSceneName = ""
 
     // MARK: Broadcast state
-    enum BroadcastState: Equatable { case idle, connecting, live, stopping }
+    /// `endingSession` (review5 P2): End Session was clicked while live — the stream DELIBERATELY
+    /// stays up until replay generation finishes (review4 P2), so the UI must not claim idle
+    /// (which offered a Go Live that the deferred stop would then kill, hid End Broadcast, and
+    /// hid health while actually streaming). Health polling keeps reporting truth in this state;
+    /// `stopBroadcastAfterSessionEnd()` advances it to `.stopping` → `.idle`.
+    enum BroadcastState: Equatable { case idle, connecting, live, endingSession, stopping }
     var broadcastState: BroadcastState = .idle
     var streamHealth: StreamHealth?
     private var healthPollTask: Task<Void, Never>?
@@ -87,15 +92,28 @@ final class BroadcastController {
     func sessionDidEnd() {
         stopSceneAutomation()
 
-        // If a broadcast is live, reset its state so the UI returns to idle.
-        // The deliberate stopBroadcastAfterSessionEnd() acts as the safety net.
-        if broadcastState == .live || broadcastState == .connecting {
+        // Review5 P2: while the stream deliberately stays live until replay generation
+        // finishes, do NOT report idle — that offered a Go Live the deferred stop would kill,
+        // hid End Broadcast, and hid health while actually streaming.
+        switch broadcastState {
+        case .live:
+            // Still streaming: enter .endingSession and KEEP the health poll + streamHealth
+            // alive (keep reporting truth). goLive() is blocked (guard requires .idle);
+            // stopBroadcastAfterSessionEnd() performs the actual stop after the replay.
+            goLiveTask?.cancel()
+            goLiveTask = nil
+            broadcastState = .endingSession
+        case .connecting:
+            // Nothing live yet — cancel the bring-up and return to idle immediately. The
+            // deferred stopBroadcastAfterSessionEnd() is just a safety net here.
             goLiveTask?.cancel()
             goLiveTask = nil
             healthPollTask?.cancel()
             healthPollTask = nil
             streamHealth = nil
             broadcastState = .idle
+        case .idle, .endingSession, .stopping:
+            break
         }
     }
 
@@ -105,10 +123,22 @@ final class BroadcastController {
     /// replay failure still stops the stream). App quit / abort / crash paths
     /// never call this — an accidental quit must never kill the broadcast.
     func stopBroadcastAfterSessionEnd() {
+        // Mirror endBroadcast()'s sequencing: transition synchronously so the UI shows
+        // "Stopping…" the moment the replay is done, then await the stops and settle to idle.
+        // When nothing was live (.idle after a .connecting cancel, or no broadcast at all) the
+        // stops below are just the safety net — no state churn.
+        let deliberateStop = broadcastState == .endingSession
+        if deliberateStop { broadcastState = .stopping }
         Task { [weak self] in
             guard let self else { return }
             await self.obs.stopStream()
             await self.obs.setRecording(false)
+            if deliberateStop {
+                self.healthPollTask?.cancel()
+                self.healthPollTask = nil
+                self.streamHealth = nil
+                self.broadcastState = .idle
+            }
         }
     }
 
@@ -195,7 +225,9 @@ final class BroadcastController {
     private func startHealthPoll() {
         healthPollTask?.cancel()
         healthPollTask = Task { @MainActor in
-            while !Task.isCancelled && broadcastState == .live {
+            // Poll through .endingSession too (review5 P2): the stream is deliberately still
+            // live while the replay renders, so health keeps reporting truth until the stop.
+            while !Task.isCancelled && (broadcastState == .live || broadcastState == .endingSession) {
                 streamHealth = await obs.streamStatus()
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
