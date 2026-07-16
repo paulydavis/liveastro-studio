@@ -429,6 +429,125 @@ final class OBSControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .disconnected)
     }
 
+    // MARK: - review11 finding 3: connect seeding must never overwrite
+    // NEWER OBS events (per-field order stamps)
+
+    /// Build a long-timeout controller connected against a ScriptedOBSServer
+    /// with `parkTypes` pre-set, parked mid-seed on the given request type.
+    /// Returns once the seed is parked. The caller resumes the parked
+    /// request and awaits the connect task.
+    private func makeSeedParkedController(
+        parking type: String,
+        configure: (ScriptedOBSServer) -> Void = { _ in }
+    ) async -> (OBSController, MockOBSSocket, ScriptedOBSServer, Task<Bool, Never>) {
+        let mock = MockOBSSocket()
+        let controller = OBSController(
+            makeClient: { OBSClient(socket: $0, requestTimeout: 10) },
+            makeSocket: { mock })
+        let server = ScriptedOBSServer()
+        configure(server)
+        server.parkTypes = [type]
+        mock.enqueueInbound(helloFrame())
+        mock.replyToLastSent(server.responder())
+        let connectTask = Task { await controller.connect(host: "localhost", port: 4455,
+                                                          password: nil) }
+        await waitUntil { server.parked.count == 1 }
+        return (controller, mock, server, connectTask)
+    }
+
+    /// A stream-started EVENT lands while the seed's GetStreamStatus answer
+    /// is still in flight; the (older) seed answer then resumes with
+    /// outputActive:false. Pre-fix the stale seed overwrote the event —
+    /// .connected over an actually-streaming OBS, with nothing to repair the
+    /// published state. The event must win.
+    func testSeedStreamAnswerNeverOverwritesNewerStreamEvent() async {
+        let (controller, mock, server, connectTask) =
+            await makeSeedParkedController(parking: "GetStreamStatus")
+        XCTAssertEqual(controller.state, .connected)
+
+        // Newer truth arrives as an event while the seed answer is parked.
+        mock.enqueueInbound(eventFrame(type: "StreamStateChanged",
+                                       data: ["outputActive": true]))
+        await waitUntil { controller.state == .streaming }
+
+        // Resume the STALE seed answer (snapshot taken before the start).
+        mock.enqueueInbound(responseFrame(requestId: server.parked[0].id, ok: true,
+                                          responseData: ["outputActive": false]))
+        let ok = await connectTask.value
+        XCTAssertTrue(ok)
+        XCTAssertEqual(controller.state, .streaming,
+                       "the seed snapshot is OLDER than the event — the event wins")
+        controller.disconnect()
+    }
+
+    /// Record flavor: a RecordStateChanged(active) event lands while the
+    /// seed's GetRecordStatus answer is in flight — the stale answer must
+    /// not clear isRecording.
+    func testSeedRecordAnswerNeverOverwritesNewerRecordEvent() async {
+        let (controller, mock, server, connectTask) =
+            await makeSeedParkedController(parking: "GetRecordStatus")
+
+        mock.enqueueInbound(eventFrame(type: "RecordStateChanged",
+                                       data: ["outputActive": true]))
+        await waitUntil { controller.isRecording }
+
+        mock.enqueueInbound(responseFrame(requestId: server.parked[0].id, ok: true,
+                                          responseData: ["outputActive": false]))
+        let ok = await connectTask.value
+        XCTAssertTrue(ok)
+        XCTAssertTrue(controller.isRecording,
+                      "the seed snapshot is OLDER than the record event — the event wins")
+        controller.disconnect()
+    }
+
+    /// Scene flavor: a CurrentProgramSceneChanged event lands while the
+    /// seed's GetSceneList answer is in flight — the stale answer must not
+    /// roll currentScene back (sceneNames, which only fetches carry, still
+    /// seed normally).
+    func testSeedSceneListAnswerNeverOverwritesNewerSceneChangeEvent() async {
+        let (controller, mock, server, connectTask) =
+            await makeSeedParkedController(parking: "GetSceneList")
+
+        mock.enqueueInbound(eventFrame(type: "CurrentProgramSceneChanged",
+                                       data: ["sceneName": "Scope"]))
+        await waitUntil { controller.currentScene == "Scope" }
+
+        mock.enqueueInbound(responseFrame(requestId: server.parked[0].id, ok: true,
+                                          responseData: [
+                                              "currentProgramSceneName": "Stack",
+                                              "scenes": [["sceneName": "Scope"], ["sceneName": "Stack"]]]))
+        let ok = await connectTask.value
+        XCTAssertTrue(ok)
+        XCTAssertEqual(controller.currentScene, "Scope",
+                       "the seeded program scene is OLDER than the scene-change event — the event wins")
+        XCTAssertEqual(controller.sceneNames.sorted(), ["Scope", "Stack"],
+                       "the scene NAMES still seed — only the superseded field is skipped")
+        controller.disconnect()
+    }
+
+    /// Per-FIELD stamps, not one global version: an UNRELATED event (a scene
+    /// change) during the stream seed must not void the stream seed — a
+    /// skipped-but-untouched field would stay unseeded with nothing to
+    /// repair it.
+    func testUnrelatedEventDoesNotVoidStreamSeed() async {
+        let (controller, mock, server, connectTask) =
+            await makeSeedParkedController(parking: "GetStreamStatus") { $0.streamActive = true }
+
+        mock.enqueueInbound(eventFrame(type: "CurrentProgramSceneChanged",
+                                       data: ["sceneName": "Scope"]))
+        await waitUntil { controller.currentScene == "Scope" }
+
+        // Resume the stream seed: OBS is streaming — the seed must apply.
+        mock.enqueueInbound(responseFrame(requestId: server.parked[0].id, ok: true,
+                                          responseData: ["outputActive": true]))
+        let ok = await connectTask.value
+        XCTAssertTrue(ok)
+        XCTAssertEqual(controller.state, .streaming,
+                       "an unrelated event must not void the stream seed")
+        XCTAssertEqual(controller.currentScene, "Scope")
+        controller.disconnect()
+    }
+
     /// connect failure (bad handshake) returns false and leaves .disconnected.
     func testConnectFailureReturnsFalse() async {
         let mock = MockOBSSocket()
