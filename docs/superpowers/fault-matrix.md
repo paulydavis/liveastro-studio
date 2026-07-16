@@ -176,3 +176,11 @@ privileged runner.
   as before (byte-for-byte behavior, existing SessionManager tests unmodified and green). It is a
   coordination/injection point, not behavior. This is the SECOND (and final) pre-approved seam used
   across the pillar — YAGNI held until this review2 evasion was found; now the cell requires it.
+
+- **F5 — test data race in the watcher recovery test (fixed).** `testWatcher_dirRemoved_logsOnceAndResumesOnRecreate`
+  captured `onLog` lines into a plain `var [String]` that the watcher's serial queue appended to while
+  the test thread read it — a data race. Replaced with the lock-protected `WatcherLogSink` (the NSLock
+  collector pattern used elsewhere). Swept the whole `FaultMatrixFileTests` file: the `Collector` is an
+  actor (safe); the relay-cell `onLog` counters (`heals`/`unreachable`/`retries`) run synchronously
+  inside `copyOnce()` on the test thread (no cross-thread access, safe); the review2-added watcher
+  helpers (`WatcherLogSink`, `FolderReplaceClock`) are lock-protected. No other unprotected collectors.

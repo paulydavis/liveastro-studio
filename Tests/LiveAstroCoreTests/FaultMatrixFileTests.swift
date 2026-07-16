@@ -417,9 +417,11 @@ final class FaultMatrixFileTests: XCTestCase {
         let folder = try fs.dir("watched")
         let watcher = StackFileWatcher(folder: folder, quietPeriod: 0.2, pollInterval: 0.3)
 
-        // Capture all log lines through the onLog seam (mirrors FrameRelay).
-        var logLines: [String] = []
-        watcher.onLog = { msg in logLines.append(msg) }
+        // Capture all log lines through the onLog seam (mirrors FrameRelay). F5 (review2): onLog fires
+        // on the watcher's serial queue while the test thread reads the collected lines — the capture
+        // MUST be lock-protected (a plain `var [String]` here is a data race). WatcherLogSink locks.
+        let logs = WatcherLogSink()
+        watcher.onLog = { msg in logs.append(msg) }
 
         let collector = collect(watcher)
         try watcher.start()
@@ -435,9 +437,8 @@ final class FaultMatrixFileTests: XCTestCase {
         try await Task.sleep(nanoseconds: 800_000_000)
 
         // (a) Log exactly once — not every tick.
-        let disappearedLines = logLines.filter { $0.contains("watched folder disappeared") }
-        XCTAssertEqual(disappearedLines.count, 1,
-                       "must log exactly once that the folder disappeared (not every tick); got: \(logLines)")
+        XCTAssertEqual(logs.count(containing: "watched folder disappeared"), 1,
+                       "must log exactly once that the folder disappeared (not every tick)")
 
         // (c) No spurious emit.
         let afterRemovalCount = await collector.items.count
@@ -449,9 +450,8 @@ final class FaultMatrixFileTests: XCTestCase {
         try await Task.sleep(nanoseconds: 800_000_000)
 
         // (b) Log that the folder returned (same live watcher).
-        let returnedLines = logLines.filter { $0.contains("watched folder returned") }
-        XCTAssertGreaterThanOrEqual(returnedLines.count, 1,
-                                    "must log that the folder returned; got: \(logLines)")
+        XCTAssertGreaterThanOrEqual(logs.count(containing: "watched folder returned"), 1,
+                                    "must log that the folder returned")
 
         // (b) Drop a fresh FITS — the live watcher (not a new one) must emit it.
         try makeFITS(0.6).write(to: folder.appendingPathComponent("live_stack2.fit"))
