@@ -94,6 +94,105 @@ final class FolderFrameSourceTests: XCTestCase {
         XCTAssertEqual(got?.sourceName, "Light_live_001.fit")
     }
 
+    /// Lock-protected log capture (live pull logs arrive off-thread).
+    private final class LogBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lines: [String] = []
+        func append(_ s: String) { lock.withLock { lines.append(s) } }
+        var all: [String] { lock.withLock { lines } }
+    }
+
+    /// Cold1 I2 (red-first: pre-fix the live task decoded EVERY emitted update eagerly
+    /// into an unbounded AsyncStream buffer — restart onto a folder holding 1000+ subs
+    /// meant multi-GB of buffered RawFrames while the serial consumer lagged): the live
+    /// stream buffers LIGHT items (URL + identity); decode happens at PULL time, one
+    /// frame in flight. Proxy for bounded peak memory: zero decode attempts while the
+    /// consumer is parked, exactly one per next().
+    func testLiveMode_decodeIsLazy_noDecodeUntilPull() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // The restart-onto-a-full-folder shape: subs already present when the source starts.
+        for i in 1...3 { _ = try writeFITS(dir, name: "Light_00\(i).fit", value: Float(i) / 10) }
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        defer { source.stop() }
+        let buffered = expectation(description: "3 light updates buffered")
+        buffered.expectedFulfillmentCount = 3
+        source.liveSeams.onUpdateBuffered = { _ in buffered.fulfill() }
+        try source.start()
+        await fulfillment(of: [buffered], timeout: 15)
+
+        XCTAssertEqual(source.liveDecodeCount, 0,
+                       "no decode may happen while the consumer is parked — light items only")
+        var it = source.frames.makeAsyncIterator()
+        let first = await it.next()
+        XCTAssertEqual(first?.sourceName, "Light_001.fit")
+        XCTAssertEqual(source.liveDecodeCount, 1, "exactly one decode per pull")
+        let second = await it.next()
+        XCTAssertEqual(second?.sourceName, "Light_002.fit")
+        XCTAssertEqual(source.liveDecodeCount, 2, "one frame in flight at a time")
+    }
+
+    /// Cold1 I2, pull-time identity mismatch: a buffered update whose file changed before
+    /// the pull is SKIPPED with the existing honest log and next() advances to the
+    /// following update — the frame is lost, the live stream (and session) is not.
+    func testLiveMode_identityMismatchAtPull_skipsHonestly_deliversNext() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let a = try writeFITS(dir, name: "Light_a.fit", value: 0.1)
+        _ = try writeFITS(dir, name: "Light_b.fit", value: 0.2)
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        defer { source.stop() }
+        let logs = LogBox()
+        source.onLog = { logs.append($0) }
+        let buffered = expectation(description: "2 light updates buffered")
+        buffered.expectedFulfillmentCount = 2
+        source.liveSeams.onUpdateBuffered = { _ in buffered.fulfill() }
+        try source.start()
+        await fulfillment(of: [buffered], timeout: 15)
+
+        // The file changes AFTER the watcher validated it, BEFORE the consumer pulls
+        // (append one byte in place: same inode, new size/mtime — identity mismatch).
+        let fh = try FileHandle(forWritingTo: a)
+        try fh.seekToEnd()
+        try fh.write(contentsOf: Data([0xFF]))
+        try fh.close()
+
+        var it = source.frames.makeAsyncIterator()
+        let got = await it.next()
+        XCTAssertEqual(got?.sourceName, "Light_b.fit",
+                       "the mismatching frame is skipped and the NEXT update delivered — " +
+                       "a lost frame must never end a live stream")
+        XCTAssertTrue(logs.all.contains(
+            "file changed between validation and read — skipping Light_a.fit"),
+            "the skip must appear honestly in the log — got \(logs.all)")
+    }
+
+    /// Cold1 M2 (red-first: pre-fix a second start() after stop() silently yielded into
+    /// the dead stream — the session recorded empty with no error): the source is
+    /// one-shot like the watcher. start() while running throws; start() after stop()
+    /// throws terminally, so SessionPipeline's rollback reports it loudly.
+    func testLiveMode_restartAfterStop_throwsLoudly() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let source = FolderFrameSource(folder: dir, mode: .live)
+        try source.start()
+        XCTAssertThrowsError(try source.start()) {
+            XCTAssertEqual($0 as? FolderFrameSourceError, .alreadyStarted)
+        }
+        source.stop()
+        XCTAssertThrowsError(try source.start(), "start() after stop() must fail loudly") {
+            XCTAssertEqual($0 as? FolderFrameSourceError, .stopped)
+        }
+    }
+
     /// Regression: a BOTTOM-UP GRBG file must reach the engine in STORED row order —
     /// FITSReader's display flip would shift the Bayer phase and swap R/B (the
     /// 2026-07-06 "cyan nebula" bug class). Pins loadRawFrame to raw stored bytes.

@@ -1,10 +1,42 @@
 import Foundation
 
+/// Lifecycle misuse of a FolderFrameSource (cold1 M2, mirroring StackFileWatcherError):
+/// the source is ONE-SHOT — initial → running → stopped (terminal). A failed initial
+/// start stays retryable; a restart after stop() fails loudly instead of silently
+/// yielding into a dead stream (which recorded an empty session).
+public enum FolderFrameSourceError: Error, Equatable {
+    /// start() while already running.
+    case alreadyStarted
+    /// start() after stop() — construct a new source instead.
+    case stopped
+}
+
+/// Lock-guarded test seams for the live path (cold1 I2): a hook that fires when a LIGHT
+/// update is buffered, and a counter of decode attempts — together they pin the lazy-decode
+/// property (no RawFrame is constructed until the consumer pulls). Set the hook before
+/// start(); both sides may touch these from different threads.
+internal final class LiveDecodeSeams: @unchecked Sendable {
+    private let lock = NSLock()
+    private var decodes = 0
+    private var bufferedHook: ((StackUpdate) -> Void)?
+    var onUpdateBuffered: ((StackUpdate) -> Void)? {
+        get { lock.withLock { bufferedHook } }
+        set { lock.withLock { bufferedHook = newValue } }
+    }
+    func noteBuffered(_ u: StackUpdate) { onUpdateBuffered?(u) }
+    func noteDecode() { lock.withLock { decodes += 1 } }
+    var decodeCount: Int { lock.withLock { decodes } }
+}
+
 /// Reads raw frames from a folder, either as a one-shot import or by watching for new files.
 ///
-/// Import mode is PULL-based: one file is loaded per consumer pull (`AsyncStream(unfolding:)`),
-/// so peak memory stays O(1) frames regardless of folder size. Live mode remains push-based
-/// from the file watcher (frame cadence is ~20s, so buffering is not a concern).
+/// BOTH modes are PULL-based (`AsyncStream(unfolding:)`): one file is decoded per consumer
+/// pull, so peak memory stays O(1) frames regardless of folder size. Import mode pulls from
+/// the sorted cursor. Live mode (cold1 I2) buffers only LIGHT items — the watcher's
+/// StackUpdate (URL + FileIdentity) — and decodes at pull time: pre-fix the live task
+/// decoded every emitted update eagerly into an unbounded RawFrame buffer, so a restart
+/// onto a folder holding 1000+ subs decoded multi-GB of Float planes faster than the serial
+/// consumer could stack them.
 public final class FolderFrameSource: FrameSource {
 
     public enum Mode { case importOnce, live }
@@ -13,10 +45,15 @@ public final class FolderFrameSource: FrameSource {
     public var isFinite: Bool { mode == .importOnce }
     public let totalCount: Int?
     /// Logging seam (mirrors FrameRelay.onLog). Forwarded to the inner StackFileWatcher
-    /// when in live mode so folder-disappearance events surface in the app log.
-    public var onLog: ((String) -> Void)?
-    /// Live mode only; nil in import mode (which uses the pull-based cursor instead).
-    private var continuation: AsyncStream<RawFrame>.Continuation?
+    /// when in live mode so folder-disappearance events surface in the app log, and to
+    /// the pull-time decoder so identity-mismatch skips surface there too.
+    public var onLog: ((String) -> Void)? {
+        didSet { livePull?.log = onLog }
+    }
+    /// Live mode only: continuation of the LIGHT update buffer (never RawFrames).
+    private let liveUpdateContinuation: AsyncStream<StackUpdate>.Continuation?
+    /// Live mode only: the pull-time decoder behind `frames`.
+    private let livePull: LivePull?
 
     private let folder: URL
     private let mode: Mode
@@ -26,10 +63,29 @@ public final class FolderFrameSource: FrameSource {
     private var liveTask: Task<Void, Never>?
     private var watcher: StackFileWatcher?
 
+    /// Test seams (cold1 I2): pin WHERE decode happens. `onUpdateBuffered` fires when a
+    /// LIGHT update enters the live buffer; the decode counter counts decode attempts.
+    internal let liveSeams: LiveDecodeSeams
+    internal var liveDecodeCount: Int { liveSeams.decodeCount }
+
+    // MARK: Lifecycle (cold1 M2 — the watcher's one-shot contract, mirrored)
+    //
+    // stop() finishes the one-shot streams, so a second start() would relay into a dead
+    // buffer and the session would record EMPTY with no error. The source is one-shot:
+    // initial → running (successful start) → stopped (terminal). A FAILED initial start
+    // stays .initial — retryable. SessionPipeline constructs a fresh source per session
+    // (AppModel.startSession / ImportController), so this guard is pure safety that turns
+    // a silent empty session into a loud error through the pipeline's start rollback.
+    private enum LifecycleState { case initial, running, stopped }
+    private let stateLock = NSLock()
+    private var state: LifecycleState = .initial
+
     public init(folder: URL, mode: Mode, fileNamePrefix: String? = nil) {
         self.folder = folder
         self.mode = mode
         self.fileNamePrefix = fileNamePrefix
+        let seams = LiveDecodeSeams()
+        self.liveSeams = seams
 
         switch mode {
         case .importOnce:
@@ -38,7 +94,8 @@ public final class FolderFrameSource: FrameSource {
             cursor.snapshotIfNeeded()
             self.importCursor = cursor
             self.totalCount = cursor.fileCount
-            self.continuation = nil
+            self.liveUpdateContinuation = nil
+            self.livePull = nil
             // One file is read per pull; unreadable files are skipped without buffering.
             self.frames = AsyncStream(unfolding: {
                 while !Task.isCancelled {
@@ -53,14 +110,26 @@ public final class FolderFrameSource: FrameSource {
         case .live:
             self.importCursor = nil
             self.totalCount = nil
-            var cont: AsyncStream<RawFrame>.Continuation!
+            var cont: AsyncStream<StackUpdate>.Continuation!
             // AsyncStream's init runs this closure synchronously; cont is non-nil here.
-            self.frames = AsyncStream { cont = $0 }
-            self.continuation = cont
+            let updates = AsyncStream<StackUpdate> { cont = $0 }
+            self.liveUpdateContinuation = cont
+            let pull = LivePull(updates: updates, seams: seams)
+            self.livePull = pull
+            // Cold1 I2: the public frame stream decodes lazily — one pull, one decode.
+            self.frames = AsyncStream(unfolding: { await pull.nextFrame() })
         }
     }
 
     public func start() throws {
+        // Cold1 M2: one-shot lifecycle — see the LifecycleState declaration.
+        try stateLock.withLock {
+            switch state {
+            case .running: throw FolderFrameSourceError.alreadyStarted
+            case .stopped: throw FolderFrameSourceError.stopped
+            case .initial: break
+            }
+        }
         switch mode {
         case .importOnce:
             // Pull-based: just snapshot the sorted file list; loading happens per pull.
@@ -75,21 +144,22 @@ public final class FolderFrameSource: FrameSource {
                                      digestPolicy: .immutableAfterPublish)
             w.onLog = onLog   // forward folder-disappearance events to the app log
             self.watcher = w
-            try w.start()
-            let continuation = self.continuation!
-            let log = onLog
+            try w.start()     // a throw leaves state == .initial — retryable
+            let cont = liveUpdateContinuation!
+            let seams = liveSeams
             liveTask = Task.detached {
+                // Cold1 I2: relay LIGHT updates only — NO decode here. Decode happens on
+                // the consumer's clock in LivePull.nextFrame(), one frame in flight.
                 for await update in w.updates {
-                    if let frame = FolderFrameSource.frame(for: update, log: log) {
-                        continuation.yield(frame)
-                    }
+                    cont.yield(update)
+                    seams.noteBuffered(update)
                 }
-                // Normally unreachable: the watcher stream only ends via stop(),
-                // which finishes the continuation itself. Kept as a backstop so
-                // consumers never hang on a dead stream.
-                continuation.finish()
+                // The watcher stream ended (its stop()): close the buffer as a backstop
+                // so consumers never hang on a dead stream.
+                cont.finish()
             }
         }
+        stateLock.withLock { state = .running }
     }
 
     /// Protocol stop: bounded by the inner watcher's own 5 s default.
@@ -98,12 +168,59 @@ public final class FolderFrameSource: FrameSource {
     /// Bounded stop (cold1 M1): `timeout` caps the inner watcher's stop so a caller with
     /// an overall shutdown budget (SessionPipeline.end() charges this against its primary
     /// drain deadline) is never pinned behind the watcher default ON TOP of its own drain.
+    /// Terminal (cold1 M2): a later start() throws. Light updates still buffered at stop
+    /// time are discarded, not decoded — stop means stop.
     public func stop(timeout: TimeInterval) {
         stopSeamLock.withLock { _lastStopTimeout = timeout }
+        stateLock.withLock { state = .stopped }
         importCursor?.stop()
+        livePull?.stop()
         watcher?.stop(timeout: timeout)
         liveTask?.cancel()
-        continuation?.finish()
+        liveUpdateContinuation?.finish()
+    }
+
+    /// Cold1 I2: pull-time decoder for the live path. The buffered stream holds LIGHT
+    /// StackUpdates; ONE frame is decoded per consumer pull, so peak memory stays O(1)
+    /// frames no matter how many subs the watcher emits while the consumer lags.
+    /// Single-consumer by contract (AsyncStream supports one meaningful iterator):
+    /// `iterator` is touched only from the frames stream's unfolding closure, which
+    /// AsyncStream serializes. The lock guards the cross-thread state (stop flag, log).
+    private final class LivePull: @unchecked Sendable {
+        private let lock = NSLock()
+        private var iterator: AsyncStream<StackUpdate>.AsyncIterator
+        private var stopped = false
+        private var logSink: ((String) -> Void)?
+        private let seams: LiveDecodeSeams
+
+        init(updates: AsyncStream<StackUpdate>, seams: LiveDecodeSeams) {
+            self.iterator = updates.makeAsyncIterator()
+            self.seams = seams
+        }
+
+        var log: ((String) -> Void)? {
+            get { lock.withLock { logSink } }
+            set { lock.withLock { logSink = newValue } }
+        }
+        func stop() { lock.withLock { stopped = true } }
+        private var isStopped: Bool { lock.withLock { stopped } }
+
+        /// One consumer pull. The verified-read path (loadRawFrame(url:expectedIdentity:))
+        /// is unchanged — it just runs NOW, at consumption. An identity mismatch or an
+        /// unreadable file is skipped (the honest log lives inside frame(for:log:)) and
+        /// the pull ADVANCES to the following update: a boundary failure may lose one
+        /// frame, never the session — returning nil would end the live stream, so nil is
+        /// reserved for stop()/cancellation/buffer end.
+        func nextFrame() async -> RawFrame? {
+            while !Task.isCancelled && !isStopped {
+                guard let update = await iterator.next() else { return nil }
+                seams.noteDecode()
+                if let frame = FolderFrameSource.frame(for: update, log: log) {
+                    return frame
+                }
+            }
+            return nil
+        }
     }
 
     /// Test seam (cold1 M1): the timeout the most recent stop() ran with — pins the
