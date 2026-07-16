@@ -763,11 +763,28 @@ public final class StackFileWatcher {
     /// any open failure (the caller skips the file this tick). The returned FileHandle OWNS the
     /// descriptor (closeOnDealloc), so close happens exactly once on every path.
     ///
+    /// Review9 item 3: the open is NON-BLOCKING and the descriptor must prove S_IFREG before it
+    /// is accepted. A blocking O_RDONLY open of a FIFO with no writer (`mkfifo blocked.fit`)
+    /// parks openat on the ONLY watcher queue forever — no later file, no recovery, no stop().
+    /// O_NONBLOCK makes the FIFO open return immediately; the fstat then rejects every
+    /// non-regular node (FIFO, socket, device, directory) silently, exactly like any other
+    /// per-file failure. For accepted regular files O_NONBLOCK is cleared again via
+    /// fcntl(F_SETFL): regular-file reads ignore the flag on macOS anyway, but the handle feeds
+    /// the streamed header/digest reads — keep its semantics explicitly blocking rather than
+    /// lean on that platform behavior.
+    ///
     /// Internal (not private) so the structural single-descriptor property is directly
     /// unit-testable (see testOpenFile_pinnedDirectoryFDReadsOldFileAcrossAtomicSwap).
     static func openFile(directoryFD: Int32, name: String) -> FileHandle? {
-        let fd = openat(directoryFD, name, O_RDONLY | O_NOFOLLOW)
+        let fd = openat(directoryFD, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
         guard fd >= 0 else { return nil }
+        var st = Darwin.stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else {
+            close(fd)   // not a regular file — skip silently this tick
+            return nil
+        }
+        let flags = fcntl(fd, F_GETFL)
+        if flags >= 0 { _ = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) }
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 

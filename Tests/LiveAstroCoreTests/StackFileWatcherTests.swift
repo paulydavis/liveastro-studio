@@ -274,6 +274,31 @@ final class StackFileWatcherTests: XCTestCase {
                        "no re-hash either — that is the entire point of the policy")
     }
 
+    // MARK: - review9 item 3: FIFO wedge
+
+    /// Review9 item 3 (red-first: pre-fix this test WEDGED the suite): candidates were
+    /// opened with a BLOCKING O_RDONLY openat without verifying the file type, so
+    /// `mkfifo blocked.fit` with no writer parked the ONLY watcher queue inside openat
+    /// forever — no later file, no recovery, and stop() (once queue-confined) could
+    /// never run. The open must be non-blocking, fstat must reject anything but
+    /// S_IFREG (skipped silently like any per-file failure), and the neighboring valid
+    /// FITS must emit normally. The FIFO name sorts BEFORE the FITS so it is opened
+    /// first — proving a wedge would have blocked the later candidate.
+    func testFIFONamedLikeImage_skippedSilently_neighborEmits_watcherNeverWedges() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.3)
+        let collector = collect(watcher)
+        let fifo = tmp.appendingPathComponent("aaa_blocked.fit")
+        XCTAssertEqual(mkfifo(fifo.path, 0o644), 0, "arrange: mkfifo must succeed")
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        try watcher.start()
+        let got = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(got, "the valid FITS next to the writer-less FIFO must emit normally")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent), ["live_stack.fit"],
+                       "the FIFO itself must never be emitted")
+        watcher.stop()   // must return — a wedged queue would hang here (or in tearDown)
+    }
+
     // MARK: - review8 finding 1: digest-stability gate (mutable policy)
 
     /// Lock-protected manual monotonic clock injected through the watcher's
