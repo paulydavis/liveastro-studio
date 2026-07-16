@@ -347,7 +347,9 @@ public final class SessionPipeline {
     /// Ends the session and renders replay.mp4. Synchronous — call off the main thread.
     ///
     /// In native (importOnce) mode, drains any in-flight frame processing before finalizing.
-    /// After the manifest is finalized, writes master.fit into the session directory.
+    /// Writes master.fit into the session directory BEFORE `endSession()` stamps `end_time` —
+    /// that ordering is the commit point (F1): a manifest claiming an ended session always has
+    /// its durable master; a failed master write throws with `end_time` still nil (truthful).
     /// In watcher mode, stops the watcher first so the stream terminates, then drains.
     public func end() throws -> URL {
         if source != nil {
