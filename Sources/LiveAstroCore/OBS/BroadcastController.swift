@@ -1,55 +1,99 @@
-import SwiftUI
-import AppKit
-import LiveAstroCore
+import Foundation
+import Observation
 
-/// Owns OBS connection, broadcast orchestration, and stall-driven scene
-/// automation — the self-contained cluster extracted verbatim from `AppModel`
-/// (T1 of the AppModel decomposition). Holds no `AppModel` reference: all
-/// cross-cutting UI writes (log, error, session-running gate) flow through the
-/// injected `AppSurface`. `AppModel` drives the session hooks
-/// (`sessionDidStart` / `sessionDidEnd` / `frameAccepted`) at the exact points
-/// the moved logic used to run inline, plus the deferred
-/// `stopBroadcastAfterSessionEnd()` once replay generation has completed or
-/// failed (review4 P2 — replay first, then stop the stream).
+/// The app/platform boundaries `BroadcastController` needs, as injected
+/// closures (the core-side mirror of the app target's `AppSurface` idiom).
+///
+/// Core never touches NSWorkspace/AppKit: `launchOBS` is an opaque request —
+/// the app adapter owns every platform detail (bundle-id resolution, the
+/// `open -a` fallback, and launch logging). Defaults are no-ops so a test
+/// harness only supplies the closures it exercises.
+public struct BroadcastDeps {
+
+    /// Appends a line to the session log (main-actor).
+    public var log: (String) -> Void
+    /// Presents a user-facing error (drives the app's error alert).
+    public var presentError: (String) -> Void
+    /// Reads whether an imaging session is currently running (gates scene
+    /// automation ticks).
+    public var isSessionRunning: () -> Bool
+    /// Requests that the OBS application be launched. Core only asks; the app
+    /// adapter owns bundle-id resolution, fallbacks, and launch logging.
+    public var launchOBS: () -> Void
+
+    public init(log: @escaping (String) -> Void = { _ in },
+                presentError: @escaping (String) -> Void = { _ in },
+                isSessionRunning: @escaping () -> Bool = { false },
+                launchOBS: @escaping () -> Void = {}) {
+        self.log = log
+        self.presentError = presentError
+        self.isSessionRunning = isSessionRunning
+        self.launchOBS = launchOBS
+    }
+}
+
+/// Owns OBS broadcast orchestration: the Go Live state machine, stream-health
+/// polling, stall-driven scene automation, and the deferred end-of-session
+/// stop. Extracted from the app target into core (review6) so the lifecycle
+/// is pinned by unit tests driving the injected `OBSController` through a
+/// mocked socket.
+///
+/// The `OBSController` is injected (never constructed here) and all app/
+/// platform boundaries flow through `BroadcastDeps` — no back-references, no
+/// AppKit. The app drives the session hooks (`sessionDidStart` /
+/// `sessionDidEnd` / `frameAccepted`) at the exact points the logic used to
+/// run inline, plus the deferred `stopBroadcastAfterSessionEnd()` once replay
+/// generation has completed or failed (review4 P2 — replay first, then stop
+/// the stream).
 @MainActor
 @Observable
-final class BroadcastController {
+public final class BroadcastController {
 
-    private let surface: AppSurface
+    private let deps: BroadcastDeps
 
-    /// High-level OBS controller (Foundation/Combine, UI-free). Owned here; the
-    /// app target does the AppKit-flavored choreography (launch, timers).
-    let obs = OBSController()
+    /// High-level OBS controller (Foundation/Combine, UI-free). Injected so
+    /// tests drive the full lifecycle through a mocked socket.
+    public let obs: OBSController
 
     // OBS connection config (bound to the settings form).
-    var obsHost = "localhost"
-    var obsPort = 4455
-    var obsPassword = ""
-    /// Launch OBS via NSWorkspace if the first connect attempt fails.
-    var obsAutoLaunch = true
+    public var obsHost = "localhost"
+    public var obsPort = 4455
+    public var obsPassword = ""
+    /// Launch OBS (via the app adapter) if the first connect attempt fails.
+    public var obsAutoLaunch = true
     /// Also start OBS recording when the stream comes up.
-    var obsRecord = false
+    public var obsRecord = false
     /// Master switch for stall-driven scene automation.
-    var sceneAutomationOn = false
+    public var sceneAutomationOn = false
     /// Scene shown while stacking makes progress (the "hero" view).
-    var stackSceneName = ""
+    public var stackSceneName = ""
     /// Scene shown when imaging stalls (e.g. a live scope/finder view).
-    var scopeSceneName = ""
+    public var scopeSceneName = ""
 
     // MARK: Broadcast state
+
     /// `endingSession` (review5 P2): End Session was clicked while live — the stream DELIBERATELY
     /// stays up until replay generation finishes (review4 P2), so the UI must not claim idle
     /// (which offered a Go Live that the deferred stop would then kill, hid End Broadcast, and
     /// hid health while actually streaming). Health polling keeps reporting truth in this state;
     /// `stopBroadcastAfterSessionEnd()` advances it to `.stopping` → `.idle`.
-    enum BroadcastState: Equatable { case idle, connecting, live, endingSession, stopping }
-    var broadcastState: BroadcastState = .idle
-    var streamHealth: StreamHealth?
+    public enum BroadcastState: Equatable { case idle, connecting, live, endingSession, stopping }
+    public private(set) var broadcastState: BroadcastState = .idle
+    public private(set) var streamHealth: StreamHealth?
     private var healthPollTask: Task<Void, Never>?
     private var goLiveTask: Task<Void, Never>?
 
-    /// bundle id used to resolve + launch OBS.
-    private static let obsBundleID = "com.obsproject.obs-studio"
+    // MARK: Timing knobs (injectable for tests — production uses the defaults)
+
+    /// Delay between connect retries while waiting for a just-launched OBS.
+    var launchRetryDelaySeconds: Double = 2
+    /// Total budget for the post-launch connect retry loop.
+    var launchRetryBudgetSeconds: Double = 20
+    /// Confirm-poll pacing forwarded to `OBSController.startBroadcast`.
+    var confirmPollSeconds: Double = 1
+    var maxConfirmPolls: Int = 5
+    /// Stream-health poll period while live.
+    var healthPollIntervalSeconds: Double = 2
 
     // Scene-automation runtime state (nil unless a session + automation is live).
     private var sceneTimer: Timer?
@@ -64,32 +108,32 @@ final class BroadcastController {
     /// CurrentProgramSceneChanged can tell "us" from "the operator".
     private var lastAutomationScene: String?
 
-    init(surface: AppSurface) {
-        self.surface = surface
+    public init(obs: OBSController, deps: BroadcastDeps) {
+        self.obs = obs
+        self.deps = deps
         // Route OBS diagnostics into the session log. onLog fires on the main
-        // actor (OBSController is @MainActor), so appending is safe.
-        obs.onLog = { message in
-            MainActor.assumeIsolated { surface.log("OBS: \(message)") }
-        }
+        // actor (OBSController is @MainActor), so forwarding is safe.
+        let log = deps.log
+        obs.onLog = { message in log("OBS: \(message)") }
     }
 
-    // MARK: - Session hooks (called by AppModel where the logic fired inline)
+    // MARK: - Session hooks (called by the app where the logic fired inline)
 
     /// Session start: begin scene automation. `subExposureSeconds` comes from the
-    /// session profile (owned by AppModel) — passed in so the controller stays
-    /// reference-free. Was the `startSceneAutomation()` call site in startSession.
-    func sessionDidStart(subExposureSeconds: Double) {
+    /// session profile (owned by the app) — passed in so the controller stays
+    /// reference-free.
+    public func sessionDidStart(subExposureSeconds: Double) {
         startSceneAutomation(subExposureSeconds: subExposureSeconds)
     }
 
     /// Session end, IMMEDIATE part: stop scene automation and reset any live
     /// broadcast state — runs at the End Session click, so automation never
     /// stays active during a (possibly long) replay render. The OBS
-    /// stream/record stop is NOT here: AppModel calls
+    /// stream/record stop is NOT here: the app calls
     /// `stopBroadcastAfterSessionEnd()` only after replay generation completes
     /// or fails (review4 P2 — the README promises "replay first, then — and
     /// only then — stop the stream", and now the code matches).
-    func sessionDidEnd() {
+    public func sessionDidEnd() {
         stopSceneAutomation()
 
         // Review5 P2: while the stream deliberately stays live until replay generation
@@ -118,11 +162,11 @@ final class BroadcastController {
     }
 
     /// Session end, DEFERRED part: the deliberate end-of-session stop — the
-    /// ONLY place we ask OBS to stop the stream. Called by AppModel strictly
+    /// ONLY place we ask OBS to stop the stream. Called by the app strictly
     /// AFTER the pipeline's end()/replay generation returned or threw (a
     /// replay failure still stops the stream). App quit / abort / crash paths
     /// never call this — an accidental quit must never kill the broadcast.
-    func stopBroadcastAfterSessionEnd() {
+    public func stopBroadcastAfterSessionEnd() {
         // Mirror endBroadcast()'s sequencing: transition synchronously so the UI shows
         // "Stopping…" the moment the replay is done, then await the stops and settle to idle.
         // When nothing was live (.idle after a .connecting cancel, or no broadcast at all) the
@@ -142,15 +186,16 @@ final class BroadcastController {
         }
     }
 
-    /// Per-accepted-frame hook. Was `onFrameAccepted()`'s scene-automation part.
-    func frameAccepted() {
+    /// Per-accepted-frame hook. Resets the stall clock and drives the
+    /// automation "resume" boundary.
+    public func frameAccepted() {
         onFrameAccepted()
     }
 
     // MARK: - OBS bring-up
 
-    /// Connect to OBS, launching it if needed. Returns whether connected.
-    /// Does NOT start any stream — broadcasting is deliberate (goLive()).
+    /// Connect to OBS, requesting an app-side launch if needed. Returns whether
+    /// connected. Does NOT start any stream — broadcasting is deliberate (goLive()).
     private func connectOBS() async -> Bool {
         guard obs.state == .disconnected else { return true }  // already connected
 
@@ -158,16 +203,19 @@ final class BroadcastController {
                                           password: obsPassword.isEmpty ? nil : obsPassword)
 
         if !connected && obsAutoLaunch {
-            launchOBS()
-            // Retry connect every 2 s until success or a 20 s budget elapses.
-            let deadline = Date().addingTimeInterval(20)
+            deps.launchOBS()
+            // Retry connect every `launchRetryDelaySeconds` until success or
+            // the `launchRetryBudgetSeconds` budget elapses.
+            let deadline = Date().addingTimeInterval(launchRetryBudgetSeconds)
             while !connected && Date() < deadline && !Task.isCancelled {
                 // Cancellation-aware sleep: a cancel throws here, which we treat
                 // as "stop retrying" — return false.
-                do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return false }
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(launchRetryDelaySeconds * 1_000_000_000))
+                } catch { return false }
                 if obs.state == .disconnected {
                     connected = await obs.connect(host: obsHost, port: obsPort,
-                                                 password: obsPassword.isEmpty ? nil : obsPassword)
+                                                  password: obsPassword.isEmpty ? nil : obsPassword)
                 } else {
                     connected = obs.state != .disconnected
                 }
@@ -175,24 +223,26 @@ final class BroadcastController {
         }
 
         if !connected {
-            surface.log("OBS: not connected")
+            deps.log("OBS: not connected")
         }
         return connected
     }
 
     // MARK: - Broadcast orchestration
 
-    func goLive() {
+    public func goLive() {
         guard broadcastState == .idle else { return }
         broadcastState = .connecting
         goLiveTask = Task { @MainActor in
             let connected = await connectOBS()
             guard connected else {
-                surface.presentError("OBS not reachable — is it installed and running?")
+                deps.presentError("OBS not reachable — is it installed and running?")
                 broadcastState = .idle; return
             }
             let scene = stackSceneName.isEmpty ? nil : stackSceneName
-            let live = await obs.startBroadcast(scene: scene)
+            let live = await obs.startBroadcast(scene: scene,
+                                                confirmPollSeconds: confirmPollSeconds,
+                                                maxConfirmPolls: maxConfirmPolls)
             // The user may have hit End Broadcast / End Session while we were
             // connecting. If so, don't transition to .live — instead undo the
             // broadcast we just started so nothing keeps running behind their back.
@@ -204,13 +254,13 @@ final class BroadcastController {
                 broadcastState = .live
                 startHealthPoll()
             } else {
-                surface.presentError("OBS started but the stream didn't go live — check OBS ▸ Settings ▸ Stream (YouTube server + key).")
+                deps.presentError("OBS started but the stream didn't go live — check OBS ▸ Settings ▸ Stream (YouTube server + key).")
                 broadcastState = .idle
             }
         }
     }
 
-    func endBroadcast() {
+    public func endBroadcast() {
         guard broadcastState == .live || broadcastState == .connecting else { return }
         broadcastState = .stopping
         goLiveTask?.cancel(); goLiveTask = nil
@@ -229,34 +279,7 @@ final class BroadcastController {
             // live while the replay renders, so health keeps reporting truth until the stop.
             while !Task.isCancelled && (broadcastState == .live || broadcastState == .endingSession) {
                 streamHealth = await obs.streamStatus()
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-            }
-        }
-    }
-
-    /// Launch OBS via NSWorkspace by bundle id; fall back to `open -a OBS`.
-    /// NSWorkspace/AppKit is app-target-only (never in LiveAstroCore).
-    private func launchOBS() {
-        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.obsBundleID) {
-            surface.log("OBS: launching \(url.lastPathComponent)…")
-            let config = NSWorkspace.OpenConfiguration()
-            config.activates = false
-            NSWorkspace.shared.openApplication(at: url, configuration: config) { [weak self] _, error in
-                if let error {
-                    Task { @MainActor in self?.surface.log("OBS: launch failed: \(error.localizedDescription)") }
-                }
-            }
-        } else {
-            // Bundle id not resolvable — try the command-line fallback, and if
-            // that isn't available either, just skip the launch and log.
-            surface.log("OBS: app not found by bundle id — trying `open -a OBS`")
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            process.arguments = ["-a", "OBS"]
-            do {
-                try process.run()
-            } catch {
-                surface.log("OBS: could not launch OBS (\(error.localizedDescription)) — skipping")
+                try? await Task.sleep(nanoseconds: UInt64(healthPollIntervalSeconds * 1_000_000_000))
             }
         }
     }
@@ -293,17 +316,18 @@ final class BroadcastController {
         lastAutomationScene = nil
     }
 
-    /// Fires every 15 s. If imaging has stalled and we aren't already showing the
-    /// scope scene, switch to it once. Honors the manual-override flag.
-    private func sceneTick() {
-        guard sceneAutomationOn, surface.isSessionRunning(), let detector = stall else { return }
+    /// Fires every 15 s (timer), internal so tests can drive a tick with a
+    /// controlled clock. If imaging has stalled and we aren't already showing
+    /// the scope scene, switch to it once. Honors the manual-override flag.
+    func sceneTick(now: Date = Date()) {
+        guard sceneAutomationOn, deps.isSessionRunning(), let detector = stall else { return }
 
         // Detect an operator-initiated program-scene change: if the current OBS
         // scene isn't the one automation last set (and isn't nil/unknown),
         // suspend automation until the next stall/resume boundary.
         detectManualOverride()
 
-        let stalledNow = detector.isStalled(at: Date())
+        let stalledNow = detector.isStalled(at: now)
         if stalledNow && !showingScopeDueToStall && !manualOverride && !scopeSceneName.isEmpty {
             showingScopeDueToStall = true
             let scene = scopeSceneName
@@ -343,7 +367,7 @@ final class BroadcastController {
         guard let current = obs.currentScene else { return }
         if let expected = lastAutomationScene, current != expected, !manualOverride {
             manualOverride = true
-            surface.log("OBS: manual scene change detected (\(current)) — automation paused until next stall/resume")
+            deps.log("OBS: manual scene change detected (\(current)) — automation paused until next stall/resume")
         }
     }
 }
