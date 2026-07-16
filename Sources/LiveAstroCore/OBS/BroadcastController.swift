@@ -154,6 +154,12 @@ public final class BroadcastController {
     /// output events any more). The owner's settlement re-runs the drain.
     private var reconcileWhenOwnerSettles = false
 
+    /// The state the current `.connecting` attempt STARTED from (review10
+    /// finding 4): cancellation/teardown of a connect returns to this origin —
+    /// a connect begun at `.unknown` never confirmed anything, so it must not
+    /// manufacture a confirmed `.idle` on the way out.
+    private var connectingOrigin: BroadcastState = .unknown
+
     /// Bound on split-snapshot re-reads before giving up (torn snapshots keep
     /// discarding conclusions; exhaustion settles `.stopUnconfirmed`).
     var maxSnapshotRetries = 3
@@ -229,14 +235,17 @@ public final class BroadcastController {
             broadcastState = .endingSession
         case .connecting:
             // Nothing live yet — invalidate the in-flight bring-up (generation bump: its
-            // completions are stale from this instant) and return to idle immediately.
+            // completions are stale from this instant) and return to the attempt's ORIGIN
+            // (review10 finding 4): a connect begun at .unknown never confirmed any output
+            // state, so hardcoding .idle here manufactured a confirmation that never
+            // happened. Only a previously CONFIRMED .idle may be reclaimed.
             broadcastGeneration += 1
             goLiveTask?.cancel()
             goLiveTask = nil
             healthPollTask?.cancel()
             healthPollTask = nil
             streamHealth = nil
-            broadcastState = .idle
+            broadcastState = teardownLanding(from: connectingOrigin)
         case .unknown, .idle, .endingSession, .stopping, .stopUnconfirmed:
             break
         }
@@ -420,6 +429,7 @@ public final class BroadcastController {
         broadcastGeneration += 1
         let gen = broadcastGeneration
         let origin = broadcastState
+        connectingOrigin = origin   // review10 finding 4: teardown returns here
         broadcastState = .connecting
         Task { @MainActor [weak self] in
             await self?.runConnectAndReconcile(gen: gen, origin: origin)
@@ -443,6 +453,7 @@ public final class BroadcastController {
         broadcastGeneration += 1
         let gen = broadcastGeneration
         let origin = broadcastState
+        connectingOrigin = origin   // review10 finding 4: teardown returns here
         broadcastState = .connecting
         return await runConnectAndReconcile(gen: gen, origin: origin)
     }
@@ -477,6 +488,7 @@ public final class BroadcastController {
         // session-end stop and any cancelled earlier attempt are stale from here.
         broadcastGeneration += 1
         let gen = broadcastGeneration
+        connectingOrigin = origin   // review10 finding 4: teardown returns here
         broadcastState = .connecting
         goLiveTask = Task { @MainActor in
             let connected = await connectOBS()
@@ -722,13 +734,15 @@ public final class BroadcastController {
             broadcastState = .stopUnconfirmed
             deps.log("OBS: control link disconnected while the stream is live — OBS keeps streaming (disconnect ≠ stop). Reconnect and Retry to stop it, or stop it in OBS.")
         case .connecting:
-            // Bring-up abandoned: invalidate it and return to idle (any stream a
-            // stale attempt manages to start is undone by its stale-completion cleanup).
+            // Bring-up abandoned: invalidate it and return to the attempt's ORIGIN
+            // (review10 finding 4 — a connect begun at .unknown confirmed nothing, so
+            // .idle here was a fabricated confirmation). Any stream a stale attempt
+            // manages to start is undone by its stale-completion cleanup.
             broadcastGeneration += 1
             goLiveTask?.cancel(); goLiveTask = nil
             healthPollTask?.cancel(); healthPollTask = nil
             streamHealth = nil
-            broadcastState = .idle
+            broadcastState = teardownLanding(from: connectingOrigin)
         case .unknown, .idle, .stopUnconfirmed:
             // Review7 P1: disconnecting from .unknown stays .unknown — nothing
             // was ever confirmed, so nothing gets claimed now either.
@@ -971,6 +985,19 @@ public final class BroadcastController {
         if reconcileWhenOwnerSettles {
             reconcileWhenOwnerSettles = false
             noteOBSStateMayHaveChanged()
+        }
+    }
+
+    /// Review10 finding 4: the state a torn-down `.connecting` attempt lands
+    /// in — its ORIGIN, honestly mapped. From `.unknown` nothing was ever
+    /// confirmed, so nothing is claimed now either; a previously CONFIRMED
+    /// `.idle` may be reclaimed; any origin that implied a possibly-live
+    /// stream stays honest as `.stopUnconfirmed`.
+    private func teardownLanding(from origin: BroadcastState) -> BroadcastState {
+        switch origin {
+        case .unknown, .connecting: return .unknown
+        case .idle: return .idle
+        case .live, .endingSession, .stopping, .stopUnconfirmed: return .stopUnconfirmed
         }
     }
 

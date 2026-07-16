@@ -1099,6 +1099,63 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertEqual(sent("StopStream", h.mock), 1, "exactly one StopStream total")
     }
 
+    /// FINDING 4 (P2): End Session during a connect that STARTED at .unknown
+    /// must return to .unknown — no output state was ever confirmed, so the
+    /// pre-fix hardcoded .idle manufactured a confirmation. Go Live stays
+    /// possible from .unknown (it reconciles internally).
+    func testSessionEndDuringColdConnectReturnsToUnknown() async {
+        let h = await makeHarness(connect: false, requestTimeout: 10)
+        h.server.parkTypes = ["GetSceneList"]   // park the connect mid-seed
+        h.mock.enqueueInbound(helloFrame())
+        h.mock.replyToLastSent(h.server.responder())
+
+        XCTAssertEqual(h.controller.broadcastState, .unknown)
+        h.controller.beginConnectAndReconcile()
+        await waitUntil { h.server.parked.count == 1 }
+        XCTAssertEqual(h.controller.broadcastState, .connecting)
+
+        h.controller.sessionDidEnd()
+        XCTAssertEqual(h.controller.broadcastState, .unknown,
+                       "nothing was ever confirmed — a fabricated .idle is a lie")
+
+        // Go Live still works from .unknown: resume the stale connect's seed
+        // (its completion is generation-stale and touches nothing), then go.
+        h.server.parkTypes = []
+        h.mock.enqueueInbound(responseFrame(requestId: h.server.parked[0].id, ok: true,
+                                            responseData: [
+                                                "currentProgramSceneName": "Stack",
+                                                "scenes": [["sceneName": "Stack"]]]))
+        await waitUntil { h.obs.state == .connected }
+        XCTAssertEqual(h.controller.broadcastState, .unknown)
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+    }
+
+    /// FINDING 4 (P2), disconnect flavor: Disconnect during a connect that
+    /// started at .unknown returns to .unknown, never a fabricated .idle —
+    /// and Go Live remains possible (not blocked by a lying state).
+    func testDisconnectDuringColdConnectReturnsToUnknown() async {
+        let h = await makeHarness(connect: false, requestTimeout: 10)
+        h.server.parkTypes = ["GetSceneList"]
+        h.mock.enqueueInbound(helloFrame())
+        h.mock.replyToLastSent(h.server.responder())
+
+        h.controller.beginConnectAndReconcile()
+        await waitUntil { h.server.parked.count == 1 }
+        XCTAssertEqual(h.controller.broadcastState, .connecting)
+
+        h.controller.disconnect()
+        await settle()
+        XCTAssertEqual(h.controller.broadcastState, .unknown,
+                       "a cold connect torn down before any confirmation stays .unknown")
+        XCTAssertEqual(sent("StopStream", h.mock), 0)
+
+        // Go Live is still offered from .unknown (the attempt itself is
+        // accepted; against the dead socket it fails honestly back to .unknown).
+        h.controller.goLive()
+        XCTAssertEqual(h.controller.broadcastState, .connecting, "Go Live must not be blocked")
+        await waitUntil { h.controller.broadcastState == .unknown }
+    }
 
     /// Boundary (c): while the orphan cleanup is awaiting OBS, .stopping is
     /// already reserved SYNCHRONOUSLY — a Go Live click during that await is
