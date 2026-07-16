@@ -328,4 +328,29 @@ final class StackFileWatcherTests: XCTestCase {
         // nil identity → legacy read, no verification.
         XCTAssertEqual(try FileIdentity.read(url: url, verifying: nil), data)
     }
+
+    /// Review6 finding 1 — identity revalidation around the verified read. Deterministic half:
+    /// the file is mutated IN PLACE (same inode — unlike the rename-replacement test above)
+    /// between capturing the identity and calling read; the fstat check must reject it. The
+    /// post-read revalidation branch (a writer active DURING readToEnd) cannot be reached
+    /// deterministically without an injectable read seam, which is not wanted — it is the same
+    /// 4-line fstat+matches check exercised here, applied to the same descriptor after the read.
+    func testReadVerifying_inPlaceMutationAfterCaptureRejected() throws {
+        let data = makeFITS(0.4)
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        try data.write(to: url)
+        let identity = try XCTUnwrap(FileIdentity.capture(url: url))
+            .withDigest(FileIdentity.contentDigest(data: data))
+
+        // Mutate in place: append one byte — same dev/ino, changed size (and mtime).
+        let fh = try FileHandle(forWritingTo: url)
+        try fh.seekToEnd()
+        try fh.write(contentsOf: Data([0xFF]))
+        try fh.close()
+
+        XCTAssertThrowsError(try FileIdentity.read(url: url, verifying: identity)) {
+            XCTAssertTrue($0 is FileIdentityMismatchError,
+                          "an in-place mutation after validation must be refused by the fstat check")
+        }
+    }
 }

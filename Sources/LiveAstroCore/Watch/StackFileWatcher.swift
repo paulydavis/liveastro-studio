@@ -56,8 +56,11 @@ public struct FileIdentity: Equatable, Sendable {
     }
 
     /// Read `url`'s ENTIRE contents from ONE opened descriptor, verifying THAT descriptor's own
-    /// fstat (dev, ino, size, mtime ns) against `expected` before reading, and — when `expected`
-    /// carries a digest — recomputing the digest over the bytes actually read and comparing.
+    /// fstat (dev, ino, size, mtime ns) against `expected` BEFORE reading and AGAIN AFTER
+    /// readToEnd() (review6 finding 1: an in-place writer active DURING the read can yield torn
+    /// bytes that a single pre-read fstat cannot see — the writer moves size/mtime, so the
+    /// post-read fstat on the same descriptor catches it), and — when `expected` carries a
+    /// digest — recomputing the digest over the bytes actually read and comparing.
     /// This is the consumer end of the watcher's single-descriptor chain: stat, completeness,
     /// digest (watcher) and the consumed bytes (here) all refer to the same file identity, or
     /// `FileIdentityMismatchError` is thrown and the caller skips the frame honestly.
@@ -73,6 +76,12 @@ public struct FileIdentity: Equatable, Sendable {
         }
         // Read from the verified descriptor — never a separate reopen by path.
         let data = try fh.readToEnd() ?? Data()
+        // Post-read revalidation: the identity must STILL hold after the bytes were read, or a
+        // writer touched the file mid-read and `data` may be torn.
+        var after = Darwin.stat()
+        guard fstat(fh.fileDescriptor, &after) == 0, expected.matches(stat: after) else {
+            throw FileIdentityMismatchError(fileName: url.lastPathComponent)
+        }
         if let want = expected.digest, contentDigest(data: data) != want {
             throw FileIdentityMismatchError(fileName: url.lastPathComponent)
         }
@@ -456,6 +465,19 @@ public final class StackFileWatcher {
 
             guard let digest = FileIdentity.contentDigest(handle: handle, size: observed.size)
             else { continue }
+
+            // Final revalidation on the pinned descriptor (review6 finding 1): the header/
+            // completeness read and the digest read above take time, and an in-place writer
+            // active DURING them moves size/mtime — the digest would then describe torn bytes.
+            // Require the identity unchanged from the initial fstat; otherwise treat the file as
+            // unstable this tick (record the latest clean observation, no emit, no dedup update,
+            // no log spam) and let it re-earn stability on later ticks.
+            guard let finalStat = Self.statFile(handle) else { continue }
+            guard finalStat == observed else {
+                lastSeenStat[name] = finalStat
+                continue
+            }
+
             guard lastEmittedDigest[name] != digest else { continue }
 
             // Yield-time revalidation (review5 item 1): the emitted URL is still a PATH the
