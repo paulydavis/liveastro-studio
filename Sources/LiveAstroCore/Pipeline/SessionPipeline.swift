@@ -6,6 +6,13 @@ public enum SessionPipelineError: Error, Equatable {
     /// even after cancellation. Finalizing would race a still-running consumer against the
     /// accumulator/snapshots, so end() throws instead of writing a corrupt master.
     case shutdownTimeout
+    /// end() was called from INSIDE a synchronous frame/log callback (onUpdate, onLog,
+    /// onRejected, onImportProgress — review10 item 4). The delivery context IS the
+    /// consumer task end() must drain, so waiting would deadlock a finite import forever
+    /// and burn the whole drain timeout in live modes. Call end() from outside the
+    /// delivery context. Deliberately NOT made to work reentrantly: deferring finalization
+    /// from inside delivery would silently change ordering semantics.
+    case reentrantEnd
 }
 
 /// Simple atomic boolean flag backed by NSLock (Foundation only).
@@ -20,14 +27,50 @@ final class NSLock_Flag {
 /// UI-free so the end-to-end test and the app share the same wiring.
 public final class SessionPipeline {
     public let session: SessionManager
+    /// Delivered SYNCHRONOUSLY on the frame-consumer task (review10 item 4): do NOT call
+    /// end() from inside this callback — it throws `.reentrantEnd` (end() must drain the
+    /// very task delivering the callback). Signal out and call end() from another context.
     public var onUpdate: ((CGImage, SnapshotRecord) -> Void)?
+    /// May be delivered synchronously on the frame-consumer task — same reentrancy rule as
+    /// `onUpdate`: end() from inside throws `.reentrantEnd`.
     public var onLog: ((String) -> Void)?
-    /// Called for every frame the stack engine rejects (native mode only).
+    /// Called for every frame the stack engine rejects (native mode only). Delivered on
+    /// the frame-consumer task — same reentrancy rule as `onUpdate`.
     public var onRejected: ((RejectionReason, String) -> Void)?
-    /// Called after each frame is processed (native import mode only).
+    /// Called after each frame is processed (native import mode only). Delivered on the
+    /// frame-consumer task — same reentrancy rule as `onUpdate`.
     public var onImportProgress: ((_ processed: Int, _ total: Int,
                                    _ accepted: Int, _ rejected: Int) -> Void)?
     private let cancelled = NSLock_Flag()
+
+    // MARK: Reentrancy detection (review10 item 4)
+    //
+    // Callbacks are delivered synchronously from the consumer task; end() waits on that
+    // task, so end() called from INSIDE a callback deadlocked a finite import forever and
+    // burned the whole drain timeout in live modes. Every synchronous delivery site wraps
+    // itself in withCallbackDelivery, recording the delivering THREAD (identity, not a
+    // plain flag — end() from a different thread while a callback is in flight is the
+    // normal case and must not be rejected); end() fails fast with .reentrantEnd when its
+    // own thread is currently a delivery thread.
+
+    private let deliveryLock = NSLock()
+    private var deliveringThreads: Set<ObjectIdentifier> = []
+
+    /// Run one synchronous frame/log delivery with the current thread marked as a delivery
+    /// context. The wrapped sites (handle, handleNative, finalizeCommitted,
+    /// finalizeRejected) never nest each other, so a plain set suffices.
+    private func withCallbackDelivery(_ body: () -> Void) {
+        let id = ObjectIdentifier(Thread.current)
+        deliveryLock.withLock { _ = deliveringThreads.insert(id) }
+        defer { deliveryLock.withLock { _ = deliveringThreads.remove(id) } }
+        body()
+    }
+
+    /// True when the CALLING thread is currently inside synchronous callback delivery.
+    private var isInsideCallbackDelivery: Bool {
+        deliveryLock.withLock { deliveringThreads.contains(ObjectIdentifier(Thread.current)) }
+    }
+
     private var processedCount = 0
     private var sourceMetadata: SourceMetadata?
     private var lastAutoReseedCount = 0
@@ -100,6 +143,21 @@ public final class SessionPipeline {
         self.calibrator = calibrator
     }
 
+    /// Review10 item 5: a RUNNING pipeline dropped without end() must not leak its live
+    /// machinery. The detached consumer captures `self` weakly (which is why this deinit
+    /// can run at all) but strongly retains the source and engine for its own lifetime —
+    /// without this hook, releasing a native-live pipeline left the source running and the
+    /// task parked on a never-ending stream forever. Cancel the stored task handle
+    /// (AsyncStream iteration honors cancellation), stop the source, and stop the watcher
+    /// (bounded — review10 item 3). Deliberately NO logging here: `onLog` may capture the
+    /// very owner being torn down, and invoking user callbacks from deinit re-enters a
+    /// half-deinitialized object graph.
+    deinit {
+        consumeTask?.cancel()
+        source?.stop()
+        watcher?.stop()
+    }
+
     /// Reseeds the stacking engine, discarding the current reference frame (native mode only).
     public func reseed() { engine?.reseed() }
 
@@ -108,34 +166,39 @@ public final class SessionPipeline {
     public func cancelImport() { cancelled.set(); source?.stop() }
 
     /// Finalize one committed frame (import batch path): snapshot + progress.
-    /// Called serially by BatchImporter in completion order.
+    /// Called serially by BatchImporter in completion order. Callback deliveries inside are
+    /// reentrancy-guarded (review10 item 4).
     private func finalizeCommitted(index: Int, sourceName: String, timestamp: Date, metadata: SourceMetadata?, engine: StackEngine) {
-        if sourceMetadata == nil, let m = metadata { sourceMetadata = m }
-        processedCount += 1
-        guard let mean = engine.currentStack() else { return }
-        guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
-        do {
-            let cg = try displayCGImage(from: mean)
-            let record = try recorder.save(
-                cgImage: cg, linear: mean, sourceFile: sourceName,
-                index: index, timestamp: timestamp,
-                estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
-            try session.recordSnapshot(record)
-            onUpdate?(cg, record)
-        } catch {
-            onLog?("Skipped frame (\(sourceName)): \(error)")
-        }
-        if let total = source?.totalCount {
-            onImportProgress?(processedCount, total, engine.acceptedCount, engine.rejectedCount)
+        withCallbackDelivery {
+            if sourceMetadata == nil, let m = metadata { sourceMetadata = m }
+            processedCount += 1
+            guard let mean = engine.currentStack() else { return }
+            guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
+            do {
+                let cg = try displayCGImage(from: mean)
+                let record = try recorder.save(
+                    cgImage: cg, linear: mean, sourceFile: sourceName,
+                    index: index, timestamp: timestamp,
+                    estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
+                try session.recordSnapshot(record)
+                onUpdate?(cg, record)
+            } catch {
+                onLog?("Skipped frame (\(sourceName)): \(error)")
+            }
+            if let total = source?.totalCount {
+                onImportProgress?(processedCount, total, engine.acceptedCount, engine.rejectedCount)
+            }
         }
     }
 
     private func finalizeRejected(sourceName: String, engine: StackEngine) {
-        processedCount += 1
-        onRejected?(.noTransform, sourceName)
-        onLog?("Rejected \(sourceName)")
-        if let total = source?.totalCount {
-            onImportProgress?(processedCount, total, engine.acceptedCount, engine.rejectedCount)
+        withCallbackDelivery {
+            processedCount += 1
+            onRejected?(.noTransform, sourceName)
+            onLog?("Rejected \(sourceName)")
+            if let total = source?.totalCount {
+                onImportProgress?(processedCount, total, engine.acceptedCount, engine.rejectedCount)
+            }
         }
     }
 
@@ -254,70 +317,77 @@ public final class SessionPipeline {
         return try? displayCGImage(from: mean)
     }
 
-    /// Processes one raw frame through the stack engine (native mode).
+    /// Processes one raw frame through the stack engine (native mode). Callback deliveries
+    /// inside are reentrancy-guarded (review10 item 4).
     private func handleNative(_ rawFrame: RawFrame, engine: StackEngine) {
-        if cancelled.isSet { return }
-        if sourceMetadata == nil, let m = rawFrame.metadata { sourceMetadata = m }
-        let frame = calibrator?.apply(rawFrame) ?? rawFrame
-        let outcome = engine.process(frame)
-        if engine.autoReseedCount != lastAutoReseedCount {
-            lastAutoReseedCount = engine.autoReseedCount
-            onLog?("Auto-reseeded — the reference frame didn't match; re-seeding on the next good sub. (Earlier subs that couldn't register stay rejected.)")
-        }
-        processedCount += 1
-        switch outcome {
-        case .becameReference, .stacked:
-            guard let mean = engine.currentStack() else { return }
-            guard let recorder else {
-                onLog?("recorder missing — frame dropped (\(frame.sourceName))")
-                return
+        withCallbackDelivery {
+            if cancelled.isSet { return }
+            if sourceMetadata == nil, let m = rawFrame.metadata { sourceMetadata = m }
+            let frame = calibrator?.apply(rawFrame) ?? rawFrame
+            let outcome = engine.process(frame)
+            if engine.autoReseedCount != lastAutoReseedCount {
+                lastAutoReseedCount = engine.autoReseedCount
+                onLog?("Auto-reseeded — the reference frame didn't match; re-seeding on the next good sub. (Earlier subs that couldn't register stay rejected.)")
             }
-            do {
-                let cg = try displayCGImage(from: mean)
-                // Pass the raw un-neutralized mean as linear: stats stay raw for v1.1 cloud gate.
-                let record = try recorder.save(
-                    cgImage: cg, linear: mean, sourceFile: frame.sourceName,
-                    index: engine.acceptedCount, timestamp: frame.timestamp,
-                    estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
-                try session.recordSnapshot(record)
-                onUpdate?(cg, record)
-            } catch {
-                onLog?("Skipped frame (\(frame.sourceName)): \(error)")
+            processedCount += 1
+            switch outcome {
+            case .becameReference, .stacked:
+                guard let mean = engine.currentStack() else { return }
+                guard let recorder else {
+                    onLog?("recorder missing — frame dropped (\(frame.sourceName))")
+                    return
+                }
+                do {
+                    let cg = try displayCGImage(from: mean)
+                    // Pass the raw un-neutralized mean as linear: stats stay raw for v1.1 cloud gate.
+                    let record = try recorder.save(
+                        cgImage: cg, linear: mean, sourceFile: frame.sourceName,
+                        index: engine.acceptedCount, timestamp: frame.timestamp,
+                        estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
+                    try session.recordSnapshot(record)
+                    onUpdate?(cg, record)
+                } catch {
+                    onLog?("Skipped frame (\(frame.sourceName)): \(error)")
+                }
+            case .rejected(let reason):
+                onRejected?(reason, frame.sourceName)
+                onLog?("Rejected \(frame.sourceName): \(reason)")
             }
-        case .rejected(let reason):
-            onRejected?(reason, frame.sourceName)
-            onLog?("Rejected \(frame.sourceName): \(reason)")
-        }
-        if let total = source?.totalCount {
-            onImportProgress?(processedCount, total, engine.acceptedCount, engine.rejectedCount)
+            if let total = source?.totalCount {
+                onImportProgress?(processedCount, total, engine.acceptedCount, engine.rejectedCount)
+            }
         }
     }
 
+    /// Processes one watcher update (watcher mode). Callback deliveries inside are
+    /// reentrancy-guarded (review10 item 4).
     private func handle(_ update: StackUpdate) {
-        guard let recorder else {
-            onLog?("recorder missing — frame dropped (\(update.url.lastPathComponent))")
-            return
-        }
-        do {
-            // Verified read (review5 item 1): the bytes decoded here are checked — on the ONE
-            // descriptor they are read from — against the identity (dev, ino, size, mtime ns,
-            // digest) the watcher validated on ITS pinned descriptor, so a file replaced between
-            // the watcher's validation and this read is skipped, never parsed.
-            let linear = try ImageLoader.load(url: update.url, expectedIdentity: update.identity)
-            let cg = try displayCGImage(from: linear)
-            let index = session.acceptedCount + 1
-            let record = try recorder.save(
-                cgImage: cg, linear: linear, sourceFile: update.url.lastPathComponent,
-                index: index, timestamp: Date(),
-                estimatedIntegrationSeconds: Double(index) * profile.subExposureSeconds)
-            try session.recordSnapshot(record)
-            onUpdate?(cg, record)
-        } catch let mismatch as FileIdentityMismatchError {
-            // A boundary failure may lose one frame, never the session; it appears honestly here.
-            onLog?("file changed between validation and read — skipping \(mismatch.fileName)")
-        } catch {
-            // Spec §7: skip bad updates, keep the last good frame on the broadcast.
-            onLog?("Skipped update (\(update.url.lastPathComponent)): \(error)")
+        withCallbackDelivery {
+            guard let recorder else {
+                onLog?("recorder missing — frame dropped (\(update.url.lastPathComponent))")
+                return
+            }
+            do {
+                // Verified read (review5 item 1): the bytes decoded here are checked — on the ONE
+                // descriptor they are read from — against the identity (dev, ino, size, mtime ns,
+                // digest) the watcher validated on ITS pinned descriptor, so a file replaced between
+                // the watcher's validation and this read is skipped, never parsed.
+                let linear = try ImageLoader.load(url: update.url, expectedIdentity: update.identity)
+                let cg = try displayCGImage(from: linear)
+                let index = session.acceptedCount + 1
+                let record = try recorder.save(
+                    cgImage: cg, linear: linear, sourceFile: update.url.lastPathComponent,
+                    index: index, timestamp: Date(),
+                    estimatedIntegrationSeconds: Double(index) * profile.subExposureSeconds)
+                try session.recordSnapshot(record)
+                onUpdate?(cg, record)
+            } catch let mismatch as FileIdentityMismatchError {
+                // A boundary failure may lose one frame, never the session; it appears honestly here.
+                onLog?("file changed between validation and read — skipping \(mismatch.fileName)")
+            } catch {
+                // Spec §7: skip bad updates, keep the last good frame on the broadcast.
+                onLog?("Skipped update (\(update.url.lastPathComponent)): \(error)")
+            }
         }
     }
 
@@ -378,7 +448,12 @@ public final class SessionPipeline {
         throw SessionPipelineError.shutdownTimeout
     }
 
-    /// Ends the session and renders replay.mp4. Synchronous — call off the main thread.
+    /// Ends the session and renders replay.mp4. Synchronous — call off the main thread,
+    /// and NEVER from inside one of this pipeline's callbacks (onUpdate / onLog /
+    /// onRejected / onImportProgress): those are delivered synchronously on the
+    /// frame-consumer task that end() must drain, so a reentrant end() throws
+    /// `.reentrantEnd` immediately (review10 item 4) instead of deadlocking a finite
+    /// import or burning the drain timeout.
     ///
     /// In native (importOnce) mode, drains any in-flight frame processing before finalizing.
     /// Writes master.fit into the session directory BEFORE `endSession()` stamps `end_time` —
@@ -386,6 +461,9 @@ public final class SessionPipeline {
     /// its durable master; a failed master write throws with `end_time` still nil (truthful).
     /// In watcher mode, stops the watcher first so the stream terminates, then drains.
     public func end() throws -> URL {
+        // Review10 item 4: fail fast — this thread is currently DELIVERING a callback from
+        // the consumer task, and every branch below waits on that task.
+        guard !isInsideCallbackDelivery else { throw SessionPipelineError.reentrantEnd }
         if source != nil {
             if source?.isFinite ?? false {
                 // Import: the stream ends on its own; drain it completely (a long import
