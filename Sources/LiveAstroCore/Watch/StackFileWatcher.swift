@@ -705,6 +705,16 @@ public final class StackFileWatcher {
         // armed (folderFD < 0, i.e. a failed re-arm while folderMissing), there is nothing safe to
         // enumerate — skip this tick; the poll timer retries the re-arm on the next tick.
         guard folderFD >= 0, let names = Self.enumerateDirectory(fd: folderFD) else { return }
+        // Review10 item 2: PENDING (unemitted) evidence for a file ABSENT this scan dies
+        // now — a file that vanishes mid-gate and returns with a manufactured matching
+        // identity must re-earn stability and the digest gate from zero, not resume off
+        // observations of an entry that demonstrably stopped existing. Emitted digests and
+        // identities are untouched: dedup governs re-emission, not pending evidence.
+        let present = Set(names)
+        if !lastSeenStat.isEmpty { lastSeenStat = lastSeenStat.filter { present.contains($0.key) } }
+        if !pendingContent.isEmpty {
+            pendingContent = pendingContent.filter { present.contains($0.key) }
+        }
         // Review9 item 2: process candidates in a deterministic order (numbered revisions
         // numerically, everything else lexicographically — see orderedBefore). The revision
         // suffix is parsed ONCE per name here and reused for the per-entry policy below.
@@ -750,6 +760,7 @@ public final class StackFileWatcher {
             // enumeration; ELOOP — a symlinked entry, refused by O_NOFOLLOW) skips the file
             // this tick, exactly like a failed stat before.
             guard let handle = Self.openFile(directoryFD: folderFD, name: name) else {
+                clearPendingEvidence(for: name)                    // review10 item 2
                 if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
                 continue
             }
@@ -758,6 +769,7 @@ public final class StackFileWatcher {
             defer { try? handle.close() }
 
             guard let observed = Self.statFile(handle), observed.size > 0 else {
+                clearPendingEvidence(for: name)                    // review10 item 2
                 if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
                 continue
             }
@@ -811,6 +823,7 @@ public final class StackFileWatcher {
                 guard let head = try? Self.readHead(handle, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
                       let header = try? FITSReader.readHeader(head),
                       observed.size >= header.minimumFileSize else {
+                    clearPendingEvidence(for: name)                    // review10 item 2
                     if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
                     continue
                 }
@@ -819,6 +832,7 @@ public final class StackFileWatcher {
             _digestComputations += 1
             guard let digest = FileIdentity.contentDigest(handle: handle, size: observed.size)
             else {
+                clearPendingEvidence(for: name)                    // review10 item 2
                 if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
                 continue
             }
@@ -830,10 +844,14 @@ public final class StackFileWatcher {
             // unstable this tick (record the latest clean observation, no emit, no dedup update,
             // no log spam) and let it re-earn stability on later ticks.
             guard let finalStat = Self.statFile(handle) else {
+                clearPendingEvidence(for: name)                    // review10 item 2
                 if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
                 continue
             }
             guard finalStat == observed else {
+                // Not an invalidity, an in-flight writer: record the LATEST clean stat so
+                // stability re-earns from what the file is now (review10 item 2 keeps this
+                // branch's existing shape — stat recorded, pending content cleared).
                 lastSeenStat[name] = finalStat
                 // Review8 finding 1: the identity moved mid-scan — restart the
                 // digest-stability gate along with stat stability.
@@ -934,6 +952,20 @@ public final class StackFileWatcher {
                 url: url, fileSize: observed.size,
                 identity: observed.withDigest(digest)))
         }
+    }
+
+    /// Review10 item 2: one observed per-file invalidity — open/fstat failure (incl. a
+    /// rejected non-regular node), zero size, malformed or incomplete FITS header, digest
+    /// failure — resets EVERYTHING pending for the entry. Stability and content evidence
+    /// must be re-earned from zero: a file that vanished or truncated during the quiet
+    /// window and returned with a manufactured matching identity (restored bytes +
+    /// utimensat'd mtime, or a reused inode) must never emit off evidence gathered for a
+    /// version that demonstrably stopped being valid. Emitted digests/identities are
+    /// untouched — dedup is content-bound and survives invalidity; only UNEMITTED evidence
+    /// dies.
+    private func clearPendingEvidence(for name: String) {
+        lastSeenStat.removeValue(forKey: name)
+        pendingContent.removeValue(forKey: name)
     }
 
     /// Mid-tick folder replacement handling — shared by the top-of-scan identity check and the

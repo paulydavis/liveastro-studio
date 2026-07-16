@@ -608,6 +608,93 @@ final class StackFileWatcherTests: XCTestCase {
                        "the drop must be logged honestly, exactly once — got \(logs.all)")
     }
 
+    // MARK: - review10 item 2: observed invalidity resets pending evidence
+
+    /// Review10 item 2 (red-first): the per-file invalidity branches (open failure, zero
+    /// size, malformed header, digest failure) left lastSeenStat and pendingContent
+    /// INTACT, so a file that truncated to zero DURING the quiet window and came back
+    /// with a manufactured matching identity emitted IMMEDIATELY off the stale evidence.
+    /// Invalidity must reset both gates: the returned file re-earns two-tick stat
+    /// stability AND the digest gate before emitting.
+    func testMutablePolicy_truncationDuringGate_evidenceResets_reEarnsBothGates() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let collector = collect(watcher)
+        try watcher.start()
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        let original = makeFITS(0.25, size: 16)
+        try original.write(to: url)
+        watcher.scanNow()   // stability tick 1 — stat recorded
+        watcher.scanNow()   // stable → digest observed → PENDING
+        let identity = try XCTUnwrap(FileIdentity.capture(url: url))
+
+        // The file truncates to ZERO mid-gate — an observed invalidity.
+        let fh = try FileHandle(forWritingTo: url)
+        try fh.truncate(atOffset: 0)
+        try fh.close()
+        watcher.scanNow()   // invalidity observed → ALL pending evidence must reset
+
+        // The original bytes return under a MANUFACTURED matching identity (in-place
+        // rewrite restores the size, utimensat restores mtime-ns: dev/ino/size/mtime all
+        // equal the evidence gathered above).
+        let wfh = try FileHandle(forWritingTo: url)
+        try wfh.write(contentsOf: original)
+        try wfh.close()
+        setMtime(url, sec: identity.mtimeSec, nsec: identity.mtimeNsec)
+        XCTAssertEqual(FileIdentity.capture(url: url), identity,
+                       "arrange: the manufactured identity matches the pre-truncation one")
+
+        clock.advance(seconds: 3601)   // a wrongly-retained pending would now be 'elapsed'
+        watcher.scanNow()              // pre-fix: stale stability + stale pending → emitted here
+        let premature = await collector.waitForCount(1, timeout: 0.3)
+        XCTAssertFalse(premature,
+                       "no emission off stale pre-invalidity evidence — both gates re-earn from zero")
+
+        watcher.scanNow()              // re-earned stability → fresh pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()              // fresh pending confirmed → emits
+        let got = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(got, "the restored file emits after re-earning stability + digest gates")
+        let items = await collector.items
+        XCTAssertEqual(items.count, 1)
+    }
+
+    /// Review10 item 2, absent-during-window variant (red-first): a file that VANISHES
+    /// mid-gate keeps no pending evidence either. Modeled deterministically by moving the
+    /// file aside (rename preserves inode and mtime) across one scan and back — the
+    /// returned file presents the EXACT pre-absence identity, and pre-fix the stale
+    /// stability + pending digest emitted it immediately.
+    func testMutablePolicy_fileAbsentMidGate_pendingEvidenceCleared_reEarns() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let collector = collect(watcher)
+        try watcher.start()
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        try makeFITS(0.25, size: 16).write(to: url)
+        watcher.scanNow()   // stability tick 1
+        watcher.scanNow()   // stable → pending digest observation
+
+        // The file disappears for one scan (move-aside: same inode, same mtime)…
+        let aside = tmp.appendingPathComponent("aside.bin")
+        try FileManager.default.moveItem(at: url, to: aside)
+        watcher.scanNow()   // absence observed while pending (unemitted) evidence exists
+        // …and returns bit- and identity-identical.
+        try FileManager.default.moveItem(at: aside, to: url)
+
+        clock.advance(seconds: 3601)
+        watcher.scanNow()   // pre-fix: stale evidence emitted here
+        let premature = await collector.waitForCount(1, timeout: 0.3)
+        XCTAssertFalse(premature, "an absent-then-returned file must re-earn both gates")
+
+        watcher.scanNow()   // stable again → fresh pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()   // confirmed → emits
+        let got = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(got, "the returned file emits after re-earning both gates")
+        let items = await collector.items
+        XCTAssertEqual(items.count, 1)
+    }
+
     // MARK: - review10 item 6: numeric sort with mixed zero padding
 
     /// Review10 item 6 (red-first): digitStringLess compared RAW digit-string lengths, so
