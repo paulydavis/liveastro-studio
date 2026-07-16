@@ -178,6 +178,30 @@ public final class OBSController: ObservableObject {
         return data["outputActive"] as? Bool
     }
 
+    /// Confirm the record OUTPUT actually became active after an accepted
+    /// StartRecord (review7 P2: acceptance ≠ output-state confirmation — see
+    /// `setRecording`'s doc). Polls GetRecordStatus, mirroring
+    /// `startBroadcast`'s stream confirm loop. Returns true once outputActive
+    /// is confirmed; false when the polls expire or status is unavailable —
+    /// the CALLER decides policy (BroadcastController warns and streams on;
+    /// recording never fails a broadcast).
+    /// At least one confirmation poll is always performed.
+    @discardableResult
+    public func confirmRecordingActive(confirmPollSeconds: Double = 1.0,
+                                       maxConfirmPolls: Int = 5) async -> Bool {
+        for i in 0..<max(1, maxConfirmPolls) {
+            if let active = await recordStatus(), active {
+                log("recording confirmed active")
+                return true
+            }
+            if i < maxConfirmPolls - 1, confirmPollSeconds > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(confirmPollSeconds * 1_000_000_000))
+            }
+        }
+        log("record output did not go active")
+        return false
+    }
+
     /// Deliberate broadcast: switch to `scene` (if given), start the stream, and
     /// confirm it went live by polling GetStreamStatus. Returns true once
     /// outputActive is confirmed; false when the polls expire or status is

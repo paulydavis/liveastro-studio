@@ -416,6 +416,18 @@ public final class BroadcastController {
                     guard gen == broadcastGeneration else { return }   // stale after await
                     if !recording {
                         deps.log("OBS: could not start recording — continuing the broadcast without it")
+                    } else {
+                        // Review7 P2: an accepted StartRecord is NOT output-state
+                        // confirmation — poll GetRecordStatus until the record
+                        // output is active or the polls expire. Expiry warns
+                        // honestly and streams on (unchanged policy).
+                        let active = await obs.confirmRecordingActive(
+                            confirmPollSeconds: confirmPollSeconds,
+                            maxConfirmPolls: maxConfirmPolls)
+                        guard gen == broadcastGeneration else { return }
+                        if !active {
+                            deps.log("OBS: recording did not activate — check OBS; continuing the broadcast without it")
+                        }
                     }
                 }
                 startHealthPoll()

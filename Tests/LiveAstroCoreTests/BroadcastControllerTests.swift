@@ -387,6 +387,32 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertEqual(sent("StartRecord", h.mock), 0)
     }
 
+    /// Review7 P2: an ACCEPTED StartRecord is not a recording — the record
+    /// OUTPUT must be confirmed active (OBSController's own doc: acceptance ≠
+    /// output-state confirmation). When it never activates, warn honestly and
+    /// keep the broadcast .live (unchanged policy: recording never fails it).
+    func testObsRecordAcceptedButNeverActiveWarnsAndStaysLive() async {
+        let h = await makeHarness()
+        h.controller.obsRecord = true
+        h.server.recordReactsToRequests = false      // accepted; output never activates
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        await waitUntil { h.box.logs.contains { $0.contains("recording did not activate") } }
+        XCTAssertEqual(h.controller.broadcastState, .live,
+                       "an inactive recording must never fail the broadcast")
+    }
+
+    /// Positive case: the record output activates → no warning of either kind.
+    func testObsRecordActivatesWithoutWarning() async {
+        let h = await makeHarness()
+        h.controller.obsRecord = true
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live && h.server.recordActive }
+        await settle()
+        XCTAssertFalse(h.box.logs.contains { $0.contains("recording did not activate") })
+        XCTAssertFalse(h.box.logs.contains { $0.contains("could not start recording") })
+    }
+
     /// A recording failure is logged honestly but never fails the broadcast.
     func testObsRecordFailureDoesNotFailBroadcast() async {
         let h = await makeHarness()
