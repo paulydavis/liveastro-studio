@@ -370,10 +370,16 @@ public final class SessionPipeline {
             try drainConsumeTaskOrThrow()
         }
         if let meta = sourceMetadata { session.fillMissingMetadata(from: meta) }
-        try session.endSession()
         guard let dir = session.sessionDirectory else {
             throw SessionError.notRunning
         }
+        // F1 (review2): write the failure-prone durable artifact (master.fit) BEFORE persisting
+        // endTime. `endSession()` is the COMMIT POINT — it stamps end_time into the manifest, which
+        // the oracle reads as "this session ended." If the master write fails AFTER that stamp, the
+        // manifest dishonestly claims an ended session with no persisted master (oracle clause 5).
+        // Ordering master-first means a master-write failure throws here, before the commit, leaving
+        // the manifest still-running (end_time nil) — truthful — and the error surfaces to the caller.
+        //
         // Native mode: write the final mean stack as master.fit (TOP-DOWN, FITSWriter default).
         // Crop to covered region first (Task 4), then additive-only background neutralization
         // (display path uses additive+multiplicative; the saved master gets additive-only so
@@ -393,6 +399,8 @@ public final class SessionPipeline {
                 totalExposureSeconds: totalExp)
             try masterData.write(to: dir.appendingPathComponent("master.fit"))
         }
+        // Commit point: master.fit is durable (native mode), so stamping end_time is now honest.
+        try session.endSession()
         return try ReplayService.regenerate(sessionDirectory: dir,
                                             replaySettings: replaySettings,
                                             maxKeyframes: maxKeyframes)

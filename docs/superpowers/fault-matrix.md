@@ -140,10 +140,47 @@ privileged runner.
   now explicitly name `testCrash_relayMidcopy_noGlobVisiblePartialFreshRelayHeals`.
 - **One pre-approved seam added (post oracle-evasion hunt).** `FrameRelay.onPrePublish` — the relay
   pre-publish sync hook — is now implemented and used by the `relay-midcopy` crash cell (justification
-  above). The other pre-approved seam (injectable manifest writer) remains unimplemented — YAGNI
-  confirmed; no cell requires it (the `manifest-midwrite` loop drives the atomic-write guarantee
-  without one).
+  above). The other pre-approved seam (injectable manifest writer) was NOT needed at T4 completion —
+  see the review2 note below for why it became justified.
 - **Total test count at pillar completion:** 30 fault-matrix tests across three suites —
   **15 file-boundary** (`FaultMatrixFileTests`), **10 lifecycle** (`FaultMatrixLifecycleTests`, of
   which 3 are the crash-terminated `faulthelper` cells), and **5 FaultKit self-tests**
   (`FaultKitTests`). 0 blank cells. Every cell TEST, N/A, or PROXY.
+
+### Notes / justification — Outside Review #2 (review2 fix wave)
+
+- **F1 — SessionPipeline end × master-write-fails (new cell).** The `end()` finalizer's last
+  failure-prone durable artifact is the native `master.fit` write. Before the fix, `endSession()`
+  (the commit point that stamps `end_time`) ran BEFORE the master write, so a failed master write
+  left a manifest claiming an ended session with no persisted master — exactly the oracle clause-5
+  dishonest state. FIXED by reordering: master.fit is written FIRST, `endSession()` only after the
+  durable artifact lands. This adds a **read-only-destination / invalid-target-analog** cell to the
+  SessionPipeline row: TEST(`testPipelineEnd_masterWriteFails_noEndTimeStampedClause5Honest`) —
+  a DIRECTORY pre-placed at the master.fit path forces `Data.write` to throw; `end()` surfaces the
+  failure, the manifest keeps `end_time` nil (still running = truthful), and the oracle passes
+  clause 5 honestly (the ended-claim clause is exempt when `end_time` is nil). This is the regression
+  proof for review2 finding F1.
+
+- **SEAM JUSTIFICATION — `SessionManager.manifestWriter` (F3 — the SECOND pre-approved seam, named
+  for the `manifest-midwrite` crash cell).** The `manifest-midwrite` crash cell asserts the
+  atomic-write guarantee: whatever instant a SIGKILL lands, the on-disk manifest is SOME complete
+  version, never a torn file. For that to be MEANINGFUL, the kill must land while a manifest write is
+  genuinely in flight. Before this fix, the helper touched its readiness flag BEFORE the rewrite loop,
+  so a fast SIGKILL could land on the pre-seeded manifest before the first challenged write ever ran —
+  a vacuous pass (the cell "passed" without any write being under the kill). Wall-clock timing cannot
+  reliably force the kill into the write window (each atomic write completes in a few ms). The
+  pre-approved injectable `manifestWriter: ((Data, URL) throws -> Void)?` is invoked at exactly the
+  persistence boundary; the helper sets it to `{ touchFlag(); write(.atomic) }`, so the builder's
+  SIGKILL — which waits for the flag — now provably overlaps an in-flight atomic write. **Production
+  safety:** the seam defaults to `nil`; when nil, `persist` runs the identical `Data(.atomic)` write
+  as before (byte-for-byte behavior, existing SessionManager tests unmodified and green). It is a
+  coordination/injection point, not behavior. This is the SECOND (and final) pre-approved seam used
+  across the pillar — YAGNI held until this review2 evasion was found; now the cell requires it.
+
+- **F5 — test data race in the watcher recovery test (fixed).** `testWatcher_dirRemoved_logsOnceAndResumesOnRecreate`
+  captured `onLog` lines into a plain `var [String]` that the watcher's serial queue appended to while
+  the test thread read it — a data race. Replaced with the lock-protected `WatcherLogSink` (the NSLock
+  collector pattern used elsewhere). Swept the whole `FaultMatrixFileTests` file: the `Collector` is an
+  actor (safe); the relay-cell `onLog` counters (`heals`/`unreachable`/`retries`) run synchronously
+  inside `copyOnce()` on the test thread (no cross-thread access, safe); the review2-added watcher
+  helpers (`WatcherLogSink`, `FolderReplaceClock`) are lock-protected. No other unprotected collectors.

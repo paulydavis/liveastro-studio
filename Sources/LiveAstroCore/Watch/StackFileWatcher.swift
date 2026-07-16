@@ -30,6 +30,10 @@ public final class StackFileWatcher {
     /// disappearance and once on return, rather than on every poll tick.
     private var folderMissing = false
 
+    /// True while a folder-return re-arm has failed and is being retried on later polls (F4).
+    /// Gates the re-arm-failure log to fire once, not every tick, until the re-arm succeeds.
+    private var rearmFailed = false
+
     /// Per-file state for stability + dedupe. Stability now tracks (size, mtime) so a
     /// preallocated-but-still-filling FITS (full size, advancing mtime) is not emitted early.
     private var lastSeenStat: [String: (size: Int, mtime: TimeInterval)] = [:]
@@ -117,17 +121,38 @@ public final class StackFileWatcher {
                 onLog?("watched folder disappeared — waiting for it to return: \(folder.path)")
                 // Cancel the stale DispatchSource fd (bound to the deleted inode).
                 cancelSource()
+                // F2 (review2): clear the PENDING stability observations. Otherwise a recreated,
+                // same-name file whose (size, mtime) happen to match the vanished file's last
+                // observation would pass the two-tick stability gate on its very FIRST sighting
+                // after return — publishing a still-in-progress FITS. Recreated files must re-earn
+                // stability across ticks. The emitted-digest map is RETAINED so dedup survives a
+                // disappear→return (a truly identical, already-emitted file is not re-emitted).
+                lastSeenStat.removeAll()
             }
             // While missing, keep the timer running (it will notice the return).
             return
         }
 
         if folderMissing {
-            // Folder just came back. Log, re-arm the source, clear the flag.
-            onLog?("watched folder returned — resuming: \(folder.path)")
-            folderMissing = false
-            // Re-arm: ignore errors (if this fails, the poll timer continues as the sole driver).
-            try? armSource()
+            // Folder just came back. F4 (review2): attempt the re-arm FIRST, and only claim recovery
+            // (log "resuming" + clear folderMissing) once it SUCCEEDS. Previously "resuming" was logged
+            // and the flag cleared BEFORE armSource(), whose failure was silently swallowed — the
+            // watcher claimed it had recovered while the DispatchSource was dead. On failure, log once
+            // (gated by rearmFailed to avoid per-tick spam) and stay folderMissing so a later poll
+            // retries. The poll timer keeps ticking regardless, so scans continue either way.
+            do {
+                try armSource()
+                onLog?("watched folder returned — resuming: \(folder.path)")
+                folderMissing = false
+                rearmFailed = false
+            } catch {
+                if !rearmFailed {
+                    rearmFailed = true
+                    onLog?("watched folder returned but re-arm failed — retrying on later polls: \(folder.path) (\(error))")
+                }
+                // Stay folderMissing; the poll scan still runs below via the timer, and the next
+                // poll re-enters this branch to retry the re-arm.
+            }
         }
 
         guard let names = try? fm.contentsOfDirectory(atPath: folder.path) else { return }

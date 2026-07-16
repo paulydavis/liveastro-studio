@@ -328,6 +328,57 @@ final class FaultMatrixLifecycleTests: XCTestCase {
                                                expectedAcceptedCount: 2))
     }
 
+    /// Pipeline end × master-write-fails (F1, review2): the native master.fit write is the last
+    /// failure-prone durable artifact in end(). Force it to fail by pre-placing a DIRECTORY at the
+    /// master.fit path (FITS data cannot be written over a directory → `Data.write` throws). end()
+    /// must surface that failure AND must NOT have stamped end_time first — a manifest claiming an
+    /// ended session with no persisted master is exactly the oracle clause-5 dishonest state. So the
+    /// aftermath must be: end() throws, manifest end_time nil (still running = truthful), no master
+    /// file. Oracle clause 5 passes because end_time is nil.
+    func testPipelineEnd_masterWriteFails_noEndTimeStampedClause5Honest() throws {
+        let fs = try TempFS("pipe-master-fail"); defer { fs.tearDown() }
+        let sessions = try fs.dir("sessions")
+
+        // Two registerable frames → the engine accumulates a real stack (currentStack() non-nil),
+        // so end() reaches the master.fit write branch.
+        let good1 = Self.starField(name: "sub_000.fit", dx: 0, dy: 0)
+        let good2 = Self.starField(name: "sub_001.fit", dx: 1.1, dy: -0.9)
+        let engine = StackEngine()
+        let pipeline = SessionPipeline(nativeSource: FaultMatrixLifecycleTests.ArrayFrameSource([good1, good2]),
+                                       engine: engine, profile: profile("MasterFail"),
+                                       rootDirectory: sessions)
+        try pipeline.start()
+        let dir = pipeline.session.sessionDirectory!
+
+        // Pre-place a DIRECTORY where master.fit will be written. FaultKit invalid-replacement-target
+        // style: Data.write(to:) over a directory throws, forcing the master write to fail.
+        let masterPath = dir.appendingPathComponent("master.fit")
+        try Disruptor.replaceWithDirectory(masterPath)
+
+        // end() drains the finite import, then attempts the master write, which throws. Crucially the
+        // reorder (F1) puts the write BEFORE endSession(), so end_time is never stamped.
+        XCTAssertThrowsError(try pipeline.end(), "a failed master.fit write must surface from end()")
+
+        // The manifest must still be RUNNING — no end_time stamped before the failed durable write.
+        let manifest = try ManifestCoding.decoder()
+            .decode(SessionManifest.self, from: Data(contentsOf: dir.appendingPathComponent("manifest.json")))
+        XCTAssertNil(manifest.endTime,
+                     "F1: end_time must NOT be persisted when the master write fails (manifest stays truthful)")
+        // No real master.fit file exists (the path is a directory, not a FITS file).
+        var isDir: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: masterPath.path, isDirectory: &isDir))
+        XCTAssertTrue(isDir.boolValue, "master.fit path is the injected directory, not a written FITS")
+
+        // Oracle clause 5: end_time nil → the ended-claim clause is exempt; the aftermath is honest.
+        // Remove the placeholder directory so clause-5's fileExists(master.fit) check reflects the
+        // true "no durable master" state (a directory at that path would spuriously satisfy it).
+        try FileManager.default.removeItem(at: masterPath)
+        assertSessionOracle(sessionRoot: dir, log: [],
+                            OracleExpectations(lossLogPattern: nil,
+                                               laterFramesApplicable: false,
+                                               expectedAcceptedCount: manifest.snapshots.count))
+    }
+
     // ============================================================================================
     // MARK: BatchImporter row
     // ============================================================================================
@@ -420,6 +471,12 @@ final class FaultMatrixLifecycleTests: XCTestCase {
     /// a growing snapshot list. The manifest on disk is EITHER the previous complete version OR the
     /// new complete version (atomic write guarantee) — never a torn/half-written file. Oracle
     /// clause 1 (parses) is the teeth of this cell.
+    ///
+    /// F3 (review2): the helper now touches its readiness flag from INSIDE the manifest write (via the
+    /// pre-approved `SessionManager.manifestWriter` seam: flag, then the real `Data(.atomic)` write),
+    /// NOT before the rewrite loop. Previously the flag preceded the loop, so a fast SIGKILL could land
+    /// on the pre-seeded manifest before the first challenged write — a vacuous pass. Now the kill
+    /// window provably overlaps an in-flight atomic write.
     func testCrash_manifestMidwrite_manifestEitherCompleteNeverTorn() throws {
         let fs = try TempFS("crash-midwrite"); defer { fs.tearDown() }
         let aftermath = try CrashArtifactBuilder.killedArtifact(scenario: "manifest-midwrite", in: fs)
