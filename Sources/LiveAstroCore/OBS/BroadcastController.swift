@@ -154,6 +154,10 @@ public final class BroadcastController {
         // actor (OBSController is @MainActor), so forwarding is safe.
         let log = deps.log
         obs.onLog = { message in log("OBS: \(message)") }
+        // Review8 item 3: output events and unexpected connection loss reach
+        // the broadcast state machine — both hooks fire on the main actor.
+        obs.onOutputEvent = { [weak self] in self?.noteOBSStateMayHaveChanged() }
+        obs.onConnectionLost = { [weak self] in self?.handleConnectionLoss() }
     }
 
     // MARK: - Session hooks (called by the app where the logic fired inline)
@@ -255,8 +259,14 @@ public final class BroadcastController {
 
     /// Connect to OBS, requesting an app-side launch if needed. Returns whether
     /// connected. Does NOT start any stream — broadcasting is deliberate (goLive()).
+    ///
+    /// Review8 item 2: the OBS client's `.connecting` state is NOT connected —
+    /// only a completed handshake counts. `obs.connect` coalesces onto any
+    /// in-flight attempt and returns its ACTUAL outcome, so awaiting it here
+    /// never reports success from a half-open client (whose seed/reconcile
+    /// queries would fail and tear down the connection being established).
     private func connectOBS() async -> Bool {
-        guard obs.state == .disconnected else { return true }  // already connected
+        if obs.state == .connected || obs.state == .streaming { return true }
 
         var connected = await obs.connect(host: obsHost, port: obsPort,
                                           password: obsPassword.isEmpty ? nil : obsPassword)
@@ -272,11 +282,13 @@ public final class BroadcastController {
                 do {
                     try await Task.sleep(nanoseconds: UInt64(launchRetryDelaySeconds * 1_000_000_000))
                 } catch { return false }
-                if obs.state == .disconnected {
+                if obs.state == .connected || obs.state == .streaming {
+                    connected = true    // someone else's attempt completed
+                } else {
+                    // .disconnected starts a fresh attempt; .connecting coalesces
+                    // onto the in-flight one — either way the result is real.
                     connected = await obs.connect(host: obsHost, port: obsPort,
                                                   password: obsPassword.isEmpty ? nil : obsPassword)
-                } else {
-                    connected = obs.state != .disconnected
                 }
             }
         }
@@ -342,20 +354,57 @@ public final class BroadcastController {
         return .bothInactive
     }
 
+    /// Manual Connect, SYNCHRONOUS entry (review8 item 2 — mirrors goLive()'s
+    /// shape): reserves `.connecting` and bumps the generation AT the click,
+    /// so a Go Live during the connect/seed/reconcile await is rejected by its
+    /// own state guard and every in-flight completion is stale from this
+    /// instant. Then launches the connect+reconcile task. ControlView's
+    /// Connect button calls this directly — no Task wrapper at the call site.
+    public func beginConnectAndReconcile() {
+        guard broadcastState != .connecting else { return }   // one attempt at a time
+        broadcastGeneration += 1
+        let gen = broadcastGeneration
+        let origin = broadcastState
+        broadcastState = .connecting
+        Task { @MainActor [weak self] in
+            await self?.runConnectAndReconcile(gen: gen, origin: origin)
+        }
+    }
+
     /// Manual Connect (review7 P1): bring the control link up (NEVER launching
     /// OBS — that is a Go Live-only affordance) and reconcile `broadcastState`
     /// with OBS's actual output state, so connecting to an already-streaming
     /// OBS adopts the broadcast instead of offering a Go Live that would
     /// double-start it. Returns whether the control link connected.
+    ///
+    /// Awaitable variant of `beginConnectAndReconcile()` (used by tests and
+    /// programmatic callers). The reservation is identical and happens before
+    /// this function's first await.
     @discardableResult
     public func connectAndReconcile() async -> Bool {
+        guard broadcastState != .connecting else {
+            return obs.state == .connected || obs.state == .streaming
+        }
+        broadcastGeneration += 1
+        let gen = broadcastGeneration
+        let origin = broadcastState
+        broadcastState = .connecting
+        return await runConnectAndReconcile(gen: gen, origin: origin)
+    }
+
+    /// The awaited half of manual Connect. Runs under the generation captured
+    /// at the click; a failed connect restores the origin state honestly
+    /// (nothing was confirmed, so nothing new is claimed).
+    @discardableResult
+    private func runConnectAndReconcile(gen: Int, origin: BroadcastState) async -> Bool {
         let connected = await obs.connect(host: obsHost, port: obsPort,
                                           password: obsPassword.isEmpty ? nil : obsPassword)
-        guard connected else { return false }
-        // Reality takes over from whatever was in flight (mirror of the other
-        // user-initiated entry points): bump, then reconcile under the new token.
-        broadcastGeneration += 1
-        if await reconcile(gen: broadcastGeneration) == .bothInactive {
+        guard gen == broadcastGeneration else { return connected }   // superseded: owner governs
+        guard connected else {
+            broadcastState = origin
+            return false
+        }
+        if await reconcile(gen: gen) == .bothInactive {
             broadcastState = .idle   // now genuinely confirmed
         }
         return true
@@ -399,14 +448,15 @@ public final class BroadcastController {
                 break   // genuinely nothing running — proceed with the bring-up
             }
             let scene = stackSceneName.isEmpty ? nil : stackSceneName
-            let live = await obs.startBroadcast(scene: scene,
-                                                confirmPollSeconds: confirmPollSeconds,
-                                                maxConfirmPolls: maxConfirmPolls)
+            let outcome = await obs.startBroadcast(scene: scene,
+                                                   confirmPollSeconds: confirmPollSeconds,
+                                                   maxConfirmPolls: maxConfirmPolls)
             guard gen == broadcastGeneration else {
-                await discardStaleGoLive(live: live)
+                settleStaleStart(outcome: outcome)
                 return
             }
-            if live {
+            switch outcome {
+            case .confirmedLive:
                 broadcastState = .live
                 // Review6 P2: "Record while streaming" — start recording only after
                 // the stream is confirmed up. A recording failure never fails the
@@ -431,7 +481,7 @@ public final class BroadcastController {
                     }
                 }
                 startHealthPoll()
-            } else {
+            case .issuedUnconfirmed:
                 // Review7 P1: startBroadcast no longer stops on a failed confirm —
                 // this CALLER owns cleanup, and only at the CURRENT generation
                 // (validated above). Confirmed-stop semantics: .idle only when OBS
@@ -445,23 +495,84 @@ public final class BroadcastController {
                 } else {
                     settleAfterStop(confirmed: false)
                 }
+            case .notIssued:
+                // Nothing was issued (cancellation confirmed before StartStream
+                // was enqueued): return to the origin state honestly — a
+                // confirmed .idle stays confirmed; from .unknown stay .unknown.
+                deps.log("OBS: go-live cancelled before anything was issued")
+                broadcastState = origin
             }
         }
     }
 
     /// Landing for a go-live completion that lost the generation race (review7
-    /// P1). NEVER sends StopStream while a newer broadcast is active or
-    /// connecting — that stop would kill the newer owner's stream (the exact
-    /// bug the internal StopStream-on-expiry in OBSController used to cause).
-    /// Only a stale SUCCESS with no newer owner may undo the stream it
-    /// started, and that stop must be CONFIRMED: an unconfirmed cleanup
-    /// escalates a (previously confirmed) .idle to .stopUnconfirmed honestly
-    /// rather than leaving a possibly-live OBS behind an idle UI.
-    private func discardStaleGoLive(live: Bool) async {
-        guard live else {
-            deps.log("OBS: stale go-live attempt discarded")
-            return
+    /// P1, extended by review8 item 1 for the outcome-typed boundary):
+    /// - `.notIssued`: cancellation was confirmed BEFORE StartStream was
+    ///   enqueued — nothing to undo, log and leave every state alone.
+    /// - `.confirmedLive`: the existing stale-success rules (never stop past a
+    ///   newer active owner; a no-owner orphan gets a CONFIRMED cleanup or an
+    ///   honest `.stopUnconfirmed`).
+    /// - `.issuedUnconfirmed`: StartStream may have been issued and nothing has
+    ///   confirmed the result. If a newer owner is active its machinery
+    ///   governs; with NO newer owner, `.stopping` is reserved SYNCHRONOUSLY
+    ///   before any await (goLive guards on .idle/.unknown, so a new Go Live
+    ///   cannot begin while the orphan cleanup is awaiting OBS) and the cleanup
+    ///   settles `.idle` only on confirmation, else `.stopUnconfirmed`.
+    /// Invariant: anything that MAY have issued StartStream never settles
+    /// `.idle` without a confirmed cleanup.
+    ///
+    /// Synchronous ON PURPOSE: the caller is usually a CANCELLED task (that's
+    /// why its start went stale), and cancellation-aware requests issued from
+    /// it would resolve instantly without ever sending StopStream. All state
+    /// reservations happen in this synchronous segment; the cleanup awaits run
+    /// in a fresh unstructured task that does not inherit the cancellation.
+    private func settleStaleStart(outcome: OBSController.StartOutcome) {
+        switch outcome {
+        case .notIssued:
+            deps.log("OBS: stale go-live attempt discarded — nothing was issued")
+
+        case .confirmedLive:
+            discardStaleGoLive()
+
+        case .issuedUnconfirmed:
+            switch broadcastState {
+            case .connecting, .live, .endingSession:
+                // A newer broadcast owner is active: its own confirm/stop
+                // machinery governs the stream — never stop past it.
+                deps.log("OBS: stale go-live attempt discarded — a newer broadcast owns the stream")
+            case .unknown, .idle, .stopping, .stopUnconfirmed:
+                // No newer owner: the possibly-issued StartStream is an orphan
+                // only we can clean up. Take ownership SYNCHRONOUSLY (generation
+                // bump + .stopping reservation happen before any await, so a
+                // new Go Live is rejected while the cleanup is in flight).
+                deps.log("OBS: stale go-live attempt discarded — StartStream may have been issued; stopping and confirming")
+                broadcastGeneration += 1
+                let gen = broadcastGeneration
+                broadcastState = .stopping
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let confirmed = await self.obs.stopBroadcast(
+                        confirmPollSeconds: self.confirmPollSeconds,
+                        maxConfirmPolls: self.maxConfirmPolls)
+                    guard gen == self.broadcastGeneration else { return }   // superseded mid-cleanup
+                    self.settleAfterStop(confirmed: confirmed)
+                }
+            }
         }
+    }
+
+    /// Stale-SUCCESS landing (review7 P1). NEVER sends StopStream while a
+    /// newer broadcast is active or connecting — that stop would kill the
+    /// newer owner's stream (the exact bug the internal StopStream-on-expiry
+    /// in OBSController used to cause). Only a stale success with no newer
+    /// owner may undo the stream it started, and that stop must be CONFIRMED:
+    /// an unconfirmed cleanup escalates a (previously confirmed) .idle to
+    /// .stopUnconfirmed honestly rather than leaving a possibly-live OBS
+    /// behind an idle UI. (Review8: with the cancellation-aware client a stale
+    /// SUCCESS needs the confirm response to beat the cancel — rare but real —
+    /// so this path is kept; the cleanup runs in a fresh task for the same
+    /// reason as `settleStaleStart`.)
+    private func discardStaleGoLive() {
         switch broadcastState {
         case .connecting, .live, .endingSession, .unknown:
             // .unknown: OBS state is unconfirmed — a stop could kill a stream we
@@ -469,12 +580,16 @@ public final class BroadcastController {
             deps.log("OBS: stale go-live attempt discarded — a newer broadcast owns the stream")
         case .idle, .stopping, .stopUnconfirmed:
             deps.log("OBS: stale go-live attempt discarded — stopping the stream it started")
-            let confirmed = await obs.stopBroadcast(confirmPollSeconds: confirmPollSeconds,
-                                                    maxConfirmPolls: maxConfirmPolls)
-            if !confirmed, broadcastState == .idle {
-                broadcastState = .stopUnconfirmed
-                deps.log("OBS: stale go-live cleanup stop not confirmed — OBS may still be live")
-                deps.presentError("OBS may still be live — check OBS, then Retry.")
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let confirmed = await self.obs.stopBroadcast(
+                    confirmPollSeconds: self.confirmPollSeconds,
+                    maxConfirmPolls: self.maxConfirmPolls)
+                if !confirmed, self.broadcastState == .idle {
+                    self.broadcastState = .stopUnconfirmed
+                    self.deps.log("OBS: stale go-live cleanup stop not confirmed — OBS may still be live")
+                    self.deps.presentError("OBS may still be live — check OBS, then Retry.")
+                }
             }
         }
     }
@@ -555,6 +670,167 @@ public final class BroadcastController {
         }
     }
 
+    // MARK: - Event-driven reconciliation (review8 item 3 — the dirty-drain)
+
+    /// Coalescing dirty flag: any OBS output event (or the health poll's
+    /// inactive detection) sets it; ONE drain task serializes every
+    /// reconciliation pass so there is a single reconciliation authority.
+    private var reconcileDirty = false
+    private var reconcileDrainTask: Task<Void, Never>?
+
+    /// Note that OBS's output state may have changed. The drain invariant:
+    /// an event sets `dirty = true` (and spawns the drain task if none is
+    /// active); the active drain clears `dirty` immediately before each
+    /// reconciliation pass; any event arriving during an await sets it again,
+    /// forcing another pass; drain-task teardown and the FINAL dirty check
+    /// occur in ONE main-actor synchronous segment — if dirty was re-set, the
+    /// drain loops again instead of exiting, so a wakeup can never be lost.
+    func noteOBSStateMayHaveChanged() {
+        reconcileDirty = true
+        guard reconcileDrainTask == nil else { return }
+        reconcileDrainTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while true {
+                self.reconcileDirty = false        // cleared immediately before the pass
+                await self.reconcilePass()
+                // ONE synchronous segment: the final dirty check and the
+                // drain teardown — no await between them.
+                if self.reconcileDirty { continue }
+                self.reconcileDrainTask = nil
+                return
+            }
+        }
+    }
+
+    /// One serialized reconciliation pass — aligns `broadcastState` with OBS's
+    /// ACTUAL output state using the review7 matrix (stream on → adopt .live;
+    /// stream off + record off → .idle; stream off + record on →
+    /// .stopUnconfirmed; status unavailable → .stopUnconfirmed), plus the
+    /// app-caused-event rules:
+    /// - a stream START during `.connecting` never steals ownership from the
+    ///   in-flight start — its own confirm governs;
+    /// - a stream STOP during `.stopping` never claims `.idle` before
+    ///   recording is ALSO confirmed inactive, and every other landing from
+    ///   `.stopping` belongs to the stop machinery's own settlement.
+    /// Captures (broadcastGeneration, connectionEpoch) at entry and revalidates
+    /// BOTH after EVERY await — multiple output events can occur within one
+    /// generation, so the generation alone cannot be trusted.
+    private func reconcilePass() async {
+        // Reconciliation needs OBS truth: with no completed link there is
+        // nothing to query (connection loss has its own synchronous rules).
+        guard obs.state == .connected || obs.state == .streaming else { return }
+        guard broadcastState != .connecting else { return }   // the bring-up owns this
+        let gen = broadcastGeneration
+        let epoch = obs.connectionEpoch
+
+        let stream = await obs.streamStatus()
+        guard gen == broadcastGeneration, epoch == obs.connectionEpoch else { return }
+        guard let stream else {
+            // Status unavailable → OBS may be live and nothing is confirmable.
+            // .stopping's landing belongs to the stop machinery; an existing
+            // .stopUnconfirmed is already honest.
+            if broadcastState != .stopping && broadcastState != .stopUnconfirmed {
+                settleReconcile(to: .stopUnconfirmed,
+                                log: "OBS: could not confirm stream state — OBS may be live")
+            }
+            return
+        }
+
+        if stream.active {
+            switch broadcastState {
+            case .live, .endingSession:
+                streamHealth = stream          // expected-live: refresh truth
+            case .stopping:
+                break                          // the stop's own confirm loop governs
+            case .idle, .unknown, .stopUnconfirmed:
+                settleReconcile(to: .live,
+                                log: "OBS: stream is active in OBS — adopted the live broadcast")
+                streamHealth = stream
+                startHealthPoll()
+            case .connecting:
+                break                          // unreachable (guarded above)
+            }
+            return
+        }
+
+        // Stream inactive: .idle additionally requires recording confirmed off.
+        let recording = await obs.recordStatus()
+        guard gen == broadcastGeneration, epoch == obs.connectionEpoch else { return }
+
+        switch broadcastState {
+        case .stopping:
+            // Only the FULLY confirmed outcome may land .idle from here —
+            // anything less stays with the in-flight stop's own settlement.
+            if recording == false {
+                settleReconcile(to: .idle,
+                                log: "OBS: stream and recording confirmed inactive — broadcast over")
+            }
+        case .live, .endingSession:
+            if recording == false {
+                settleReconcile(to: .idle, log: "OBS: stream ended in OBS — broadcast over")
+            } else if recording == true {
+                settleReconcile(to: .stopUnconfirmed,
+                                log: "OBS: stream ended in OBS but recording is still active — Retry stops it")
+            } else {
+                settleReconcile(to: .stopUnconfirmed,
+                                log: "OBS: stream ended in OBS — could not confirm recording state")
+            }
+        case .idle, .unknown, .stopUnconfirmed:
+            if recording == false {
+                if broadcastState != .idle {
+                    settleReconcile(to: .idle,
+                                    log: "OBS: stream and recording confirmed inactive")
+                }
+            } else if broadcastState != .stopUnconfirmed {
+                settleReconcile(to: .stopUnconfirmed,
+                                log: recording == true
+                                    ? "OBS: recording is active in OBS — Retry stops it, or stop it in OBS"
+                                    : "OBS: could not confirm recording state — OBS may be live")
+            }
+        case .connecting:
+            break
+        }
+    }
+
+    /// Reconcile settlement: reality takes over — bump the generation so every
+    /// in-flight completion of the superseded state is stale, then transition.
+    /// Runs in the synchronous segment after the pass's last (revalidated) await.
+    private func settleReconcile(to state: BroadcastState, log message: String) {
+        broadcastGeneration += 1
+        goLiveTask?.cancel(); goLiveTask = nil
+        healthPollTask?.cancel(); healthPollTask = nil
+        if state != .live { streamHealth = nil }
+        broadcastState = state
+        deps.log(message)
+    }
+
+    /// Unexpected control-link loss (review8 item 3) — deliberate
+    /// `disconnect()` never comes through here. The reviewer-specified rules:
+    /// - `.idle` → `.unknown`: the confirmed idle is no longer confirmable;
+    ///   reconnect-and-reconcile stays one click.
+    /// - `.live` / `.endingSession` / `.stopping` → `.stopUnconfirmed`: OBS
+    ///   keeps streaming without a control link (disconnect ≠ stop).
+    /// - `.connecting`: leave — the in-flight bring-up's own requests fail and
+    ///   its machinery settles honestly.
+    /// - `.unknown` / `.stopUnconfirmed`: already honest, unchanged.
+    private func handleConnectionLoss() {
+        switch broadcastState {
+        case .idle:
+            broadcastGeneration += 1
+            broadcastState = .unknown
+            deps.log("OBS: control link lost — OBS state unknown until the next connect")
+        case .live, .endingSession, .stopping:
+            broadcastGeneration += 1
+            goLiveTask?.cancel(); goLiveTask = nil
+            healthPollTask?.cancel(); healthPollTask = nil
+            streamHealth = nil
+            broadcastState = .stopUnconfirmed
+            deps.log("OBS: control link lost while the broadcast was active — OBS may still be live (disconnect ≠ stop). Reconnect and Retry to stop it, or stop it in OBS.")
+        case .connecting, .unknown, .stopUnconfirmed:
+            break
+        }
+    }
+
     /// Common landing for every confirmed-stop attempt (deferred session-end
     /// stop, End Broadcast, Retry): `.idle` only when OBS confirmed stream and
     /// recording inactive — otherwise `.stopUnconfirmed` with an honest error.
@@ -579,30 +855,17 @@ public final class BroadcastController {
                 let health = await obs.streamStatus()
                 guard gen == broadcastGeneration,
                       broadcastState == .live || broadcastState == .endingSession else { return }
-                // Review7 P1: OBS CONFIRMED the stream inactive while we claim
-                // .live — an external stop (operator hit Stop in OBS itself).
-                // Settle honestly: .idle additionally requires recording
-                // confirmed inactive (the invariant); recording active or
-                // unknown lands .stopUnconfirmed and Retry reconciles.
-                // .endingSession keeps polling — the deferred session-end stop
-                // owns that transition.
-                if let health, !health.active, broadcastState == .live {
-                    let recording = await obs.recordStatus()
-                    guard gen == broadcastGeneration, broadcastState == .live else { return }
-                    streamHealth = nil
-                    if recording == false {
-                        broadcastState = .idle
-                        deps.log("OBS: stream ended in OBS — broadcast over")
-                    } else if recording == true {
-                        broadcastState = .stopUnconfirmed
-                        deps.log("OBS: stream ended in OBS but recording is still active — Retry stops it")
-                    } else {
-                        broadcastState = .stopUnconfirmed
-                        deps.log("OBS: stream ended in OBS — could not confirm recording state")
-                    }
-                    return
+                if let health, !health.active {
+                    // OBS CONFIRMED the stream inactive while we claim it live —
+                    // an external stop. Review8 item 3: don't transition HERE;
+                    // route the detection into the SAME serialized reconcile
+                    // authority that handles output events. The drain settles
+                    // (.idle only with recording also confirmed inactive) and
+                    // its generation bump ends this poll.
+                    noteOBSStateMayHaveChanged()
+                } else {
+                    streamHealth = health
                 }
-                streamHealth = health
                 try? await Task.sleep(nanoseconds: UInt64(healthPollIntervalSeconds * 1_000_000_000))
             }
         }

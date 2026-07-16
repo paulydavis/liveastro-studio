@@ -164,13 +164,16 @@ final class StackFileWatcherTests: XCTestCase {
     }
 
     /// Mutate ONE interior byte of `url` in place (same size), then restore the file's
-    /// mtime to `identity`'s ns-exact value — a manufactured identity collision.
+    /// mtime to `identity`'s ns-exact value — a manufactured identity collision. `byte`
+    /// selects the content version (review8: tests distinguish a mid-rewrite hybrid from
+    /// the finished rewrite by writing different bytes at the same offset).
     private func mutateInteriorPreservingIdentity(_ url: URL, byteFromEnd: Int,
-                                                  identity: FileIdentity) throws {
+                                                  identity: FileIdentity,
+                                                  byte: UInt8 = 0xAB) throws {
         let fh = try FileHandle(forWritingTo: url)
         let size = try fh.seekToEnd()
         try fh.seek(toOffset: size - UInt64(byteFromEnd))
-        fh.write(Data([0xAB]))
+        fh.write(Data([byte]))
         try fh.close()
         setMtime(url, sec: identity.mtimeSec, nsec: identity.mtimeNsec)
         XCTAssertEqual(FileIdentity.capture(url: url), identity,
@@ -221,7 +224,10 @@ final class StackFileWatcherTests: XCTestCase {
     /// deterministically. utimensat stands in for the REAL-WORLD case identity-gating
     /// cannot see: coarse or cached filesystem timestamps letting an in-place rewrite land
     /// on the identical mtime. The MUTABLE policy must still re-hash the stable file and
-    /// EMIT the changed digest — the content update is never lost.
+    /// EMIT the changed digest — the content update is never lost. Review8 finding 1 adds
+    /// the digest-stability gate on top: the changed digest must be observed on TWO
+    /// separated scans before it emits, so the emission lands one poll tick later — the
+    /// intent (the stat-identical content change IS eventually emitted) is unchanged.
     func testMutablePolicy_identityCollisionStillEmitsChangedContent() async throws {
         watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.2,
                                    digestPolicy: .mutableStackerOutput)
@@ -266,6 +272,503 @@ final class StackFileWatcherTests: XCTestCase {
                        "identity collision is skipped by design under the immutable policy")
         XCTAssertEqual(watcher.digestComputations, hashesAfterEmit,
                        "no re-hash either — that is the entire point of the policy")
+    }
+
+    // MARK: - review9 item 3: FIFO wedge
+
+    /// Review9 item 3 (red-first: pre-fix this test WEDGED the suite): candidates were
+    /// opened with a BLOCKING O_RDONLY openat without verifying the file type, so
+    /// `mkfifo blocked.fit` with no writer parked the ONLY watcher queue inside openat
+    /// forever — no later file, no recovery, and stop() (once queue-confined) could
+    /// never run. The open must be non-blocking, fstat must reject anything but
+    /// S_IFREG (skipped silently like any per-file failure), and the neighboring valid
+    /// FITS must emit normally. The FIFO name sorts BEFORE the FITS so it is opened
+    /// first — proving a wedge would have blocked the later candidate.
+    func testFIFONamedLikeImage_skippedSilently_neighborEmits_watcherNeverWedges() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.3)
+        let collector = collect(watcher)
+        let fifo = tmp.appendingPathComponent("aaa_blocked.fit")
+        XCTAssertEqual(mkfifo(fifo.path, 0o644), 0, "arrange: mkfifo must succeed")
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        try watcher.start()
+        let got = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(got, "the valid FITS next to the writer-less FIFO must emit normally")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent), ["live_stack.fit"],
+                       "the FIFO itself must never be emitted")
+        watcher.stop()   // must return — a wedged queue would hang here (or in tearDown)
+    }
+
+    // MARK: - review9 item 4: lifecycle (queue confinement, one-shot state, no resurrection)
+
+    /// Lock-protected log capture: onLog fires on the watcher queue while the test
+    /// thread asserts.
+    private final class LogBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lines: [String] = []
+        func append(_ s: String) { lock.withLock { lines.append(s) } }
+        var all: [String] { lock.withLock { lines } }
+    }
+
+    /// Review9 item 4 (red-first): a scan parked across stop() — here replayed through the
+    /// manual-scan seam — must observe the terminal state and neither RE-ARM (resurrection:
+    /// pre-fix the recovery branch reopened the folder fd, logged "resuming", and left a live
+    /// DispatchSource on a stopped watcher) nor emit anything later.
+    func testStopDuringParkedRecoveryScan_noRearmNoLaterEmission() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        // The folder disappears; the watcher notices and enters the missing state.
+        let aside = tmp.deletingLastPathComponent()
+            .appendingPathComponent("watch-aside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: tmp, to: aside)
+        watcher.scanNow()
+        XCTAssertTrue(logs.all.contains { $0.contains("disappeared") }, "arrange: missing noticed")
+        // The folder returns WITH a fresh valid file — the recovery scan is now "parked":
+        // stop() lands before it runs.
+        try FileManager.default.moveItem(at: aside, to: tmp)
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        watcher.stop()
+        // The parked recovery scan resumes after stop(): it must no-op.
+        watcher.scanNow()
+        watcher.scanNow()
+        clock.advance(seconds: 3601)
+        watcher.scanNow()
+        XCTAssertFalse(logs.all.contains { $0.contains("resuming") },
+                       "a scan resumed after stop() must not re-arm (no resurrection)")
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let items = await collector.items
+        XCTAssertTrue(items.isEmpty, "no emission may follow stop()")
+    }
+
+    /// Review9 item 4: lifecycle state is queue-confined, so stop() synchronizes onto the
+    /// watcher queue — and an onLog callback (which RUNS on that queue) invoking stop()
+    /// must be detected as reentrant and run inline, not deadlock through queue.sync.
+    func testOnLogInvokingStop_noDeadlock_cleanStop() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let w = watcher!
+        watcher.onLog = { [weak w] msg in
+            if msg.contains("disappeared") { w?.stop() }   // reentrant stop from the queue
+        }
+        let collector = collect(watcher)
+        try watcher.start()
+        let aside = tmp.deletingLastPathComponent()
+            .appendingPathComponent("watch-aside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: tmp, to: aside)
+        watcher.scanNow()   // fires onLog("disappeared") on the queue → inline stop(); a
+                            // deadlock would hang this line forever
+        try FileManager.default.moveItem(at: aside, to: tmp)   // restore for teardown
+        watcher.stop()      // idempotent second stop — must be a clean no-op
+        watcher.scanNow()   // and post-stop scans must no-op
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let items = await collector.items
+        XCTAssertTrue(items.isEmpty, "clean stop — nothing emitted")
+    }
+
+    /// Review9 item 4: repeated start() while running previously overwrote the live
+    /// source/timer references (leaking the armed fd and a running timer). It must fail
+    /// explicitly instead.
+    func testRepeatedStartWhileRunning_failsExplicitly() throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600)
+        try watcher.start()
+        XCTAssertThrowsError(try watcher.start()) {
+            XCTAssertEqual($0 as? StackFileWatcherError, .alreadyStarted)
+        }
+    }
+
+    /// Review9 item 4: the state machine is ONE-SHOT — initial → running → stopped, with
+    /// stopped terminal. start() after stop() must fail explicitly, never resurrect.
+    func testStartAfterStop_failsTerminally() throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600)
+        try watcher.start()
+        watcher.stop()
+        XCTAssertThrowsError(try watcher.start()) {
+            XCTAssertEqual($0 as? StackFileWatcherError, .stopped)
+        }
+    }
+
+    /// Review9 item 4: a FAILED initial start (folder absent) leaves the watcher in the
+    /// initial state — RETRYABLE, not terminal. A second start() once the folder exists
+    /// succeeds.
+    func testFailedFirstStart_leavesWatcherRetryable() throws {
+        let folder = tmp.appendingPathComponent("appears-later", isDirectory: true)
+        watcher = StackFileWatcher(folder: folder, quietPeriod: 3600, pollInterval: 3600)
+        XCTAssertThrowsError(try watcher.start(), "arrange: first start fails (no folder)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        XCTAssertNoThrow(try watcher.start(), "a failed initial start must be retryable")
+    }
+
+    // MARK: - review8 finding 1: digest-stability gate (mutable policy)
+
+    /// Lock-protected manual monotonic clock injected through the watcher's
+    /// `monotonicNowNanos` seam: tests advance it explicitly, so the gate's quiet-period
+    /// separation requirement is exercised with ZERO wall-clock sleeps — the debounce and
+    /// poll timer are parked on huge intervals and scans are driven one at a time through
+    /// scanNow(). (The watcher reads the clock on its serial queue while the test thread
+    /// advances it — lock-protect, F5 pattern.)
+    private final class ManualClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var nanos: UInt64 = 1_000_000_000
+        func now() -> UInt64 { lock.withLock { nanos } }
+        func advance(seconds: TimeInterval) {
+            lock.withLock { nanos += UInt64(seconds * 1_000_000_000) }
+        }
+    }
+
+    /// A manually-driven watcher: debounce and poll parked on huge intervals (nothing runs
+    /// except explicit scanNow() calls) with an injected manual monotonic clock. The huge
+    /// quietPeriod is ALSO the digest-stability separation requirement, so tests must
+    /// advance the clock past it to confirm a pending digest.
+    private func makeManualWatcher(policy: StackFileWatcher.DigestPolicy,
+                                   clock: ManualClock,
+                                   prefix: String? = nil) throws -> StackFileWatcher {
+        let w = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
+                                 fileNamePrefix: prefix, digestPolicy: policy)
+        w.monotonicNowNanos = { clock.now() }
+        return w
+    }
+
+    // MARK: - review9 item 1: hybrid per-entry policy (numbered stacker revisions)
+
+    /// Review9 item 1 (red-first, the counter arithmetic proves both halves): under
+    /// `.mutableStackerOutput` every matching file was re-hashed on EVERY stable scan —
+    /// with Siril 1.4+'s numbered revisions (live_stack_00001.fit …) accumulating, 1000
+    /// × 50 MB revisions meant 50 GB hashed per 2 s scan, starving new updates. Numbered
+    /// revisions are written once and never rewritten, so after their CONFIRMED first
+    /// emission they must use the identity fast-path (digest computations FLAT), while
+    /// the CLASSIC in-place fixed-name file keeps re-hashing each stable scan by design:
+    /// with one classic + three numbered files emitted, k further scans must add
+    /// EXACTLY k digest computations (classic only), not 4k.
+    func testMutablePolicy_numberedRevisionsFlatAfterEmission_classicStillRehashes() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        for i in 1...3 {
+            try makeFITS(Float(i) * 0.1)
+                .write(to: tmp.appendingPathComponent("live_stack_0000\(i).fit"))
+        }
+        watcher.scanNow()                     // sighting — stat recorded, nothing hashed
+        watcher.scanNow()                     // stable → 4 digests → all 4 pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                     // 4 digests confirm the pendings → 4 emissions
+        let got = await collector.waitForCount(4, timeout: 2)
+        XCTAssertTrue(got, "arrange: classic + 3 numbered revisions all emit")
+        let hashesAfterEmit = watcher.digestComputations
+        XCTAssertEqual(hashesAfterEmit, 8,
+                       "arrange: 4 pending digests + 4 confirming digests, nothing else")
+
+        for _ in 0..<3 { clock.advance(seconds: 3601); watcher.scanNow() }
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit + 3,
+                       "exactly ONE hash per further scan: the classic in-place file still " +
+                       "re-hashes, all emitted numbered revisions stay FLAT")
+        let items = await collector.items
+        XCTAssertEqual(items.count, 4, "no re-emissions during the flat scans")
+    }
+
+    /// Review9 item 1, the pre-emission half: a numbered revision may be written
+    /// NON-ATOMICALLY before publication, so it must NOT ride the raw
+    /// `.immutableAfterPublish` branch (which has no content gate). Its FIRST emission
+    /// earns stat stability AND the two-observation digest-stability gate exactly like
+    /// the classic file — a single stable sighting of a new numbered file must not emit.
+    /// Post-emission trust is the ONLY divergence point.
+    func testMutablePolicy_newNumberedRevision_firstEmissionStillPassesDigestGate() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.7).write(to: tmp.appendingPathComponent("live_stack_00004.fit"))
+        watcher.scanNow()                     // first sighting — stat recorded only
+        watcher.scanNow()                     // stable → digest PENDING, must not emit
+        let single = await collector.waitForCount(1, timeout: 0.3)
+        XCTAssertFalse(single,
+                       "a single stable sighting of a new numbered revision must not emit " +
+                       "(the digest gate applies to its first emission)")
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                     // same digest after the quiet period → emits
+        let got = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(got, "the confirmed first emission goes through")
+        // …and only THEN does the identity fast-path take over.
+        let hashesAfterEmit = watcher.digestComputations
+        clock.advance(seconds: 3601)
+        watcher.scanNow()
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit,
+                       "post-confirmation the numbered revision is never re-hashed")
+    }
+
+    // MARK: - review9 item 2: deterministic emission ordering
+
+    /// Review9 item 2 (red-first): enumerateDirectory returns raw readdir order (POSIX-
+    /// undefined), so several revisions accumulating during a reconnect could emit
+    /// _00010 → _00002 → _00009, visually regressing the replay. Candidates must be
+    /// sorted with the SAME parser that classifies them: numbered revisions in NUMERIC
+    /// order via digit-STRING comparison (length, then lexicographic) — the 30-digit
+    /// suffix must classify and sort identically, never overflow an Int conversion into
+    /// a different path. Files are created in deliberately scrambled order.
+    func testNumberedRevisions_scrambledCreationOrder_emitInNumericOrder() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let collector = collect(watcher)
+        try watcher.start()
+        let thirtyDigits = String(repeating: "0", count: 28) + "11"   // numerically 11
+        let creationOrder = ["live_stack_00010.fit", "live_stack_\(thirtyDigits).fit",
+                             "live_stack_00002.fit", "live_stack_00009.fit"]
+        for (i, name) in creationOrder.enumerated() {
+            try makeFITS(Float(i + 1) * 0.1).write(to: tmp.appendingPathComponent(name))
+        }
+        watcher.scanNow()                     // sighting
+        watcher.scanNow()                     // stable → pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                     // confirmed → all emit, in candidate order
+        let got = await collector.waitForCount(4, timeout: 2)
+        XCTAssertTrue(got, "arrange: all four revisions emit")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00002.fit", "live_stack_00009.fit",
+                        "live_stack_00010.fit", "live_stack_\(thirtyDigits).fit"],
+                       "emissions must arrive in NUMERIC revision order regardless of " +
+                       "creation/readdir order (30-digit suffix sorts numerically too)")
+    }
+
+    /// Review8 finding 1 (red-first): stat stability is satisfied while an in-place
+    /// rewriter PAUSES mid-rewrite (size unchanged, mtime coarse/restored), so pre-fix the
+    /// watcher hashed the temporary A/B hybrid and emitted it immediately — and the
+    /// consumer then correctly verified that exact hybrid, because digest verification
+    /// proves byte identity, not producer completeness. The digest-stability gate must
+    /// hold a NEW digest as pending and emit only when the SAME digest is observed again
+    /// at least `quietPeriod` of MONOTONIC time later; a DIFFERENT digest on a later scan
+    /// replaces the pending one, still unemitted.
+    ///
+    /// Review9 item 5 (honest scope): this proves the SHORT-pause case only — the pause
+    /// here does NOT span both gate observations (the rewrite finishes before the pending
+    /// hybrid could be confirmed). A writer that pauses on the hybrid through BOTH
+    /// observations DOES emit it — see
+    /// testMutablePolicy_pauseSpansBothObservations_hybridEmits_acceptedBoundary.
+    func testMutablePolicy_midRewritePause_shorterThanQuietPeriod_hybridNotEmitted() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let collector = collect(watcher)
+        try watcher.start()
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        try makeFITS(0.25, size: 16).write(to: url)
+        watcher.scanNow()                       // sighting — records stat
+        watcher.scanNow()                       // stable → digest A becomes pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // A confirmed after the quiet period → emits
+        let gotA = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(gotA, "version A emits")
+
+        let emitted = FileIdentity.capture(url: url)!
+        // Mid-rewrite pause: interior bytes hold the A/B hybrid H; the identity
+        // (size, mtime-ns) collides with the emitted version, so stat stability is
+        // already satisfied — pre-fix, this scan emitted H.
+        try mutateInteriorPreservingIdentity(url, byteFromEnd: 64, identity: emitted, byte: 0xAB)
+        let hybridDigest = FileIdentity.contentDigest(data: try Data(contentsOf: url))
+        watcher.scanNow()                       // H observed ONCE → pending, must NOT emit
+        let hybridEmitted = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(hybridEmitted,
+                       "a single sighting of a new digest must not emit (mid-rewrite pause)")
+
+        // The rewrite finishes: final version B, identity restored again (worst case).
+        try mutateInteriorPreservingIdentity(url, byteFromEnd: 64, identity: emitted, byte: 0xCD)
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // B ≠ pending H → pending replaced, no emit
+        let replacedEmitted = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(replacedEmitted,
+                       "a digest different from the pending one replaces it — H is never emitted")
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // B confirmed after the quiet period → emits
+        let gotB = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(gotB, "the finished rewrite emits")
+        let items = await collector.items
+        XCTAssertEqual(items.count, 2)
+        XCTAssertEqual(items[1].identity?.digest,
+                       FileIdentity.contentDigest(data: try Data(contentsOf: url)),
+                       "the second emission is the FINISHED rewrite")
+        XCTAssertFalse(items.contains { $0.identity?.digest == hybridDigest },
+                       "the unfinished hybrid's digest must never be emitted")
+    }
+
+    /// Review9 item 5 — the ACCEPTED DESIGN BOUNDARY, documented as behavior: a writer
+    /// that pauses on hybrid H through BOTH digest-gate observations EMITS H. The gate
+    /// proves only that the content remained unchanged for the quiet period; it cannot
+    /// prove the producer's transaction ended — from the watcher's side, a long pause on
+    /// a hybrid is indistinguishable from a finished write, and no amount of polling can
+    /// tell them apart. Only PRODUCER-SIDE atomic publication (write to a temp name, then
+    /// rename into place) is absolute. This test pins the limit honestly so a future
+    /// change that silently widens or narrows it fails loudly.
+    func testMutablePolicy_pauseSpansBothObservations_hybridEmits_acceptedBoundary() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let collector = collect(watcher)
+        try watcher.start()
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        try makeFITS(0.25, size: 16).write(to: url)
+        watcher.scanNow()                       // sighting
+        watcher.scanNow()                       // stable → digest A pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // A confirmed → emits
+        let gotA = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(gotA, "arrange: version A emits")
+
+        // The writer pauses on hybrid H — and stays paused across BOTH observations.
+        let emitted = FileIdentity.capture(url: url)!
+        try mutateInteriorPreservingIdentity(url, byteFromEnd: 64, identity: emitted, byte: 0xAB)
+        let hybridDigest = FileIdentity.contentDigest(data: try Data(contentsOf: url))
+        watcher.scanNow()                       // H observed once → pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // H observed AGAIN, quiet period elapsed → emits
+        let gotH = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(gotH, "the long-paused hybrid IS emitted — the accepted boundary")
+        let items = await collector.items
+        XCTAssertEqual(items.last?.identity?.digest, hybridDigest,
+                       "and the emitted digest is the hybrid's — this is the documented limit")
+    }
+
+    /// Review8 finding 1, confirmation path: a stat-identical rewrite (utimensat identity
+    /// collision) is emitted only on a SECOND sighting of the same digest separated by at
+    /// least `quietPeriod` of MONOTONIC time — near-back-to-back scans (the event debounce
+    /// and the poll timer share the serial queue) must NOT count as separated
+    /// observations. Exactly one emission for B; the content change is never lost.
+    func testMutablePolicy_sameDigestTwice_requiresQuietPeriodSeparation() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let collector = collect(watcher)
+        try watcher.start()
+        let url = tmp.appendingPathComponent("live_stack.fit")
+        try makeFITS(0.25, size: 16).write(to: url)
+        watcher.scanNow()                       // sighting
+        watcher.scanNow()                       // stable → digest A pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // A confirmed → emits
+        let gotA = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(gotA, "version A emits")
+
+        let emitted = FileIdentity.capture(url: url)!
+        try mutateInteriorPreservingIdentity(url, byteFromEnd: 64, identity: emitted)
+        watcher.scanNow()                       // B observed once → pending
+        let firstSighting = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(firstSighting, "the first sighting of B must not emit")
+        watcher.scanNow()                       // same digest, ~zero monotonic separation
+        let backToBack = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(backToBack,
+                       "back-to-back scans are not separated observations — no emit before the quiet period")
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // same digest, separation satisfied → emits
+        let gotB = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(gotB,
+                      "B emits once its digest is observed unchanged across the quiet period")
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                       // already-emitted digest → dedup
+        let reEmitted = await collector.waitForCount(3, timeout: 0.3)
+        XCTAssertFalse(reEmitted, "B emits exactly once")
+    }
+
+    // MARK: - review8 finding 2: the identity fast-path dies with the folder generation
+
+    /// Emit one immutable-policy sub through manual scans and prove the identity fast-path
+    /// is active (digest counter flat on a further scan). Returns the collector and the
+    /// digest count after the emission. Shared arrange step for the finding-2 pair.
+    private func emitBaselineSubWithFastPathActive(_ url: URL) async throws
+        -> (collector: Collector, hashesAfterEmit: Int) {
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.25, size: 16).write(to: url)
+        watcher.scanNow()   // sighting — records stat
+        watcher.scanNow()   // stable → hash → emit (immutable policy: no digest gate)
+        let got = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(got, "arrange: baseline sub emits")
+        let hashesAfterEmit = watcher.digestComputations
+        XCTAssertGreaterThan(hashesAfterEmit, 0, "arrange: the emission itself hashed")
+        watcher.scanNow()   // identity fast-path: same (dev, ino, size, mtime-ns) → no work
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit,
+                       "arrange: identity fast-path active — counter flat")
+        return (collector, hashesAfterEmit)
+    }
+
+    /// Review8 finding 2 (red-first): `lastEmittedIdentity` — the `.immutableAfterPublish`
+    /// skip-hashing fast-path — was RETAINED across folder disappearance, so a remounted
+    /// share or reused inode presenting the same name/size/cached timestamp suppressed a
+    /// genuinely new sub forever (never re-hashed, never emitted). Deterministic shape:
+    /// (1) emit with the fast-path active (counter flat); (2) REMOVE the watched folder;
+    /// (3) mutate the file's CONTENT while preserving its full stat identity — same inode,
+    /// same size, utimensat-restored mtime-ns; (4) RESTORE the same folder; (5) after
+    /// recovery the file must be re-hashed EXACTLY once (counter +1) and EMITTED with the
+    /// changed digest. Identities are location-bound and die with the folder generation.
+    func testImmutablePolicy_folderReturn_sameIdentityDifferentContent_rehashedAndEmitted() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
+                                   digestPolicy: .immutableAfterPublish)
+        let url = tmp.appendingPathComponent("sub_001.fit")
+        let (collector, hashesAfterEmit) = try await emitBaselineSubWithFastPathActive(url)
+
+        // (2) The watched folder disappears (unmount/reconnect modeled as a move-aside).
+        let emitted = FileIdentity.capture(url: url)!
+        let aside = tmp.deletingLastPathComponent()
+            .appendingPathComponent("watch-aside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: tmp, to: aside)
+        watcher.scanNow()   // notices the disappearance — this folder generation ends
+
+        // (3) Content changes while every stat field the fast-path trusts is preserved:
+        // same inode (in-place write), same size, mtime-ns restored with utimensat — the
+        // reused-inode/cached-attribute worst case on a reconnecting share.
+        try mutateInteriorPreservingIdentity(aside.appendingPathComponent("sub_001.fit"),
+                                             byteFromEnd: 64, identity: emitted)
+        // (4) The same folder returns.
+        try FileManager.default.moveItem(at: aside, to: tmp)
+        watcher.scanNow()   // recovery re-arms + first post-return sighting (stat recorded)
+        watcher.scanNow()   // stable → the dead generation's identity must NOT be trusted
+
+        // (5) Exactly one rehash, and the changed content is EMITTED.
+        let reEmitted = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(reEmitted,
+                      "a same-identity, different-content file after a reconnect must be emitted")
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit + 1,
+                       "…after exactly one rehash (the honest price of the reconnect)")
+        let items = await collector.items
+        XCTAssertEqual(items.count, 2)
+        guard items.count >= 2 else { return }   // already failed above; don't trap on items[1]
+        XCTAssertNotEqual(items[0].identity?.digest, items[1].identity?.digest,
+                          "the post-return emission carries the CHANGED content digest")
+        // The emission repopulated the fast-path for the NEW generation: flat again.
+        watcher.scanNow()
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit + 1,
+                       "fast-path re-established for the new folder generation")
+    }
+
+    /// Review8 finding 2, the true-duplicate half: the same disappear→return with IDENTICAL
+    /// content. `lastEmittedDigest` is retained across the generation change (digests are
+    /// content-bound), so the file is re-hashed exactly once but NOT re-emitted — dedup
+    /// holds, and the dedup branch re-establishes the identity fast-path.
+    func testImmutablePolicy_folderReturn_identicalContent_rehashedNotReEmitted() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
+                                   digestPolicy: .immutableAfterPublish)
+        let url = tmp.appendingPathComponent("sub_001.fit")
+        let (collector, hashesAfterEmit) = try await emitBaselineSubWithFastPathActive(url)
+
+        let aside = tmp.deletingLastPathComponent()
+            .appendingPathComponent("watch-aside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: tmp, to: aside)
+        watcher.scanNow()   // disappearance — generation ends
+        try FileManager.default.moveItem(at: aside, to: tmp)   // identical content returns
+        watcher.scanNow()   // recovery + first sighting
+        watcher.scanNow()   // stable → re-hashed (the identity cache died with the generation)…
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit + 1,
+                       "identical content is re-hashed exactly once after the reconnect")
+        // …but the digest matches the emitted one → dedup holds, no re-emission.
+        let reEmitted = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(reEmitted, "identical content must NOT re-emit (digest dedup retained)")
+        // The dedup branch re-records the identity: the fast-path is flat again.
+        watcher.scanNow()
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit + 1,
+                       "fast-path re-established by the dedup branch")
     }
 
     /// Review4 P2 (mid-scan TOCTOU): the structural property of fd-relative enumeration, tested

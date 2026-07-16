@@ -33,6 +33,19 @@ public final class OBSController: ObservableObject {
     /// Diagnostic log sink. Every swallowed error and lifecycle note is emitted here.
     public var onLog: ((String) -> Void)?
 
+    /// Fired on the main actor for every output-affecting OBS event
+    /// (StreamStateChanged / RecordStateChanged), AFTER the published state was
+    /// updated — the broadcast orchestrator's reconciliation trigger (review8
+    /// item 3).
+    public var onOutputEvent: (() -> Void)?
+
+    /// Fired on the main actor when the connection is lost UNEXPECTEDLY —
+    /// receive-loop death (surfaced by the client finishing its events stream)
+    /// or a request-error convergence — after this controller has already
+    /// converged to `.disconnected`. NEVER fired for a deliberate
+    /// `disconnect()` (review8 item 3).
+    public var onConnectionLost: (() -> Void)?
+
     // MARK: - Dependencies
 
     private let makeClient: (OBSSocket) -> OBSClient
@@ -41,6 +54,18 @@ public final class OBSController: ObservableObject {
     private var client: OBSClient?
     /// Task consuming `client.events`. Cancelled on disconnect / before a new connect.
     private var eventsTask: Task<Void, Never>?
+
+    /// Monotonic connection identity (review8 item 2): bumped at every connect
+    /// start and every disconnect/teardown. Every async consumer of a client —
+    /// the connect completion AND failure paths, `seedState`, request-error
+    /// convergence, and the event consumer — captures the epoch of the client
+    /// it talks to and, after every await, touches NOTHING when the epoch has
+    /// moved on: only the client whose epoch generated a signal may mutate
+    /// published state or tear the session down.
+    private(set) var connectionEpoch = 0
+    /// The one in-flight connect attempt (review8 item 2): a second caller
+    /// awaits this task's result instead of starting a competing handshake.
+    private var connectTask: Task<Bool, Never>?
 
     // MARK: - Init
 
@@ -55,9 +80,16 @@ public final class OBSController: ObservableObject {
     /// Open a connection to `ws://host:port`, perform the handshake, and seed
     /// scene/stream/record state. Returns `true` on success. On failure the
     /// controller returns to `.disconnected` and logs the reason.
+    ///
+    /// Coalescing (review8 item 2): concurrent connect attempts share ONE
+    /// in-flight task — a second caller awaits the first attempt's result
+    /// instead of tearing it down mid-handshake and starting a competitor.
     @discardableResult
     public func connect(host: String, port: Int, password: String?) async -> Bool {
-        // Tear down any prior session first (idempotent reconnect).
+        if let task = connectTask { return await task.value }
+
+        // Tear down any prior session first (idempotent reconnect). This bumps
+        // the epoch, so every consumer of the old client goes stale.
         teardown()
 
         guard let url = URL(string: "ws://\(host):\(port)") else {
@@ -66,24 +98,50 @@ public final class OBSController: ObservableObject {
             return false
         }
 
+        connectionEpoch += 1                 // connect start
+        let epoch = connectionEpoch
         state = .connecting
         let socket = makeSocket()
         let client = makeClient(socket)
         self.client = client
 
+        let task = Task { @MainActor [weak self] () -> Bool in
+            guard let self else { return false }
+            return await self.performConnect(client: client, url: url,
+                                             password: password, epoch: epoch)
+        }
+        connectTask = task
+        let ok = await task.value
+        // Epoch-guarded clear: never nil out a NEWER attempt's slot from a
+        // superseded completion.
+        if epoch == connectionEpoch { connectTask = nil }
+        return ok
+    }
+
+    /// The awaited half of `connect` — handshake, event subscription, seeding.
+    /// Every landing past an await is epoch-guarded: a teardown/reconnect that
+    /// happened mid-handshake owns the published state, and this (now stale)
+    /// attempt touches nothing beyond closing its own orphaned client.
+    private func performConnect(client: OBSClient, url: URL,
+                                password: String?, epoch: Int) async -> Bool {
         do {
             try await client.connect(url: url, password: password)
         } catch {
             log("connect failed: \(error)")
+            guard epoch == connectionEpoch else { return false }   // superseded: touch nothing
             self.client = nil
             state = .disconnected
             return false
         }
-
+        guard epoch == connectionEpoch else {
+            // Superseded mid-handshake: close the orphaned client quietly.
+            Task { await client.disconnect() }
+            return false
+        }
         // Handshake succeeded. Start listening for events, then seed state.
         state = .connected
-        subscribeToEvents(of: client)
-        await seedState()
+        subscribeToEvents(of: client, epoch: epoch)
+        await seedState(epoch: epoch)
         return true
     }
 
@@ -95,7 +153,12 @@ public final class OBSController: ObservableObject {
     }
 
     /// Cancel the events task and disconnect the client without touching `state`.
+    /// Bumps the epoch (review8 item 2): every in-flight consumer of the old
+    /// client — including a mid-handshake connect — is stale from this instant.
     private func teardown() {
+        connectionEpoch += 1
+        connectTask?.cancel()
+        connectTask = nil
         eventsTask?.cancel()
         eventsTask = nil
         if let client {
@@ -108,18 +171,25 @@ public final class OBSController: ObservableObject {
 
     /// Query GetSceneList / GetStreamStatus / GetRecordStatus and populate the
     /// published state. Any failure moves us to `.disconnected` (the connection
-    /// probably dropped) via `handle(error:)`.
-    private func seedState() async {
+    /// probably dropped) via `handle(error:epoch:)`. Every mutation is
+    /// epoch-guarded: a reconnect mid-seed means these answers describe a dead
+    /// session, so they must not overwrite the new one's state.
+    private func seedState(epoch: Int) async {
         await refreshScenes()
+        guard epoch == connectionEpoch else { return }
 
-        if let stream = await requestData("GetStreamStatus", nil),
-           let active = stream["outputActive"] as? Bool,
-           state != .disconnected {
-            state = active ? .streaming : .connected
+        if let stream = await requestData("GetStreamStatus", nil) {
+            guard epoch == connectionEpoch else { return }
+            if let active = stream["outputActive"] as? Bool, state != .disconnected {
+                state = active ? .streaming : .connected
+            }
         }
-        if let record = await requestData("GetRecordStatus", nil),
-           let active = record["outputActive"] as? Bool {
-            isRecording = active
+        guard epoch == connectionEpoch else { return }
+        if let record = await requestData("GetRecordStatus", nil) {
+            guard epoch == connectionEpoch else { return }
+            if let active = record["outputActive"] as? Bool {
+                isRecording = active
+            }
         }
     }
 
@@ -127,7 +197,9 @@ public final class OBSController: ObservableObject {
 
     /// Fetch the scene list and current program scene.
     public func refreshScenes() async {
+        let epoch = connectionEpoch
         guard let data = await requestData("GetSceneList", nil) else { return }
+        guard epoch == connectionEpoch else { return }   // answered by a dead session
 
         if let scenes = data["scenes"] as? [[String: Any]] {
             // OBS returns scenes top-of-list first; UI convention lists them in
@@ -202,30 +274,56 @@ public final class OBSController: ObservableObject {
         return false
     }
 
+    /// Outcome of `startBroadcast` (review8 item 1) — a Bool hid the issuance
+    /// boundary, so a cancelled start whose StartStream WAS sent got no cleanup.
+    public enum StartOutcome: Equatable {
+        /// Cancellation was CONFIRMED to have occurred before the StartStream
+        /// send was enqueued — nothing was issued, there is nothing to undo.
+        case notIssued
+        /// StartStream was (or may have been) issued but going live was never
+        /// confirmed: cancelled mid-request, confirm polls expired, or status
+        /// unavailable. OBS may be live — the caller owes a confirmed cleanup.
+        case issuedUnconfirmed
+        /// GetStreamStatus confirmed outputActive — the broadcast is up.
+        case confirmedLive
+    }
+
     /// Deliberate broadcast: switch to `scene` (if given), start the stream, and
-    /// confirm it went live by polling GetStreamStatus. Returns true once
-    /// outputActive is confirmed; false when the polls expire or status is
-    /// unavailable — and on failure this sends NOTHING further. The CALLER owns
-    /// cleanup policy (review7 P1: an internal StopStream-on-expiry here fired
-    /// BEFORE the caller's generation check could run, so a stale attempt's
-    /// cleanup could kill a newer broadcast's stream).
+    /// confirm it went live by polling GetStreamStatus. The issuance boundary is
+    /// CONSERVATIVE (review8 item 1): `.notIssued` is returned ONLY when
+    /// cancellation is confirmed before the StartStream send was enqueued
+    /// (`Task.isCancelled` checked immediately before issuing it; the client's
+    /// request is itself cancellation-aware and never enqueues a send for a
+    /// task already cancelled). Once the send has begun — or its status is
+    /// ambiguous — the result is `.issuedUnconfirmed`, and on that outcome this
+    /// method sends NOTHING further: the CALLER owns cleanup policy (review7
+    /// P1: an internal StopStream-on-expiry here fired BEFORE the caller's
+    /// generation check could run, so a stale attempt's cleanup could kill a
+    /// newer broadcast's stream).
     /// At least one confirmation poll is always performed (maxConfirmPolls is floored to 1).
     @discardableResult
     public func startBroadcast(scene: String?, confirmPollSeconds: Double = 1.0,
-                               maxConfirmPolls: Int = 5) async -> Bool {
+                               maxConfirmPolls: Int = 5) async -> StartOutcome {
         if let scene, !scene.isEmpty { await setScene(scene) }
+        // The issuance boundary: a cancellation observed HERE is confirmed to
+        // precede the StartStream send. (A cancel that lands after this check
+        // races the send and must be treated as possibly-issued.)
+        if Task.isCancelled {
+            log("start cancelled before StartStream was issued")
+            return .notIssued
+        }
         await startStream()
         for i in 0..<max(1, maxConfirmPolls) {
             if let h = await streamStatus(), h.active {
                 log("broadcast live")
-                return true
+                return .confirmedLive
             }
             if i < maxConfirmPolls - 1, confirmPollSeconds > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(confirmPollSeconds * 1_000_000_000))
             }
         }
         log("stream did not go active — check OBS ▸ Settings ▸ Stream")
-        return false
+        return .issuedUnconfirmed
     }
 
     /// Stop a broadcast: stop the stream, turn recording off, and CONFIRM both
@@ -257,33 +355,39 @@ public final class OBSController: ObservableObject {
     // MARK: - Request plumbing
 
     /// Issue a request; on success return its responseData, on failure log and
-    /// return nil. `.notConnected` failures converge state to `.disconnected`
-    /// (the socket died and the client won't push a signal — see design note).
+    /// return nil. `.notConnected` failures converge state to `.disconnected`,
+    /// but ONLY when the failing client is still the current one (review8 item
+    /// 2): the epoch captured alongside the client identifies which session
+    /// generated the error, so a stale client's death can never tear down a
+    /// newer connection.
     @discardableResult
     private func requestData(_ type: String, _ data: [String: Any]?) async -> [String: Any]? {
         guard let client else {
             log("\(type): not connected")
             return nil
         }
+        let epoch = connectionEpoch
         do {
             return try await client.request(type, data: data)
         } catch {
             log("\(type) failed: \(error)")
-            handle(error: error)
+            handle(error: error, epoch: epoch)
             return nil
         }
     }
 
-    /// Converge state on a dropped connection. The client's `events` stream is
-    /// NOT finished when its receive loop dies (Task 5 forward-note), so we
-    /// detect the drop here — the failed request is our liveness signal — and
-    /// tear down so the UI doesn't hang in `.streaming`/`.connected`.
-    private func handle(error: Error) {
+    /// Converge state on a dropped connection — the failed request is a
+    /// liveness signal. Epoch-guarded (review8 item 2): only the client whose
+    /// epoch generated the error may tear the session down; errors surfacing
+    /// from an already-superseded client touch nothing.
+    private func handle(error: Error, epoch: Int) {
         if case OBSClient.OBSError.notConnected = error {
+            guard epoch == connectionEpoch else { return }
             if state != .disconnected {
                 log("connection lost — converging to .disconnected")
                 teardown()
                 state = .disconnected
+                onConnectionLost?()
             }
         }
     }
@@ -291,15 +395,31 @@ public final class OBSController: ObservableObject {
     // MARK: - Events
 
     /// Consume the client's event stream and keep published state live.
-    private func subscribeToEvents(of client: OBSClient) {
+    /// Epoch-guarded (review8 item 2): once the session is superseded, this
+    /// consumer stops applying the dead client's events entirely.
+    ///
+    /// The stream FINISHING is a signal (review8 item 3): the client finishes
+    /// it when its receive loop dies unexpectedly, so falling out of the loop
+    /// at the CURRENT epoch (not cancelled, not superseded) means the socket
+    /// is gone — converge to `.disconnected` and surface `onConnectionLost`.
+    /// Deliberate disconnects cancel this task and bump the epoch first, so
+    /// they can never reach the convergence.
+    private func subscribeToEvents(of client: OBSClient, epoch: Int) {
         let events = client.events
         eventsTask = Task { [weak self] in
             for await event in events {
-                if Task.isCancelled { return }
+                guard let self, !Task.isCancelled else { return }
+                guard self.connectionEpoch == epoch else { return }
                 // Task {} inherits this controller's main-actor isolation, so
                 // apply(event:data:) is a same-actor synchronous call.
-                self?.apply(event: event.type, data: event.data)
+                self.apply(event: event.type, data: event.data)
             }
+            guard let self, !Task.isCancelled else { return }
+            guard self.connectionEpoch == epoch else { return }
+            self.log("connection lost — converging to .disconnected")
+            self.teardown()
+            self.state = .disconnected
+            self.onConnectionLost?()
         }
     }
 
@@ -315,11 +435,13 @@ public final class OBSController: ObservableObject {
             if let active = data["outputActive"] as? Bool {
                 state = active ? .streaming : .connected
             }
+            onOutputEvent?()   // review8 item 3: reconcile broadcast state
 
         case "RecordStateChanged":
             if let active = data["outputActive"] as? Bool {
                 isRecording = active
             }
+            onOutputEvent?()   // review8 item 3: reconcile broadcast state
 
         case "SceneListChanged":
             // Scene set changed under us — re-fetch names.

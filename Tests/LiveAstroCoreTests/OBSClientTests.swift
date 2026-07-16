@@ -189,9 +189,9 @@ final class OBSClientTests: XCTestCase {
         async let r2 = client.request("Second", data: nil)
 
         // Wait until both op-6 frames have been recorded.
-        try await waitUntil { await mock.sentFrames.filter { $0.contains("\"op\":6") }.count == 2 }
+        try await waitUntil { mock.sentFrames.filter { $0.contains("\"op\":6") }.count == 2 }
 
-        let sent6 = await mock.sentFrames.filter { $0.contains("\"op\":6") }
+        let sent6 = mock.sentFrames.filter { $0.contains("\"op\":6") }
         // Match each id to its request TYPE, not its position in `sent6`. The two
         // `async let` requests send concurrently via child Tasks, so their frames
         // can be recorded in EITHER order — indexing sent6[0]/[1] would flip the
@@ -222,7 +222,7 @@ final class OBSClientTests: XCTestCase {
         let client = OBSClient(socket: mock)
         try await connect(client, mock)
 
-        var iterator = await client.events.makeAsyncIterator()
+        var iterator = client.events.makeAsyncIterator()
 
         mock.enqueueInbound(eventFrame(type: "StreamStateChanged",
                                        data: ["outputActive": true]))
@@ -264,7 +264,7 @@ final class OBSClientTests: XCTestCase {
         mock.replyToLastSent(nil)   // never answer
 
         async let pending = client.request("GetVersion", data: nil)
-        try await waitUntil { await mock.sentFrames.filter { $0.contains("\"op\":6") }.count == 1 }
+        try await waitUntil { mock.sentFrames.filter { $0.contains("\"op\":6") }.count == 1 }
 
         await client.disconnect()
 
@@ -274,6 +274,82 @@ final class OBSClientTests: XCTestCase {
         } catch OBSClient.OBSError.notConnected {
             // expected
         }
+    }
+
+    // MARK: - Connection-loss signalling (review8 item 3)
+
+    /// The receive loop's death must FINISH the events stream — that finish is
+    /// the connection-loss signal consumers rely on. Pre-fix the stream was
+    /// never finished when the loop died, so nothing downstream could tell.
+    func testReceiveLoopFailureFinishesEventStream() async throws {
+        let mock = MockOBSSocket()
+        let client = OBSClient(socket: mock, requestTimeout: 10)
+        try await connect(client, mock)
+
+        let exp = expectation(description: "events stream finished")
+        let consumer = Task {
+            for await _ in client.events { }
+            exp.fulfill()
+        }
+
+        mock.finishWithError(OBSSocketError.notConnected)   // the socket dies
+        await fulfillment(of: [exp], timeout: 2)
+        consumer.cancel()
+        await client.disconnect()
+    }
+
+    // MARK: - Cancellation (review8 item 1)
+
+    /// A request whose task is cancelled BEFORE the request body runs resumes
+    /// immediately with CancellationError and sends NOTHING — the cancel-before-
+    /// continuation-registration race must not wait out the timeout.
+    func testRequestCancelledBeforeStartResolvesImmediatelyAndSendsNothing() async throws {
+        let mock = MockOBSSocket()
+        let client = OBSClient(socket: mock, requestTimeout: 10)
+        try await connect(client, mock)
+        mock.replyToLastSent(nil)
+        let sentBefore = mock.sentFrames.count
+
+        let task = Task { try await client.request("GetVersion", data: nil) }
+        task.cancel()   // before the request body ever runs
+
+        let started = Date()
+        do {
+            _ = try await task.value
+            XCTFail("Expected CancellationError")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "got \(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2,
+                          "a pre-cancelled request must not wait for the 10 s timeout")
+        // The send must never have been enqueued — cancellation was confirmed
+        // before the issuance boundary.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(mock.sentFrames.count, sentBefore,
+                       "a request cancelled before enqueue must send no frame")
+    }
+
+    /// A request cancelled while in flight (sent, unanswered) resumes promptly
+    /// with CancellationError instead of hanging until the timeout.
+    func testRequestCancelledInFlightResolvesPromptly() async throws {
+        let mock = MockOBSSocket()
+        let client = OBSClient(socket: mock, requestTimeout: 10)
+        try await connect(client, mock)
+        mock.replyToLastSent(nil)   // never answer
+
+        let task = Task { try await client.request("GetVersion", data: nil) }
+        try await waitUntil { mock.sentFrames.filter { $0.contains("\"op\":6") }.count == 1 }
+
+        let started = Date()
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected CancellationError")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "got \(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2,
+                          "an in-flight cancel must resolve promptly, not at the timeout")
     }
 
     // MARK: - Helpers

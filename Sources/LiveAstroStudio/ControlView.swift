@@ -479,7 +479,12 @@ private struct OBSSection: View {
                     // Disconnect ≠ stop, by design: no StopStream is sent.
                     Button("Disconnect") { model.broadcast.disconnect() }
                 } else {
-                    Button("Connect") { connectOBS() }
+                    // Synchronous entry (review8 item 2): .connecting is reserved AT
+                    // the click, so Go Live can't race the connect await — and after
+                    // the link comes up the controller RECONCILES broadcastState with
+                    // OBS's actual stream/record state (review7: an already-streaming
+                    // OBS is adopted, never offered a double-starting Go Live).
+                    Button("Connect") { model.broadcast.beginConnectAndReconcile() }
                 }
             }
 
@@ -529,13 +534,4 @@ private struct OBSSection: View {
         }
     }
 
-    /// Connect via BroadcastController (review7): after the link comes up the
-    /// controller RECONCILES broadcastState with OBS's actual stream/record
-    /// state — connecting to an already-streaming OBS adopts the live broadcast
-    /// instead of leaving the footer offering a Go Live that would double-start
-    /// it. `obs` stays observed here for config/scene reads only; the scene
-    /// list is seeded by the connect itself.
-    private func connectOBS() {
-        Task { await model.broadcast.connectAndReconcile() }
-    }
 }

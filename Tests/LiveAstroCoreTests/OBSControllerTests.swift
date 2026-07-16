@@ -271,8 +271,8 @@ final class OBSControllerTests: XCTestCase {
 
     func testStartBroadcastSendsSceneThenStreamAndConfirmsActive() async throws {
         let (controller, mock) = try await makeConnectedController(streamStatusActive: true)
-        let ok = await controller.startBroadcast(scene: "Stack", confirmPollSeconds: 0, maxConfirmPolls: 3)
-        XCTAssertTrue(ok)
+        let outcome = await controller.startBroadcast(scene: "Stack", confirmPollSeconds: 0, maxConfirmPolls: 3)
+        XCTAssertEqual(outcome, .confirmedLive)
         let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
                                    .map { requestType(fromSent: $0) }
         XCTAssertTrue(types.contains("SetCurrentProgramScene"))
@@ -294,20 +294,40 @@ final class OBSControllerTests: XCTestCase {
         controller.disconnect()
     }
 
-    func testStartBroadcastNeverActiveReturnsFalseAndSendsNoStop() async throws {
+    func testStartBroadcastNeverActiveReturnsIssuedUnconfirmedAndSendsNoStop() async throws {
         // GetStreamStatus always reports outputActive:false → give up, return
-        // false, and send NOTHING further. Review7 P1: the CALLER owns cleanup —
-        // an internal StopStream-on-expiry here fired before the caller's
-        // generation check could run, so a stale attempt could kill a newer
-        // broadcast's stream.
+        // .issuedUnconfirmed (review8: StartStream WAS sent, so the boundary is
+        // "issued but never confirmed"), and send NOTHING further. Review7 P1:
+        // the CALLER owns cleanup — an internal StopStream-on-expiry here fired
+        // before the caller's generation check could run, so a stale attempt
+        // could kill a newer broadcast's stream.
         let (controller, mock) = try await makeConnectedController(streamStatusActive: false)
-        let ok = await controller.startBroadcast(scene: "Stack", confirmPollSeconds: 0, maxConfirmPolls: 3)
-        XCTAssertFalse(ok)
+        let outcome = await controller.startBroadcast(scene: "Stack", confirmPollSeconds: 0, maxConfirmPolls: 3)
+        XCTAssertEqual(outcome, .issuedUnconfirmed)
         let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
                                    .map { requestType(fromSent: $0) }
         XCTAssertTrue(types.contains("StartStream"))
         XCTAssertFalse(types.contains("StopStream"),
                        "startBroadcast must not stop on failure — the caller owns cleanup")
+        controller.disconnect()
+    }
+
+    /// Review8 item 1: a startBroadcast whose task is already cancelled at the
+    /// issuance boundary returns .notIssued and sends NO StartStream — the
+    /// conservative boundary's only "confirmed not sent" case.
+    func testStartBroadcastCancelledBeforeIssuanceReturnsNotIssued() async throws {
+        let (controller, mock) = try await makeConnectedController(streamStatusActive: false)
+        let task = Task { await controller.startBroadcast(scene: nil as String?,
+                                                          confirmPollSeconds: 0,
+                                                          maxConfirmPolls: 1) }
+        task.cancel()   // before the body runs — we're on the same actor
+        let outcome = await task.value
+        XCTAssertEqual(outcome, .notIssued)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
+                                   .map { requestType(fromSent: $0) }
+        XCTAssertFalse(types.contains("StartStream"),
+                       "a .notIssued outcome guarantees StartStream was never sent")
         controller.disconnect()
     }
 
@@ -321,6 +341,68 @@ final class OBSControllerTests: XCTestCase {
         let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
                                    .map { requestType(fromSent: $0) }
         XCTAssertTrue(types.contains("StopStream"))
+        controller.disconnect()
+    }
+
+    // MARK: - review8 item 2: connect coalescing + epoch guarding
+
+    /// Two rapid connects coalesce onto ONE in-flight attempt: a single
+    /// handshake (one Identify), both callers get the same successful result.
+    /// Pre-fix the second connect() tore down the first mid-handshake.
+    func testConcurrentConnectsCoalesceToOneHandshake() async {
+        let mock = MockOBSSocket()
+        let controller = makeController(mock)
+        mock.enqueueInbound(helloFrame())
+        mock.replyToLastSent(sessionResponder())
+
+        async let first = controller.connect(host: "localhost", port: 4455, password: nil)
+        async let second = controller.connect(host: "localhost", port: 4455, password: nil)
+        let (a, b) = await (first, second)
+
+        XCTAssertTrue(a)
+        XCTAssertTrue(b, "the second caller must await the same attempt's result")
+        let identifies = mock.sentFrames.filter { $0.contains("\"op\":1") }.count
+        XCTAssertEqual(identifies, 1, "two rapid connects must coalesce into one handshake")
+        XCTAssertEqual(controller.state, .connected)
+        controller.disconnect()
+    }
+
+    /// A request error surfacing from a STALE client (its socket died after a
+    /// reconnect already established a new session) must not tear down the
+    /// newer connection — only the client whose epoch generated the error may
+    /// converge state.
+    func testStaleRequestErrorDoesNotTearDownNewerConnection() async {
+        let mock1 = MockOBSSocket()
+        var current = mock1
+        let controller = OBSController(
+            makeClient: { OBSClient(socket: $0, requestTimeout: 10) },
+            makeSocket: { current })
+
+        _ = await connect(controller, mock1)
+        XCTAssertEqual(controller.state, .connected)
+
+        // Park a status request on the OLD client: no reply ever comes; the
+        // request will fail with .notConnected once the old client dies.
+        mock1.replyToLastSent { _ in nil }
+        let sentBefore = mock1.sentFrames.count
+        let parked = Task { await controller.streamStatus() }
+        await waitUntil { mock1.sentFrames.count == sentBefore + 1 }
+
+        // Reconnect: the prologue teardown kills the old client, whose parked
+        // request now fails — AFTER the new session is (being) established.
+        let mock2 = MockOBSSocket()
+        current = mock2
+        mock2.enqueueInbound(helloFrame())
+        mock2.replyToLastSent(sessionResponder(scenes: ["X"], currentScene: "X"))
+        let ok = await controller.connect(host: "localhost", port: 4455, password: nil)
+        XCTAssertTrue(ok, "the reconnect itself must succeed")
+
+        let stale = await parked.value
+        XCTAssertNil(stale, "the old client's request fails, returning nil")
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(controller.state, .connected,
+                       "a stale client's request error must not tear down the newer connection")
+        XCTAssertEqual(controller.sceneNames, ["X"], "the new session's seed is intact")
         controller.disconnect()
     }
 

@@ -61,10 +61,16 @@ public final class SessionPipeline {
                 replaySettings: ReplaySettings = .init(),
                 maxKeyframes: Int = FrameSelector.defaultMaxKeyframes,
                 fileNamePrefix: String? = nil, neutralizeBackground: Bool = false) {
-        // Review7 P2: Siril REWRITES live_stack.fit in place, so identity
-        // (dev, ino, size, mtime-ns) must never gate hashing here — a coarse or
-        // cached filesystem timestamp could collide across a real content
-        // change. Full rehash every stable scan (the strict policy).
+        // Review7 P2 / review9 item 1: Siril watcher mode matches BOTH the classic
+        // in-place live_stack.fit AND the immutable numbered revisions
+        // (live_stack_00001.fit …) Siril 1.4+ writes under the same prefix.
+        // `.mutableStackerOutput` handles this per entry: the classic file is
+        // REWRITTEN in place, so identity (dev, ino, size, mtime-ns) never gates
+        // its hashing (a coarse or cached filesystem timestamp could collide
+        // across a real content change — full rehash every stable scan); numbered
+        // revisions are written once, so after their confirmed first emission
+        // (same stat-stability + digest-stability gates) they cost one fstat per
+        // poll instead of re-hashing an ever-growing revision history.
         self.watcher = StackFileWatcher(folder: watchFolder, fileNamePrefix: fileNamePrefix,
                                         digestPolicy: .mutableStackerOutput)
         self.source = nil
