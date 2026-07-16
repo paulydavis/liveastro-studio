@@ -19,7 +19,6 @@ proper live in the app target only.
 flowchart TB
     subgraph App["LiveAstroStudio (SwiftUI app)"]
         AppModel["AppModel (owner: session lifecycle, settings, shared UI state)"]
-        BC["BroadcastController (OBS / Go Live / scene automation)"]
         LSC["LiveSourceController (relay, prune, detect)"]
         IC["ImportController (batch import, replay regen, GraXpert)"]
         Views["MainView · ControlView · BroadcastView · HelpView · CalibrationSection"]
@@ -38,13 +37,15 @@ flowchart TB
         Replay["Replay: FrameSelector, ReplayGenerator, ReplayService"]
         Proc["Processing: Processor, GraXpertProcessor, ProcessRunner"]
         OBS["OBS: OBSClient, OBSController, OBSAuth, StallDetector, StreamHealth"]
+        BC["BroadcastController (Go Live state machine / confirmed stops /\nscene automation) — injected OBSController + BroadcastDeps"]
         Set["Settings: SessionSettings + Store"]
         Text["Text: MarkdownBlocks (Help renderer)"]
     end
 
     TestSupport["Test-support executables: fakesiril (synthetic Siril livestack),\nfaulthelper (SIGKILL crash scenarios) — see §5"]
 
-    AppModel -->|owns via AppSurface| BC & LSC & IC
+    AppModel -->|owns via AppSurface| LSC & IC
+    AppModel -->|owns via BroadcastDeps| BC
     Views --> AppModel
     AppModel --> Pipe
     AppModel --> Set
@@ -268,10 +269,12 @@ How the code holds it:
 The app layer is decomposed: `AppModel` (~420 lines) owns session lifecycle
 (`startSession`/`wireCallbacks`/`endSession`), settings persistence, the
 session-profile draft, and shared UI state (log, error, counts, latest image,
-zoom/pan, tabs) — and composes three controllers through the **`AppSurface`
-seam**: a struct of closures over AppModel's cross-cutting state. Controllers
-hold **no back-reference to AppModel** (no retain cycles; unit-testable with
-captured closures). All four are `@MainActor @Observable`. The controllers are
+zoom/pan, tabs) — and composes three controllers through closure seams:
+`LiveSourceController` and `ImportController` via the **`AppSurface`** struct,
+and the core-resident `BroadcastController` via **`BroadcastDeps`** (same
+idea, four closures). Controllers hold **no back-reference to AppModel** (no
+retain cycles; unit-testable with captured closures). All four are
+`@MainActor @Observable`. The controllers are
 implicitly-unwrapped properties assigned exactly once early in `AppModel.init`
 — the IUO only breaks the init-order knot (the closures capture `self`).
 
@@ -289,10 +292,15 @@ flowchart TB
 ```
 
 Controller responsibilities: **BroadcastController** — OBS config, connect +
-auto-launch, Go Live state machine, health poll, stall scene automation;
-**LiveSourceController** — FrameRelay lifecycle, prune, the three detect
-paths; **ImportController** — `importSubs`/cancel/progress,
-`regenerateReplay`, `processMaster` (GraXpert).
+auto-launch, Go Live state machine, confirmed stops, health poll, stall scene
+automation. Since review6 it lives in **LiveAstroCore** (unit-tested through
+the mocked OBS socket): `OBSController` is constructor-injected and the app
+boundaries flow through a `BroadcastDeps` closure struct (log, presentError,
+isSessionRunning, launchOBS) instead of `AppSurface`; the app-side
+`OBSLauncher` adapter owns every launch detail (bundle-id resolution, `open -a`
+fallback, launch logging). **LiveSourceController** — FrameRelay lifecycle,
+prune, the three detect paths; **ImportController** —
+`importSubs`/cancel/progress, `regenerateReplay`, `processMaster` (GraXpert).
 
 - **Display adjustments** (`DisplayAdjustments`, persisted): black point,
   stretch strength, saturation, optional multiscale DBE flatten — all
@@ -325,17 +333,33 @@ Hello→Identify→Identified handshake, requestId correlation, event stream),
 `OBSAuth` (CryptoKit SHA-256 challenge auth), and `OBSController` (@MainActor
 state machine `disconnected→connecting→connected→streaming` + scene/record
 state; every op except connect swallows errors into the log — **OBS never
-blocks the astronomy session**). `BroadcastController` (app target) does the
-AppKit choreography: connect with auto-launch via NSWorkspace (20 s retry
-budget), **Go Live** (deliberate broadcast: set scene, StartStream, confirm via
-status polls, undo on race with End), 2 s stream-health polling, and
-stall-based **scene automation** — a 15 s timer checks a `StallDetector`
-(threshold `max(3×subExposure, 90 s)`); on stall it switches to the scope scene
-once, on the next accepted frame back to the stack scene; an operator-initiated
-scene change pauses automation until the next stall/resume boundary. End
-Session is the **only** place the stream is stopped — and only after replay
-generation completes or fails (scene automation stops immediately at the
-click); quit/crash deliberately leaves an OBS broadcast running.
+blocks the astronomy session** — though the stop ops report request outcome and
+`stopBroadcast` confirms stream+record inactive via status polls).
+`BroadcastController` (core, injected `OBSController` + `BroadcastDeps`) does
+the broadcast choreography: connect with auto-launch *requested* through
+`deps.launchOBS` (the app's `OBSLauncher` owns the NSWorkspace details; 20 s
+retry budget), **Go Live** (deliberate broadcast: set scene, StartStream,
+confirm via status polls, optional record-while-streaming after the stream is
+confirmed up), 2 s stream-health polling, and stall-based **scene automation**
+— a 15 s timer checks a `StallDetector` (threshold `max(3×subExposure, 90 s)`);
+on stall it switches to the scope scene once, on the next accepted frame back
+to the stack scene; an operator-initiated scene change pauses automation until
+the next stall/resume boundary.
+
+Broadcast state invariant (review6): **`.idle` means OBS has confirmed stream
+and recording inactive; `.stopUnconfirmed` means OBS may still be live — Go
+Live is blocked and Retry is available; every asynchronous completion must
+match the current generation before changing state; core requests launch, the
+app adapter owns every platform detail.** Monotonic generation tokens
+(broadcast + scene automation) make stale completions no-ops: a cancelled Go
+Live can't mutate a newer attempt, the deferred end-of-session stop skips when
+a newer broadcast is live, and queued scene changes never fire after
+automation stops. End Session stops the stream only after replay generation
+completes or fails (scene automation stops immediately at the click; during
+`.endingSession` the operator may override with End Broadcast — generation
+bumps synchronously, `.idle` only on a confirmed stop); quit/crash/disconnect
+deliberately leaves an OBS broadcast running — a disconnect that strands a
+live stream lands `.stopUnconfirmed`, never idle.
 
 ## 8. Key design decisions
 

@@ -268,9 +268,13 @@ struct ControlView: View {
                     case .endingSession:
                         // Review5 P2: the stream deliberately stays live until the replay
                         // finishes — don't offer Go Live, and keep showing live health truth.
+                        // Review6: offer End Broadcast as an operator override (stream down
+                        // NOW while the replay renders).
                         HStack(spacing: 10) {
                             ProgressView().controlSize(.small)
                             Text("Ending broadcast…")
+                            Button("End Broadcast", role: .destructive) { model.broadcast.endBroadcast() }
+                                .help("Stop the stream now instead of waiting for the replay to finish rendering.")
                             if let h = model.broadcast.streamHealth {
                                 Text("● LIVE · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
                                     .foregroundStyle(.red).font(.caption)
@@ -278,6 +282,17 @@ struct ControlView: View {
                         }
                     case .stopping:
                         HStack { ProgressView().controlSize(.small); Text("Stopping…") }
+                    case .stopUnconfirmed:
+                        // Review6 P1: the stop was never confirmed — OBS may still be live.
+                        // Honest state: block Go Live and offer Retry.
+                        HStack(spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.yellow)
+                            Text("OBS may still be live — check OBS")
+                                .font(.caption)
+                            Button("Retry") { model.broadcast.retryStop() }
+                                .help("Re-attempt the stop and confirm the stream and recording are down.")
+                        }
                     }
                     Spacer()
                 }
@@ -447,7 +462,10 @@ private struct OBSSection: View {
                 }
                 Spacer()
                 if connected {
-                    Button("Disconnect") { obs.disconnect() }
+                    // Route through BroadcastController so a disconnect that strands a
+                    // live stream lands in .stopUnconfirmed (honest state), never .idle.
+                    // Disconnect ≠ stop, by design: no StopStream is sent.
+                    Button("Disconnect") { model.broadcast.disconnect() }
                 } else {
                     Button("Connect") { connectOBS() }
                 }

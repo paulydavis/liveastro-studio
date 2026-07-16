@@ -88,10 +88,12 @@ final class AppModel {
 
     // MARK: - Broadcast
 
-    /// OBS / broadcast / scene-automation cluster (T1 extraction). Owned here as
-    /// an implicitly-unwrapped `let`-in-spirit: it's assigned exactly once, early
-    /// in `init`, before any use — the IUO is only to break the init-order knot
-    /// (the `AppSurface` closures capture `self`, so `broadcast` cannot be a
+    /// OBS / broadcast / scene-automation cluster (T1 extraction; core-resident
+    /// since review6 — constructed here with an injected `OBSController` and the
+    /// `BroadcastDeps` closure seam). Owned here as an implicitly-unwrapped
+    /// `let`-in-spirit: it's assigned exactly once, early in `init`, before any
+    /// use — the IUO is only to break the init-order knot (the `BroadcastDeps`
+    /// closures capture `self`, so `broadcast` cannot be a
     /// stored `let` initialized in its declaration). Assigned exactly once in
     /// `init` and never reassigned — the `var` (rather than `private(set) var`)
     /// is required only so SwiftUI can form writable bindings through it

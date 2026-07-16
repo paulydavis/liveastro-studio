@@ -148,12 +148,20 @@ public final class OBSController: ObservableObject {
         _ = await requestData("StartStream", nil)
     }
 
-    public func stopStream() async {
-        _ = await requestData("StopStream", nil)
+    /// Stop the stream. Returns whether the StopStream request round-tripped
+    /// ok — this is REQUEST success, not yet confirmation the output went
+    /// inactive (use `stopBroadcast`'s confirm loop or `streamStatus()` for
+    /// that). Errors are still swallowed into `onLog` as before.
+    @discardableResult
+    public func stopStream() async -> Bool {
+        await requestData("StopStream", nil) != nil
     }
 
-    public func setRecording(_ on: Bool) async {
-        _ = await requestData(on ? "StartRecord" : "StopRecord", nil)
+    /// Start/stop recording. Returns whether the request round-tripped ok
+    /// (request success, not output-state confirmation).
+    @discardableResult
+    public func setRecording(_ on: Bool) async -> Bool {
+        await requestData(on ? "StartRecord" : "StopRecord", nil) != nil
     }
 
     // MARK: - Broadcast operations
@@ -162,6 +170,12 @@ public final class OBSController: ObservableObject {
     public func streamStatus() async -> StreamHealth? {
         guard let data = await requestData("GetStreamStatus", nil) else { return nil }
         return StreamHealth.parse(data)
+    }
+
+    /// Fetch whether the record output is active; nil if unavailable.
+    public func recordStatus() async -> Bool? {
+        guard let data = await requestData("GetRecordStatus", nil) else { return nil }
+        return data["outputActive"] as? Bool
     }
 
     /// Deliberate broadcast: switch to `scene` (if given), start the stream, and
@@ -188,10 +202,30 @@ public final class OBSController: ObservableObject {
         return false
     }
 
-    /// Stop a broadcast: stop the stream and turn recording off.
-    public func stopBroadcast() async {
+    /// Stop a broadcast: stop the stream, turn recording off, and CONFIRM both
+    /// outputs went inactive by polling GetStreamStatus/GetRecordStatus (the
+    /// mirror of `startBroadcast`'s confirm loop). Returns `true` only once
+    /// stream AND record are confirmed inactive; `false` on request failure,
+    /// no client, or an unconfirmed stop — the caller must then treat OBS as
+    /// possibly still live (review6 P1: no idle-despite-unknown-remote-state).
+    /// At least one confirmation poll is always performed.
+    @discardableResult
+    public func stopBroadcast(confirmPollSeconds: Double = 1.0,
+                              maxConfirmPolls: Int = 5) async -> Bool {
         await stopStream()
         await setRecording(false)
+        for i in 0..<max(1, maxConfirmPolls) {
+            if let stream = await streamStatus(), !stream.active,
+               let recording = await recordStatus(), !recording {
+                log("broadcast confirmed stopped")
+                return true
+            }
+            if i < maxConfirmPolls - 1, confirmPollSeconds > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(confirmPollSeconds * 1_000_000_000))
+            }
+        }
+        log("could not confirm stream/record inactive — OBS may still be live")
+        return false
     }
 
     // MARK: - Request plumbing
