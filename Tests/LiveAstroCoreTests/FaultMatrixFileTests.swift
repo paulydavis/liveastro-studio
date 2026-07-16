@@ -464,6 +464,99 @@ final class FaultMatrixFileTests: XCTestCase {
         watcher.stop()
     }
 
+    /// Watcher × folder replacement (F2, review2): a same-name file recreated after the watched
+    /// folder disappears must NOT inherit the vanished file's pending stability observation. Before
+    /// the fix, `lastSeenStat` survived the disappearance, so a recreated same-name file whose
+    /// (size, mtime) matched the last observation passed the two-tick stability gate on its FIRST
+    /// post-return sighting — publishing a possibly-in-progress FITS. After the fix the pending map
+    /// is cleared on disappearance (emitted-digest retained for dedup), so the recreated file must
+    /// re-earn stability across ticks before it emits.
+    ///
+    /// Deterministic reproduction: the recreated file is given the SAME size and (via setAttributes)
+    /// the SAME mtime as the vanished baseline — the exact coarse-mtime collision the finding calls
+    /// out — but DIFFERENT content (different digest, so dedup does not mask the stability gate). It
+    /// must not emit on the first post-return sighting; once stable across a tick, it emits exactly
+    /// once.
+    func testWatcher_folderReplaced_sameNameFileReEarnsStabilityNotEmittedEarly() async throws {
+        let fs = try TempFS("watch-replace"); defer { fs.tearDown() }
+        let folder = try fs.dir("watched")
+        let pollInterval: TimeInterval = 0.4
+        let watcher = StackFileWatcher(folder: folder, quietPeriod: 0.1, pollInterval: pollInterval,
+                                       fileNamePrefix: "live_stack")
+        let collector = collect(watcher)
+
+        // Timestamp the "folder returned" log and the replacement's emit so we can prove the emit
+        // did NOT happen in the same scan tick that saw the folder return (it re-earned stability).
+        let clock = FolderReplaceClock()
+        watcher.onLog = { msg in if msg.contains("watched folder returned") { clock.markReturned() } }
+        try watcher.start(); defer { watcher.stop() }
+
+        // Baseline: a complete FITS emits, and its (size, mtime) become the pending/last-seen stat.
+        let name = "live_stack.fit"
+        let url = folder.appendingPathComponent(name)
+        let baseline = makeFITS(0.4, size: 64)
+        try baseline.write(to: url)
+        let baselineEmit = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(baselineEmit, "baseline file emits")
+        let baselineMtime = try FileManager.default
+            .attributesOfItem(atPath: url.path)[.modificationDate] as! Date
+
+        // Disruption: remove the whole watched folder (clears pending stability under the fix).
+        try Disruptor.removeDirectory(folder)
+        try await Task.sleep(nanoseconds: 900_000_000)   // let poll ticks notice the disappearance
+
+        // Recovery: recreate the folder with the replacement ALREADY inside, so the return scan sees
+        // the folder-plus-file atomically in one tick (no interleaving where the return tick sees an
+        // empty folder — that would let the buggy code's first-sighting emit land a tick later and
+        // spuriously pass). Stage a sibling dir containing a DIFFERENT-content, SAME-name, SAME-size
+        // file whose mtime is forced to the vanished baseline's — the exact coarse-mtime collision the
+        // finding calls out — then rename the whole dir into place. Different pixels → different digest,
+        // so dedup does not mask the stability gate.
+        let staged = fs.root.appendingPathComponent("staged-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: staged, withIntermediateDirectories: true)
+        let replacement = makeFITS(0.9, size: 64)
+        XCTAssertEqual(replacement.count, baseline.count, "arrange: replacement is the same size")
+        let stagedFile = staged.appendingPathComponent(name)
+        try replacement.write(to: stagedFile)
+        try FileManager.default.setAttributes([.modificationDate: baselineMtime],
+                                              ofItemAtPath: stagedFile.path)
+        try FileManager.default.moveItem(at: staged, to: folder)   // atomic folder-with-file return
+        clock.markReplacementWritten()
+
+        // The replacement must emit (recovery works), but only AFTER re-earning stability — i.e. not
+        // in the same scan tick that first re-sees it. We prove that by the emit timestamp lagging the
+        // "folder returned" mark by at least ~one poll interval. Without the fix, the stale (size,
+        // mtime) match fires an emit in the very first post-return sighting (same tick as the return),
+        // so the gap would be ~0.
+        let emittedAfterStable = await collector.waitForCount(2, timeout: 6)
+        XCTAssertTrue(emittedAfterStable, "the replacement must emit once it re-earns stability")
+        clock.markEmit()
+
+        let gap = clock.returnToEmitGap()
+        XCTAssertGreaterThanOrEqual(gap, pollInterval * 0.8,
+            "F2: recreated same-name/size/mtime file must re-earn stability across a tick, not emit in the return tick (gap \(gap)s < ~one poll interval)")
+    }
+
+    /// Thread-safe timestamp collector for the folder-replacement stability test: the watcher's log
+    /// fires on its serial queue while the test thread reads — lock-protect (F5 pattern).
+    private final class FolderReplaceClock {
+        private let lock = NSLock()
+        private var returnedAt: Date?
+        private var replacementAt: Date?
+        private var emitAt: Date?
+        func markReturned() { lock.lock(); if returnedAt == nil { returnedAt = Date() }; lock.unlock() }
+        func markReplacementWritten() { lock.lock(); replacementAt = Date(); lock.unlock() }
+        func markEmit() { lock.lock(); if emitAt == nil { emitAt = Date() }; lock.unlock() }
+        /// Seconds between the LATER of (folder-returned, replacement-written) and the emit. Using the
+        /// later of the two avoids counting time before the replacement even existed on disk.
+        func returnToEmitGap() -> TimeInterval {
+            lock.lock(); defer { lock.unlock() }
+            let start = max(returnedAt ?? .distantPast, replacementAt ?? .distantPast)
+            guard let emit = emitAt, start > .distantPast else { return 0 }
+            return emit.timeIntervalSince(start)
+        }
+    }
+
     /// stop() during the missing-folder window must be a no-op (no crash, idempotent).
     func testWatcher_stopAfterDirRemoved_noCrash() async throws {
         let fs = try TempFS("watch-stop-missing"); defer { fs.tearDown() }

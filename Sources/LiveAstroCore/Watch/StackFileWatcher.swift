@@ -117,6 +117,13 @@ public final class StackFileWatcher {
                 onLog?("watched folder disappeared — waiting for it to return: \(folder.path)")
                 // Cancel the stale DispatchSource fd (bound to the deleted inode).
                 cancelSource()
+                // F2 (review2): clear the PENDING stability observations. Otherwise a recreated,
+                // same-name file whose (size, mtime) happen to match the vanished file's last
+                // observation would pass the two-tick stability gate on its very FIRST sighting
+                // after return — publishing a still-in-progress FITS. Recreated files must re-earn
+                // stability across ticks. The emitted-digest map is RETAINED so dedup survives a
+                // disappear→return (a truly identical, already-emitted file is not re-emitted).
+                lastSeenStat.removeAll()
             }
             // While missing, keep the timer running (it will notice the return).
             return
