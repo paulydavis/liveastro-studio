@@ -294,15 +294,20 @@ final class OBSControllerTests: XCTestCase {
         controller.disconnect()
     }
 
-    func testStartBroadcastNeverActiveStopsAndReturnsFalse() async throws {
-        // GetStreamStatus always reports outputActive:false → give up + StopStream.
+    func testStartBroadcastNeverActiveReturnsFalseAndSendsNoStop() async throws {
+        // GetStreamStatus always reports outputActive:false → give up, return
+        // false, and send NOTHING further. Review7 P1: the CALLER owns cleanup —
+        // an internal StopStream-on-expiry here fired before the caller's
+        // generation check could run, so a stale attempt could kill a newer
+        // broadcast's stream.
         let (controller, mock) = try await makeConnectedController(streamStatusActive: false)
         let ok = await controller.startBroadcast(scene: "Stack", confirmPollSeconds: 0, maxConfirmPolls: 3)
         XCTAssertFalse(ok)
         let types = mock.sentFrames.filter { $0.contains("\"op\":6") }
                                    .map { requestType(fromSent: $0) }
         XCTAssertTrue(types.contains("StartStream"))
-        XCTAssertTrue(types.contains("StopStream"))   // reset OBS on failure
+        XCTAssertFalse(types.contains("StopStream"),
+                       "startBroadcast must not stop on failure — the caller owns cleanup")
         controller.disconnect()
     }
 

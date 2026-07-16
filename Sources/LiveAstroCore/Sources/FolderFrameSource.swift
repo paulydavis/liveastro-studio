@@ -67,7 +67,12 @@ public final class FolderFrameSource: FrameSource {
             importCursor?.snapshotIfNeeded()
 
         case .live:
-            let w = StackFileWatcher(folder: folder, fileNamePrefix: fileNamePrefix)
+            // Review7 P2: native relay / rig folders publish each sub ONCE and
+            // never touch it again — an already-emitted identity is trusted, so
+            // every poll costs one fstat per file instead of re-hashing the
+            // whole (ever-growing) folder each scan.
+            let w = StackFileWatcher(folder: folder, fileNamePrefix: fileNamePrefix,
+                                     digestPolicy: .immutableAfterPublish)
             w.onLog = onLog   // forward folder-disappearance events to the app log
             self.watcher = w
             try w.start()

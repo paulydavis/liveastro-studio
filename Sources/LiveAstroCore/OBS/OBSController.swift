@@ -178,10 +178,37 @@ public final class OBSController: ObservableObject {
         return data["outputActive"] as? Bool
     }
 
+    /// Confirm the record OUTPUT actually became active after an accepted
+    /// StartRecord (review7 P2: acceptance ≠ output-state confirmation — see
+    /// `setRecording`'s doc). Polls GetRecordStatus, mirroring
+    /// `startBroadcast`'s stream confirm loop. Returns true once outputActive
+    /// is confirmed; false when the polls expire or status is unavailable —
+    /// the CALLER decides policy (BroadcastController warns and streams on;
+    /// recording never fails a broadcast).
+    /// At least one confirmation poll is always performed.
+    @discardableResult
+    public func confirmRecordingActive(confirmPollSeconds: Double = 1.0,
+                                       maxConfirmPolls: Int = 5) async -> Bool {
+        for i in 0..<max(1, maxConfirmPolls) {
+            if let active = await recordStatus(), active {
+                log("recording confirmed active")
+                return true
+            }
+            if i < maxConfirmPolls - 1, confirmPollSeconds > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(confirmPollSeconds * 1_000_000_000))
+            }
+        }
+        log("record output did not go active")
+        return false
+    }
+
     /// Deliberate broadcast: switch to `scene` (if given), start the stream, and
-    /// confirm it went live by polling GetStreamStatus. On failure to confirm,
-    /// send StopStream to reset OBS (don't leave it half-streaming) and return
-    /// false. Returns true once outputActive is confirmed.
+    /// confirm it went live by polling GetStreamStatus. Returns true once
+    /// outputActive is confirmed; false when the polls expire or status is
+    /// unavailable — and on failure this sends NOTHING further. The CALLER owns
+    /// cleanup policy (review7 P1: an internal StopStream-on-expiry here fired
+    /// BEFORE the caller's generation check could run, so a stale attempt's
+    /// cleanup could kill a newer broadcast's stream).
     /// At least one confirmation poll is always performed (maxConfirmPolls is floored to 1).
     @discardableResult
     public func startBroadcast(scene: String?, confirmPollSeconds: Double = 1.0,
@@ -197,8 +224,7 @@ public final class OBSController: ObservableObject {
                 try? await Task.sleep(nanoseconds: UInt64(confirmPollSeconds * 1_000_000_000))
             }
         }
-        log("stream did not go active — stopping; check OBS ▸ Settings ▸ Stream")
-        await stopStream()
+        log("stream did not go active — check OBS ▸ Settings ▸ Stream")
         return false
     }
 
@@ -270,7 +296,9 @@ public final class OBSController: ObservableObject {
         eventsTask = Task { [weak self] in
             for await event in events {
                 if Task.isCancelled { return }
-                await self?.apply(event: event.type, data: event.data)
+                // Task {} inherits this controller's main-actor isolation, so
+                // apply(event:data:) is a same-actor synchronous call.
+                self?.apply(event: event.type, data: event.data)
             }
         }
     }

@@ -61,7 +61,12 @@ public final class SessionPipeline {
                 replaySettings: ReplaySettings = .init(),
                 maxKeyframes: Int = FrameSelector.defaultMaxKeyframes,
                 fileNamePrefix: String? = nil, neutralizeBackground: Bool = false) {
-        self.watcher = StackFileWatcher(folder: watchFolder, fileNamePrefix: fileNamePrefix)
+        // Review7 P2: Siril REWRITES live_stack.fit in place, so identity
+        // (dev, ino, size, mtime-ns) must never gate hashing here — a coarse or
+        // cached filesystem timestamp could collide across a real content
+        // change. Full rehash every stable scan (the strict policy).
+        self.watcher = StackFileWatcher(folder: watchFolder, fileNamePrefix: fileNamePrefix,
+                                        digestPolicy: .mutableStackerOutput)
         self.source = nil
         self.engine = nil
         self.profile = profile
