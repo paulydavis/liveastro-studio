@@ -252,9 +252,13 @@ How the code holds it:
   production no-ops: `FrameRelay.onPrePublish` (sync point between
   copy-verification and the atomic rename; `relay-midcopy` cell) and
   `SessionManager.manifestWriter` (injectable manifest write, nil in
-  production → the identical atomic write; `manifest-midwrite` cell, so the
-  kill provably overlaps an in-flight write). Justifications live in
-  fault-matrix.md next to their cells.
+  production → the identical atomic write; `manifest-midwrite` cell). The
+  helper's injected writer stages the full bytes to a same-dir temp, sets the
+  readiness flag only after staging has begun, then renames to publish — so
+  the kill lands within an open write transaction (staged-but-unpublished
+  data, or a subsequent staged write). Not guaranteed: which version survives;
+  only that the published manifest is always some complete version.
+  Justifications live in fault-matrix.md next to their cells.
 
 ## 6. App / UI structure
 

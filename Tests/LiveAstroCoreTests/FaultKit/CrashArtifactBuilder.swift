@@ -50,9 +50,11 @@ enum CrashArtifactBuilder {
         }
 
         // The helper has reached its coordinated point (flag touched). SIGKILL lands mid-state.
-        // NOTE (F3): for `manifest-midwrite` the flag is touched from INSIDE a manifest write (via the
-        // injected SessionManager.manifestWriter seam), so this kill provably overlaps an in-flight
-        // atomic write — not a pre-seeded manifest sitting idle before the first challenged write.
+        // NOTE (F3/review3): for `manifest-midwrite` the injected SessionManager.manifestWriter seam
+        // touches the flag only AFTER staging a new manifest version to a same-dir temp file (with
+        // the atomic rename/publish still pending), so this kill lands within an open write
+        // transaction (staged-but-unpublished data, or a subsequent iteration's staged write) — not
+        // on a pre-seeded manifest sitting idle before the first challenged write.
         kill(process.processIdentifier, SIGKILL)
         process.waitUntilExit()
         return aftermath
