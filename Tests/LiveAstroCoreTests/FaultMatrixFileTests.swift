@@ -740,10 +740,9 @@ final class FaultMatrixFileTests: XCTestCase {
     private final class WatcherLogSink {
         private let lock = NSLock()
         private var lines: [String] = []
-        func append(_ s: String) { lock.lock(); lines.append(s); lock.unlock() }
+        func append(_ s: String) { lock.withLock { lines.append(s) } }
         func count(containing sub: String) -> Int {
-            lock.lock(); defer { lock.unlock() }
-            return lines.filter { $0.contains(sub) }.count
+            lock.withLock { lines.filter { $0.contains(sub) }.count }
         }
         /// Poll until at least `n` lines containing `sub` have been logged (Collector.waitForCount
         /// pattern) — no raw sleeps for correctness in poll-driven assertions.
@@ -764,16 +763,17 @@ final class FaultMatrixFileTests: XCTestCase {
         private var returnedAt: Date?
         private var replacementAt: Date?
         private var emitAt: Date?
-        func markReturned() { lock.lock(); if returnedAt == nil { returnedAt = Date() }; lock.unlock() }
-        func markReplacementWritten() { lock.lock(); replacementAt = Date(); lock.unlock() }
-        func markEmit() { lock.lock(); if emitAt == nil { emitAt = Date() }; lock.unlock() }
+        func markReturned() { lock.withLock { if returnedAt == nil { returnedAt = Date() } } }
+        func markReplacementWritten() { lock.withLock { replacementAt = Date() } }
+        func markEmit() { lock.withLock { if emitAt == nil { emitAt = Date() } } }
         /// Seconds between the LATER of (folder-returned, replacement-written) and the emit. Using the
         /// later of the two avoids counting time before the replacement even existed on disk.
         func returnToEmitGap() -> TimeInterval {
-            lock.lock(); defer { lock.unlock() }
-            let start = max(returnedAt ?? .distantPast, replacementAt ?? .distantPast)
-            guard let emit = emitAt, start > .distantPast else { return 0 }
-            return emit.timeIntervalSince(start)
+            lock.withLock {
+                let start = max(returnedAt ?? .distantPast, replacementAt ?? .distantPast)
+                guard let emit = emitAt, start > .distantPast else { return 0 }
+                return emit.timeIntervalSince(start)
+            }
         }
     }
 
