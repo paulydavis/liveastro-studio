@@ -1372,4 +1372,204 @@ final class StackFileWatcherTests: XCTestCase {
                           "an in-place mutation after validation must be refused by the fstat check")
         }
     }
+
+    // MARK: - cold1 C1: permanently-invalid revision write-off (the starvation escape valve)
+
+    /// Cold1 C1 (CRITICAL, red-first — the reviewer's exact starvation repro): one
+    /// permanently-invalid numbered revision (truncated _00001, a producer crash) fails
+    /// validity on EVERY scan, sets the holdback, and pre-fix silently starved ALL higher
+    /// revisions forever — no emission, no log line, ever. The escape valve: a blocker
+    /// that is INVALID (structural — not merely mid-gate) accrues a per-name consecutive-
+    /// invalid-scan counter; at `invalidRevisionWriteOffScans` consecutive invalid scans
+    /// it is permanently written off with ONE honest log line, its hold releases, and the
+    /// healthy higher revisions proceed in order. The write-off does NOT advance the
+    /// high-water mark (only real emissions do).
+    func testMutablePolicy_permanentlyInvalidRevision_writtenOff_higherRevisionsProceed() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        let full = makeFITS(0.5, size: 64)
+        // Truncated: header parses but declares more data than the file holds — the
+        // structural-invalidity branch fires on every stable scan.
+        try full.prefix(full.count / 2)
+            .write(to: tmp.appendingPathComponent("live_stack_00001.fit"))
+        try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
+        try makeFITS(0.3).write(to: tmp.appendingPathComponent("live_stack_00003.fit"))
+
+        watcher.scanNow()                 // sighting — stats recorded, nothing invalid yet
+        watcher.scanNow()                 // stable: _00001 invalid #1; _00002/_00003 digests pending
+        clock.advance(seconds: 3601)      // the healthy pendings are confirmable from here on
+        // Each invalid observation clears _00001's evidence (review10 item 2), so it
+        // re-earns stability on the following scan — observations #2…#(N-1) land every
+        // OTHER scan: 2×(N-2)+1 scans leave the count at N-1 with the hold still up.
+        for _ in 0..<(2 * (StackFileWatcher.invalidRevisionWriteOffScans - 2) + 1) {
+            watcher.scanNow()
+        }
+        let heldThroughout = await collector.waitForCount(1, timeout: 0.3)
+        XCTAssertFalse(heldThroughout,
+                       "before the write-off threshold the invalid _00001 still holds the series")
+
+        watcher.scanNow()                 // invalid #N → written off → _00002/_00003 emit THIS scan
+        let got = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(got, "healthy revisions must proceed once the invalid blocker is written off")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00002.fit", "live_stack_00003.fit"],
+                       "the healthy revisions emit in numeric order; the invalid one never does")
+        let writeOffLines = logs.all.filter { $0.contains("abandoning") }
+        XCTAssertEqual(writeOffLines.count, 1,
+                       "the write-off must appear honestly in the log exactly once — got \(logs.all)")
+        let line = writeOffLines.first ?? ""
+        XCTAssertTrue(line.contains("revision 00001") && line.contains("frame lost"),
+                      "the log names the revision and admits the frame loss — got \(writeOffLines)")
+
+        // Post-write-off scans stay silent: no repeat log, no late emission of _00001.
+        clock.advance(seconds: 3601)
+        watcher.scanNow()
+        watcher.scanNow()
+        let after = await collector.items
+        XCTAssertEqual(after.count, 2, "the written-off revision must never emit")
+        XCTAssertEqual(logs.all.filter { $0.contains("abandoning") }.count, 1,
+                       "the write-off line fires once, not per tick")
+    }
+
+    /// Cold1 C1 counterpart (mid-gate is NOT invalid): a lower revision that is merely
+    /// STILL STABILIZING — stat identity moving every scan, i.e. making progress — holds
+    /// higher revisions indefinitely, well past the write-off threshold, and is never
+    /// written off. When it finally completes, both emit in numeric order.
+    func testMutablePolicy_stillStabilizingRevision_neverWrittenOff_emitsInOrder() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
+        try makeFITS(0.1, size: 16).write(to: url1)
+        try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
+        watcher.scanNow()                 // sighting
+
+        // _00001 is rewritten before every scan (same size, new mtime): stat-unstable —
+        // a mid-gate blocker for MORE scans than the write-off threshold.
+        for i in 0..<(StackFileWatcher.invalidRevisionWriteOffScans + 2) {
+            try makeFITS(0.1 + Float(i + 1) * 0.01, size: 16).write(to: url1)
+            clock.advance(seconds: 3601)
+            watcher.scanNow()
+        }
+        let premature = await collector.waitForCount(1, timeout: 0.3)
+        XCTAssertFalse(premature, "_00002 stays held while _00001 is still stabilizing")
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "a still-progressing blocker must NEVER be written off — got \(logs.all)")
+
+        // _00001 settles → earns stability + the digest gate → both emit in order.
+        watcher.scanNow()                 // stable → digest pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                 // confirmed → _00001 emits; _00002 follows in order
+        let got = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(got, "both revisions emit once the blocker completes")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00001.fit", "live_stack_00002.fit"],
+                       "order preserved — the hold was the point, the write-off must not fire")
+    }
+
+    /// Cold1 C1, recovery-before-threshold: an invalid revision that becomes valid before
+    /// accruing the write-off count emits normally (counter reset on passing validity),
+    /// in order, with no write-off log.
+    func testMutablePolicy_invalidRevisionRecoversBeforeThreshold_emitsNormally() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        let full = makeFITS(0.5, size: 64)
+        let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
+        try full.prefix(full.count / 2).write(to: url1)   // truncated — invalid while stable
+        try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
+
+        watcher.scanNow()                 // sighting
+        watcher.scanNow()                 // _00001 invalid #1; _00002 pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                 // invalid #2 — still under the threshold
+
+        try full.write(to: url1)          // the producer finishes the file — a new attempt
+        watcher.scanNow()                 // identity changed → re-earns stability (not invalid)
+        watcher.scanNow()                 // stable → digest pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                 // confirmed → _00001 emits, _00002 follows
+        let got = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(got, "a recovered revision emits normally")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00001.fit", "live_stack_00002.fit"])
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "no write-off for a file that recovered under the threshold — got \(logs.all)")
+    }
+
+    // MARK: - cold1 I3: ordering machinery is .mutableStackerOutput-only
+
+    /// Cold1 I3 (red-first): under `.immutableAfterPublish` numbered files are just files —
+    /// order is irrelevant to stacking, and a bulk copy arriving out of numeric order
+    /// (rsync/Finder/SMB visibility lag) must lose NOTHING. Pre-fix the high-water mark
+    /// permanently dropped _00001.._00003 after _00100 emitted.
+    func testImmutablePolicy_outOfOrderArrival_allEmit_noHoldsNoDrops() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .immutableAfterPublish, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.9).write(to: tmp.appendingPathComponent("live_stack_00100.fit"))
+        watcher.scanNow()                 // sighting
+        watcher.scanNow()                 // stable → emits (immutable: no digest gate)
+        let gotHigh = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(gotHigh, "arrange: _00100 emits first")
+
+        // The rest of the bulk copy becomes visible later — numerically BELOW _00100.
+        for i in 1...3 {
+            try makeFITS(Float(i) * 0.1).write(to: tmp.appendingPathComponent("live_stack_0000\(i).fit"))
+        }
+        watcher.scanNow()                 // sighting
+        watcher.scanNow()                 // stable → ALL must emit (no mark, no holds)
+        let got = await collector.waitForCount(4, timeout: 2)
+        XCTAssertTrue(got, "an out-of-order bulk copy must lose nothing under the immutable policy")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00100.fit", "live_stack_00001.fit",
+                        "live_stack_00002.fit", "live_stack_00003.fit"],
+                       "all four frames delivered — numeric order within each scan")
+        XCTAssertTrue(logs.all.filter { $0.contains("out of order") }.isEmpty,
+                      "no out-of-order drops under the immutable policy — got \(logs.all)")
+    }
+
+    /// Cold1 C1 × I3, immutable half of the starvation repro: with ordering machinery
+    /// scoped to the mutable policy, an invalid numbered file under `.immutableAfterPublish`
+    /// never holds its neighbors at all — the healthy files emit on their first stable scan.
+    func testImmutablePolicy_invalidNumberedFile_neverStarvesNeighbors() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .immutableAfterPublish, clock: clock,
+                                        prefix: "live_stack")
+        let collector = collect(watcher)
+        try watcher.start()
+        let full = makeFITS(0.5, size: 64)
+        try full.prefix(full.count / 2)
+            .write(to: tmp.appendingPathComponent("live_stack_00001.fit"))   // truncated forever
+        try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
+        try makeFITS(0.3).write(to: tmp.appendingPathComponent("live_stack_00003.fit"))
+        watcher.scanNow()                 // sighting
+        watcher.scanNow()                 // stable → the healthy pair emits immediately
+        let got = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(got, "an invalid file must not hold healthy neighbors under the immutable policy")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00002.fit", "live_stack_00003.fit"])
+    }
 }

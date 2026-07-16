@@ -409,6 +409,83 @@ public final class StackFileWatcher {
     /// drop line fires once per file, not on every poll tick while the file sits there.
     private var outOfOrderDropLogged: Set<String> = []
 
+    // MARK: Invalid-revision write-off (cold1 C1)
+    //
+    // The holdback above has two very different causes. A MID-GATE blocker (stat-unstable
+    // this tick, or pending digest-stability) is making progress and holds indefinitely —
+    // that is the point of the order gate. A blocker that is structurally INVALID (open
+    // failure, non-regular node, zero/short size, header parse failure, size below the
+    // header-declared length, digest failure) may be a permanent corpse — a producer that
+    // crashed mid-write of live_stack_00001.fit leaves a truncated file that fails validity
+    // on EVERY scan and, without an escape valve, silently starves every higher revision
+    // forever (both invariant clauses violated: the whole session is lost, and nothing
+    // appears in the log). The valve: each structurally-invalid observation of a numbered
+    // revision accrues a per-name CONSECUTIVE-invalid-scan count; at
+    // `invalidRevisionWriteOffScans` consecutive invalid scans the revision is permanently
+    // written off for ordering purposes — one honest log line, its hold releases, later
+    // revisions proceed (the frame is lost, the session preserved). The high-water mark is
+    // NOT advanced by a write-off (only real emissions advance it), so a written-off file
+    // that later becomes valid lands at or below the mark once healthier revisions emit and
+    // takes the existing out-of-order drop treatment. The count resets whenever the file
+    // passes all validity checks (reaches the gates) or its stat identity changes (a
+    // rewrite is a new attempt); it is cleared with the per-generation state.
+
+    /// Consecutive structurally-invalid OBSERVATIONS after which a numbered revision is
+    /// written off. An invalid observation clears the file's pending evidence (review10
+    /// item 2), so the file re-earns stat stability before it can be observed invalid
+    /// again — observations therefore land every OTHER scan and a write-off takes
+    /// ~2×N poll ticks (~20 s at the production 2 s poll): long enough that no plausible
+    /// slow writer is misjudged (a writer in progress moves the stat identity, which
+    /// resets the count), short enough that a producer-crash corpse cannot starve a
+    /// session.
+    static let invalidRevisionWriteOffScans = 5
+
+    /// Consecutive-invalid tracking: the count and the stat identity it was accrued under
+    /// (nil when the invalidity precedes a successful fstat — open/stat failures).
+    private struct InvalidTrack { var count: Int; var identity: FileIdentity? }
+    private var invalidScanTracks: [String: InvalidTrack] = [:]
+    /// Numbered revisions permanently written off this folder generation.
+    private var invalidWrittenOff: Set<String> = []
+
+    /// Cold1 I3: the ordering machinery — high-water mark, reject-below, holdback, and the
+    /// C1 write-off that rides the holdback — exists for REPLAY/REVISION semantics, i.e.
+    /// `.mutableStackerOutput` only. Under `.immutableAfterPublish` numbered files are just
+    /// files (order is irrelevant to stacking): no hold, no drop — a bulk copy arriving out
+    /// of numeric order loses nothing. Numeric SORTING stays for both policies (harmless
+    /// determinism within a scan).
+    private var revisionOrderingEnabled: Bool { digestPolicy == .mutableStackerOutput }
+
+    /// Record one structurally-INVALID observation of a candidate (cold1 C1). Returns true
+    /// when higher-numbered revisions must still be held back this scan (the invalidity is
+    /// under the write-off threshold), false when the file exerts no hold: not a numbered
+    /// revision, ordering not in force (I3), already written off, or written off RIGHT NOW —
+    /// in which case the one honest log line fires and the name joins the out-of-order
+    /// dropped set (so a later mark-drop of a recovered file does not log twice).
+    private func noteInvalidObservation(name: String, revision: String?,
+                                        identity: FileIdentity?) -> Bool {
+        guard revisionOrderingEnabled, let revision else { return false }
+        guard !invalidWrittenOff.contains(name) else { return false }
+        var track = invalidScanTracks[name] ?? InvalidTrack(count: 0, identity: identity)
+        if track.identity != identity {
+            // The stat identity moved since the last invalid sighting — a rewrite is a new
+            // attempt; consecutiveness restarts under the new identity.
+            track = InvalidTrack(count: 0, identity: identity)
+        }
+        track.count += 1
+        guard track.count >= Self.invalidRevisionWriteOffScans else {
+            invalidScanTracks[name] = track
+            return true
+        }
+        // Written off: the hold releases, later revisions proceed, the frame is lost —
+        // honestly. The high-water mark is NOT advanced (only real emissions advance it).
+        invalidScanTracks[name] = nil
+        invalidWrittenOff.insert(name)
+        outOfOrderDropLogged.insert(name)
+        onLog?("revision \(revision) invalid for \(track.count) scans — abandoning it; "
+               + "later revisions proceed (frame lost: \(name))")
+        return false
+    }
+
     // MARK: Numbered-revision parser (review9 items 1+2)
     //
     // The SINGLE source of truth for both CLASSIFYING a numbered stacker revision
@@ -695,6 +772,11 @@ public final class StackFileWatcher {
                 // revisions still dedup; only the ordering gate restarts.
                 emittedRevisionHighWater = nil
                 outOfOrderDropLogged.removeAll()
+                // Cold1 C1: the write-off state is per-generation too — a persisting corpse
+                // re-accrues its invalid count (and is written off again, honestly) after a
+                // reconnect.
+                invalidScanTracks.removeAll()
+                invalidWrittenOff.removeAll()
             }
             if nodeExists {
                 // Something non-directory occupies the watched path. Log once per occupation
@@ -772,6 +854,12 @@ public final class StackFileWatcher {
         if !pendingContent.isEmpty {
             pendingContent = pendingContent.filter { present.contains($0.key) }
         }
+        // Cold1 C1: an ABSENT file breaks the consecutiveness of its invalid-scan count —
+        // the count restarts if the name reappears (still invalid). The write-off SET is
+        // retained: a written-off corpse being briefly invisible does not resurrect it.
+        if !invalidScanTracks.isEmpty {
+            invalidScanTracks = invalidScanTracks.filter { present.contains($0.key) }
+        }
         // Review9 item 2: process candidates in a deterministic order (numbered revisions
         // numerically, everything else lexicographically — see orderedBefore). The revision
         // suffix is parsed ONCE per name here and reused for the per-entry policy below.
@@ -797,8 +885,9 @@ public final class StackFileWatcher {
             // would regress the consumer's replay. Drop the frame permanently, keep the
             // session, log once. Names that already emitted are exempt: their re-sightings
             // are governed by the identity fast-path and digest dedup below (the mark
-            // governs ORDER, never re-emission).
-            if let revision, lastEmittedDigest[name] == nil,
+            // governs ORDER, never re-emission). Cold1 I3: `.mutableStackerOutput` only —
+            // under the immutable policy order is irrelevant and nothing may be dropped.
+            if revisionOrderingEnabled, let revision, lastEmittedDigest[name] == nil,
                let mark = emittedRevisionHighWater,
                Self.numericCompare(revision, mark) != .orderedDescending {
                 if outOfOrderDropLogged.insert(name).inserted {
@@ -821,16 +910,23 @@ public final class StackFileWatcher {
             // this tick, exactly like a failed stat before.
             guard let handle = Self.openFile(directoryFD: folderFD, name: name) else {
                 clearPendingEvidence(for: name)                    // review10 item 2
-                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
+                // Review10 item 1 + cold1 C1: invalid — holds until the write-off threshold.
+                if noteInvalidObservation(name: name, revision: revision, identity: nil) {
+                    holdRevisionsAbove = true
+                }
                 continue
             }
             // Exactly-once close on every path out of this iteration: this explicit close pairs
             // with closeOnDealloc as a backstop (FileHandle tracks closed state — no double close).
             defer { try? handle.close() }
 
-            guard let observed = Self.statFile(handle), observed.size > 0 else {
+            let statResult = Self.statFile(handle)
+            guard let observed = statResult, observed.size > 0 else {
                 clearPendingEvidence(for: name)                    // review10 item 2
-                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
+                // Review10 item 1 + cold1 C1: invalid (stat failure or zero size).
+                if noteInvalidObservation(name: name, revision: revision, identity: statResult) {
+                    holdRevisionsAbove = true
+                }
                 continue
             }
 
@@ -870,7 +966,9 @@ public final class StackFileWatcher {
                 // gate — a pending content observation is only meaningful under the exact
                 // identity it was observed with.
                 pendingContent[name] = nil
-                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: unstable
+                // Review10 item 1: unstable — a MID-GATE blocker (making progress), never
+                // subject to the C1 write-off; holds indefinitely (I3: mutable policy only).
+                if revision != nil, revisionOrderingEnabled { holdRevisionsAbove = true }
                 continue
             }
 
@@ -884,7 +982,10 @@ public final class StackFileWatcher {
                       let header = try? FITSReader.readHeader(head),
                       observed.size >= header.minimumFileSize else {
                     clearPendingEvidence(for: name)                    // review10 item 2
-                    if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
+                    // Review10 item 1 + cold1 C1: invalid (malformed/incomplete FITS).
+                    if noteInvalidObservation(name: name, revision: revision, identity: observed) {
+                        holdRevisionsAbove = true
+                    }
                     continue
                 }
             }
@@ -899,7 +1000,10 @@ public final class StackFileWatcher {
             else {
                 if stopRequested.isSet { return }                  // review10 item 3: aborted by stop()
                 clearPendingEvidence(for: name)                    // review10 item 2
-                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
+                // Review10 item 1 + cold1 C1: invalid (digest failure).
+                if noteInvalidObservation(name: name, revision: revision, identity: observed) {
+                    holdRevisionsAbove = true
+                }
                 continue
             }
 
@@ -911,7 +1015,10 @@ public final class StackFileWatcher {
             // no log spam) and let it re-earn stability on later ticks.
             guard let finalStat = Self.statFile(handle) else {
                 clearPendingEvidence(for: name)                    // review10 item 2
-                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
+                // Review10 item 1 + cold1 C1: invalid (revalidation stat failure).
+                if noteInvalidObservation(name: name, revision: revision, identity: observed) {
+                    holdRevisionsAbove = true
+                }
                 continue
             }
             guard finalStat == observed else {
@@ -922,9 +1029,14 @@ public final class StackFileWatcher {
                 // Review8 finding 1: the identity moved mid-scan — restart the
                 // digest-stability gate along with stat stability.
                 pendingContent[name] = nil
-                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: unstable
+                // Review10 item 1: unstable — mid-gate, never written off (I3: mutable only).
+                if revision != nil, revisionOrderingEnabled { holdRevisionsAbove = true }
                 continue
             }
+            // Cold1 C1: the file passed EVERY structural validity check this scan — the
+            // consecutive-invalid count restarts from zero (a recovery under the threshold
+            // emits normally; only an unbroken run of invalid scans writes a revision off).
+            invalidScanTracks[name] = nil
 
             guard lastEmittedDigest[name] != digest else {
                 // Identical content re-published under a NEW identity (in-place
@@ -981,13 +1093,17 @@ public final class StackFileWatcher {
                     if revision != nil { holdRevisionsAbove = true }   // review10 item 1: mid-gate
                     continue
                 }
+                // NOTE (cold1 I3): these two mid-gate holds need no revisionOrderingEnabled
+                // guard — this whole gate only runs under `.mutableStackerOutput`.
             }
 
             // Review10 item 1 (HOLDBACK): every gate passed, but a LOWER-numbered revision
             // earlier in this scan is still earning its gates — emitting above it would
             // hand the consumer an order regression. This emission waits; its evidence is
-            // intact, so it goes out on the first scan after the blocker clears.
-            if revision != nil, holdRevisionsAbove { continue }
+            // intact, so it goes out on the first scan after the blocker clears. Cold1 I3:
+            // mutable policy only (holdRevisionsAbove is never set otherwise; the guard
+            // makes the scoping explicit).
+            if revisionOrderingEnabled, revision != nil, holdRevisionsAbove { continue }
 
             // Yield-time revalidation (review5 item 1): the emitted URL is still a PATH the
             // consumer resolves later, so before publishing, re-check that the watched path still
@@ -1009,11 +1125,12 @@ public final class StackFileWatcher {
             pendingContent[name] = nil          // the emission consumes the gate evidence
             lastEmittedDigest[name] = digest
             lastEmittedIdentity[name] = observed
-            if let revision,
+            if revisionOrderingEnabled, let revision,
                emittedRevisionHighWater.map({ Self.numericCompare(revision, $0) == .orderedDescending })
                     ?? true {
                 // Review10 item 1: advance the high-water mark at emission — the single
-                // point a revision becomes consumer-visible.
+                // point a revision becomes consumer-visible. Cold1 I3: the mark exists
+                // only where ordering does (`.mutableStackerOutput`).
                 emittedRevisionHighWater = revision
             }
             continuation.yield(StackUpdate(
@@ -1054,6 +1171,9 @@ public final class StackFileWatcher {
         // above still dedup any re-sighting of an already-emitted revision).
         emittedRevisionHighWater = nil
         outOfOrderDropLogged.removeAll()
+        // Cold1 C1: write-off state dies with the generation (see the disappear branch).
+        invalidScanTracks.removeAll()
+        invalidWrittenOff.removeAll()
         folderMissing = true
     }
 
