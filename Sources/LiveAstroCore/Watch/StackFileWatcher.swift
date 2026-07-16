@@ -294,9 +294,14 @@ public final class StackFileWatcher {
     /// Stat identity (digest nil) of the version whose digest currently sits in
     /// `lastEmittedDigest[name]` (review7 P2). Under `.immutableAfterPublish`,
     /// a candidate whose observed identity equals this entry skips ALL content
-    /// work. Retained across folder disappear/replace exactly like
-    /// `lastEmittedDigest` (dedup survives a disappear→return; only the PENDING
-    /// stability observations are cleared).
+    /// work. CLEARED on every folder disappear/replace/re-arm (review8 finding
+    /// 2) — the asymmetry with `lastEmittedDigest` is deliberate: identities
+    /// are LOCATION-BOUND and die with the folder generation (a remounted
+    /// share or reused inode can reproduce the same dev/ino/size/cached
+    /// mtime-ns for different bytes, which would silently suppress a genuinely
+    /// new sub), while digests are CONTENT-BOUND and survive it (dedup stays
+    /// safe). The cost is one rehash per file after a reconnect — the honest
+    /// price of not trusting a dead generation's identities.
     private var lastEmittedIdentity: [String: FileIdentity] = [:]
 
     /// Count of full content digests computed by this watcher (review7 P2) —
@@ -437,6 +442,11 @@ public final class StackFileWatcher {
                 // Review8 finding 1: pending content observations belong to the folder
                 // generation they were made in — the gate restarts after a return.
                 pendingContent.removeAll()
+                // Review8 finding 2: the identity FAST-PATH dies with the folder
+                // generation — identities are location-bound (a remounted share or
+                // reused inode can present the same dev/ino/size/cached mtime-ns for
+                // different bytes), digests are content-bound and are retained above.
+                lastEmittedIdentity.removeAll()
             }
             if nodeExists {
                 // Something non-directory occupies the watched path. Log once per occupation
@@ -653,14 +663,18 @@ public final class StackFileWatcher {
 
     /// Mid-tick folder replacement handling — shared by the top-of-scan identity check and the
     /// yield-time revalidation: log honestly, drop the stale source, clear PENDING stability
-    /// observations (emitted digests RETAINED for dedup), and mark missing so the next tick
-    /// re-arms via the recovery branch.
+    /// observations AND the location-bound identity fast-path (emitted digests RETAINED for
+    /// dedup — content-bound, they survive the generation change), and mark missing so the
+    /// next tick re-arms via the recovery branch.
     private func handleFolderReplaced() {
         onLog?("watched folder was replaced — re-arming: \(folder.path)")
         cancelSource()
         lastSeenStat.removeAll()
         // Review8 finding 1: the digest-stability gate restarts with the folder generation.
         pendingContent.removeAll()
+        // Review8 finding 2: identities die with the folder generation (see the
+        // lastEmittedIdentity declaration for the digest/identity asymmetry).
+        lastEmittedIdentity.removeAll()
         folderMissing = true
     }
 

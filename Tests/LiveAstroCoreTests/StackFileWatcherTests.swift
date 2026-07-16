@@ -396,6 +396,105 @@ final class StackFileWatcherTests: XCTestCase {
         XCTAssertFalse(reEmitted, "B emits exactly once")
     }
 
+    // MARK: - review8 finding 2: the identity fast-path dies with the folder generation
+
+    /// Emit one immutable-policy sub through manual scans and prove the identity fast-path
+    /// is active (digest counter flat on a further scan). Returns the collector and the
+    /// digest count after the emission. Shared arrange step for the finding-2 pair.
+    private func emitBaselineSubWithFastPathActive(_ url: URL) async throws
+        -> (collector: Collector, hashesAfterEmit: Int) {
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.25, size: 16).write(to: url)
+        watcher.scanNow()   // sighting — records stat
+        watcher.scanNow()   // stable → hash → emit (immutable policy: no digest gate)
+        let got = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(got, "arrange: baseline sub emits")
+        let hashesAfterEmit = watcher.digestComputations
+        XCTAssertGreaterThan(hashesAfterEmit, 0, "arrange: the emission itself hashed")
+        watcher.scanNow()   // identity fast-path: same (dev, ino, size, mtime-ns) → no work
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit,
+                       "arrange: identity fast-path active — counter flat")
+        return (collector, hashesAfterEmit)
+    }
+
+    /// Review8 finding 2 (red-first): `lastEmittedIdentity` — the `.immutableAfterPublish`
+    /// skip-hashing fast-path — was RETAINED across folder disappearance, so a remounted
+    /// share or reused inode presenting the same name/size/cached timestamp suppressed a
+    /// genuinely new sub forever (never re-hashed, never emitted). Deterministic shape:
+    /// (1) emit with the fast-path active (counter flat); (2) REMOVE the watched folder;
+    /// (3) mutate the file's CONTENT while preserving its full stat identity — same inode,
+    /// same size, utimensat-restored mtime-ns; (4) RESTORE the same folder; (5) after
+    /// recovery the file must be re-hashed EXACTLY once (counter +1) and EMITTED with the
+    /// changed digest. Identities are location-bound and die with the folder generation.
+    func testImmutablePolicy_folderReturn_sameIdentityDifferentContent_rehashedAndEmitted() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
+                                   digestPolicy: .immutableAfterPublish)
+        let url = tmp.appendingPathComponent("sub_001.fit")
+        let (collector, hashesAfterEmit) = try await emitBaselineSubWithFastPathActive(url)
+
+        // (2) The watched folder disappears (unmount/reconnect modeled as a move-aside).
+        let emitted = FileIdentity.capture(url: url)!
+        let aside = tmp.deletingLastPathComponent()
+            .appendingPathComponent("watch-aside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: tmp, to: aside)
+        watcher.scanNow()   // notices the disappearance — this folder generation ends
+
+        // (3) Content changes while every stat field the fast-path trusts is preserved:
+        // same inode (in-place write), same size, mtime-ns restored with utimensat — the
+        // reused-inode/cached-attribute worst case on a reconnecting share.
+        try mutateInteriorPreservingIdentity(aside.appendingPathComponent("sub_001.fit"),
+                                             byteFromEnd: 64, identity: emitted)
+        // (4) The same folder returns.
+        try FileManager.default.moveItem(at: aside, to: tmp)
+        watcher.scanNow()   // recovery re-arms + first post-return sighting (stat recorded)
+        watcher.scanNow()   // stable → the dead generation's identity must NOT be trusted
+
+        // (5) Exactly one rehash, and the changed content is EMITTED.
+        let reEmitted = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(reEmitted,
+                      "a same-identity, different-content file after a reconnect must be emitted")
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit + 1,
+                       "…after exactly one rehash (the honest price of the reconnect)")
+        let items = await collector.items
+        XCTAssertEqual(items.count, 2)
+        guard items.count >= 2 else { return }   // already failed above; don't trap on items[1]
+        XCTAssertNotEqual(items[0].identity?.digest, items[1].identity?.digest,
+                          "the post-return emission carries the CHANGED content digest")
+        // The emission repopulated the fast-path for the NEW generation: flat again.
+        watcher.scanNow()
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit + 1,
+                       "fast-path re-established for the new folder generation")
+    }
+
+    /// Review8 finding 2, the true-duplicate half: the same disappear→return with IDENTICAL
+    /// content. `lastEmittedDigest` is retained across the generation change (digests are
+    /// content-bound), so the file is re-hashed exactly once but NOT re-emitted — dedup
+    /// holds, and the dedup branch re-establishes the identity fast-path.
+    func testImmutablePolicy_folderReturn_identicalContent_rehashedNotReEmitted() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
+                                   digestPolicy: .immutableAfterPublish)
+        let url = tmp.appendingPathComponent("sub_001.fit")
+        let (collector, hashesAfterEmit) = try await emitBaselineSubWithFastPathActive(url)
+
+        let aside = tmp.deletingLastPathComponent()
+            .appendingPathComponent("watch-aside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: tmp, to: aside)
+        watcher.scanNow()   // disappearance — generation ends
+        try FileManager.default.moveItem(at: aside, to: tmp)   // identical content returns
+        watcher.scanNow()   // recovery + first sighting
+        watcher.scanNow()   // stable → re-hashed (the identity cache died with the generation)…
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit + 1,
+                       "identical content is re-hashed exactly once after the reconnect")
+        // …but the digest matches the emitted one → dedup holds, no re-emission.
+        let reEmitted = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(reEmitted, "identical content must NOT re-emit (digest dedup retained)")
+        // The dedup branch re-records the identity: the fast-path is flat again.
+        watcher.scanNow()
+        XCTAssertEqual(watcher.digestComputations, hashesAfterEmit + 1,
+                       "fast-path re-established by the dedup branch")
+    }
+
     /// Review4 P2 (mid-scan TOCTOU): the structural property of fd-relative enumeration, tested
     /// DETERMINISTICALLY with no timing. `scan()` validates the armed directory's (dev, ino) once,
     /// then enumerates — previously BY PATH, so a swap landing between the identity check and the
