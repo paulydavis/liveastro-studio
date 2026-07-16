@@ -151,6 +151,17 @@ public struct StackUpdate: Equatable, Sendable {
     }
 }
 
+/// Lifecycle misuse of a StackFileWatcher (review9 item 4). The watcher is ONE-SHOT:
+/// initial → running (successful start) → stopped (terminal). A failed initial start
+/// stays retryable; everything else fails explicitly instead of silently overwriting
+/// live sources/timers or resurrecting a stopped watcher.
+public enum StackFileWatcherError: Error, Equatable {
+    /// start() while already running — the live source/timer must never be overwritten.
+    case alreadyStarted
+    /// start() after stop() — stopped is terminal; construct a new watcher instead.
+    case stopped
+}
+
 /// Watches a folder for completed writes of stack images.
 /// Siril rewrites live_stack.fit in place, so this is modification-watching with
 /// write-completion checks, not new-file detection (spec §5.2).
@@ -201,6 +212,29 @@ public final class StackFileWatcher {
     private var pollTimer: DispatchSourceTimer?
     private var debounceWork: DispatchWorkItem?
     private var folderFD: Int32 = -1
+
+    // MARK: Lifecycle (review9 item 4)
+    //
+    // All lifecycle state — `state`, the sources/timer/debounce references, the fd — is
+    // QUEUE-CONFINED: start()/stop() and the synchronized accessors hop onto the watcher
+    // queue instead of mutating queue-owned state from the caller thread. The hop is
+    // REENTRANCY-SAFE: a DispatchSpecificKey identifies the watcher queue, so a callback
+    // already running on it (an onLog handler invoking stop(), a test seam) executes the
+    // body inline rather than deadlocking through queue.sync.
+
+    /// One-shot state machine: initial → running (successful start) → stopped (terminal).
+    /// A FAILED initial start leaves the watcher in `.initial` — retryable.
+    private enum LifecycleState { case initial, running, stopped }
+    private var state: LifecycleState = .initial
+
+    /// Identifies the watcher queue for reentrancy detection (value set in init).
+    private let queueKey = DispatchSpecificKey<Bool>()
+
+    /// Run `body` on the watcher queue: inline when already there, queue.sync otherwise.
+    private func onQueueSync<T>(_ body: () throws -> T) rethrows -> T {
+        if DispatchQueue.getSpecific(key: queueKey) == true { return try body() }
+        return try queue.sync(execute: body)
+    }
 
     /// True while the watched folder is absent. Used to log exactly once on
     /// disappearance and once on return, rather than on every poll tick.
@@ -324,7 +358,7 @@ public final class StackFileWatcher {
     /// Tests park the debounce and poll timer on huge intervals and call this
     /// to choreograph exact scan sequences deterministically. Production code
     /// never calls it.
-    internal func scanNow() { queue.sync { scan() } }
+    internal func scanNow() { onQueueSync { scan() } }
 
     private let fileNamePrefix: String?
     private let digestPolicy: DigestPolicy
@@ -403,21 +437,46 @@ public final class StackFileWatcher {
         } else {
             self.revisionRegex = nil
         }
+        queue.setSpecific(key: queueKey, value: true)
         var cont: AsyncStream<StackUpdate>.Continuation!
         self.updates = AsyncStream { cont = $0 }
         self.continuation = cont
     }
 
-    public func start() throws {
-        try armSource()
+    /// Fallback for an owner that drops a started watcher without stop() (review9 item 4):
+    /// the one-shot guard alone would leak the armed folder fd and leave the sources/timer
+    /// scheduled. deinit can only run when no queued block holds a strong reference (every
+    /// handler captures self weakly), so `state` is safe to read without the queue hop —
+    /// which could deadlock anyway if the last release happened ON the watcher queue.
+    /// Source/timer cancellation is thread-safe, and the source's cancel handler (which
+    /// closes the fd) captures only the fd, never self.
+    deinit {
+        guard state == .running else { return }
+        debounceWork?.cancel()
+        source?.cancel()
+        pollTimer?.cancel()
+        continuation.finish()
+    }
 
-        // Poll fallback: catches events DispatchSource misses (network volumes, in-place mmap writes).
-        // The timer keeps running even while the folder is missing — it's what detects the return.
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + pollInterval, repeating: pollInterval)
-        timer.setEventHandler { [weak self] in self?.scan() }
-        timer.resume()
-        pollTimer = timer
+    public func start() throws {
+        try onQueueSync {
+            switch state {
+            case .running: throw StackFileWatcherError.alreadyStarted
+            case .stopped: throw StackFileWatcherError.stopped
+            case .initial: break
+            }
+            try armSource()   // a throw here leaves state == .initial — retryable
+
+            // Poll fallback: catches events DispatchSource misses (network volumes, in-place
+            // mmap writes). The timer keeps running even while the folder is missing — it's
+            // what detects the return.
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + pollInterval, repeating: pollInterval)
+            timer.setEventHandler { [weak self] in self?.scan() }
+            timer.resume()
+            pollTimer = timer
+            state = .running
+        }
     }
 
     /// Open the folder fd and arm the DispatchSource.
@@ -462,13 +521,22 @@ public final class StackFileWatcher {
     }
 
     public func stop() {
-        // The fd is closed by the source's cancel handler, never here (see armSource()).
-        cancelSource()
-        pollTimer?.cancel(); pollTimer = nil
-        continuation.finish()
+        onQueueSync {
+            guard state != .stopped else { return }   // idempotent
+            // Terminal state FIRST (review9 item 4): any reentrant callback fired during
+            // the teardown below observes .stopped immediately and no-ops — no re-arm, no
+            // emit, no re-scheduled scan.
+            state = .stopped
+            debounceWork?.cancel(); debounceWork = nil
+            // The fd is closed by the source's cancel handler, never here (see armSource()).
+            cancelSource()
+            pollTimer?.cancel(); pollTimer = nil
+            continuation.finish()
+        }
     }
 
     private func scheduleScan() {
+        guard state == .running else { return }
         debounceWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.scan() }
         debounceWork = work
@@ -476,6 +544,9 @@ public final class StackFileWatcher {
     }
 
     private func scan() {
+        // Review9 item 4: a scan parked across stop() (debounced work, a queued poll tick,
+        // a test-seam replay) must observe the terminal state and no-op — never re-arm or emit.
+        guard state == .running else { return }
         let fm = FileManager.default
 
         // --- Folder presence check (disappearance + return detection) ---
@@ -545,6 +616,10 @@ public final class StackFileWatcher {
         }
 
         if folderMissing {
+            // Review9 item 4: a reentrant stop() (an onLog callback above — the disappearance
+            // or replacement log — runs on this queue and may stop the watcher inline) must
+            // prevent the re-arm below: re-arming after stop() is resurrection.
+            guard state == .running else { return }
             // Folder just came back. F4 (review2): attempt the re-arm FIRST, and only claim recovery
             // (log "resuming" + clear folderMissing) once it SUCCEEDS. Previously "resuming" was logged
             // and the flag cleared BEFORE armSource(), whose failure was silently swallowed — the
@@ -733,6 +808,9 @@ public final class StackFileWatcher {
                 handleFolderReplaced()
                 return
             }
+            // Review9 item 4: nothing may be emitted after stop() — a reentrant stop from an
+            // onLog callback earlier in this scan lands here as a terminal-state no-op.
+            guard state == .running else { return }
             lastEmittedDigest[name] = digest
             lastEmittedIdentity[name] = observed
             continuation.yield(StackUpdate(

@@ -299,6 +299,109 @@ final class StackFileWatcherTests: XCTestCase {
         watcher.stop()   // must return — a wedged queue would hang here (or in tearDown)
     }
 
+    // MARK: - review9 item 4: lifecycle (queue confinement, one-shot state, no resurrection)
+
+    /// Lock-protected log capture: onLog fires on the watcher queue while the test
+    /// thread asserts.
+    private final class LogBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lines: [String] = []
+        func append(_ s: String) { lock.withLock { lines.append(s) } }
+        var all: [String] { lock.withLock { lines } }
+    }
+
+    /// Review9 item 4 (red-first): a scan parked across stop() — here replayed through the
+    /// manual-scan seam — must observe the terminal state and neither RE-ARM (resurrection:
+    /// pre-fix the recovery branch reopened the folder fd, logged "resuming", and left a live
+    /// DispatchSource on a stopped watcher) nor emit anything later.
+    func testStopDuringParkedRecoveryScan_noRearmNoLaterEmission() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        // The folder disappears; the watcher notices and enters the missing state.
+        let aside = tmp.deletingLastPathComponent()
+            .appendingPathComponent("watch-aside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: tmp, to: aside)
+        watcher.scanNow()
+        XCTAssertTrue(logs.all.contains { $0.contains("disappeared") }, "arrange: missing noticed")
+        // The folder returns WITH a fresh valid file — the recovery scan is now "parked":
+        // stop() lands before it runs.
+        try FileManager.default.moveItem(at: aside, to: tmp)
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        watcher.stop()
+        // The parked recovery scan resumes after stop(): it must no-op.
+        watcher.scanNow()
+        watcher.scanNow()
+        clock.advance(seconds: 3601)
+        watcher.scanNow()
+        XCTAssertFalse(logs.all.contains { $0.contains("resuming") },
+                       "a scan resumed after stop() must not re-arm (no resurrection)")
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let items = await collector.items
+        XCTAssertTrue(items.isEmpty, "no emission may follow stop()")
+    }
+
+    /// Review9 item 4: lifecycle state is queue-confined, so stop() synchronizes onto the
+    /// watcher queue — and an onLog callback (which RUNS on that queue) invoking stop()
+    /// must be detected as reentrant and run inline, not deadlock through queue.sync.
+    func testOnLogInvokingStop_noDeadlock_cleanStop() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock)
+        let w = watcher!
+        watcher.onLog = { [weak w] msg in
+            if msg.contains("disappeared") { w?.stop() }   // reentrant stop from the queue
+        }
+        let collector = collect(watcher)
+        try watcher.start()
+        let aside = tmp.deletingLastPathComponent()
+            .appendingPathComponent("watch-aside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: tmp, to: aside)
+        watcher.scanNow()   // fires onLog("disappeared") on the queue → inline stop(); a
+                            // deadlock would hang this line forever
+        try FileManager.default.moveItem(at: aside, to: tmp)   // restore for teardown
+        watcher.stop()      // idempotent second stop — must be a clean no-op
+        watcher.scanNow()   // and post-stop scans must no-op
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let items = await collector.items
+        XCTAssertTrue(items.isEmpty, "clean stop — nothing emitted")
+    }
+
+    /// Review9 item 4: repeated start() while running previously overwrote the live
+    /// source/timer references (leaking the armed fd and a running timer). It must fail
+    /// explicitly instead.
+    func testRepeatedStartWhileRunning_failsExplicitly() throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600)
+        try watcher.start()
+        XCTAssertThrowsError(try watcher.start()) {
+            XCTAssertEqual($0 as? StackFileWatcherError, .alreadyStarted)
+        }
+    }
+
+    /// Review9 item 4: the state machine is ONE-SHOT — initial → running → stopped, with
+    /// stopped terminal. start() after stop() must fail explicitly, never resurrect.
+    func testStartAfterStop_failsTerminally() throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600)
+        try watcher.start()
+        watcher.stop()
+        XCTAssertThrowsError(try watcher.start()) {
+            XCTAssertEqual($0 as? StackFileWatcherError, .stopped)
+        }
+    }
+
+    /// Review9 item 4: a FAILED initial start (folder absent) leaves the watcher in the
+    /// initial state — RETRYABLE, not terminal. A second start() once the folder exists
+    /// succeeds.
+    func testFailedFirstStart_leavesWatcherRetryable() throws {
+        let folder = tmp.appendingPathComponent("appears-later", isDirectory: true)
+        watcher = StackFileWatcher(folder: folder, quietPeriod: 3600, pollInterval: 3600)
+        XCTAssertThrowsError(try watcher.start(), "arrange: first start fails (no folder)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        XCTAssertNoThrow(try watcher.start(), "a failed initial start must be retryable")
+    }
+
     // MARK: - review8 finding 1: digest-stability gate (mutable policy)
 
     /// Lock-protected manual monotonic clock injected through the watcher's
