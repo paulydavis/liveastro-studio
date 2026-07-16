@@ -95,6 +95,11 @@ final class ScriptedOBSServer {
     var recordReactsToRequests = true
     var failTypes: Set<String> = []
     var parkTypes: Set<String> = []
+    /// Answer the first N requests of a parked type NORMALLY before parking
+    /// (review7: goLive reconciles with a GetStreamStatus/GetRecordStatus pair
+    /// before StartStream, so tests that park the CONFIRM poll's
+    /// GetStreamStatus skip the reconcile's with `parkSkip["GetStreamStatus"] = 1`).
+    var parkSkip: [String: Int] = [:]
     private(set) var parked: [(type: String, id: String)] = []
 
     /// The reply hook to install via `mock.replyToLastSent(_:)`. Also answers
@@ -106,8 +111,13 @@ final class ScriptedOBSServer {
             let id = requestId(fromSent: sent)
             let type = requestType(fromSent: sent)
             if parkTypes.contains(type) {
-                parked.append((type: type, id: id))
-                return nil
+                let skip = parkSkip[type] ?? 0
+                if skip > 0 {
+                    parkSkip[type] = skip - 1
+                } else {
+                    parked.append((type: type, id: id))
+                    return nil
+                }
             }
             if failTypes.contains(type) {
                 return responseFrame(requestId: id, ok: false, code: 500)

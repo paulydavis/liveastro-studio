@@ -255,6 +255,18 @@ struct ControlView: View {
                     case .idle:
                         Button("Go Live") { model.broadcast.goLive() }
                             .help("Broadcast the live stack to YouTube via OBS (configure the YouTube key in OBS ▸ Settings ▸ Stream first).")
+                    case .unknown:
+                        // Review7: initial state — OBS output state never confirmed, so
+                        // no idle claim. Go Live still works one-click: it connects and
+                        // reconciles with OBS's actual state first (adopting an
+                        // already-live stream instead of double-starting it).
+                        HStack(spacing: 10) {
+                            Button("Go Live") { model.broadcast.goLive() }
+                                .help("Connect to OBS, sync with its actual stream state, and start broadcasting if nothing is already live.")
+                            Text("OBS not checked yet")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     case .connecting:
                         HStack { ProgressView().controlSize(.small); Text("Connecting OBS…") }
                     case .live:
@@ -517,13 +529,13 @@ private struct OBSSection: View {
         }
     }
 
-    /// Connect using the form's host/port/password and refresh the scene list.
+    /// Connect via BroadcastController (review7): after the link comes up the
+    /// controller RECONCILES broadcastState with OBS's actual stream/record
+    /// state — connecting to an already-streaming OBS adopts the live broadcast
+    /// instead of leaving the footer offering a Go Live that would double-start
+    /// it. `obs` stays observed here for config/scene reads only; the scene
+    /// list is seeded by the connect itself.
     private func connectOBS() {
-        Task {
-            let ok = await obs.connect(
-                host: model.broadcast.obsHost, port: model.broadcast.obsPort,
-                password: model.broadcast.obsPassword.isEmpty ? nil : model.broadcast.obsPassword)
-            if ok { await obs.refreshScenes() }
-        }
+        Task { await model.broadcast.connectAndReconcile() }
     }
 }
