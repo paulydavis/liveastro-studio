@@ -39,8 +39,9 @@ swift run LiveAstroStudio
 ## OBS automation
 
 LiveAstro can drive OBS over the obs-websocket 5.x protocol so you never have to
-touch OBS during a session — it launches OBS, connects, starts the stream, and
-switches scenes based on whether stacking is making progress.
+touch OBS during a session — **Go Live** launches OBS, connects, and starts the
+stream, and scene automation switches scenes based on whether stacking is making
+progress. Broadcasting is deliberate: starting a session never starts a stream.
 
 **One-time OBS setup**
 
@@ -55,21 +56,25 @@ switches scenes based on whether stacking is making progress.
   `connected` / `streaming`), plus a red **REC** indicator while OBS is recording.
 - **Connect / Disconnect** — connect manually with the current host/port/password.
 - **Host / Port / Password** — connection settings; locked while connected.
-- **Auto-launch OBS on session start** — when on (default), starting a session
-  that can't reach OBS launches OBS (in the background, without stealing focus)
-  and retries the connection for up to 20 s.
+- **Auto-launch OBS on Go Live** — when on (default), clicking Go Live with OBS
+  unreachable launches OBS (in the background, without stealing focus) and
+  retries the connection for up to 20 s. The manual Connect button never
+  launches OBS.
 - **Scene picker + ↻** — pick the live program scene; ↻ refreshes the scene list
   from OBS.
 - **Record while streaming** — also start OBS recording when the stream comes up.
 - **Scene automation (scope on stall)** with **Stack scene** / **Scope scene**
   pickers — see below.
 
-**What happens on Start / End Session**
+**What happens on Go Live / Start / End Session**
 
-- **Start Session** connects to OBS (auto-launching if needed), starts the stream,
-  optionally starts recording, and switches to the Stack scene. Every OBS step is
-  best-effort: if any of it fails, the failure is logged and the astronomy session
-  continues regardless — **OBS never blocks the session.**
+- **Start Session** starts stacking and scene automation only — it never starts
+  a stream. Broadcasting begins when you click **Go Live** (footer): it connects
+  to OBS (auto-launching if needed), switches to the Stack scene, starts the
+  stream, optionally starts recording, and confirms via status polls; **End
+  Broadcast** stops it without ending the session. Every OBS step is
+  best-effort: if any of it fails, the failure is logged and the astronomy
+  session continues regardless — **OBS never blocks the session.**
 - **Scene automation:** while a session runs with automation on, a stall detector
   (seeded from your sub-exposure length) watches for stacking to stall. On a stall
   it switches OBS to the **Scope scene** once; when frames resume it switches back
@@ -86,10 +91,10 @@ Run through these against a live OBS before relying on the automation:
 
 - [ ] **Auth** — with a WebSocket password set, Connect succeeds; with a wrong
       password it fails and logs an auth error (session still starts).
-- [ ] **Cold auto-launch** — with OBS quit and Auto-launch on, Start Session
+- [ ] **Cold auto-launch** — with OBS quit and Auto-launch on, Go Live
       launches OBS (in the background) and connects within ~20 s.
-- [ ] **Stream toggle** — Start Session turns OBS's stream indicator on; End
-      Session turns it off.
+- [ ] **Stream toggle** — Go Live turns OBS's stream indicator on; End
+      Session (or End Broadcast) turns it off.
 - [ ] **Scene automation via stall** — with automation on and Stack/Scope scenes
       chosen, stop feeding frames (or pause `fakesiril`); after the stall threshold
       OBS switches to the Scope scene, and resuming frames switches back to Stack.
@@ -113,12 +118,15 @@ There are two entry points:
 **Import Subs… (batch import from acquired files)**
 
 1. In the Control window, set the source mode to **Raw subs folder (native stacking)**.
-2. Click **Import Subs…** and choose the folder containing your `.fit` files
-   (the folder that your capture software writes to, e.g. `~/Documents/lights/`).
-3. Fill in the session profile and click **Start Session**.
-   The engine imports each file in chronological order: bilinear debayer → star
-   registration → incremental mean stack.  An indeterminate spinner is shown while
-   the import runs; accepted and rejected frames are listed in the session log.
+2. Fill in the session profile (target and exposure are auto-detected from the
+   newest sub's FITS header), then click **Import Subs…** and choose the folder
+   containing your `.fit` files. The import starts immediately — no Start
+   Session needed (and it refuses to start while a live session is running).
+   The engine imports each file in chronological order: calibration (if
+   configured) → RCD debayer → star registration → gradient leveling →
+   σ-clip → quality-weighted stack. A progress bar shows N / total with
+   accepted/rejected counts and a Cancel button; a cancelled import finalizes
+   the frames stacked so far.
    The session lands in `~/Documents/LiveAstro/<date-target>/` like any
    other session — including `replay.mp4` and `master.fit`.
 
