@@ -369,6 +369,33 @@ public final class StackFileWatcher {
     private let fileNamePrefix: String?
     private let digestPolicy: DigestPolicy
 
+    // MARK: Revision order gate (review10 item 1)
+    //
+    // The review9 sort makes emission order deterministic WITHIN one scan, but revisions
+    // earn their gates independently ACROSS scans: an incomplete _00001 (unstable, mid
+    // digest-gate, invalid) was skipped while a complete _00002 emitted, and _00001 then
+    // emitted on a later scan — the consumer saw [2, 1] and the replay regressed. Two
+    // rules close this, both riding the single numericCompare comparator:
+    //  (a) HOLDBACK — within a scan, once a numbered revision is found NOT yet emittable,
+    //      no higher-numbered revision emits this scan; a held revision keeps its gate
+    //      evidence and emits as soon as the blocker clears. Non-numbered entries sort
+    //      before the revision series and are unaffected.
+    //  (b) REJECT BELOW THE MARK — a never-emitted numbered revision at or below the
+    //      high-water mark of emitted revisions arrived out of order and is dropped
+    //      permanently with one honest log line: the FRAME is lost, the session preserved
+    //      (the invariant), and the consumer's replay never regresses.
+
+    /// Highest numbered revision EMITTED this folder generation (digit string, compared
+    /// with numericCompare). Advanced at emission — the single point revisions become
+    /// consumer-visible — and cleared with the per-generation state on folder
+    /// disappear/replace. Emitted DIGESTS survive generations (dedup stays content-bound);
+    /// the mark governs ORDER only.
+    private var emittedRevisionHighWater: String?
+
+    /// Names already dropped+logged as out-of-order this folder generation, so the honest
+    /// drop line fires once per file, not on every poll tick while the file sits there.
+    private var outOfOrderDropLogged: Set<String> = []
+
     // MARK: Numbered-revision parser (review9 items 1+2)
     //
     // The SINGLE source of truth for both CLASSIFYING a numbered stacker revision
@@ -401,10 +428,28 @@ public final class StackFileWatcher {
         return String(name[digitsRange])
     }
 
-    /// Numeric order for digit strings without Int conversion: a shorter digit string is a
-    /// smaller number; equal lengths compare lexicographically.
+    /// Numeric order for digit strings without Int conversion (review10 item 6): leading
+    /// zeros are numerically insignificant, so they are stripped before the shorter-is-
+    /// smaller / lexicographic-on-equal-length comparison — the former RAW-length compare
+    /// sorted "10" before "002". Equal numeric VALUES with different padding ("007" vs "7")
+    /// tie-break on the raw string, so this stays a stable total order.
     private static func digitStringLess(_ a: String, _ b: String) -> Bool {
-        a.count != b.count ? a.count < b.count : a < b
+        switch numericCompare(a, b) {
+        case .orderedAscending:  return true
+        case .orderedDescending: return false
+        case .orderedSame:       return a < b
+        }
+    }
+
+    /// Numeric comparison of two digit strings with leading zeros stripped (an all-zeros
+    /// string strips to the empty suffix, which behaves as "0"). The ONE comparator behind
+    /// candidate ordering AND the emitted-revision high-water mark (review10 items 1+6) —
+    /// classification, ordering, and the order gate can never disagree.
+    private static func numericCompare(_ a: String, _ b: String) -> ComparisonResult {
+        let na = a.drop { $0 == "0" }, nb = b.drop { $0 == "0" }
+        if na.count != nb.count { return na.count < nb.count ? .orderedAscending : .orderedDescending }
+        if na == nb { return .orderedSame }
+        return na < nb ? .orderedAscending : .orderedDescending
     }
 
     /// Deterministic candidate order (review9 item 2): readdir order is POSIX-undefined, and
@@ -588,6 +633,11 @@ public final class StackFileWatcher {
                 // reused inode can present the same dev/ino/size/cached mtime-ns for
                 // different bytes), digests are content-bound and are retained above.
                 lastEmittedIdentity.removeAll()
+                // Review10 item 1: revision ORDER state is per-generation like the pending
+                // maps. Emitted digests survive (above), so re-sightings of already-emitted
+                // revisions still dedup; only the ordering gate restarts.
+                emittedRevisionHighWater = nil
+                outOfOrderDropLogged.removeAll()
             }
             if nodeExists {
                 // Something non-directory occupies the watched path. Log once per occupation
@@ -660,6 +710,10 @@ public final class StackFileWatcher {
         // suffix is parsed ONCE per name here and reused for the per-entry policy below.
         let candidates = names.map { (name: $0, revision: revisionSuffix(of: $0)) }
             .sorted(by: Self.orderedBefore)
+        // Review10 item 1 (HOLDBACK): true once a numbered revision in THIS scan proved not
+        // yet emittable — every higher-numbered revision then advances its gates normally
+        // but is not allowed to EMIT this scan (see the pre-emission check below).
+        var holdRevisionsAbove = false
         for (name, revision) in candidates {
             guard !name.hasPrefix("."), !name.lowercased().hasSuffix(".tmp") else { continue }
             if let prefix = fileNamePrefix, !prefix.isEmpty,
@@ -667,6 +721,21 @@ public final class StackFileWatcher {
             let ext = (name as NSString).pathExtension.lowercased()
             let isFITS = ImageLoader.fitsExtensions.contains(ext)
             guard isFITS || ImageLoader.bitmapExtensions.contains(ext) else { continue }
+
+            // Review10 item 1 (REJECT BELOW THE MARK): a never-emitted numbered revision at
+            // or below the emitted high-water mark arrived out of order — emitting it now
+            // would regress the consumer's replay. Drop the frame permanently, keep the
+            // session, log once. Names that already emitted are exempt: their re-sightings
+            // are governed by the identity fast-path and digest dedup below (the mark
+            // governs ORDER, never re-emission).
+            if let revision, lastEmittedDigest[name] == nil,
+               let mark = emittedRevisionHighWater,
+               Self.numericCompare(revision, mark) != .orderedDescending {
+                if outOfOrderDropLogged.insert(name).inserted {
+                    onLog?("revision \(revision) arrived out of order — skipped (high-water \(mark))")
+                }
+                continue
+            }
 
             let url = folder.appendingPathComponent(name)
 
@@ -680,12 +749,18 @@ public final class StackFileWatcher {
             // replacement read by path). openat failure (ENOENT — the entry vanished since
             // enumeration; ELOOP — a symlinked entry, refused by O_NOFOLLOW) skips the file
             // this tick, exactly like a failed stat before.
-            guard let handle = Self.openFile(directoryFD: folderFD, name: name) else { continue }
+            guard let handle = Self.openFile(directoryFD: folderFD, name: name) else {
+                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
+                continue
+            }
             // Exactly-once close on every path out of this iteration: this explicit close pairs
             // with closeOnDealloc as a backstop (FileHandle tracks closed state — no double close).
             defer { try? handle.close() }
 
-            guard let observed = Self.statFile(handle), observed.size > 0 else { continue }
+            guard let observed = Self.statFile(handle), observed.size > 0 else {
+                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
+                continue
+            }
 
             let previous = lastSeenStat[name]
             lastSeenStat[name] = observed
@@ -723,6 +798,7 @@ public final class StackFileWatcher {
                 // gate — a pending content observation is only meaningful under the exact
                 // identity it was observed with.
                 pendingContent[name] = nil
+                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: unstable
                 continue
             }
 
@@ -734,12 +810,18 @@ public final class StackFileWatcher {
                 // preallocated-but-unfilled files (stable check).
                 guard let head = try? Self.readHead(handle, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
                       let header = try? FITSReader.readHeader(head),
-                      observed.size >= header.minimumFileSize else { continue }
+                      observed.size >= header.minimumFileSize else {
+                    if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
+                    continue
+                }
             }
 
             _digestComputations += 1
             guard let digest = FileIdentity.contentDigest(handle: handle, size: observed.size)
-            else { continue }
+            else {
+                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
+                continue
+            }
 
             // Final revalidation on the pinned descriptor (review6 finding 1): the header/
             // completeness read and the digest read above take time, and an in-place writer
@@ -747,12 +829,16 @@ public final class StackFileWatcher {
             // Require the identity unchanged from the initial fstat; otherwise treat the file as
             // unstable this tick (record the latest clean observation, no emit, no dedup update,
             // no log spam) and let it re-earn stability on later ticks.
-            guard let finalStat = Self.statFile(handle) else { continue }
+            guard let finalStat = Self.statFile(handle) else {
+                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: invalid
+                continue
+            }
             guard finalStat == observed else {
                 lastSeenStat[name] = finalStat
                 // Review8 finding 1: the identity moved mid-scan — restart the
                 // digest-stability gate along with stat stability.
                 pendingContent[name] = nil
+                if revision != nil { holdRevisionsAbove = true }   // review10 item 1: unstable
                 continue
             }
 
@@ -798,14 +884,26 @@ public final class StackFileWatcher {
                 if let pending = pendingContent[name], pending.digest == digest,
                    pending.identity == observed {
                     guard now >= pending.firstObservedNanos,
-                          now - pending.firstObservedNanos >= quietPeriodNanos else { continue }
-                    pendingContent[name] = nil
+                          now - pending.firstObservedNanos >= quietPeriodNanos else {
+                        if revision != nil { holdRevisionsAbove = true }   // review10 item 1: mid-gate
+                        continue
+                    }
+                    // Gate satisfied. The pending observation is cleared at EMISSION below,
+                    // not here — a held-back revision (review10 item 1) keeps its evidence
+                    // and re-qualifies immediately once the lower revision clears.
                 } else {
                     pendingContent[name] = PendingContent(digest: digest, identity: observed,
                                                           firstObservedNanos: now)
+                    if revision != nil { holdRevisionsAbove = true }   // review10 item 1: mid-gate
                     continue
                 }
             }
+
+            // Review10 item 1 (HOLDBACK): every gate passed, but a LOWER-numbered revision
+            // earlier in this scan is still earning its gates — emitting above it would
+            // hand the consumer an order regression. This emission waits; its evidence is
+            // intact, so it goes out on the first scan after the blocker clears.
+            if revision != nil, holdRevisionsAbove { continue }
 
             // Yield-time revalidation (review5 item 1): the emitted URL is still a PATH the
             // consumer resolves later, so before publishing, re-check that the watched path still
@@ -822,8 +920,16 @@ public final class StackFileWatcher {
             // Review9 item 4: nothing may be emitted after stop() — a reentrant stop from an
             // onLog callback earlier in this scan lands here as a terminal-state no-op.
             guard state == .running else { return }
+            pendingContent[name] = nil          // the emission consumes the gate evidence
             lastEmittedDigest[name] = digest
             lastEmittedIdentity[name] = observed
+            if let revision,
+               emittedRevisionHighWater.map({ Self.numericCompare(revision, $0) == .orderedDescending })
+                    ?? true {
+                // Review10 item 1: advance the high-water mark at emission — the single
+                // point a revision becomes consumer-visible.
+                emittedRevisionHighWater = revision
+            }
             continuation.yield(StackUpdate(
                 url: url, fileSize: observed.size,
                 identity: observed.withDigest(digest)))
@@ -844,6 +950,10 @@ public final class StackFileWatcher {
         // Review8 finding 2: identities die with the folder generation (see the
         // lastEmittedIdentity declaration for the digest/identity asymmetry).
         lastEmittedIdentity.removeAll()
+        // Review10 item 1: the revision order gate is per-generation too (emitted digests
+        // above still dedup any re-sighting of an already-emitted revision).
+        emittedRevisionHighWater = nil
+        outOfOrderDropLogged.removeAll()
         folderMissing = true
     }
 

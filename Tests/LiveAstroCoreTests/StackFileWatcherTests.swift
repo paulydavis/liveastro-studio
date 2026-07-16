@@ -538,6 +538,136 @@ final class StackFileWatcherTests: XCTestCase {
                        "creation/readdir order (30-digit suffix sorts numerically too)")
     }
 
+    // MARK: - review10 item 1: cross-scan revision ordering (high-water mark + holdback)
+
+    /// Review10 item 1a (red-first): the review9 sort fixed INTRA-scan order only. An
+    /// incomplete _00001 (still mid digest-gate) was skipped while a complete _00002
+    /// emitted; _00001 then emitted on a later scan → the consumer saw [2, 1] and the
+    /// replay regressed. HOLDBACK: once a numbered revision is not yet emittable this
+    /// scan, no HIGHER-numbered revision may emit this scan — it waits (its own gate
+    /// evidence intact) until the lower revision clears. Both then emit in order [1, 2].
+    func testNumberedRevisions_lowerRevisionMidGate_higherHeldBack_emitInOrder() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let collector = collect(watcher)
+        try watcher.start()
+        // _00002 gets a one-scan head start on its gates, so it is confirmable while
+        // _00001 is still one gate-tick behind.
+        try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
+        watcher.scanNow()                     // _00002 sighted
+        try makeFITS(0.1).write(to: tmp.appendingPathComponent("live_stack_00001.fit"))
+        watcher.scanNow()                     // _00001 sighted; _00002 stable → pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                     // _00001 pending; _00002 gate SATISFIED — pre-fix
+                                              // it emitted here, ahead of _00001
+        let premature = await collector.waitForCount(1, timeout: 0.3)
+        XCTAssertFalse(premature,
+                       "_00002 must be held back while _00001 is still earning its gates")
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                     // _00001 confirms → emits; _00002 follows in order
+        let got = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(got, "both revisions emit once the lower one clears its gates")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00001.fit", "live_stack_00002.fit"],
+                       "the consumer must see revisions in numeric order, never [2, 1]")
+    }
+
+    /// Review10 item 1b (red-first): a numbered revision arriving AFTER a higher one has
+    /// already emitted is permanently dropped — emitting it would regress the consumer's
+    /// replay. The frame is lost, the session preserved, and the drop appears honestly in
+    /// the log exactly ONCE (not per tick).
+    func testNumberedRevisions_lowerRevisionAfterHigherEmitted_droppedWithHonestLog() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
+        watcher.scanNow()                     // sighted
+        watcher.scanNow()                     // stable → pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                     // confirmed → _00002 emits (high-water 00002)
+        let gotHigh = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(gotHigh, "arrange: _00002 emits first")
+
+        // _00001 arrives late — below the high-water mark.
+        try makeFITS(0.1).write(to: tmp.appendingPathComponent("live_stack_00001.fit"))
+        for _ in 0..<4 { clock.advance(seconds: 3601); watcher.scanNow() }
+        let late = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(late, "a revision below the high-water mark must never emit")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent), ["live_stack_00002.fit"])
+        let dropLines = logs.all.filter {
+            $0 == "revision 00001 arrived out of order — skipped (high-water 00002)"
+        }
+        XCTAssertEqual(dropLines.count, 1,
+                       "the drop must be logged honestly, exactly once — got \(logs.all)")
+    }
+
+    // MARK: - review10 item 6: numeric sort with mixed zero padding
+
+    /// Review10 item 6 (red-first): digitStringLess compared RAW digit-string lengths, so
+    /// "10" sorted before "002" — mixed zero padding scrambled the numeric order the
+    /// review9 sort was built to guarantee. Leading zeros must be numerically
+    /// insignificant: _002, _0009, _10 emit as 2, 9, 10.
+    func testNumberedRevisions_mixedZeroPadding_emitInNumericOrder() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let collector = collect(watcher)
+        try watcher.start()
+        for (i, name) in ["live_stack_10.fit", "live_stack_002.fit",
+                          "live_stack_0009.fit"].enumerated() {
+            try makeFITS(Float(i + 1) * 0.1).write(to: tmp.appendingPathComponent(name))
+        }
+        watcher.scanNow()                     // sighting
+        watcher.scanNow()                     // stable → pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                     // confirmed → emit in numeric order
+        let got = await collector.waitForCount(3, timeout: 2)
+        XCTAssertTrue(got, "arrange: all three revisions emit")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_002.fit", "live_stack_0009.fit", "live_stack_10.fit"],
+                       "leading zeros are numerically insignificant: 2 < 9 < 10")
+    }
+
+    /// Review10 item 6, equal-value tiebreak: _007 and _7 are the SAME revision number.
+    /// The raw-string tiebreak makes the order deterministic (_007 first), and the
+    /// high-water mark then drops the duplicate revision number honestly — the consumer
+    /// never sees revision 7 twice.
+    func testNumberedRevisions_equalValueDifferentPadding_deterministicTiebreak() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.3).write(to: tmp.appendingPathComponent("live_stack_007.fit"))
+        try makeFITS(0.6).write(to: tmp.appendingPathComponent("live_stack_7.fit"))
+        watcher.scanNow()                     // sighting
+        watcher.scanNow()                     // stable → pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                     // _007 (raw tiebreak first) emits; _7 = duplicate
+        let got = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(got)
+        clock.advance(seconds: 3601)
+        watcher.scanNow()
+        let dup = await collector.waitForCount(2, timeout: 0.3)
+        XCTAssertFalse(dup, "the duplicate revision number must not emit a second time")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent), ["live_stack_007.fit"],
+                       "equal numeric values tie-break on the raw string — deterministic")
+        XCTAssertTrue(logs.all.contains(
+            "revision 7 arrived out of order — skipped (high-water 007)"),
+            "the duplicate drop appears honestly in the log — got \(logs.all)")
+    }
+
     /// Review8 finding 1 (red-first): stat stability is satisfied while an in-place
     /// rewriter PAUSES mid-rewrite (size unchanged, mtime coarse/restored), so pre-fix the
     /// watcher hashed the temporary A/B hybrid and emitted it immediately — and the
