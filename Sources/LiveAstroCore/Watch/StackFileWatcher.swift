@@ -56,6 +56,43 @@ public final class StackFileWatcher {
         return NodeIdentity(dev: st.st_dev, ino: st.st_ino)
     }
 
+    /// Enumerate the directory pinned by the armed `fd` — fd-relative, never by path (review4 P2).
+    ///
+    /// This closes the mid-scan TOCTOU structurally: `scan()` validates the path's (dev, ino)
+    /// identity once at the top, and a swap landing between that check and a PATH-based enumeration
+    /// would apply old `lastSeenStat` observations to the NEW directory's files. Enumerating through
+    /// the armed fd pins the OLD inode instead — a rename-over unlinks the old directory from the
+    /// namespace, but the open fd keeps it readable — so a mid-scan swap is harmless BY
+    /// CONSTRUCTION: this scan observes only old-directory contents, and the NEXT scan's identity
+    /// check detects the swap and resets state.
+    ///
+    /// Descriptor discipline: `fdopendir` takes OWNERSHIP of the descriptor it is given (`closedir`
+    /// closes it), so the armed fd — owned by the DispatchSource cancel handler — must never be
+    /// handed to it, and a `dup()` of the O_EVTONLY fd is unsuitable too (it shares the original's
+    /// status flags and seek offset). Instead each call opens a fresh READ descriptor on the same
+    /// inode via `openat(fd, ".")` — resolved relative to the fd, not the path — and lets
+    /// `closedir` own that. Returns nil when the directory cannot be opened for reading.
+    ///
+    /// Internal (not private) so the structural property is directly unit-testable
+    /// (`testEnumerateDirectory_pinnedFDSeesOldContentsAcrossAtomicSwap`).
+    static func enumerateDirectory(fd: Int32) -> [String]? {
+        let readFD = openat(fd, ".", O_RDONLY | O_DIRECTORY)
+        guard readFD >= 0 else { return nil }
+        guard let dir = fdopendir(readFD) else {
+            close(readFD)   // fdopendir failed → ownership never transferred; close it ourselves
+            return nil
+        }
+        defer { closedir(dir) }   // closes readFD too
+        var names: [String] = []
+        while let entry = readdir(dir) {
+            let name = withUnsafeBytes(of: entry.pointee.d_name) { raw -> String in
+                String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+            }
+            if name != "." && name != ".." { names.append(name) }
+        }
+        return names
+    }
+
     /// Per-file state for stability + dedupe. Stability now tracks (size, mtime) so a
     /// preallocated-but-still-filling FITS (full size, advancing mtime) is not emitted early.
     private var lastSeenStat: [String: (size: Int, mtime: TimeInterval)] = [:]
@@ -229,7 +266,14 @@ public final class StackFileWatcher {
             }
         }
 
-        guard let names = try? fm.contentsOfDirectory(atPath: folder.path) else { return }
+        // Review4 P2: enumerate + stat through the ARMED fd, never by path. The identity check
+        // above and this enumeration are not atomic; a swap landing between them must not let this
+        // pass apply old lastSeenStat observations to the new directory's files. The fd pins the
+        // inode the identity check approved, so this scan structurally observes only that
+        // directory's contents; the NEXT scan detects the swap and resets state. When no source is
+        // armed (folderFD < 0, i.e. a failed re-arm while folderMissing), there is nothing safe to
+        // enumerate — skip this tick; the poll timer retries the re-arm on the next tick.
+        guard folderFD >= 0, let names = Self.enumerateDirectory(fd: folderFD) else { return }
         for name in names {
             guard !name.hasPrefix("."), !name.lowercased().hasSuffix(".tmp") else { continue }
             if let prefix = fileNamePrefix, !prefix.isEmpty,
@@ -239,9 +283,14 @@ public final class StackFileWatcher {
             guard isFITS || ImageLoader.bitmapExtensions.contains(ext) else { continue }
 
             let url = folder.appendingPathComponent(name)
-            guard let attrs = try? fm.attributesOfItem(atPath: url.path),
-                  let size = (attrs[.size] as? NSNumber)?.intValue, size > 0 else { continue }
-            let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            // fd-relative per-file stat (fstatat does not consume folderFD) — the stability
+            // observation is taken from the same pinned directory the enumeration saw.
+            var st = Darwin.stat()
+            guard fstatat(folderFD, name, &st, 0) == 0 else { continue }
+            let size = Int(st.st_size)
+            guard size > 0 else { continue }
+            let mtime = TimeInterval(st.st_mtimespec.tv_sec)
+                      + TimeInterval(st.st_mtimespec.tv_nsec) / 1_000_000_000
             let stat = (size: size, mtime: mtime)
 
             let previous = lastSeenStat[name]
@@ -253,6 +302,12 @@ public final class StackFileWatcher {
             // stability requirement holds it back until the in-place writes stop.
             guard previous?.size == stat.size, previous?.mtime == stat.mtime else { continue }
 
+            // HONEST NOTE (review4 P2): the CONTENT reads below (FITS header + digest) remain
+            // PATH-based (FileHandle(forReadingFrom:)). The structural fd-relative fix above closes
+            // the STATE-consistency hole (old lastSeenStat applied to new-directory files); a swap
+            // racing a content read can at worst read a different file's bytes, which the existing
+            // stability + digest gates already protect against (an unstable or changed file is
+            // held back / re-observed on the next scan, and dedup is digest-keyed).
             if isFITS {
                 // Bulletproof completeness: header declares exact expected data length (spec §5.2).
                 // Combined with the stability gate above, this rejects both truncated files
