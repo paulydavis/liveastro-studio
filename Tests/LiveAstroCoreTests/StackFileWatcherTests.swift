@@ -149,4 +149,44 @@ final class StackFileWatcherTests: XCTestCase {
         let items = await collector.items
         XCTAssertTrue(items.isEmpty)
     }
+
+    /// Review4 P2 (mid-scan TOCTOU): the structural property of fd-relative enumeration, tested
+    /// DETERMINISTICALLY with no timing. `scan()` validates the armed directory's (dev, ino) once,
+    /// then enumerates — previously BY PATH, so a swap landing between the identity check and the
+    /// enumeration applied old `lastSeenStat` observations to the NEW directory's files. The fix
+    /// enumerates through the armed fd (`openat(fd, ".")` → `fdopendir` → `readdir`), which pins the
+    /// OLD inode: a mid-scan swap is harmless BY CONSTRUCTION because the scan can only ever observe
+    /// old-directory contents; the NEXT scan's identity check detects the swap and resets state.
+    ///
+    /// Proof: open an fd on dir A, atomically rename dir B over A's path (the exact mid-scan swap,
+    /// frozen at its worst-case point), then enumerate via the still-open fd — it must return A's
+    /// contents, not B's, even though the PATH now resolves to B. Called twice to prove each call
+    /// uses a fresh read descriptor (no shared-offset residue on the armed O_EVTONLY fd).
+    func testEnumerateDirectory_pinnedFDSeesOldContentsAcrossAtomicSwap() throws {
+        // Dir A (at the "watched" path) with two entries.
+        let a = tmp.appendingPathComponent("A", isDirectory: true)
+        try FileManager.default.createDirectory(at: a, withIntermediateDirectories: true)
+        try Data("a".utf8).write(to: a.appendingPathComponent("a1.fit"))
+        try Data("a".utf8).write(to: a.appendingPathComponent("a2.fit"))
+        // The armed fd — same open mode the watcher's DispatchSource uses.
+        let fd = open(a.path, O_EVTONLY)
+        XCTAssertGreaterThanOrEqual(fd, 0, "arrange: open(O_EVTONLY) on dir A")
+        defer { close(fd) }
+
+        // Dir B (same volume) with a different entry; atomically swap it over A's path.
+        let b = tmp.appendingPathComponent("B", isDirectory: true)
+        try FileManager.default.createDirectory(at: b, withIntermediateDirectories: true)
+        try Data("b".utf8).write(to: b.appendingPathComponent("b1.fit"))
+        try Disruptor.atomicallySwapDirectory(at: a, with: b)
+
+        // The PATH now resolves to B's contents…
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: a.path), ["b1.fit"],
+                       "arrange: the swap landed — the path resolves to the new directory")
+        // …but the armed fd still pins A: fd-relative enumeration sees ONLY old-dir contents.
+        XCTAssertEqual(StackFileWatcher.enumerateDirectory(fd: fd)?.sorted(), ["a1.fit", "a2.fit"],
+                       "fd-relative enumeration must observe the OLD (pinned) directory, not the swapped-in one")
+        // Repeatable: a second enumeration on the same armed fd returns the same listing.
+        XCTAssertEqual(StackFileWatcher.enumerateDirectory(fd: fd)?.sorted(), ["a1.fit", "a2.fit"],
+                       "each enumeration opens a fresh read descriptor — no offset residue across scans")
+    }
 }

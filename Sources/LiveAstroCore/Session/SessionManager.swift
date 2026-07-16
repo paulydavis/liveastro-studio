@@ -16,11 +16,13 @@ public final class SessionManager {
     /// Injectable manifest-write seam (F3 / spec §Seams — the SECOND pre-approved seam).
     /// PRODUCTION LEAVES THIS nil: `persist` then uses the built-in atomic write path
     /// (`Data(.atomic)` = temp+rename), byte-identical to the pre-seam behavior. It exists ONLY so
-    /// the `manifest-midwrite` crash cell can perform an explicitly staged atomic write (stage full
-    /// bytes to a same-dir temp, touch a readiness flag, then rename to publish) — so the SIGKILL
-    /// that waits on the flag lands within an open write transaction rather than on a pre-seeded
-    /// manifest before any challenged write. When set, the closure is responsible for performing the
-    /// actual durable write of `data` to `url`.
+    /// the `manifest-midwrite` crash cell can block at the pre-publish point of a challenged write
+    /// (stage full bytes to a same-dir temp, touch a readiness flag, then block forever — never
+    /// publish) — so the SIGKILL that waits on the flag lands DETERMINISTICALLY between staging and
+    /// publication, and the aftermath provably shows the prior published version intact beside the
+    /// complete, closed, unpublished staged temp. A block-point cannot be interposed inside
+    /// production `Data(.atomic)`; the injected writer performs byte-identical staging steps. When
+    /// set, the closure is responsible for performing the actual write of `data` to `url`.
     public var manifestWriter: ((Data, URL) throws -> Void)?
 
     public init(rootDirectory: URL) { self.rootDirectory = rootDirectory }

@@ -46,7 +46,7 @@ invalid replacement target · slow/hung consumer · crash-terminated (helper) ·
 | **FITS ingest** (`FITSReader.read`) | TEST(`testFITS_midWrite_readerRejectsHeaderOnlyAcceptsComplete`) — header-only intermediate throws `truncatedData`; complete file parses once | TEST(`testFITS_truncated_readerThrowsNoPartialImage`) — pixels cut at 60% → throws `truncatedData`, no partial image; TEST(`testFITS_truncated_watcherRejectsThenAcceptsComplete`) — via watcher: rejected then complete write ingests | N/A — the reader is a pure `Data`→image function; a file deleted before read simply never reaches `read`. Deletion-during-read is covered at the watcher boundary (`testWatcher_deletedMidRun_noCrashNextFileFine`) | N/A — reader takes bytes, not a directory; the containing-dir case is the watcher's (`testWatcher_dirRemoved_logsOnceAndResumesOnRecreate`) | N/A — `read` never writes; there is no destination at this boundary | TEST(`testFITS_invalidReplacement_directoryNamedFit`) — path `x.fit` is a directory: `Data(contentsOf:)` throws (no bytes); watcher skips it, a later real file still ingests | N/A — synchronous pure function, no consumer callback | N/A — reader is a reader; crash-mid-write applies to writers (T3 `faulthelper`) | N/A — no persistent reader state to recover |
 | **FrameRelay** | TEST(`testRelay_midWriteGrowing_neverPublishedUntilStable_noTempLitter`) — grown across ticks, never published until stable; temp never visible under glob | TEST(`testRelay_truncatedDest_healedOnceWithLog`) — pre-existing truncated dest healed exactly once, one `relay healed` log, then skipped | TEST(`testRelay_deletedMidRun_noPublishNoCrashPendingCleared`) — source deleted between ticks: no publish, no crash, pending entry cleared (recreate re-primes) | TEST(`testRelay_sourceDirRemoved_logsAndSurvivesThenResumes`) — source dir removed: logs `source unreachable`, keeps ticking, resumes on restore | PROXY(read-only dir ≈ ENOSPC/EIO) — `testRelay_readOnlyDest_copyFailsLoggedRetriedNoLitter` — staged copy fails, logged `retry next poll`, no temp litter, relays after restore | N/A — relay copies real files; "invalid replacement" (dir/symlink where a file is expected) is a reader/pruner concern, not the relay's copy path | N/A — relay has no consumer callback; it is a producer. Downstream slow-consumer is the pipeline row (T3) | PROXY→T3(`testCrash_relayMidcopy_noGlobVisiblePartialFreshRelayHeals`) — relay crash-mid-copy covered in T3 via `faulthelper` (partial `.relaytmp` aftermath): no glob-visible partial left in dst after SIGKILL | PROXY→T3(`testCrash_relayMidcopy_noGlobVisiblePartialFreshRelayHeals`) — restart against relay artifacts is T3: a fresh relay over the same src/dst heals (completes the copy, healed size == source size) |
 | **RelayPruner** | N/A — pruner acts on whole dated session dirs at rest; there is no growing/partial file to observe | N/A — pruner never reads file contents; a truncated file inside a session is irrelevant to age-based removal | N/A — a session dir deleted before prune simply isn't listed; `contentsOfDirectory` failure returns `[]` (best-effort) | N/A — the ROOT missing → `contentsOfDirectory` fails → returns `[]` (guarded, non-throwing); no separate test needed | PROXY(read-only dir ≈ undeletable/ENOSPC) — `testPruner_readOnlySessionDir_skippedBestEffortOthersRemoved` — read-only old session skipped best-effort (no throw), deletable sibling still removed | TEST(`testPruner_danglingSymlinkEntry_skippedUntouched`) — dangling symlink with a dated name: `isDirectory` false → skipped, left untouched; real old dir still pruned | N/A — pruner is synchronous, no consumer | N/A — pruner is a periodic sweep, not a writer; no crash-mid-write artifact | N/A — pruner is idempotent and stateless; nothing to recover |
-| **StackFileWatcher** | TEST(`testWatcher_midWriteGrowing_notEmittedUntilStable`) — preallocated + mtime-bumping file not emitted until stable, then exactly once | PROXY→existing — truncated FITS rejection is covered by the FITS row's `testFITS_truncated_watcherRejectsThenAcceptsComplete` and existing `StackFileWatcherTests.testIgnoresPartialFITSUntilComplete` (size < `minimumFileSize` gate) | TEST(`testWatcher_deletedMidRun_noCrashNextFileFine`) — file deleted after emit: no crash, no re-emit, a new file still ingests | TEST(`testWatcher_dirRemoved_logsOnceAndResumesOnRecreate`, `testWatcher_stopAfterDirRemoved_noCrash`) — folder removed mid-run: logs exactly once ("watched folder disappeared"), no spurious emit, no crash; folder recreated → same live watcher resumes (re-arms DispatchSource fd) and ingests a new FITS; stop() during missing window is idempotent. Full invariant including clause 6 (honest log) now met. FOUND-BUG #1 fixed. TEST(`testWatcher_folderAtomicallyReplaced_reArmsAndReEarnsStability`) — folder ATOMICALLY swapped (rename(2)-family `RENAME_SWAP`, no missing interval, review3 P1): detected via (st_dev, st_ino) identity mismatch against the armed fd, logged ("watched folder was replaced"), stale source cancelled and re-armed on the new inode BEFORE claiming recovery, pending stability cleared (same-name/size/mtime file re-earns stability across a tick; emitted digests retained for dedup), a genuinely new file in the swapped-in dir ingests | N/A — the watcher only reads the watched folder; it never writes a destination | TEST(`testWatcher_regularFileAtFolderPath_notMistakenForRecovery`) — a regular FILE at the exact watched-folder path (review3 P2): NOT recovery — `open(O_EVTONLY)` would succeed on it, but presence now requires an actual directory; no "resuming" claim while the impostor sits there (logged once, no per-tick spam), genuine directory recreation resumes and a new file ingests. A directory named `*.fit` INSIDE the folder remains covered by `testFITS_invalidReplacement_directoryNamedFit` (watcher skips, no emit) | N/A(here) — the slow/hung consumer is a downstream-of-watcher pipeline concern (drain-timeout), T3 row | N/A — watcher is a reader; crash-mid-write applies to the writer feeding it | N/A(here) — watcher holds only in-memory stat/digest state; recovery is a fresh `start()` (see dir-removed) |
+| **StackFileWatcher** | TEST(`testWatcher_midWriteGrowing_notEmittedUntilStable`) — preallocated + mtime-bumping file not emitted until stable, then exactly once | PROXY→existing — truncated FITS rejection is covered by the FITS row's `testFITS_truncated_watcherRejectsThenAcceptsComplete` and existing `StackFileWatcherTests.testIgnoresPartialFITSUntilComplete` (size < `minimumFileSize` gate) | TEST(`testWatcher_deletedMidRun_noCrashNextFileFine`) — file deleted after emit: no crash, no re-emit, a new file still ingests | TEST(`testWatcher_dirRemoved_logsOnceAndResumesOnRecreate`, `testWatcher_stopAfterDirRemoved_noCrash`) — folder removed mid-run: logs exactly once ("watched folder disappeared"), no spurious emit, no crash; folder recreated → same live watcher resumes (re-arms DispatchSource fd) and ingests a new FITS; stop() during missing window is idempotent. Full invariant including clause 6 (honest log) now met. FOUND-BUG #1 fixed. TEST(`testWatcher_folderAtomicallyReplaced_reArmsAndReEarnsStability`) — folder ATOMICALLY swapped (rename(2)-family `RENAME_SWAP`, no missing interval, review3 P1): detected via (st_dev, st_ino) identity mismatch against the armed fd, logged ("watched folder was replaced"), stale source cancelled and re-armed on the new inode BEFORE claiming recovery, pending stability cleared (same-name/size/mtime file re-earns stability across a tick; emitted digests retained for dedup), a genuinely new file in the swapped-in dir ingests. Review4 closes the residual MID-SCAN window structurally: `scan()` enumerates and stats through the ARMED fd (`openat(fd, ".")` → `fdopendir`/`readdir`, `fstatat`), never by path, so a swap landing between the identity check and the enumeration is harmless BY CONSTRUCTION — the fd pins the old inode and the pass observes only old-directory contents; the next scan's identity check detects the swap. Pinned deterministically (no timing) by TEST(`testEnumerateDirectory_pinnedFDSeesOldContentsAcrossAtomicSwap`). Content reads (FITS header/digest) remain path-based, protected by the stability+digest gates | N/A — the watcher only reads the watched folder; it never writes a destination | TEST(`testWatcher_regularFileAtFolderPath_notMistakenForRecovery`) — a regular FILE at the exact watched-folder path (review3 P2): NOT recovery — `open(O_EVTONLY)` would succeed on it, but presence now requires an actual directory; no "resuming" claim while the impostor sits there (logged once, no per-tick spam), genuine directory recreation resumes and a new file ingests. A directory named `*.fit` INSIDE the folder remains covered by `testFITS_invalidReplacement_directoryNamedFit` (watcher skips, no emit) | N/A(here) — the slow/hung consumer is a downstream-of-watcher pipeline concern (drain-timeout), T3 row | N/A — watcher is a reader; crash-mid-write applies to the writer feeding it | N/A(here) — watcher holds only in-memory stat/digest state; recovery is a fresh `start()` (see dir-removed) |
 
 ### Notes / justification for proxies and gaps
 
@@ -83,7 +83,7 @@ privileged runner.
 | Scenario | Test | Assertion |
 |---|---|---|
 | `session-midframes` | TEST(`testCrash_sessionMidframes_manifestIntact3SnapshotsFreshStartClean`) | SIGKILL with 3 durable snapshots → manifest parses, 3 snapshots intact + readable, `end_time` nil (running is truthful); a fresh manager starts a sibling session cleanly |
-| `manifest-midwrite` | TEST(`testCrash_manifestMidwrite_manifestEitherCompleteNeverTorn`) | SIGKILL mid-rewrite → manifest is EITHER the previous complete version OR the new complete version (atomic write) — never torn; oracle clause 1 (parses) is the teeth |
+| `manifest-midwrite` | TEST(`testCrash_manifestMidwrite_killBetweenStageAndPublish_priorVersionIntact`) | SIGKILL lands DETERMINISTICALLY between staging and publication of a challenged write (the seam writer stages, flags, then blocks forever — never publishes; review4). Aftermath fully assertable: published manifest is EXACTLY the last pre-challenge version (count pinned to 123), the `.staged-<pid>` temp parses as the complete, closed, unpublished challenged version (count 124), oracle passes; the builder verifies death BY SIGKILL (uncaught signal 9) |
 | `relay-midcopy` | TEST(`testCrash_relayMidcopy_noGlobVisiblePartialFreshRelayHeals`) | SIGKILL mid-copy → dst has NO glob-visible partial (staged to a hidden `.<name>.relaytmp` / itemReplacement dir, only atomically renamed into place); a fresh relay over the same dirs completes the copy (heals), healed size == source size |
 
 ### Notes / justification — Task 3
@@ -104,15 +104,15 @@ privileged runner.
   killed-mid-state directory, satisfying the spec's "terminated helper process, not merely objects
   released in-process" rule. Two cells were hardened after an oracle-evasion hunt found they were
   killing an IDLE process (flag touched AFTER the op settled):
-  - `manifest-midwrite`: the helper pre-seeds a large (multi-MB) manifest, then LOOPS FOREVER
-    rewriting it through the injected `SessionManager.manifestWriter` seam — no sleeps, no block, no
-    per-iteration PNG encode (so the manifest write dominates the loop). The seam performs an explicit
-    staged atomic write (full bytes staged to a same-dir temp → readiness flag → rename to publish),
-    so the flag first appears only while staged-but-unpublished bytes exist on disk and the kill lands
-    within an open write transaction (or a later iteration's write cycle) — never on the idle
-    pre-seeded manifest. The atomic-publish guarantee is genuinely exercised: **whatever instant the
-    kill lands, the published manifest on disk is SOME complete version — never a torn/half-serialized
-    file.** (What is NOT guaranteed: WHICH version survives — the test asserts only that it parses.)
+  - `manifest-midwrite` (as hardened at review4 — see the review4 note below for the history): the
+    helper pre-seeds a large (multi-MB) manifest, performs a few NORMAL staged-atomic writes through
+    the injected `SessionManager.manifestWriter` seam (proving writes were flowing), then on the
+    CHALLENGED write stages the full new manifest bytes to a same-dir `.staged-<pid>` temp, touches
+    the readiness flag, and BLOCKS FOREVER — it never publishes. **The kill deterministically lands
+    between staging and publication of the challenged write; the aftermath proves the prior
+    published version survives intact** (exact pre-challenge snapshot count) beside the complete,
+    closed, unpublished staged temp (exact challenged count). This is a process-crash test, not a
+    power-loss test — no fsync/durability claim is made about the staged bytes.
     - **Platform note (mutation-check finding):** the prescribed mutation (switch `persist` from
       `.atomic` to `options: []`) does NOT tear on this macOS/APFS host — verified over 100+ SIGKILL
       samples at manifest sizes up to 300 MB, tear rate 0. `Data.write(options: [])` writes in-place
@@ -122,7 +122,9 @@ privileged runner.
       guarantee. The oracle's clause-1 (parse) TEETH are proven independently by
       `FaultKitTests.testOracleHasTeeth` (a truncated manifest fails clause 1). We keep `.atomic`
       because it is the portable guarantee (other filesystems / larger-than-one-syscall writes CAN
-      tear), and keep the mid-activity loop so the kill is genuinely mid-write rather than post-settle.
+      tear). (The mid-activity LOOP this note originally referred to was replaced at review4 by the
+      deterministic block-at-pre-publish design above — the kill now always lands mid-transaction
+      by construction, not by loop timing.)
   - `relay-midcopy`: see the seam justification below.
 - **SEAM JUSTIFICATION — `FrameRelay.onPrePublish` (required by the `relay-midcopy` cell).** The relay
   stages src → hidden `.<name>.relaytmp`, re-stats to verify the copy, then atomically renames it into
@@ -185,7 +187,9 @@ privileged runner.
   WHICH version survives — only that the published manifest is always some complete version, because
   publication happens solely via atomic rename of fully staged bytes. (A first cut set the flag
   before calling `write(.atomic)`, which left a preemption window between flag and write where the
-  kill overlapped no write at all — review3 P2 closed it with the staged writer.) **Production
+  kill overlapped no write at all — review3 P2 closed it with the staged writer. Review4 then made
+  the kill point fully deterministic: the challenged write now blocks forever pre-publish — see the
+  review4 note below.) **Production
   safety:** the seam defaults to `nil`; when nil, `persist` runs the identical `Data(.atomic)` write
   as before (byte-for-byte behavior, existing SessionManager tests unmodified and green). It is a
   coordination/injection point, not behavior. This is the SECOND (and final) pre-approved seam used
@@ -198,3 +202,41 @@ privileged runner.
   actor (safe); the relay-cell `onLog` counters (`heals`/`unreachable`/`retries`) run synchronously
   inside `copyOnce()` on the test thread (no cross-thread access, safe); the review2-added watcher
   helpers (`WatcherLogSink`, `FolderReplaceClock`) are lock-protected. No other unprotected collectors.
+
+### Notes / justification — Outside Review #4 (review4 fix wave)
+
+- **P2 — `manifest-midwrite` kill point made DETERMINISTIC (supersedes the review2/review3 loop).**
+  The review3 design touched the flag between stage and publish but then kept LOOPING; the builder's
+  polled SIGKILL (20 ms granularity) landed many cycles later, at a RANDOM loop phase — possibly the
+  re-encode gap between writes. "Lands inside an open write transaction" was a property of where the
+  flag FIRST appeared, not of where the kill actually landed. FIX: the seam writer performs a few
+  normal stage→publish cycles (writes provably flowing), then on the CHALLENGED write stages the full
+  new bytes to `.staged-<pid>`, touches the flag, and BLOCKS FOREVER — never publishing. The kill now
+  deterministically lands between staging and publication, and the cell asserts the exact aftermath:
+  published manifest == the last pre-challenge version (count 123), staged temp == the complete,
+  closed, unpublished challenged version (count 124), oracle green
+  (`testCrash_manifestMidwrite_killBetweenStageAndPublish_priorVersionIntact`). No durability (fsync)
+  claim is made about the staged bytes — this is a process-crash test, not a power-loss test. The
+  seam remains justified: a block-point cannot be interposed inside production `Data(.atomic)`; the
+  injected writer performs byte-identical staging steps, and the production path's crash-atomicity is
+  separately covered by the APFS in-place cells.
+- **P2 — CrashArtifactBuilder now VERIFIES the termination (all crash scenarios).**
+  `kill(pid, SIGKILL)` must return 0 (throws `killFailed` otherwise), and after
+  `Process.waitUntilExit()` the builder requires `terminationReason == .uncaughtSignal` with
+  `terminationStatus == SIGKILL` (throws `notKilledBySIGKILL` otherwise) — an artifact is only valid
+  if the helper died BY SIGKILL, never via a clean or errored exit. (Foundation's `Process` reaps the
+  child itself; the builder deliberately does NOT call `waitpid` — that would race Process's own
+  child handling.)
+- **P2 — watcher mid-scan TOCTOU closed STRUCTURALLY (fd-relative enumeration).** `scan()` validates
+  the watched path's (dev, ino) identity once at the top; enumeration previously ran BY PATH below
+  it, so a swap landing in between applied old `lastSeenStat` observations to the NEW directory's
+  files. Now enumeration and per-file stats go through the ARMED fd
+  (`StackFileWatcher.enumerateDirectory(fd:)`: `openat(fd, ".", O_RDONLY|O_DIRECTORY)` →
+  `fdopendir` → `readdir`; `fstatat(folderFD, name, …)`) — the fd pins the old inode, so a mid-scan
+  swap is harmless by construction and the next scan's identity check resets state. No new seam and
+  no timing: the structural property is unit-tested deterministically
+  (`testEnumerateDirectory_pinnedFDSeesOldContentsAcrossAtomicSwap` — fd opened on dir A, dir B
+  atomically renamed over A's path, fd-relative enumeration still returns A's contents). Content
+  reads (FITS header + digest) remain path-based — honestly noted in the code — and are protected by
+  the stability + digest gates; the path-based `fileExists` check is kept ONLY for the
+  folderMissing/recovery branch, where the fd is dead by definition.
