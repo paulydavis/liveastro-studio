@@ -175,7 +175,7 @@ swift test -c release --filter PerformanceTests     # 26 MP perf gate (< 10 s pe
 ```
 
 Design specs:
-- v1: `docs/superpowers/specs/2026-07-05-liveastro-studio-v1-design.md`
-- v2 native stacking: `docs/superpowers/specs/2026-07-07-liveastro-v2-native-stacking-design.md`
+- v1: `docs/history/specs/2026-07-05-liveastro-studio-v1-design.md`
+- v2 native stacking: `docs/history/specs/2026-07-07-liveastro-v2-native-stacking-design.md`
 
 Validation comparison script: `Scripts/compare_to_master.py`
