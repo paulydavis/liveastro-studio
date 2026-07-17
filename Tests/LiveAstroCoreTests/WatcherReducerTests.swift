@@ -19,7 +19,7 @@ final class WatcherReducerTests: XCTestCase {
             FolderGeneration(rawValue: 2))).isEmpty)
 
         let firstPass = observeBatch([
-            observation(name: one, revision: "00001", outcome: .invalid(reason: "truncated")),
+            observation(name: one, revision: "00001", outcome: .invalid),
             observation(name: two, revision: "00002", outcome: .digested(
                 identity: twoIdentity, digest: "changed-two", byteCount: twoIdentity.size)),
             observation(name: three, revision: "00003", outcome: .digested(
@@ -34,14 +34,14 @@ final class WatcherReducerTests: XCTestCase {
             10)
 
         XCTAssertTrue(observeBatch([
-            observation(name: one, revision: "00001", outcome: .invalid(reason: "truncated")),
+            observation(name: one, revision: "00001", outcome: .invalid),
             observation(name: two, revision: "00002", outcome: .digested(
                 identity: twoIdentity, digest: "changed-two", byteCount: twoIdentity.size)),
             observation(name: three, revision: "00003", outcome: .digested(
                 identity: threeIdentity, digest: "three", byteCount: threeIdentity.size)),
         ], nowNanos: 20, reducer: &reducer).isEmpty)
         let heldEffects = observeBatch([
-            observation(name: one, revision: "00001", outcome: .invalid(reason: "truncated")),
+            observation(name: one, revision: "00001", outcome: .invalid),
             observation(name: two, revision: "00002", outcome: .digested(
                 identity: twoIdentity, digest: "changed-two", byteCount: twoIdentity.size)),
             observation(name: three, revision: "00003", outcome: .digested(
@@ -55,7 +55,7 @@ final class WatcherReducerTests: XCTestCase {
             kind: .numbered(revision: "00002"))))
 
         let released = observeBatch([
-            observation(name: one, revision: "00001", outcome: .invalid(reason: "truncated")),
+            observation(name: one, revision: "00001", outcome: .invalid),
             observation(name: two, revision: "00002", outcome: .identityUnchanged(
                 identity: twoIdentity)),
             observation(name: three, revision: "00003", outcome: .identityUnchanged(
@@ -1297,7 +1297,7 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertTrue(observe(
             name: name,
             kind: .numbered(revision: "00007"),
-            outcome: .invalid(reason: "torn replacement"),
+            outcome: .invalid,
             nowNanos: 20,
             reducer: &reducer).isEmpty)
         XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
@@ -1638,7 +1638,7 @@ final class WatcherReducerTests: XCTestCase {
         let effects = observe(
             name: "live_stack.fit",
             kind: .classicMutable,
-            outcome: .invalid(reason: "truncated"),
+            outcome: .invalid,
             nowNanos: 20,
             reducer: &reducer)
 
@@ -1887,7 +1887,7 @@ final class WatcherReducerTests: XCTestCase {
         observation(
             name: revisionName(revision),
             revision: revision,
-            outcome: .invalid(reason: "incomplete"))
+            outcome: .invalid)
     }
 
     private func emittedNames(in effects: [WatcherEffect]) -> [String] {

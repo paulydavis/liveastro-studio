@@ -138,7 +138,7 @@ struct FileObservation: Equatable {
 
 enum ObservationOutcome: Equatable {
     case absent
-    case invalid(reason: String)
+    case invalid
     case unstable(identity: FileIdentity)
     case identityUnchanged(identity: FileIdentity)
     case digested(identity: FileIdentity, digest: String, byteCount: Int)

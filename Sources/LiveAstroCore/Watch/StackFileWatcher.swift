@@ -629,21 +629,19 @@ public final class StackFileWatcher {
     /// the streaming digest observed stopRequested and the entire scan must abort.
     private func observeFile(named name: String) -> FileObservation? {
         let url = folder.appendingPathComponent(name)
-        let invalid: (String) -> FileObservation = { reason in
-            FileObservation(
-                name: name,
-                url: url,
-                kind: self.reducer.entryKind(for: name),
-                outcome: .invalid(reason: reason))
-        }
+        let invalid = FileObservation(
+            name: name,
+            url: url,
+            kind: reducer.entryKind(for: name),
+            outcome: .invalid)
 
         guard let handle = Self.openFile(directoryFD: folderFD, name: name) else {
-            return invalid("open failed or entry is not a regular file")
+            return invalid
         }
         defer { try? handle.close() }
 
         guard let observed = Self.statFile(handle), observed.size > 0 else {
-            return invalid("stat failed or file is empty")
+            return invalid
         }
         let ext = (name as NSString).pathExtension.lowercased()
         let entry = EnumeratedEntry(
@@ -652,7 +650,7 @@ public final class StackFileWatcher {
             identity: observed,
             isFITS: ImageLoader.fitsExtensions.contains(ext))
         guard let request = reducer.readPlan(for: [entry]).first else {
-            return invalid("no read plan")
+            return invalid
         }
 
         switch request {
@@ -673,7 +671,7 @@ public final class StackFileWatcher {
                         name: requestName,
                         url: requestURL,
                         kind: kind,
-                        outcome: .invalid(reason: "malformed or incomplete FITS"))
+                        outcome: .invalid)
                 }
             }
 
@@ -688,7 +686,7 @@ public final class StackFileWatcher {
                     name: requestName,
                     url: requestURL,
                     kind: kind,
-                    outcome: .invalid(reason: "digest failed"))
+                    outcome: .invalid)
             }
 
             guard let finalStat = Self.statFile(handle) else {
@@ -696,7 +694,7 @@ public final class StackFileWatcher {
                     name: requestName,
                     url: requestURL,
                     kind: kind,
-                    outcome: .invalid(reason: "final stat failed"))
+                    outcome: .invalid)
             }
             guard finalStat == identity else {
                 return FileObservation(

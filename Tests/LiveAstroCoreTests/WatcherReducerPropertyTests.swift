@@ -117,7 +117,7 @@ final class WatcherReducerPropertyTests: XCTestCase {
                 case 0:
                     outcome = .absent
                 case 1:
-                    outcome = .invalid(reason: "incomplete")
+                    outcome = .invalid
                     presentNames.append(name)
                 case 2:
                     outcome = .unstable(identity: identity)
@@ -205,7 +205,7 @@ final class WatcherReducerPropertyTests: XCTestCase {
             makeObservation(
                 name: blocker,
                 revision: "11",
-                outcome: .invalid(reason: "incomplete")),
+                outcome: .invalid),
             makeObservation(
                 name: victim,
                 revision: "12",
@@ -415,7 +415,7 @@ final class WatcherReducerPropertyTests: XCTestCase {
         makeObservation(
             name: revisionName(revision),
             revision: revision,
-            outcome: .invalid(reason: "incomplete"))
+            outcome: .invalid)
     }
 
     private func isTerminal(_ state: FileState?) -> Bool {
