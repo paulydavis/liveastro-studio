@@ -166,16 +166,23 @@ final class WatcherReducerPropertyTests: XCTestCase {
                 return false
             }
             let expectedBlocker: String?
+            let expectedVictims: Set<String>?
             if let firstFailure,
                potential.index(after: firstFailure) < potential.endIndex {
                 expectedBlocker = potential[firstFailure]
+                expectedVictims = Set(potential[potential.index(after: firstFailure)...])
             } else {
                 expectedBlocker = nil
+                expectedVictims = nil
             }
 
             XCTAssertEqual(
                 reducer.state.generation.ordering.activeBlocker?.blocker,
                 expectedBlocker,
+                "seed=\(Self.seed) transition=\(transition) potential=\(potential)")
+            XCTAssertEqual(
+                reducer.state.generation.ordering.activeBlocker?.victims,
+                expectedVictims,
                 "seed=\(Self.seed) transition=\(transition) potential=\(potential)")
         }
     }

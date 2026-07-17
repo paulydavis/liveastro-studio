@@ -78,7 +78,8 @@ final class WatcherReducerTests: XCTestCase {
                        BlockingEpisode(
                         blocker: revisionName("00002"),
                         startNanos: 100,
-                        deadlineNanos: 100 &+ reducer.blockingBudgetNanos))
+                        deadlineNanos: 100 &+ reducer.blockingBudgetNanos,
+                        victims: [revisionName("00003")]))
 
         XCTAssertTrue(observeBatch([
             invalidRevision("00001"),
@@ -99,7 +100,8 @@ final class WatcherReducerTests: XCTestCase {
                        BlockingEpisode(
                         blocker: revisionName("00002"),
                         startNanos: 300,
-                        deadlineNanos: 300 &+ reducer.blockingBudgetNanos),
+                        deadlineNanos: 300 &+ reducer.blockingBudgetNanos,
+                        victims: [revisionName("00003")]),
                        "the second blocker role starts a new episode at the transition")
     }
 
@@ -216,7 +218,8 @@ final class WatcherReducerTests: XCTestCase {
                     ordering: RevisionOrderingState(activeBlocker: BlockingEpisode(
                         blocker: blocker,
                         startNanos: 0,
-                        deadlineNanos: ceiling - 1))),
+                        deadlineNanos: ceiling - 1,
+                        victims: [revisionName("00002")]))),
                 lastEmittedDigestByName: [:]),
             configuration: configuration)
 
@@ -396,7 +399,8 @@ final class WatcherReducerTests: XCTestCase {
                        BlockingEpisode(
                         blocker: blocker,
                         startNanos: 20,
-                        deadlineNanos: 20 &+ reducer.blockingBudgetNanos))
+                        deadlineNanos: 20 &+ reducer.blockingBudgetNanos,
+                        victims: [victim]))
 
         XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
             intent: victimIntent,
@@ -410,6 +414,131 @@ final class WatcherReducerTests: XCTestCase {
         ], nowNanos: 30, reducer: &reducer).isEmpty)
         XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos, 30,
                        "a later victim starts a fresh episode, never the stale clock")
+    }
+
+    func testUnrelatedClassicEmissionPreservesInvalidVictimEpisode() {
+        let blocker = revisionName("00001")
+        let victim = revisionName("00002")
+        let classic = "live_stack.fit"
+        let classicCandidate = makeCandidate(
+            name: classic,
+            identity: makeIdentity(9),
+            digest: "classic")
+        var reducer = makeReducer(files: [classic: .ready(classicCandidate)])
+
+        let effects = observeBatch([
+            FileObservation(
+                name: classic,
+                url: classicCandidate.url,
+                kind: .classicMutable,
+                outcome: .identityUnchanged(identity: classicCandidate.identity)),
+            invalidRevision("00001"),
+            invalidRevision("00002"),
+        ], nowNanos: 100, reducer: &reducer)
+        guard let classicIntent = effects.compactMap({ effect -> EmissionIntent? in
+            guard case .emit(let intent) = effect,
+                  intent.candidate.name == classic else { return nil }
+            return intent
+        }).first else {
+            return XCTFail("ready classic entry must receive an earlier emission intent")
+        }
+        let episodeBeforeEmission = reducer.state.generation.ordering.activeBlocker
+        XCTAssertEqual(episodeBeforeEmission?.blocker, blocker)
+        XCTAssertEqual(episodeBeforeEmission?.startNanos, 100)
+        XCTAssertEqual(episodeBeforeEmission?.deadlineNanos,
+                       100 &+ reducer.blockingBudgetNanos)
+        XCTAssertEqual(episodeBeforeEmission?.victims, [victim])
+
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: classicIntent,
+            outcome: .yielded))).isEmpty)
+
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker,
+                       episodeBeforeEmission,
+                       "unrelated classic completion cannot erase invalid victim \(victim)")
+    }
+
+    func testTerminalizingOneOfMultipleVictimsRetainsClockAndRemainingVictim() {
+        let blocker = revisionName("00001")
+        let terminalizingVictim = revisionName("00002")
+        let remainingVictim = revisionName("00003")
+        let identity = makeIdentity(2)
+        let digest = "already-emitted"
+        var reducer = makeReducer(
+            files: [terminalizingVictim: .digestPending(PendingDigest(
+                digest: digest,
+                identity: identity,
+                firstObservedNanos: 0))],
+            digests: [terminalizingVictim: digest])
+
+        XCTAssertTrue(observeBatch([
+            invalidRevision("00001"),
+            observation(
+                name: terminalizingVictim,
+                revision: "00002",
+                outcome: .identityUnchanged(identity: identity)),
+            invalidRevision("00003"),
+        ], nowNanos: 100, reducer: &reducer).isEmpty)
+        let originalEpisode = reducer.state.generation.ordering.activeBlocker
+        XCTAssertEqual(originalEpisode?.blocker, blocker)
+        XCTAssertEqual(originalEpisode?.victims, [terminalizingVictim, remainingVictim])
+
+        XCTAssertTrue(observeBatch([
+            invalidRevision("00001"),
+            observation(
+                name: terminalizingVictim,
+                revision: "00002",
+                outcome: .digested(
+                    identity: identity,
+                    digest: digest,
+                    byteCount: identity.size)),
+            invalidRevision("00003"),
+        ], nowNanos: 200, reducer: &reducer).isEmpty)
+
+        XCTAssertEqual(reducer.state.generation.files[terminalizingVictim],
+                       .settled(.duplicateOfLastEmission(identity: identity, digest: digest)))
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, blocker)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos,
+                       originalEpisode?.startNanos)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.deadlineNanos,
+                       originalEpisode?.deadlineNanos)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.victims,
+                       [remainingVictim])
+    }
+
+    func testObservationRefreshReplacesVictimSnapshotAndTearsDownWhenEmpty() {
+        let blocker = revisionName("00001")
+        let firstVictim = revisionName("00002")
+        let remainingVictim = revisionName("00003")
+        var reducer = makeReducer()
+
+        XCTAssertTrue(observeBatch([
+            invalidRevision("00001"),
+            invalidRevision("00002"),
+            invalidRevision("00003"),
+        ], nowNanos: 100, reducer: &reducer).isEmpty)
+        let originalEpisode = reducer.state.generation.ordering.activeBlocker
+        XCTAssertEqual(originalEpisode?.blocker, blocker)
+        XCTAssertEqual(originalEpisode?.victims, [firstVictim, remainingVictim])
+
+        XCTAssertTrue(observeBatch([
+            invalidRevision("00001"),
+            observation(name: firstVictim, revision: "00002", outcome: .absent),
+            invalidRevision("00003"),
+        ], nowNanos: 200, reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos,
+                       originalEpisode?.startNanos)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.deadlineNanos,
+                       originalEpisode?.deadlineNanos)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.victims,
+                       [remainingVictim])
+
+        XCTAssertTrue(observeBatch([
+            invalidRevision("00001"),
+            observation(name: firstVictim, revision: "00002", outcome: .absent),
+            observation(name: remainingVictim, revision: "00003", outcome: .absent),
+        ], nowNanos: 300, reducer: &reducer).isEmpty)
+        XCTAssertNil(reducer.state.generation.ordering.activeBlocker)
     }
 
     func testSuccessfulEmissionOfActiveBlockerPrunesInconsistentEpisode() {
@@ -428,7 +557,8 @@ final class WatcherReducerTests: XCTestCase {
             activeBlocker: BlockingEpisode(
                 blocker: blocker,
                 startNanos: 10,
-                deadlineNanos: 20))
+                deadlineNanos: 20,
+                victims: [victim]))
 
         XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
             intent: EmissionIntent(generation: reducer.state.generation.id, candidate: candidate),
@@ -457,7 +587,10 @@ final class WatcherReducerTests: XCTestCase {
                     id: FolderGeneration(rawValue: 41),
                     files: files,
                     ordering: RevisionOrderingState(activeBlocker: BlockingEpisode(
-                        blocker: "blocked.fit", startNanos: 100, deadlineNanos: 200))),
+                        blocker: "blocked.fit",
+                        startNanos: 100,
+                        deadlineNanos: 200,
+                        victims: ["victim.fit"]))),
                 lastEmittedDigestByName: digests),
             configuration: makeConfiguration())
 
@@ -1033,7 +1166,8 @@ final class WatcherReducerTests: XCTestCase {
                 ordering: RevisionOrderingState(activeBlocker: BlockingEpisode(
                     blocker: "live_stack.fit",
                     startNanos: 1_000,
-                    deadlineNanos: 2_000))),
+                    deadlineNanos: 2_000,
+                    victims: ["victim.fit"]))),
             lastEmittedDigestByName: ["settled.fit": "settled"])
     }
 

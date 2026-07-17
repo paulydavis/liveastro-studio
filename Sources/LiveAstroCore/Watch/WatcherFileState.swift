@@ -50,6 +50,31 @@ struct BlockingEpisode: Equatable {
     let blocker: String
     let startNanos: UInt64
     var deadlineNanos: UInt64
+    private(set) var victims: Set<String>
+
+    init?(
+        blocker: String,
+        startNanos: UInt64,
+        deadlineNanos: UInt64,
+        victims: Set<String>
+    ) {
+        guard !victims.isEmpty else { return nil }
+        self.blocker = blocker
+        self.startNanos = startNanos
+        self.deadlineNanos = deadlineNanos
+        self.victims = victims
+    }
+
+    mutating func refreshVictims(_ victims: Set<String>) -> Bool {
+        guard !victims.isEmpty else { return false }
+        self.victims = victims
+        return true
+    }
+
+    mutating func removeVictim(named name: String) -> Bool {
+        victims.remove(name)
+        return !victims.isEmpty
+    }
 }
 
 struct WatcherReducerConfiguration {
@@ -209,45 +234,34 @@ struct WatcherReducer {
                 identity: candidate.identity,
                 digest: candidate.digest))
             state.lastEmittedDigestByName[candidate.name] = candidate.digest
-            pruneActiveBlockerIfPredicateIsFalse()
+            reconcileActiveBlocker(afterEmitting: candidate)
             return []
         }
     }
 
-    private mutating func pruneActiveBlockerIfPredicateIsFalse() {
-        guard let episode = state.generation.ordering.activeBlocker else { return }
-        guard revisionOrderingEnabled,
-              let blockerRevision = revisionOrder.revision(in: episode.blocker),
-              !isTerminal(state.generation.files[episode.blocker]),
-              !isReady(state.generation.files[episode.blocker])
-        else {
+    private mutating func reconcileActiveBlocker(afterEmitting candidate: EmissionCandidate) {
+        guard var episode = state.generation.ordering.activeBlocker else { return }
+
+        if candidate.name == episode.blocker {
             state.generation.ordering.activeBlocker = nil
             return
         }
 
-        if let mark = emittedRevisionHighWater,
-           revisionOrder.compare(blockerRevision, mark) != .orderedDescending {
-            state.generation.ordering.activeBlocker = nil
-            return
-        }
-
-        let blocker = (name: episode.blocker, revision: Optional(blockerRevision))
-        var hasLaterPotentialVictim = false
-        for (name, fileState) in state.generation.files {
-            guard let revision = revisionOrder.revision(in: name),
-                  !isTerminal(fileState) else { continue }
-            let candidate = (name: name, revision: Optional(revision))
-            if revisionOrder.orderedBefore(candidate, blocker), !isReady(fileState) {
+        if episode.victims.contains(candidate.name) {
+            if episode.removeVictim(named: candidate.name) {
+                state.generation.ordering.activeBlocker = episode
+            } else {
                 state.generation.ordering.activeBlocker = nil
-                return
-            }
-            if revisionOrder.orderedBefore(blocker, candidate) {
-                hasLaterPotentialVictim = true
             }
         }
-        if !hasLaterPotentialVictim {
-            state.generation.ordering.activeBlocker = nil
-        }
+
+        guard state.generation.ordering.activeBlocker != nil,
+              revisionOrder.revision(in: candidate.name) != nil,
+              let blockerRevision = revisionOrder.revision(in: episode.blocker),
+              let mark = emittedRevisionHighWater,
+              revisionOrder.compare(blockerRevision, mark) != .orderedDescending
+        else { return }
+        state.generation.ordering.activeBlocker = nil
     }
 
     private struct ClassifiedObservation {
@@ -374,11 +388,12 @@ struct WatcherReducer {
                     intentNames: &intentNames)
             }
 
-            let laterVictims = potential.index(after: blockerIndex) < potential.endIndex
-            guard laterVictims else {
+            let victimStart = potential.index(after: blockerIndex)
+            guard victimStart < potential.endIndex else {
                 state.generation.ordering.activeBlocker = nil
                 return effects
             }
+            let victimNames = Set(potential[victimStart...].map(\.observation.name))
 
             let blocker = potential[blockerIndex]
             let blockerName = blocker.observation.name
@@ -386,11 +401,16 @@ struct WatcherReducer {
                 state.generation.ordering.activeBlocker = BlockingEpisode(
                     blocker: blockerName,
                     startNanos: nowNanos,
-                    deadlineNanos: nowNanos &+ blockingBudgetNanos)
+                    deadlineNanos: nowNanos &+ blockingBudgetNanos,
+                    victims: victimNames)
                 return effects
             }
 
             guard var episode = state.generation.ordering.activeBlocker else {
+                return effects
+            }
+            guard episode.refreshVictims(victimNames) else {
+                state.generation.ordering.activeBlocker = nil
                 return effects
             }
             let ceiling = episode.startNanos &+ blockingCeilingNanos
@@ -398,9 +418,9 @@ struct WatcherReducer {
                 let renewed = min(nowNanos &+ blockingGraceNanos, ceiling)
                 if renewed > episode.deadlineNanos {
                     episode.deadlineNanos = renewed
-                    state.generation.ordering.activeBlocker = episode
                 }
             }
+            state.generation.ordering.activeBlocker = episode
             guard nowNanos >= min(episode.deadlineNanos, ceiling) else { return effects }
 
             state.generation.files[blockerName] = .writtenOff
