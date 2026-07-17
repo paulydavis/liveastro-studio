@@ -1686,6 +1686,124 @@ final class StackFileWatcherTests: XCTestCase {
                       "no write-off at any point — got \(logs.all)")
     }
 
+    // MARK: - cold2 I1: the blocking deadline is EPISODE-scoped — lone time is never charged
+
+    /// Cold2 I1 (P1, red-first — the reviewer's exact repro): _00001 blocks _00002 only
+    /// BRIEFLY; _00002 vanishes; a long LONE period follows (nobody is blocked — the
+    /// budget is on blocking-without-emitting, not on slowness, so a lone in-progress
+    /// revision may take all night); then _00003 appears. Pre-fix the BlockTrack survived
+    /// the lone period (cleared only on emission/absence/generation), so the lone wall
+    /// time was charged to the deadline and _00001 was written off THE INSTANT _00003
+    /// appeared. Post-fix each blocking episode runs a fresh clock: while blocksLater is
+    /// false the track is cleared, so _00001 gets a full fresh budget, completes inside
+    /// it, and emits in order — no write-off, no frame loss.
+    func testMutablePolicy_loneBlockerPeriodNotCharged_freshClockPerBlockingEpisode() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        let full = makeFITS(0.5, size: 64)
+        let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
+        let url2 = tmp.appendingPathComponent("live_stack_00002.fit")
+        try full.prefix(full.count / 2).write(to: url1)   // in-progress (invalid while stable)
+        try makeFITS(0.2).write(to: url2)
+        let ceiling = Double(watcher.blockingCeilingNanos) / 1e9
+
+        watcher.scanNow()                 // _00001 blocks _00002 — its episode clock starts
+        watcher.scanNow()                 // still blocking, briefly
+        try FileManager.default.removeItem(at: url2)   // _00002 vanishes — nobody is blocked
+        watcher.scanNow()                 // lone: blocksLater false → the episode is over
+
+        // Long lone period, far past budget AND ceiling — this wall time must not count.
+        clock.advance(seconds: ceiling + 10_000)
+        watcher.scanNow()
+        clock.advance(seconds: ceiling + 10_000)
+        watcher.scanNow()
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "a lone in-progress revision starves nobody — never written off; got \(logs.all)")
+
+        // A new blocking episode begins: _00003 appears. _00001 must get a FRESH budget,
+        // not be written off instantly off the lone period's stale clock.
+        try makeFITS(0.3).write(to: tmp.appendingPathComponent("live_stack_00003.fit"))
+        watcher.scanNow()                 // episode 2 starts — fresh clock
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "the returning blocker starts a fresh clock — no instant write-off; got \(logs.all)")
+
+        // The producer completes _00001 well inside the fresh budget → [1, 3] in order.
+        try full.write(to: url1)
+        watcher.scanNow()                 // identity changed → re-earns stability
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                 // stable → digest pending (and _00003 confirmable)
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                 // digest confirmed → _00001 emits, _00003 follows
+        let got = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(got, "the blocker completes inside its FRESH budget and emits")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00001.fit", "live_stack_00003.fit"],
+                       "order preserved — the fresh episode budget was honored")
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "no write-off anywhere in this run — got \(logs.all)")
+    }
+
+    /// Cold2 I1, log-honesty half: when a fresh episode DOES exhaust its budget, the
+    /// write-off log reports the TRUE blocking duration — the current episode's hold,
+    /// never the lone period's wall time (pre-fix heldSeconds spanned the lone period
+    /// and was factually wrong).
+    func testMutablePolicy_writeOffLogReportsEpisodeDuration_notLoneWallTime() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        let full = makeFITS(0.5, size: 64)
+        let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
+        let url2 = tmp.appendingPathComponent("live_stack_00002.fit")
+        try full.prefix(full.count / 2).write(to: url1)   // permanently truncated corpse
+        try makeFITS(0.2).write(to: url2)
+        let budget = Double(watcher.blockingBudgetNanos) / 1e9
+        let ceiling = Double(watcher.blockingCeilingNanos) / 1e9
+        let loneSeconds = 2 * ceiling + 20_000            // far larger than any budget
+
+        watcher.scanNow()                 // episode 1: blocks _00002 briefly
+        try FileManager.default.removeItem(at: url2)
+        watcher.scanNow()                 // lone — episode over
+        clock.advance(seconds: loneSeconds)
+        watcher.scanNow()                 // still lone; the clock must not be charged
+
+        try makeFITS(0.3).write(to: tmp.appendingPathComponent("live_stack_00003.fit"))
+        watcher.scanNow()                 // episode 2 starts — fresh clock
+        // The corpse never completes: run episode 2 past its own budget.
+        var episodeElapsed: TimeInterval = 0
+        while episodeElapsed <= budget + 3601,
+              logs.all.filter({ $0.contains("abandoning") }).isEmpty {
+            clock.advance(seconds: 3601)
+            episodeElapsed += 3601
+            watcher.scanNow()
+        }
+        let writeOffs = logs.all.filter { $0.contains("abandoning") }
+        XCTAssertEqual(writeOffs.count, 1,
+                       "episode 2 exhausts its own budget — exactly one write-off; got \(logs.all)")
+        // Parse "blocked emissions for <N>s" and pin the duration to the EPISODE.
+        let line = writeOffs.first ?? ""
+        let held = Int(line.components(separatedBy: "blocked emissions for ").last?
+            .components(separatedBy: "s ").first ?? "") ?? -1
+        XCTAssertGreaterThanOrEqual(Double(held), budget,
+                                    "the write-off honors the full episode budget — got \(line)")
+        XCTAssertLessThan(Double(held), loneSeconds,
+                          "heldSeconds must report the EPISODE's hold, never the lone wall time — got \(line)")
+        // The healthy revision proceeds once the corpse is written off.
+        let got = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(got, "_00003 must emit once the corpse is written off")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent), ["live_stack_00003.fit"])
+    }
+
     // MARK: - cold1 I3: ordering machinery is .mutableStackerOutput-only
 
     /// Cold1 I3 (red-first): under `.immutableAfterPublish` numbered files are just files —

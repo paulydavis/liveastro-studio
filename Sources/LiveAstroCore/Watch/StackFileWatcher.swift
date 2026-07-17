@@ -434,8 +434,11 @@ public final class StackFileWatcher {
     // off exactly like the old valve: one honest log line, it joins the dropped set, the hold
     // releases, later revisions proceed (the frame is lost, the session preserved). The
     // high-water mark is NOT advanced (only real emissions advance it). The track clears when
-    // the blocker emits, vanishes from the scan, or the folder generation changes. Structural
-    // invalidity is no longer separately counted — the DEADLINE is the mechanism.
+    // the blocker emits, vanishes from the scan, the folder generation changes, or — cold2 I1 —
+    // the blocking EPISODE ends (no later unemitted revision is present to be held: the budget
+    // charges blocking-without-emitting time only, so lone in-progress time never counts and a
+    // returning blocker starts a fresh clock; the ceiling caps each CONTINUOUS episode).
+    // Structural invalidity is no longer separately counted — the DEADLINE is the mechanism.
 
     /// Budget floor: 30 s. Rationale: >> the default 0.5 s quiet period plus several 2 s
     /// poll/stability cycles (no plausible healthy writer is misjudged), << a night (a corpse
@@ -504,8 +507,26 @@ public final class StackFileWatcher {
                                       holdAlreadySet: Bool, blocksLater: Bool) -> Bool {
         guard revisionOrderingEnabled, let revision else { return false }
         guard !writtenOffRevisions.contains(name) else { return false }
-        if holdAlreadySet { return true }
-        guard blocksLater else { return true }
+        if holdAlreadySet {
+            // Cold2 I1: a queued VICTIM's own deadline never runs — and any track it
+            // still carries from an earlier episode dies here, so it "becomes the
+            // blocker, with a fresh clock, only once everything below it has cleared"
+            // (the documented rule, now enforced).
+            blockTracks[name] = nil
+            return true
+        }
+        guard blocksLater else {
+            // Cold2 I1 (P1): the deadline is EPISODE-scoped — it charges only
+            // blocking-without-emitting time. With no later unemitted revision present,
+            // nobody is blocked: the episode is over and its clock DIES with it (a lone
+            // in-progress revision starves nobody and may take all night). Pre-fix the
+            // track survived lone periods, so the next blocking episode inherited a
+            // spent deadline (an instant write-off) and the write-off log charged lone
+            // wall time as "blocked" — factually wrong. A returning blocker now starts
+            // a fresh clock; the ceiling still caps any single CONTINUOUS episode.
+            blockTracks[name] = nil
+            return true
+        }
         let now = monotonicNowNanos()
         guard var track = blockTracks[name] else {
             blockTracks[name] = BlockTrack(startNanos: now,
