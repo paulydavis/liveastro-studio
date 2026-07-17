@@ -58,13 +58,34 @@ final class WatcherReducerPropertyTests: XCTestCase {
     }
 
     func testNumberedCandidatesRespectMarkAndBlockerEligibility() {
+        enum CandidateShape: String {
+            case topLevel
+            case emittedReplacement
+            case duplicateReplacement
+        }
+
         var generator = SplitMix64(seed: Self.seed)
 
         for transition in 0..<Self.transitionCount {
-            let markRevision = "050"
+            let shape: CandidateShape
+            switch transition % 3 {
+            case 0:
+                shape = .topLevel
+            case 1:
+                shape = .emittedReplacement
+            default:
+                shape = .duplicateReplacement
+            }
+            let markRevision = "00050"
             let markName = revisionName(markRevision)
-            let candidateValue = Int(generator.next() % 50) + 1
-            let candidateRevision = String(candidateValue)
+            let generatedCandidateValue = Int(generator.next() % 50) + 1
+            // Multiples of 25 rotate all three shapes through numeric equality.
+            let candidateValue = transition.isMultiple(of: 25)
+                ? 50
+                : generatedCandidateValue
+            let candidateRevision = String(
+                repeating: "0",
+                count: Int(generator.next() % 3)) + String(candidateValue)
             let candidateName = revisionName(candidateRevision)
             let candidateIdentity = makeIdentity(Int64(1_000 + transition))
             let candidate = makeCandidate(
@@ -72,21 +93,26 @@ final class WatcherReducerPropertyTests: XCTestCase {
                 identity: candidateIdentity,
                 digest: "replacement-\(transition)",
                 revision: candidateRevision)
-            let outerWasEmitted = generator.next().isMultiple(of: 2)
-            let settlement: Settlement = outerWasEmitted
-                ? .emittedNow(
+            let candidateState: FileState
+            switch shape {
+            case .topLevel:
+                candidateState = .ready(candidate)
+            case .emittedReplacement:
+                candidateState = .settled(.emittedNow(
                     identity: makeIdentity(Int64(10_000 + transition)),
                     digest: "outer-emitted-\(transition)",
-                    replacement: .ready(candidate))
-                : .duplicateOfLastEmission(
+                    replacement: .ready(candidate)))
+            case .duplicateReplacement:
+                candidateState = .settled(.duplicateOfLastEmission(
                     identity: makeIdentity(Int64(10_000 + transition)),
                     digest: "outer-duplicate-\(transition)",
-                    replacement: .ready(candidate))
+                    replacement: .ready(candidate)))
+            }
             var markReducer = makeReducer(files: [
                 markName: .settled(.emittedNow(
                     identity: makeIdentity(50),
                     digest: "mark")),
-                candidateName: .settled(settlement),
+                candidateName: candidateState,
             ])
 
             let markEffects = observe(
@@ -99,12 +125,13 @@ final class WatcherReducerPropertyTests: XCTestCase {
                 if case .emit(let intent) = $0 { return intent.candidate == candidate }
                 return false
             }
-            let isSanctionedCurrentMarkReplacement = candidateValue == 50 && outerWasEmitted
+            let isSanctionedCurrentMarkReplacement =
+                candidateValue == 50 && shape == .emittedReplacement
             XCTAssertEqual(
                 markEmitted,
                 isSanctionedCurrentMarkReplacement,
                 "seed=\(Self.seed) transition=\(transition) mark candidate=\(candidateRevision) "
-                    + "outerEmitted=\(outerWasEmitted)")
+                    + "shape=\(shape.rawValue)")
             XCTAssertEqual(
                 markReducer.shouldExecuteEmission(EmissionIntent(
                     generation: markReducer.state.generation.id,
@@ -112,10 +139,14 @@ final class WatcherReducerPropertyTests: XCTestCase {
                 isSanctionedCurrentMarkReplacement,
                 "seed=\(Self.seed) transition=\(transition) mark approval")
 
-            let blockerRevision = "25"
-            var blockerCandidateValue = Int(generator.next() % 49) + 1
-            if blockerCandidateValue >= 25 { blockerCandidateValue += 1 }
-            let blockerCandidateRevision = String(blockerCandidateValue)
+            let blockerRevision = "00025"
+            let candidatePrecedesBlocker = (transition / 3).isMultiple(of: 2)
+            let blockerCandidateValue = candidatePrecedesBlocker
+                ? Int(generator.next() % 24) + 1
+                : Int(generator.next() % 34) + 26
+            let blockerCandidateRevision = String(
+                repeating: "0",
+                count: Int(generator.next() % 3)) + String(blockerCandidateValue)
             let blockerCandidateName = revisionName(blockerCandidateRevision)
             let blockerCandidateIdentity = makeIdentity(Int64(20_000 + transition))
             let blockerCandidate = makeCandidate(
@@ -135,13 +166,12 @@ final class WatcherReducerPropertyTests: XCTestCase {
                     name: blockerCandidateName,
                     revision: blockerCandidateRevision,
                     outcome: .identityUnchanged(identity: blockerCandidateIdentity)),
-                invalidObservation("60"),
+                invalidObservation("00060"),
             ], nowNanos: UInt64(transition), reducer: &blockerReducer)
             let blockerEmitted = blockerEffects.contains {
                 if case .emit(let intent) = $0 { return intent.candidate == blockerCandidate }
                 return false
             }
-            let candidatePrecedesBlocker = blockerCandidateValue < 25
             XCTAssertEqual(
                 blockerEmitted,
                 candidatePrecedesBlocker,

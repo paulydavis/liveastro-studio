@@ -249,7 +249,8 @@ struct WatcherReducer {
                           let mark = derivedRevisionHighWater,
                           !isEligibleAgainstDerivedHighWater(
                             candidate,
-                            fileState: .settled(settlement))
+                            fileState: .settled(settlement),
+                            mark: mark)
                     else { return [] }
                     state.generation.files[candidate.name] = .settled(
                         settlement.withReplacement(.ignoredOutOfOrder(
@@ -272,7 +273,8 @@ struct WatcherReducer {
                       let mark = derivedRevisionHighWater,
                       !isEligibleAgainstDerivedHighWater(
                         candidate,
-                        fileState: .ready(candidate))
+                        fileState: .ready(candidate),
+                        mark: mark)
                 else { return [] }
                 state.generation.files[candidate.name] = .droppedOutOfOrder
                 return [.log(
@@ -293,7 +295,11 @@ struct WatcherReducer {
         guard intent.generation == state.generation.id else { return false }
         let fileState = state.generation.files[intent.candidate.name]
         guard readyCandidate(in: fileState) == intent.candidate else { return false }
-        return isEligibleAgainstDerivedHighWater(intent.candidate, fileState: fileState)
+        let mark = derivedRevisionHighWater
+        return isEligibleAgainstDerivedHighWater(
+            intent.candidate,
+            fileState: fileState,
+            mark: mark)
             && isEligibleAgainstActiveBlocker(intent.candidate)
     }
 
@@ -313,13 +319,15 @@ struct WatcherReducer {
         readyCandidate(in: fileState) != nil || !isTerminal(fileState)
     }
 
+    /// Callers derive the mark once per decision scope; batch callers must not rescan per file.
     private func isEligibleAgainstDerivedHighWater(
         _ candidate: EmissionCandidate,
-        fileState: FileState?
+        fileState: FileState?,
+        mark: String?
     ) -> Bool {
         guard revisionOrderingEnabled,
               case .numbered(let revision) = candidate.kind,
-              let mark = derivedRevisionHighWater else { return true }
+              let mark else { return true }
         switch revisionOrder.compare(revision, mark) {
         case .orderedDescending:
             return true
@@ -413,7 +421,10 @@ struct WatcherReducer {
             let name = item.observation.name
             let fileState = state.generation.files[name]
             if let candidate = readyCandidate(in: fileState) {
-                guard !isEligibleAgainstDerivedHighWater(candidate, fileState: fileState)
+                guard !isEligibleAgainstDerivedHighWater(
+                    candidate,
+                    fileState: fileState,
+                    mark: mark)
                 else { continue }
                 if case .settled(let settlement) = fileState {
                     state.generation.files[name] = .settled(

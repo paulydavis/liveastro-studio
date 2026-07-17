@@ -359,6 +359,71 @@ final class WatcherReducerTests: XCTestCase {
                        "the raw-digit-first revision remains the derived tie survivor")
     }
 
+    func testNestedReplacementRejectedAfterEarlierEqualRevisionSettles() {
+        let firstName = "live_stack_007.fit"
+        let replacementName = "live_stack_07.fit"
+        let firstCandidate = makeCandidate(
+            name: firstName,
+            identity: makeIdentity(7),
+            digest: "first-seven",
+            kind: .numbered(revision: "007"))
+        let replacementCandidate = makeCandidate(
+            name: replacementName,
+            identity: makeIdentity(70),
+            digest: "replacement-seven",
+            kind: .numbered(revision: "07"))
+        let firstIntent = EmissionIntent(
+            generation: FolderGeneration(rawValue: 1),
+            candidate: firstCandidate)
+        let replacementIntent = EmissionIntent(
+            generation: FolderGeneration(rawValue: 1),
+            candidate: replacementCandidate)
+        var reducer = makeReducer(files: [
+            firstName: .ready(firstCandidate),
+            replacementName: .settled(.duplicateOfLastEmission(
+                identity: makeIdentity(700),
+                digest: "old-seven",
+                replacement: .ready(replacementCandidate))),
+        ])
+
+        XCTAssertNil(reducer.derivedRevisionHighWater)
+        XCTAssertEqual(observeBatch([
+            observation(
+                name: replacementName,
+                revision: "07",
+                outcome: .identityUnchanged(identity: replacementCandidate.identity)),
+            observation(
+                name: firstName,
+                revision: "007",
+                outcome: .identityUnchanged(identity: firstCandidate.identity)),
+        ], nowNanos: 10, reducer: &reducer), [
+            .emit(firstIntent),
+            .emit(replacementIntent),
+        ])
+
+        XCTAssertTrue(reducer.shouldExecuteEmission(firstIntent))
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: firstIntent,
+            outcome: .yielded))).isEmpty)
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "007")
+        XCTAssertFalse(reducer.shouldExecuteEmission(replacementIntent))
+
+        XCTAssertEqual(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: replacementIntent,
+            outcome: .rejected))), [
+                .log("revision 07 arrived out of order — skipped (high-water 007)"),
+            ])
+        let ignoredReplacement = FileState.settled(.duplicateOfLastEmission(
+            identity: makeIdentity(700),
+            digest: "old-seven",
+            replacement: .ignoredOutOfOrder(identity: replacementCandidate.identity)))
+        XCTAssertEqual(reducer.state.generation.files[replacementName], ignoredReplacement)
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: replacementIntent,
+            outcome: .rejected))).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[replacementName], ignoredReplacement)
+    }
+
     func testMarkDropLogsOnceAndNeverEmitsOrAdvancesHighWater() {
         let identity = makeIdentity(3)
         let emitted = revisionName("00003")
