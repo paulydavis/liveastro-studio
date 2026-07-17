@@ -193,6 +193,130 @@ final class FolderFrameSourceTests: XCTestCase {
         }
     }
 
+    // MARK: - review11 finding 3: atomic lifecycle (.starting reserved under the lock)
+
+    /// Lock-guarded capture of concurrent start() outcomes.
+    private final class StartResults: @unchecked Sendable {
+        private let lock = NSLock()
+        private var successes = 0
+        private var errors: [Error] = []
+        func success() { lock.withLock { successes += 1 } }
+        func failure(_ e: Error) { lock.withLock { errors.append(e) } }
+        var snapshot: (successes: Int, errors: [Error]) { lock.withLock { (successes, errors) } }
+    }
+
+    /// Lock-guarded capture of the watcher handed to the beforeStartCommit seam.
+    private final class WatcherBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var watchers: [StackFileWatcher] = []
+        func add(_ w: StackFileWatcher) { lock.withLock { watchers.append(w) } }
+        var all: [StackFileWatcher] { lock.withLock { watchers } }
+    }
+
+    /// Review11 finding 3 (P2, red-first): start() checked `.initial` under the lock but
+    /// constructed/started the watcher OUTSIDE it and committed `.running` afterwards — two
+    /// concurrent start() calls could both pass the check, construct TWO watchers (one
+    /// orphaned: armed fd + live timer, unreachable forever) and both report success. The
+    /// lifecycle must reserve an intermediate `.starting` under the lock: exactly one caller
+    /// wins, the loser throws `.alreadyStarted` before constructing anything, and exactly one
+    /// watcher is ever built (pinned via the construction seam). Repeated to make the pre-fix
+    /// race land reliably.
+    func testLiveMode_concurrentDoubleStart_exactlyOneRunsOtherThrows_noOrphanWatcher() throws {
+        for round in 0..<10 {
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+
+            let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+            let constructed = WatcherBox()
+            source.beforeStartCommit = { constructed.add($0) }
+            let results = StartResults()
+            let ready = DispatchSemaphore(value: 0)
+            let go = DispatchSemaphore(value: 0)
+            let done = DispatchSemaphore(value: 0)
+            for _ in 0..<2 {
+                Thread.detachNewThread {
+                    ready.signal()
+                    go.wait()
+                    do { try source.start(); results.success() }
+                    catch { results.failure(error) }
+                    done.signal()
+                }
+            }
+            ready.wait(); ready.wait()
+            go.signal(); go.signal()
+            XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
+            XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
+
+            let (successes, errors) = results.snapshot
+            XCTAssertEqual(successes, 1, "round \(round): exactly ONE start() may win")
+            XCTAssertEqual(errors.count, 1, "round \(round): the loser must throw, not silently 'succeed'")
+            XCTAssertEqual(errors.first as? FolderFrameSourceError, .alreadyStarted,
+                           "round \(round): the loser fails with .alreadyStarted")
+            XCTAssertEqual(constructed.all.count, 1,
+                           "round \(round): exactly one watcher may ever be constructed — no orphan")
+            source.stop()
+        }
+    }
+
+    /// Review11 finding 3, stop-during-start: stop() lands while start() is between the
+    /// watcher's construction and the `.running` commit (parked deterministically at the
+    /// beforeStartCommit seam). The revalidation under the lock must see `.stopped`, TEAR
+    /// DOWN the freshly constructed watcher (terminal — its one-shot contract proves it),
+    /// and fail start() loudly with `.stopped`: a stopped source must never be resurrected
+    /// with an already-finished stream (pre-fix the late `.running` overwrite did exactly
+    /// that, and the session recorded empty).
+    func testLiveMode_stopDuringStart_staysStopped_watcherTornDown_streamFinished() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        let constructed = WatcherBox()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        source.beforeStartCommit = { w in
+            constructed.add(w)
+            entered.signal()
+            release.wait()          // park start() in the stop-during-start window
+        }
+        let startDone = DispatchSemaphore(value: 0)
+        let errBox = CapturedErrorBox()
+        Thread.detachNewThread {
+            do { try source.start() } catch { errBox.set(error) }
+            startDone.signal()
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 10), .success,
+                       "arrange: start() is parked after watcher construction, before commit")
+        source.stop()               // stop() wins the race
+        release.signal()
+        XCTAssertEqual(startDone.wait(timeout: .now() + 10), .success)
+
+        XCTAssertEqual(errBox.value as? FolderFrameSourceError, .stopped,
+                       "a start() that lost to stop() must fail loudly, never commit .running")
+        // The constructed watcher was torn down, not leaked: its one-shot contract reports
+        // terminal .stopped (a merely-orphaned RUNNING watcher would say .alreadyStarted).
+        let discarded = try XCTUnwrap(constructed.all.first, "arrange: a watcher was constructed")
+        XCTAssertThrowsError(try discarded.start()) {
+            XCTAssertEqual($0 as? StackFileWatcherError, .stopped,
+                           "the discarded watcher must be STOPPED, not left running as an orphan")
+        }
+        // No resurrection: the source stays terminally stopped and its stream stays finished.
+        XCTAssertThrowsError(try source.start()) {
+            XCTAssertEqual($0 as? FolderFrameSourceError, .stopped)
+        }
+        let finished = expectation(description: "frames stream stays finished")
+        Task {
+            var it = source.frames.makeAsyncIterator()
+            let frame = await it.next()
+            XCTAssertNil(frame, "a stopped source's stream must be finished, never revived")
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 5)
+    }
+
     /// Regression: a BOTTOM-UP GRBG file must reach the engine in STORED row order —
     /// FITSReader's display flip would shift the Bayer phase and swap R/B (the
     /// 2026-07-06 "cyan nebula" bug class). Pins loadRawFrame to raw stored bytes.

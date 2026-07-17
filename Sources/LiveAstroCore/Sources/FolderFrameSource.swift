@@ -68,15 +68,32 @@ public final class FolderFrameSource: FrameSource {
     internal let liveSeams: LiveDecodeSeams
     internal var liveDecodeCount: Int { liveSeams.decodeCount }
 
-    // MARK: Lifecycle (cold1 M2 — the watcher's one-shot contract, mirrored)
+    /// Test seam (review11 finding 3): invoked in live mode AFTER the inner watcher has been
+    /// constructed and started, BEFORE the lock is retaken to commit `.running` — the
+    /// stop()-during-start() window, made deterministic. Receives the constructed watcher so
+    /// tests can assert a loser is torn down, never leaked. nil in production. Install
+    /// before start().
+    internal var beforeStartCommit: ((StackFileWatcher) -> Void)?
+
+    // MARK: Lifecycle (cold1 M2 — the watcher's one-shot contract, mirrored; review11 f3)
     //
     // stop() finishes the one-shot streams, so a second start() would relay into a dead
     // buffer and the session would record EMPTY with no error. The source is one-shot:
-    // initial → running (successful start) → stopped (terminal). A FAILED initial start
-    // stays .initial — retryable. SessionPipeline constructs a fresh source per session
-    // (AppModel.startSession / ImportController), so this guard is pure safety that turns
-    // a silent empty session into a loud error through the pipeline's start rollback.
-    private enum LifecycleState { case initial, running, stopped }
+    // initial → starting (reserved under the lock) → running (committed) → stopped
+    // (terminal). A FAILED initial start reverts to .initial — retryable. SessionPipeline
+    // constructs a fresh source per session (AppModel.startSession / ImportController), so
+    // this guard is pure safety that turns a silent empty session into a loud error through
+    // the pipeline's start rollback.
+    //
+    // Review11 finding 3: `.starting` is RESERVED under the lock before any construction, so
+    // two concurrent start() calls can never both build watchers (pre-fix the .initial check
+    // and the .running assignment straddled unlocked watcher construction — the loser's
+    // watcher leaked, armed forever, and both calls "succeeded"). The lock is RELEASED during
+    // watcher construction/startup (it does I/O — never hold a lock over it), and the commit
+    // REVALIDATES: if stop() won meanwhile (it marks .stopped from any state, including
+    // .starting), the freshly built watcher is torn down and start() throws `.stopped` —
+    // a stopped source is never resurrected onto an already-finished stream.
+    private enum LifecycleState { case initial, starting, running, stopped }
     private let stateLock = NSLock()
     private var state: LifecycleState = .initial
 
@@ -122,18 +139,23 @@ public final class FolderFrameSource: FrameSource {
     }
 
     public func start() throws {
-        // Cold1 M2: one-shot lifecycle — see the LifecycleState declaration.
+        // Cold1 M2 + review11 finding 3: reserve `.starting` under the lock BEFORE any
+        // construction — concurrent start() calls are rejected here, so two racers can never
+        // both build watchers. See the LifecycleState declaration.
         try stateLock.withLock {
             switch state {
-            case .running: throw FolderFrameSourceError.alreadyStarted
+            case .running, .starting: throw FolderFrameSourceError.alreadyStarted
             case .stopped: throw FolderFrameSourceError.stopped
-            case .initial: break
+            case .initial: state = .starting
             }
         }
         switch mode {
         case .importOnce:
-            // Pull-based: just snapshot the sorted file list; loading happens per pull.
+            // Pull-based: just snapshot the sorted file list (I/O — outside the lock);
+            // loading happens per pull.
             importCursor?.snapshotIfNeeded()
+            // Commit (or bow to a stop() that won meanwhile; the cursor is already stopped).
+            try commitRunning(onCommit: {}, tearDownOnStop: {})
 
         case .live:
             // Review7 P2: native relay / rig folders publish each sub ONCE and
@@ -143,23 +165,55 @@ public final class FolderFrameSource: FrameSource {
             let w = StackFileWatcher(folder: folder, fileNamePrefix: fileNamePrefix,
                                      digestPolicy: .immutableAfterPublish)
             w.onLog = onLog   // forward folder-disappearance events to the app log
-            self.watcher = w
-            try w.start()     // a throw leaves state == .initial — retryable
+            do {
+                try w.start()   // I/O — the lock is NOT held here
+            } catch {
+                // A failed initial start stays retryable: revert the reservation — unless
+                // stop() already won the race, in which case terminal .stopped stands.
+                stateLock.withLock { if state == .starting { state = .initial } }
+                throw error
+            }
+            beforeStartCommit?(w)   // test seam: the stop-during-start window, deterministic
             let cont = liveUpdateContinuation!
             let seams = liveSeams
-            liveTask = Task.detached {
-                // Cold1 I2: relay LIGHT updates only — NO decode here. Decode happens on
-                // the consumer's clock in LivePull.nextFrame(), one frame in flight.
-                for await update in w.updates {
-                    cont.yield(update)
-                    seams.noteBuffered(update)
+            // Revalidate + commit under the lock: watcher/liveTask become visible to stop()
+            // atomically with `.running` (stop() reads them under the same lock).
+            try commitRunning(onCommit: {
+                self.watcher = w
+                self.liveTask = Task.detached {
+                    // Cold1 I2: relay LIGHT updates only — NO decode here. Decode happens on
+                    // the consumer's clock in LivePull.nextFrame(), one frame in flight.
+                    for await update in w.updates {
+                        cont.yield(update)
+                        seams.noteBuffered(update)
+                    }
+                    // The watcher stream ended (its stop()): close the buffer as a backstop
+                    // so consumers never hang on a dead stream.
+                    cont.finish()
                 }
-                // The watcher stream ended (its stop()): close the buffer as a backstop
-                // so consumers never hang on a dead stream.
-                cont.finish()
-            }
+            }, tearDownOnStop: {
+                // stop() won while the watcher was being built: tear the orphan down —
+                // stopping it disarms its folder fd/timer and finishes its stream. The
+                // source's own streams were already finished by stop(). No resurrection.
+                w.stop()
+            })
         }
-        stateLock.withLock { state = .running }
+    }
+
+    /// Review11 finding 3: retake the lock and commit `.running`, or — when stop() won during
+    /// the unlocked construction window — run `tearDownOnStop` and throw `.stopped` so the
+    /// caller hears loudly that the source it started is already dead.
+    private func commitRunning(onCommit: () -> Void, tearDownOnStop: () -> Void) throws {
+        let stopWon: Bool = stateLock.withLock {
+            guard state != .stopped else { return true }
+            onCommit()          // runs under the lock — assignments are atomic with .running
+            state = .running
+            return false
+        }
+        if stopWon {
+            tearDownOnStop()
+            throw FolderFrameSourceError.stopped
+        }
     }
 
     /// Protocol stop: bounded by the inner watcher's own 5 s default.
@@ -169,14 +223,20 @@ public final class FolderFrameSource: FrameSource {
     /// an overall shutdown budget (SessionPipeline.end() charges this against its primary
     /// drain deadline) is never pinned behind the watcher default ON TOP of its own drain.
     /// Terminal (cold1 M2): a later start() throws. Light updates still buffered at stop
-    /// time are discarded, not decoded — stop means stop.
+    /// time are discarded, not decoded — stop means stop. Review11 finding 3: `.stopped` is
+    /// marked from ANY state — including `.starting`, so a start() in flight sees it at its
+    /// commit revalidation and tears its watcher down instead of committing — and the
+    /// watcher/task references are captured under the SAME lock that publishes them.
     public func stop(timeout: TimeInterval) {
         stopSeamLock.withLock { _lastStopTimeout = timeout }
-        stateLock.withLock { state = .stopped }
+        let (w, task): (StackFileWatcher?, Task<Void, Never>?) = stateLock.withLock {
+            state = .stopped
+            return (watcher, liveTask)
+        }
         importCursor?.stop()
         livePull?.stop()
-        watcher?.stop(timeout: timeout)
-        liveTask?.cancel()
+        w?.stop(timeout: timeout)
+        task?.cancel()
         liveUpdateContinuation?.finish()
     }
 
