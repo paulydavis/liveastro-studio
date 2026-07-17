@@ -276,7 +276,7 @@ final class SessionPipelineShutdownTests: XCTestCase {
                        "a never-started end() rejection must not claim the finalization barrier")
     }
 
-    func testShutdownTimeoutClaimsStickyFinalizationBarrierBeforeRetry() throws {
+    func testShutdownTimeoutReportsRetryPendingFinalizationBarrierBeforeRetry() throws {
         let sandbox = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let sessions = sandbox.appendingPathComponent("sessions")
@@ -298,14 +298,14 @@ final class SessionPipelineShutdownTests: XCTestCase {
         XCTAssertThrowsError(try pipeline.end()) { error in
             XCTAssertEqual(error as? SessionPipelineError, .shutdownTimeout)
         }
-        XCTAssertEqual(pipeline.reseed(), .finalizationInProgress,
-                       "shutdownTimeout happens after a valid running end() claims finalization")
-        XCTAssertEqual(pipeline.reseed(), .finalizationInProgress,
+        XCTAssertEqual(pipeline.reseed(), .finalizationRetryPending,
+                       "shutdownTimeout happens after a valid running end() claims finalization, but the retry window should be named honestly")
+        XCTAssertEqual(pipeline.reseed(), .finalizationRetryPending,
                        "the claimed finalization barrier must remain sticky before a retry")
         wedged.signal()
     }
 
-    func testFiniteShutdownTimeoutReportsFinalizationInProgressBeforeImportUnavailability() throws {
+    func testFiniteShutdownTimeoutReportsRetryPendingBeforeImportUnavailability() throws {
         let sandbox = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let sessions = sandbox.appendingPathComponent("sessions")
@@ -327,8 +327,8 @@ final class SessionPipelineShutdownTests: XCTestCase {
         XCTAssertThrowsError(try pipeline.end()) { error in
             XCTAssertEqual(error as? SessionPipelineError, .shutdownTimeout)
         }
-        XCTAssertEqual(pipeline.reseed(), .finalizationInProgress,
-                       "a claimed finalization barrier must outrank finite-import reseed refusal")
+        XCTAssertEqual(pipeline.reseed(), .finalizationRetryPending,
+                       "a failed finalization barrier must outrank finite-import reseed refusal")
         wedged.signal()
     }
 }

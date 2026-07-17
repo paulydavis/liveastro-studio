@@ -18,4 +18,12 @@ final class IntegrationFormatDerivedTests: XCTestCase {
         let s = IntegrationFormat.caption(seconds: 798, subSeconds: 30)
         XCTAssertTrue(s.contains("27 × 30s"), s)
     }
+
+    func testDerivedCaptionRoundsDisplayedTimeWithFrameCount() {
+        // The derived caption must not display "1m 30s · 2 × 60s": once the
+        // frame count rounds to 2, the displayed integration time follows the
+        // same rounded frame count.
+        let s = IntegrationFormat.caption(seconds: 90, subSeconds: 60)
+        XCTAssertEqual(s, "2m · 2 × 60s")
+    }
 }

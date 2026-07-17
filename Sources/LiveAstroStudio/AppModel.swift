@@ -398,6 +398,7 @@ final class AppModel {
         case .reseeded?: log.append("reference reseeded")
         case .unavailableDuringImport?: log.append("reseed unavailable while an import is running")
         case .finalizationInProgress?: log.append("reseed refused — session finalization has begun")
+        case .finalizationRetryPending?: log.append("reseed refused — session finalization failed; retry End Session before reseeding")
         case .notNative?, nil: log.append("reseed unavailable — no native stack is active")
         }
     }

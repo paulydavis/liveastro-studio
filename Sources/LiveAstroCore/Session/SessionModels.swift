@@ -178,7 +178,11 @@ public enum IntegrationFormat {
     /// reseed resets the current-stack integration, and the count follows it —
     /// unlike the session-total accepted index).
     public static func caption(seconds: Double, subSeconds: Double) -> String {
-        let frames = subSeconds > 0 ? Int((seconds / subSeconds).rounded()) : 0
-        return caption(seconds: seconds, frames: frames, subSeconds: subSeconds)
+        guard subSeconds > 0 else {
+            return caption(seconds: seconds, frames: 0, subSeconds: subSeconds)
+        }
+        let frames = Int((seconds / subSeconds).rounded())
+        let displayedSeconds = Double(frames) * subSeconds
+        return caption(seconds: displayedSeconds, frames: frames, subSeconds: subSeconds)
     }
 }

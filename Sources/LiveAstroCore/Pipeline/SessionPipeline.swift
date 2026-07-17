@@ -109,6 +109,7 @@ public final class SessionPipeline {
     private let consumeDone = DispatchSemaphore(value: 0)
     private let finalizationLock = NSLock()
     private var finalizationClaimed = false
+    private var finalizationFailedAfterClaim = false
     /// Drain deadlines for end() (P1-3). Internal so tests can shrink them; production uses 10s/5s.
     var drainPrimaryTimeout: DispatchTimeInterval = .seconds(10)
     var drainGraceTimeout: DispatchTimeInterval = .seconds(5)
@@ -173,7 +174,7 @@ public final class SessionPipeline {
     }
 
     public enum ReseedResult: Equatable {
-        case reseeded, notNative, unavailableDuringImport, finalizationInProgress
+        case reseeded, notNative, unavailableDuringImport, finalizationInProgress, finalizationRetryPending
     }
 
     /// Reseeds the stacking engine, discarding the current reference frame (native mode only).
@@ -181,7 +182,9 @@ public final class SessionPipeline {
     public func reseed() -> ReseedResult {
         guard let engine else { return .notNative }
         return finalizationLock.withLock {
-            guard !finalizationClaimed else { return .finalizationInProgress }
+            guard !finalizationClaimed else {
+                return finalizationFailedAfterClaim ? .finalizationRetryPending : .finalizationInProgress
+            }
             guard source?.isFinite != true else { return .unavailableDuringImport }
             engine.reseed()
             return .reseeded
@@ -544,103 +547,115 @@ public final class SessionPipeline {
         // threw notRunning from endSession(). A FAILED first end() (shutdownTimeout,
         // master-write failure) leaves the session .running, so retry is unaffected.
         guard session.state == .running else { throw SessionError.notRunning }
-        finalizationLock.withLock { finalizationClaimed = true }
-        if source != nil {
-            if source?.isFinite ?? false {
-                // Import: the stream ends on its own; drain it completely while frames
-                // keep landing, but BOUNDED (cold1 I1): a stalled read triggers
-                // cancel + grace → shutdownTimeout instead of pinning end() forever.
-                try drainFiniteImportOrThrow()
-                source?.stop()
-            } else {
-                // Live source: the stream never ends by itself — stop it first, then drain.
-                // Cold1 M1: the source's own bounded stop (FolderFrameSource → inner
-                // watcher, previously an un-budgeted 5 s default ON TOP of the drain) is
-                // charged against the SAME primary budget, mirroring the watcher-mode
-                // branch below: stop + drain together never exceed primary (+ grace).
-                let primaryDeadline = DispatchTime.now() + drainPrimaryTimeout
-                if let folderSource = source as? FolderFrameSource {
-                    folderSource.stop(timeout: Self.seconds(drainPrimaryTimeout))
-                } else {
+        finalizationLock.withLock {
+            finalizationClaimed = true
+            finalizationFailedAfterClaim = false
+        }
+        do {
+            if source != nil {
+                if source?.isFinite ?? false {
+                    // Import: the stream ends on its own; drain it completely while frames
+                    // keep landing, but BOUNDED (cold1 I1): a stalled read triggers
+                    // cancel + grace → shutdownTimeout instead of pinning end() forever.
+                    try drainFiniteImportOrThrow()
                     source?.stop()
+                } else {
+                    // Live source: the stream never ends by itself — stop it first, then drain.
+                    // Cold1 M1: the source's own bounded stop (FolderFrameSource → inner
+                    // watcher, previously an un-budgeted 5 s default ON TOP of the drain) is
+                    // charged against the SAME primary budget, mirroring the watcher-mode
+                    // branch below: stop + drain together never exceed primary (+ grace).
+                    let primaryDeadline = DispatchTime.now() + drainPrimaryTimeout
+                    if let folderSource = source as? FolderFrameSource {
+                        folderSource.stop(timeout: Self.seconds(drainPrimaryTimeout))
+                    } else {
+                        source?.stop()
+                    }
+                    try drainConsumeTaskOrThrow(primaryDeadline: primaryDeadline)
                 }
+            } else {
+                // Watcher mode: stop the watcher to terminate the updates stream, then drain.
+                // Review10 item 3: the watcher stop is itself BOUNDED and shares the primary
+                // drain budget — a scan stalled on a dead share can no longer pin end()
+                // outside the documented primary+grace timeout. The deadline is captured
+                // before the stop so stop-time is charged against the same budget.
+                let primaryDeadline = DispatchTime.now() + drainPrimaryTimeout
+                watcher?.stop(timeout: Self.seconds(drainPrimaryTimeout))
                 try drainConsumeTaskOrThrow(primaryDeadline: primaryDeadline)
             }
-        } else {
-            // Watcher mode: stop the watcher to terminate the updates stream, then drain.
-            // Review10 item 3: the watcher stop is itself BOUNDED and shares the primary
-            // drain budget — a scan stalled on a dead share can no longer pin end()
-            // outside the documented primary+grace timeout. The deadline is captured
-            // before the stop so stop-time is charged against the same budget.
-            let primaryDeadline = DispatchTime.now() + drainPrimaryTimeout
-            watcher?.stop(timeout: Self.seconds(drainPrimaryTimeout))
-            try drainConsumeTaskOrThrow(primaryDeadline: primaryDeadline)
-        }
-        if let meta = sourceMetadata { session.fillMissingMetadata(from: meta) }
-        guard let dir = session.sessionDirectory else {
-            throw SessionError.notRunning
-        }
-        // F1 (review2): write the failure-prone durable artifact (master.fit) BEFORE persisting
-        // endTime. `endSession()` is the COMMIT POINT — it stamps end_time into the manifest, which
-        // the oracle reads as "this session ended." If the master write fails AFTER that stamp, the
-        // manifest dishonestly claims an ended session with no persisted master (oracle clause 5).
-        // Ordering master-first means a master-write failure throws here, before the commit, leaving
-        // the manifest still-running (end_time nil) — truthful — and the error surfaces to the caller.
-        //
-        // Native mode: write the final mean stack as master.fit (TOP-DOWN, FITSWriter default).
-        // Crop to covered region first (Task 4), then additive-only background neutralization
-        // (display path uses additive+multiplicative; the saved master gets additive-only so
-        // colour ratios stay physically calibratable). Crop happens BEFORE balance so balance
-        // operates on the final spatial extent.
-        var finalization: SessionFinalizationFacts?
-        if let eng = engine {
-            let final = try eng.finalizationState()
-            let outcome: MasterOutcome
-            switch final.stackState {
-            case .active:
-                guard let master0 = final.image else {
-                    throw StackEngine.FinalizationError.invariantBreach
-                }
-                let master = cropMaster(master0, coverage: final.coverage)   // crop BEFORE balance
-                let balanced = neutralizeBackground
-                    ? AutoStretch.neutralizeBackgroundAdditive(master)
-                    : master
-                let totalExp = Double(final.frameCount) * profile.subExposureSeconds
-                let masterData = FITSWriter.float32(
-                    width: balanced.width, height: balanced.height,
-                    channels: balanced.channels, pixels: balanced.pixels,
-                    metadata: sourceMetadata,
-                    stackCount: final.frameCount,
-                    totalExposureSeconds: totalExp)
-                try masterData.write(to: dir.appendingPathComponent("master.fit"))
-                outcome = .written
-            case .awaitingSeedAfterReseed:
-                onLog?("reference cleared by reseed (manual or automatic) and never re-seeded — no master available (\(final.sessionAcceptedCount) snapshots retained)")
-                outcome = .awaitingSeed
-            case .initialEmpty:
-                // Review11 finding 2, empty native session: zero accepted frames — there is
-                // no stack to persist. `masterExpected` stays true (immutable since start);
-                // the manifest records the zero-frame fact (empty snapshots) and the oracle's
-                // clause 5 keys on masterExpected && frames recorded, so ending without a
-                // master here is honest — and it is SAID, not silent.
-                onLog?("no frames accepted — no master written")
-                outcome = .noFrames
+            if let meta = sourceMetadata { session.fillMissingMetadata(from: meta) }
+            guard let dir = session.sessionDirectory else {
+                throw SessionError.notRunning
             }
-            finalization = SessionFinalizationFacts(
-                masterOutcome: outcome,
-                stackFrameCount: final.frameCount,
-                sessionAcceptedCount: final.sessionAcceptedCount,
-                sessionRejectedCount: final.sessionRejectedCount)
-        } else {
-            // Review11 finding 2, watcher mode: the stack is the external stacker's artifact;
-            // this session never promises a master (masterExpected == false since start).
-            // State the expectation once so the ended-without-master manifest reads honestly.
-            onLog?("watcher session — the stack lives with the external stacker; no master.fit")
+            // F1 (review2): write the failure-prone durable artifact (master.fit) BEFORE persisting
+            // endTime. `endSession()` is the COMMIT POINT — it stamps end_time into the manifest, which
+            // the oracle reads as "this session ended." If the master write fails AFTER that stamp, the
+            // manifest dishonestly claims an ended session with no persisted master (oracle clause 5).
+            // Ordering master-first means a master-write failure throws here, before the commit, leaving
+            // the manifest still-running (end_time nil) — truthful — and the error surfaces to the caller.
+            //
+            // Native mode: write the final mean stack as master.fit (TOP-DOWN, FITSWriter default).
+            // Crop to covered region first (Task 4), then additive-only background neutralization
+            // (display path uses additive+multiplicative; the saved master gets additive-only so
+            // colour ratios stay physically calibratable). Crop happens BEFORE balance so balance
+            // operates on the final spatial extent.
+            var finalization: SessionFinalizationFacts?
+            if let eng = engine {
+                let final = try eng.finalizationState()
+                let outcome: MasterOutcome
+                switch final.stackState {
+                case .active:
+                    guard let master0 = final.image else {
+                        throw StackEngine.FinalizationError.invariantBreach
+                    }
+                    let master = cropMaster(master0, coverage: final.coverage)   // crop BEFORE balance
+                    let balanced = neutralizeBackground
+                        ? AutoStretch.neutralizeBackgroundAdditive(master)
+                        : master
+                    let totalExp = Double(final.frameCount) * profile.subExposureSeconds
+                    let masterData = FITSWriter.float32(
+                        width: balanced.width, height: balanced.height,
+                        channels: balanced.channels, pixels: balanced.pixels,
+                        metadata: sourceMetadata,
+                        stackCount: final.frameCount,
+                        totalExposureSeconds: totalExp)
+                    try masterData.write(to: dir.appendingPathComponent("master.fit"))
+                    outcome = .written
+                case .awaitingSeedAfterReseed:
+                    onLog?("reference cleared by reseed (manual or automatic) and never re-seeded — no master available (\(final.sessionAcceptedCount) snapshots retained)")
+                    outcome = .awaitingSeed
+                case .initialEmpty:
+                    // Review11 finding 2, empty native session: zero accepted frames — there is
+                    // no stack to persist. `masterExpected` stays true (immutable since start);
+                    // the manifest records the zero-frame fact (empty snapshots) and the oracle's
+                    // clause 5 keys on masterExpected && frames recorded, so ending without a
+                    // master here is honest — and it is SAID, not silent.
+                    onLog?("no frames accepted — no master written")
+                    outcome = .noFrames
+                }
+                finalization = SessionFinalizationFacts(
+                    masterOutcome: outcome,
+                    stackFrameCount: final.frameCount,
+                    sessionAcceptedCount: final.sessionAcceptedCount,
+                    sessionRejectedCount: final.sessionRejectedCount)
+            } else {
+                // Review11 finding 2, watcher mode: the stack is the external stacker's artifact;
+                // this session never promises a master (masterExpected == false since start).
+                // State the expectation once so the ended-without-master manifest reads honestly.
+                onLog?("watcher session — the stack lives with the external stacker; no master.fit")
+            }
+            // Commit point: master.fit is durable (native mode), so stamping end_time is now honest.
+            try session.endSession(finalization: finalization)
+            return try ReplayService.regenerate(sessionDirectory: dir,
+                                                replaySettings: replaySettings,
+                                                maxKeyframes: maxKeyframes)
+        } catch {
+            finalizationLock.withLock {
+                if finalizationClaimed {
+                    finalizationFailedAfterClaim = true
+                }
+            }
+            throw error
         }
-        // Commit point: master.fit is durable (native mode), so stamping end_time is now honest.
-        try session.endSession(finalization: finalization)
-        return try ReplayService.regenerate(sessionDirectory: dir,
-                                            replaySettings: replaySettings,
-                                            maxKeyframes: maxKeyframes)
     }
 }
