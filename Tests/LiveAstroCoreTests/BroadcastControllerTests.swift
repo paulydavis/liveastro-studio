@@ -999,9 +999,12 @@ final class BroadcastControllerTests: XCTestCase {
         h.server.streamReactsToRequests = false
         h.server.failTypes = ["GetStreamStatus"]
 
-        // Session end during .connecting cancels the bring-up and claims idle
-        // synchronously — WITHOUT any stop of its own.
+        // Session end during .connecting cancels the bring-up. Cold2 I-3: the
+        // possibly-issued landing is now SYNCHRONOUS (.stopUnconfirmed, never
+        // the origin's .idle); the stale settle then runs the owned cleanup.
         h.controller.sessionDidEnd()
+        XCTAssertNotEqual(h.controller.broadcastState, .idle,
+                          "an in-flight StartStream must never land a confirmed idle")
 
         // Pre-fix the cancelled request kept waiting; resume it so the stale
         // start completes with a FAILED confirm (status unavailable).
@@ -1009,11 +1012,12 @@ final class BroadcastControllerTests: XCTestCase {
 
         // A StartStream may have been issued and the cleanup could not be
         // confirmed: the only honest landing is .stopUnconfirmed, never .idle.
-        await waitUntil { h.controller.broadcastState == .stopUnconfirmed }
-        XCTAssertGreaterThan(sent("StopStream", h.mock), 0,
-                             "the orphan cleanup stop must actually be attempted")
+        await waitUntil { sent("StopStream", h.mock) > 0 }
+        await waitUntil {
+            h.controller.broadcastState == .stopUnconfirmed
+                && h.box.errors.contains { $0.contains("may still be live") }
+        }
         XCTAssertTrue(h.server.streamActive, "OBS really is still live")
-        XCTAssertTrue(h.box.errors.contains { $0.contains("may still be live") })
     }
 
     // MARK: - review10 findings 1-4: split-snapshot / ownership races
@@ -1314,6 +1318,67 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertTrue(h.server.streamActive, "OBS really is still live")
     }
 
+    // MARK: - cold2 I-3: sessionDidEnd/disconnect during an IN-FLIGHT StartStream
+    // must never land a confirmed .idle (the double-StartStream window)
+
+    /// Cold2 I-3 (red-first, session-end flavor): goLive from a confirmed .idle; the
+    /// StartStream request is IN FLIGHT (parked at the server) when sessionDidEnd()
+    /// runs. Pre-fix the .connecting branch lacked endBroadcast's appStartInFlight
+    /// guard: it landed teardownLanding(origin) = confirmed .idle SYNCHRONOUSLY over a
+    /// possibly-issued StartStream, and a second goLive from that lying .idle
+    /// double-started the stream. Post-fix the branch lands the possibly-issued state
+    /// (.stopUnconfirmed) and the cancelled bring-up's stale settle runs the owned
+    /// confirmed cleanup — Go Live stays rejected until it resolves.
+    func testSessionEndDuringInFlightStartStreamNeverLandsIdleNorDoubleStarts() async {
+        let h = await makeHarness(requestTimeout: 10)
+        h.server.parkTypes = ["StartStream"]
+        h.controller.goLive()
+        await waitUntil { h.server.parked.count == 1 }   // StartStream in flight
+        XCTAssertEqual(h.controller.broadcastState, .connecting)
+
+        h.controller.sessionDidEnd()
+        XCTAssertNotEqual(h.controller.broadcastState, .idle,
+                          "an in-flight StartStream must never land a confirmed idle")
+
+        // A second goLive is rejected while the possibly-issued start is unresolved.
+        h.controller.goLive()
+        await settle()
+        XCTAssertEqual(sent("StartStream", h.mock), 1,
+                       "no second StartStream may ever be issued behind the unresolved first")
+
+        // The owned cleanup resolves against the quiet server: confirmed → .idle.
+        await waitUntil { h.controller.broadcastState == .idle }
+        XCTAssertEqual(sent("StartStream", h.mock), 1)
+    }
+
+    /// Cold2 I-3 (red-first, disconnect flavor): the identical hole in disconnect()'s
+    /// .connecting branch. Pre-fix it landed teardownLanding(origin) = confirmed .idle
+    /// over an in-flight StartStream — with the control link deliberately down, nothing
+    /// could ever heal the lie. Post-fix it lands .stopUnconfirmed with an honest log
+    /// (disconnect ≠ stop, the start was possibly issued) and Go Live stays blocked.
+    func testDisconnectDuringInFlightStartStreamLandsStopUnconfirmed() async {
+        let h = await makeHarness(requestTimeout: 10)
+        h.server.parkTypes = ["StartStream"]
+        h.controller.goLive()
+        await waitUntil { h.server.parked.count == 1 }   // StartStream in flight
+        XCTAssertEqual(h.controller.broadcastState, .connecting)
+
+        h.controller.disconnect()
+        XCTAssertNotEqual(h.controller.broadcastState, .idle,
+                          "disconnect over an in-flight StartStream must never claim confirmed idle")
+        await settle()
+        XCTAssertEqual(h.controller.broadcastState, .stopUnconfirmed,
+                       "possibly-issued behind a dead link is only ever .stopUnconfirmed")
+        XCTAssertTrue(h.box.logs.contains { $0.contains("StartStream may have been issued") },
+                      "the possibly-issued landing must be logged honestly — got \(h.box.logs)")
+
+        // Go Live is rejected from .stopUnconfirmed; no second StartStream.
+        h.controller.goLive()
+        await settle()
+        XCTAssertEqual(sent("StartStream", h.mock), 1)
+        XCTAssertEqual(h.controller.broadcastState, .stopUnconfirmed)
+    }
+
     // MARK: - cold-review1 MINOR 4: endBroadcast during .connecting with
     // provably nothing issued aborts honestly — never a "may still be live" lie
 
@@ -1534,10 +1599,15 @@ final class BroadcastControllerTests: XCTestCase {
         await waitUntil { h.mock.parkedSendCount == 1 }
 
         h.controller.sessionDidEnd()   // cancels the bring-up; cleanup owes a stop
+        // Cold2 I-3: the possibly-issued landing is synchronous — never .idle.
+        XCTAssertEqual(h.controller.broadcastState, .stopUnconfirmed)
+        // The owned cleanup then runs; with every request expiring behind the
+        // parked send it settles .stopUnconfirmed with the honest error.
+        await waitUntil({ h.box.errors.contains { $0.contains("may still be live") } },
+                        timeout: 5)
         await waitUntil({ h.controller.broadcastState == .stopUnconfirmed }, timeout: 5)
         XCTAssertEqual(sent("StopStream", h.mock), 0,
                        "the Stop frame must never reach the wire before the ambiguous Start")
-        XCTAssertTrue(h.box.errors.contains { $0.contains("may still be live") })
 
         // The Start delivers late after all: OBS goes live — and the settled
         // .stopUnconfirmed was the honest claim (never idle-over-live).

@@ -144,14 +144,23 @@ public final class BroadcastController {
     /// it settles `.stopUnconfirmed`, never `.idle`).
     private(set) var outputEventGeneration = 0
 
-    /// True exactly while an app-issued StartStream (goLive's
-    /// `obs.startBroadcast`) is in flight — set immediately before the call,
-    /// cleared the instant its `StartOutcome` settles. Review10 finding 2:
-    /// this is the OWNERSHIP-precise replacement for the drain's old blanket
-    /// ".connecting ignores events" rule — only the app's OWN StartStream echo
-    /// may be deferred to the in-flight goLive confirmation; during a manual
-    /// connect/reconcile an external stream start must reconcile.
-    private var appStartInFlight = false
+    /// The generation whose app-issued StartStream (goLive's
+    /// `obs.startBroadcast`) is currently in flight — set immediately before
+    /// the call, cleared the instant its `StartOutcome` settles. Review10
+    /// finding 2: this is the OWNERSHIP-precise replacement for the drain's
+    /// old blanket ".connecting ignores events" rule — only the app's OWN
+    /// StartStream echo may be deferred to the in-flight goLive confirmation;
+    /// during a manual connect/reconcile an external stream start must
+    /// reconcile.
+    ///
+    /// Cold2 T-1: GENERATION-SCOPED (this was the one remaining un-stamped
+    /// ownership state). The settle clears only its OWN generation's claim,
+    /// so a stale start's late clear can never wipe a newer goLive's claim;
+    /// `appStartInFlight` reads true only for the CURRENT generation's
+    /// attempt. Branch sites that bump the generation capture the flag
+    /// BEFORE the bump.
+    private var appStartInFlightGen: Int?
+    private var appStartInFlight: Bool { appStartInFlightGen == broadcastGeneration }
 
     /// Set when the drain must defer to an owner in flight (an app-issued
     /// start, or the stop machinery during `.stopping` when a stream RESTART
@@ -226,10 +235,16 @@ public final class BroadcastController {
         // Review11 finding 4: the health poll and reconcile drain hold self
         // only weakly (per-iteration rebind), so deinit IS reachable while
         // they run — cancel them here so they end promptly rather than at
-        // their next wake against a dead weak self. goLiveTask and the stop/
-        // cleanup tasks need no deinit handling: they retain self strongly
-        // for their (bounded) settlement, so deinit cannot run while one is
-        // alive.
+        // their next wake against a dead weak self. goLiveTask and the
+        // endBroadcast/retryStop tasks DO retain self strongly for their
+        // bounded settlement (deinit cannot run while one is alive), but the
+        // unstructured `.stopping` cleanup tasks (the deferred session-end
+        // stop and the possibly-issued/stale-start cleanups) hold self only
+        // WEAKLY (cold2 T-2 — the old comment claimed strong retention): a
+        // cleanup dropped with the controller is simply ABANDONED at its next
+        // weak-self check. That is the accepted contract — the app holds the
+        // controller for the app's lifetime, so an abandoned mid-cleanup can
+        // only happen in tests/teardown, never over a real broadcast.
         healthPollTask?.cancel()
         reconcileDrainTask?.cancel()
     }
@@ -266,18 +281,35 @@ public final class BroadcastController {
             goLiveTask = nil
             broadcastState = .endingSession
         case .connecting:
-            // Nothing live yet — invalidate the in-flight bring-up (generation bump: its
-            // completions are stale from this instant) and return to the attempt's ORIGIN
-            // (review10 finding 4): a connect begun at .unknown never confirmed any output
-            // state, so hardcoding .idle here manufactured a confirmation that never
-            // happened. Only a previously CONFIRMED .idle may be reclaimed.
+            // Cold2 I-3: split on the SAME boundary endBroadcast already uses —
+            // `appStartInFlight`, the exact in-flight window of an app-issued
+            // StartStream. Captured BEFORE the bump (T-1: the claim is stamped
+            // with the generation that made it).
+            let startPossiblyIssued = appStartInFlight
             broadcastGeneration += 1
             goLiveTask?.cancel()
             goLiveTask = nil
             healthPollTask?.cancel()
             healthPollTask = nil
             streamHealth = nil
-            broadcastState = teardownLanding(from: connectingOrigin)
+            if startPossiblyIssued {
+                // POSSIBLY-ISSUED (cold2 I-3): landing the attempt's origin here
+                // manufactured a confirmed .idle DURING an in-flight StartStream —
+                // a second goLive from that lying .idle double-started the stream.
+                // Land the honest possibly-issued state instead; the cancelled
+                // bring-up's own settle (settleStaleStart's .issuedUnconfirmed
+                // no-newer-owner branch) runs the owned CONFIRMED cleanup from
+                // here — the same machinery endBroadcast's composition relies on.
+                broadcastState = .stopUnconfirmed
+                deps.log("OBS: session ended during the broadcast bring-up — StartStream may have been issued; OBS may be live until the cleanup confirms")
+            } else {
+                // Nothing live yet — invalidate the in-flight bring-up (generation bump:
+                // its completions are stale from this instant) and return to the attempt's
+                // ORIGIN (review10 finding 4): a connect begun at .unknown never confirmed
+                // any output state, so hardcoding .idle here manufactured a confirmation
+                // that never happened. Only a previously CONFIRMED .idle may be reclaimed.
+                broadcastState = teardownLanding(from: connectingOrigin)
+            }
         case .unknown, .idle, .endingSession, .stopping, .stopUnconfirmed:
             break
         }
@@ -316,7 +348,13 @@ public final class BroadcastController {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let confirmed = await self.confirmedStop()
-            guard gen == self.broadcastGeneration else { return }   // stale: someone took over
+            guard gen == self.broadcastGeneration else {
+                // Cold2 T-3: a stale stop owner still settles the deferred-drain
+                // latch — otherwise reconcileWhenOwnerSettles stayed set and fired
+                // one spurious pass under some later owner.
+                self.runDeferredReconcileIfNeeded()
+                return   // stale: someone took over
+            }
             self.healthPollTask?.cancel()
             self.healthPollTask = nil
             self.streamHealth = nil
@@ -603,11 +641,13 @@ public final class BroadcastController {
             // here until its StartOutcome settles — the ONLY window in which
             // the drain defers a stream-started event (it is our own echo;
             // the confirmation below owns it).
-            appStartInFlight = true
+            appStartInFlightGen = gen
             let outcome = await obs.startBroadcast(scene: scene,
                                                    confirmPollSeconds: confirmPollSeconds,
                                                    maxConfirmPolls: maxConfirmPolls)
-            appStartInFlight = false
+            // Cold2 T-1: clear only THIS attempt's claim — a stale settle must
+            // never wipe a newer goLive's in-flight claim.
+            if appStartInFlightGen == gen { appStartInFlightGen = nil }
             runDeferredReconcileIfNeeded()
             guard gen == broadcastGeneration else {
                 settleStaleStart(outcome: outcome)
@@ -664,7 +704,10 @@ public final class BroadcastController {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     let confirmed = await self.confirmedStop()
-                    guard cleanupGen == self.broadcastGeneration else { return }   // superseded mid-cleanup
+                    guard cleanupGen == self.broadcastGeneration else {
+                        self.runDeferredReconcileIfNeeded()   // cold2 T-3
+                        return   // superseded mid-cleanup
+                    }
                     if confirmed {
                         self.deps.presentError("OBS started but the stream didn't go live — check OBS ▸ Settings ▸ Stream (YouTube server + key).")
                         self.broadcastState = .idle
@@ -730,7 +773,10 @@ public final class BroadcastController {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     let confirmed = await self.confirmedStop()
-                    guard gen == self.broadcastGeneration else { return }   // superseded mid-cleanup
+                    guard gen == self.broadcastGeneration else {
+                        self.runDeferredReconcileIfNeeded()   // cold2 T-3
+                        return   // superseded mid-cleanup
+                    }
                     self.settleAfterStop(confirmed: confirmed)
                 }
             }
@@ -816,7 +862,10 @@ public final class BroadcastController {
         healthPollTask?.cancel(); healthPollTask = nil
         Task { @MainActor in
             let confirmed = await confirmedStop()
-            guard gen == broadcastGeneration else { return }
+            guard gen == broadcastGeneration else {
+                runDeferredReconcileIfNeeded()   // cold2 T-3: never latch the deferred pass
+                return
+            }
             streamHealth = nil
             settleAfterStop(confirmed: confirmed)
         }
@@ -834,10 +883,16 @@ public final class BroadcastController {
             if obs.state == .disconnected {
                 await obs.connect(host: obsHost, port: obsPort,
                                   password: obsPassword.isEmpty ? nil : obsPassword)
-                guard gen == broadcastGeneration else { return }
+                guard gen == broadcastGeneration else {
+                    runDeferredReconcileIfNeeded()   // cold2 T-3
+                    return
+                }
             }
             let confirmed = await confirmedStop()
-            guard gen == broadcastGeneration else { return }
+            guard gen == broadcastGeneration else {
+                runDeferredReconcileIfNeeded()   // cold2 T-3
+                return
+            }
             streamHealth = nil
             settleAfterStop(confirmed: confirmed)
         }
@@ -859,15 +914,27 @@ public final class BroadcastController {
             broadcastState = .stopUnconfirmed
             deps.log("OBS: control link disconnected while the stream is live — OBS keeps streaming (disconnect ≠ stop). Reconnect and Retry to stop it, or stop it in OBS.")
         case .connecting:
-            // Bring-up abandoned: invalidate it and return to the attempt's ORIGIN
-            // (review10 finding 4 — a connect begun at .unknown confirmed nothing, so
-            // .idle here was a fabricated confirmation). Any stream a stale attempt
-            // manages to start is undone by its stale-completion cleanup.
+            // Cold2 I-3: the same appStartInFlight split as sessionDidEnd()/
+            // endBroadcast() — captured BEFORE the bump (T-1).
+            let startPossiblyIssued = appStartInFlight
             broadcastGeneration += 1
             goLiveTask?.cancel(); goLiveTask = nil
             healthPollTask?.cancel(); healthPollTask = nil
             streamHealth = nil
-            broadcastState = teardownLanding(from: connectingOrigin)
+            if startPossiblyIssued {
+                // POSSIBLY-ISSUED behind a link deliberately going down: only
+                // .stopUnconfirmed is honest (disconnect ≠ stop — OBS may bring
+                // the stream up after the link died). Pre-fix this landed the
+                // origin's confirmed .idle over an in-flight StartStream, and
+                // with the link down nothing could ever heal the lie.
+                broadcastState = .stopUnconfirmed
+                deps.log("OBS: control link disconnected during the broadcast bring-up — StartStream may have been issued; OBS may be live (disconnect ≠ stop). Reconnect and Retry to stop it, or check OBS.")
+            } else {
+                // Bring-up abandoned with provably nothing issued: return to the
+                // attempt's ORIGIN (review10 finding 4 — a connect begun at .unknown
+                // confirmed nothing, so .idle here was a fabricated confirmation).
+                broadcastState = teardownLanding(from: connectingOrigin)
+            }
         case .unknown, .idle, .stopUnconfirmed:
             // Review7 P1: disconnecting from .unknown stays .unknown — nothing
             // was ever confirmed, so nothing gets claimed now either.
@@ -1085,11 +1152,15 @@ public final class BroadcastController {
             // rules: an app-issued StartStream in flight can only settle
             // .stopUnconfirmed; with nothing issued, the origin's loss-map
             // landing (.unknown; .stopUnconfirmed if a stop was already owed).
+            // Cold2 T-1: captured BEFORE the bump — the claim is stamped with
+            // the generation that made it, and this branch is deciding about
+            // exactly that attempt.
+            let startPossiblyIssued = appStartInFlight
             broadcastGeneration += 1
             goLiveTask?.cancel(); goLiveTask = nil
             healthPollTask?.cancel(); healthPollTask = nil
             streamHealth = nil
-            if appStartInFlight {
+            if startPossiblyIssued {
                 broadcastState = .stopUnconfirmed
                 deps.log("OBS: control link lost during the broadcast bring-up — StartStream may have been issued; OBS may be live (disconnect ≠ stop). Reconnect and Retry to stop it, or check OBS.")
             } else {
