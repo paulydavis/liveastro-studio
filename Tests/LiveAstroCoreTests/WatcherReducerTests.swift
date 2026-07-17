@@ -267,6 +267,45 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(emittedNames(in: effects), [two, ten])
     }
 
+    func testNumericEqualRevisionUsesRawDigitsBeforeFullNameTiebreak() {
+        let rawSeven = "LIVE_STACK_7.fit"
+        let paddedSeven = "live_stack_007.fit"
+        let rawCandidate = makeCandidate(
+            name: rawSeven,
+            identity: makeIdentity(7),
+            digest: "raw-seven",
+            kind: .numbered(revision: "7"))
+        let paddedCandidate = makeCandidate(
+            name: paddedSeven,
+            identity: makeIdentity(70),
+            digest: "padded-seven",
+            kind: .numbered(revision: "007"))
+        var reducer = makeReducer(files: [
+            rawSeven: .ready(rawCandidate),
+            paddedSeven: .ready(paddedCandidate),
+        ])
+
+        let effects = observeBatch([
+            observation(name: rawSeven, revision: "7", outcome: .identityUnchanged(
+                identity: rawCandidate.identity)),
+            observation(name: paddedSeven, revision: "007", outcome: .identityUnchanged(
+                identity: paddedCandidate.identity)),
+        ], nowNanos: 10, reducer: &reducer)
+
+        XCTAssertEqual(
+            emittedNames(in: effects),
+            [paddedSeven, rawSeven],
+            "numeric ties compare raw digit strings before case-varied full names")
+        for effect in effects {
+            guard case .emit(let intent) = effect else { continue }
+            XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+                intent: intent,
+                outcome: .yielded))).isEmpty)
+        }
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "007",
+                       "the raw-digit-first revision remains the derived tie survivor")
+    }
+
     func testMarkDropLogsOnceAndNeverEmitsOrAdvancesHighWater() {
         let identity = makeIdentity(3)
         let emitted = revisionName("00003")
@@ -305,6 +344,98 @@ final class WatcherReducerTests: XCTestCase {
             intent: intent,
             outcome: .yielded))).isEmpty)
         XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+    }
+
+    func testImmutableNumberedEmissionSettlesWithoutDerivedHighWater() {
+        let name = revisionName("00007")
+        let candidate = makeCandidate(
+            name: name,
+            identity: makeIdentity(7),
+            digest: "seven",
+            kind: .numbered(revision: "00007"))
+        var reducer = makeReducer(
+            files: [name: .ready(candidate)],
+            digestPolicy: .immutableAfterPublish)
+
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: EmissionIntent(generation: reducer.state.generation.id, candidate: candidate),
+            outcome: .yielded))).isEmpty)
+
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
+            identity: candidate.identity,
+            digest: candidate.digest)))
+        XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], candidate.digest)
+        XCTAssertNil(reducer.emittedRevisionHighWater,
+                     "revision ordering and its derived mark are mutable-policy-only")
+    }
+
+    func testVictimEmissionResultImmediatelyPrunesExhaustedEpisode() {
+        let blocker = revisionName("00001")
+        let victim = revisionName("00002")
+        let victimCandidate = makeCandidate(
+            name: victim,
+            identity: makeIdentity(2),
+            digest: "victim",
+            kind: .numbered(revision: "00002"))
+        var reducer = makeReducer(files: [victim: .ready(victimCandidate)])
+
+        let issued = observeBatch([
+            observation(name: victim, revision: "00002", outcome: .identityUnchanged(
+                identity: victimCandidate.identity)),
+        ], nowNanos: 10, reducer: &reducer)
+        guard case .emit(let victimIntent) = issued.first else {
+            return XCTFail("higher ready revision must first receive an intent")
+        }
+
+        XCTAssertTrue(observeBatch([
+            invalidRevision("00001"),
+            observation(name: victim, revision: "00002", outcome: .identityUnchanged(
+                identity: victimCandidate.identity)),
+        ], nowNanos: 20, reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker,
+                       BlockingEpisode(
+                        blocker: blocker,
+                        startNanos: 20,
+                        deadlineNanos: 20 &+ reducer.blockingBudgetNanos))
+
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: victimIntent,
+            outcome: .yielded))).isEmpty)
+        XCTAssertNil(reducer.state.generation.ordering.activeBlocker,
+                     "the sole victim became terminal, so the episode predicate is false")
+
+        XCTAssertTrue(observeBatch([
+            invalidRevision("00003"),
+            invalidRevision("00004"),
+        ], nowNanos: 30, reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos, 30,
+                       "a later victim starts a fresh episode, never the stale clock")
+    }
+
+    func testSuccessfulEmissionOfActiveBlockerPrunesInconsistentEpisode() {
+        let blocker = revisionName("00001")
+        let victim = revisionName("00002")
+        let candidate = makeCandidate(
+            name: blocker,
+            identity: makeIdentity(1),
+            digest: "blocker",
+            kind: .numbered(revision: "00001"))
+        var reducer = makeReducer(
+            files: [
+                blocker: .ready(candidate),
+                victim: .observing(stat: makeIdentity(2)),
+            ],
+            activeBlocker: BlockingEpisode(
+                blocker: blocker,
+                startNanos: 10,
+                deadlineNanos: 20))
+
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: EmissionIntent(generation: reducer.state.generation.id, candidate: candidate),
+            outcome: .yielded))).isEmpty)
+
+        XCTAssertNil(reducer.state.generation.ordering.activeBlocker,
+                     "terminalizing the recorded blocker must remove an impossible episode")
     }
 
     func testGenerationReplacementPreservesOnlyLatestDigestByName() {
@@ -930,6 +1061,7 @@ final class WatcherReducerTests: XCTestCase {
         generation: UInt64 = 1,
         files: [String: FileState] = [:],
         digests: [String: String] = [:],
+        activeBlocker: BlockingEpisode? = nil,
         digestPolicy: StackFileWatcher.DigestPolicy = .mutableStackerOutput,
         filePrefix: String? = "live_stack",
         quietPeriodNanos: UInt64 = 100,
@@ -940,7 +1072,7 @@ final class WatcherReducerTests: XCTestCase {
                 generation: GenerationState(
                     id: FolderGeneration(rawValue: generation),
                     files: files,
-                    ordering: RevisionOrderingState(activeBlocker: nil)),
+                    ordering: RevisionOrderingState(activeBlocker: activeBlocker)),
                 lastEmittedDigestByName: digests),
             configuration: makeConfiguration(
                 digestPolicy: digestPolicy,

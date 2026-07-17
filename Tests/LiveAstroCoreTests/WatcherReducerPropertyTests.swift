@@ -202,24 +202,41 @@ final class WatcherReducerPropertyTests: XCTestCase {
             makeObservation(
                 name: victim,
                 revision: "12",
-                outcome: .identityUnchanged(identity: victimIdentity)),
+                outcome: .digested(
+                    identity: victimIdentity,
+                    digest: "current-victim",
+                    byteCount: victimIdentity.size)),
         ]
 
         for transition in 0..<Self.transitionCount {
-            let historyA = [
-                blocker: "history-a-\(generator.next())",
-                victim: "history-a-\(generator.next())",
+            let emptyHistory: [String: String] = [:]
+            var populatedHistory = [
+                blocker: "nonmatching-blocker-\(generator.next())",
+                victim: "nonmatching-victim-\(generator.next())",
             ]
-            let historyB = [
-                blocker: "history-b-\(generator.next())",
-                victim: "history-b-\(generator.next())",
-            ]
-            var reducerA = makeReducer(files: files, digests: historyA)
-            var reducerB = makeReducer(files: files, digests: historyB)
+            let extraKeyCount = Int(generator.next() % 5)
+            for extra in 0..<extraKeyCount {
+                populatedHistory[revisionName(String(20 + transition * 5 + extra))]
+                    = "nonmatching-extra-\(generator.next())"
+            }
+            if transition.isMultiple(of: 2) {
+                populatedHistory["classic-\(transition).fit"]
+                    = "nonmatching-classic-\(generator.next())"
+            }
+            var reducerA = makeReducer(files: files, digests: emptyHistory)
+            var reducerB = makeReducer(files: files, digests: populatedHistory)
 
-            _ = reduce(entries, nowNanos: UInt64(transition), reducer: &reducerA)
-            _ = reduce(entries, nowNanos: UInt64(transition), reducer: &reducerB)
+            let effectsA = reduce(entries, nowNanos: UInt64(transition), reducer: &reducerA)
+            let effectsB = reduce(entries, nowNanos: UInt64(transition), reducer: &reducerB)
 
+            XCTAssertEqual(
+                effectsA,
+                effectsB,
+                "seed=\(Self.seed) transition=\(transition)")
+            XCTAssertEqual(
+                reducerA.state.generation.files,
+                reducerB.state.generation.files,
+                "seed=\(Self.seed) transition=\(transition) duplicate classification diverged")
             XCTAssertEqual(
                 reducerA.emittedRevisionHighWater,
                 reducerB.emittedRevisionHighWater,

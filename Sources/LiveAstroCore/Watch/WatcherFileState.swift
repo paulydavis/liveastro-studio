@@ -171,7 +171,8 @@ struct WatcherReducer {
     }
 
     var emittedRevisionHighWater: String? {
-        state.generation.files.reduce(nil as String?) { highWater, entry in
+        guard revisionOrderingEnabled else { return nil }
+        return state.generation.files.reduce(nil as String?) { highWater, entry in
             guard case .settled(.emittedNow) = entry.value,
                   let revision = revisionOrder.revision(in: entry.key) else { return highWater }
             guard let highWater else { return revision }
@@ -208,7 +209,44 @@ struct WatcherReducer {
                 identity: candidate.identity,
                 digest: candidate.digest))
             state.lastEmittedDigestByName[candidate.name] = candidate.digest
+            pruneActiveBlockerIfPredicateIsFalse()
             return []
+        }
+    }
+
+    private mutating func pruneActiveBlockerIfPredicateIsFalse() {
+        guard let episode = state.generation.ordering.activeBlocker else { return }
+        guard revisionOrderingEnabled,
+              let blockerRevision = revisionOrder.revision(in: episode.blocker),
+              !isTerminal(state.generation.files[episode.blocker]),
+              !isReady(state.generation.files[episode.blocker])
+        else {
+            state.generation.ordering.activeBlocker = nil
+            return
+        }
+
+        if let mark = emittedRevisionHighWater,
+           revisionOrder.compare(blockerRevision, mark) != .orderedDescending {
+            state.generation.ordering.activeBlocker = nil
+            return
+        }
+
+        let blocker = (name: episode.blocker, revision: Optional(blockerRevision))
+        var hasLaterPotentialVictim = false
+        for (name, fileState) in state.generation.files {
+            guard let revision = revisionOrder.revision(in: name),
+                  !isTerminal(fileState) else { continue }
+            let candidate = (name: name, revision: Optional(revision))
+            if revisionOrder.orderedBefore(candidate, blocker), !isReady(fileState) {
+                state.generation.ordering.activeBlocker = nil
+                return
+            }
+            if revisionOrder.orderedBefore(blocker, candidate) {
+                hasLaterPotentialVictim = true
+            }
+        }
+        if !hasLaterPotentialVictim {
+            state.generation.ordering.activeBlocker = nil
         }
     }
 
@@ -383,6 +421,11 @@ struct WatcherReducer {
         case .observing, .digestPending, .ready, nil:
             return false
         }
+    }
+
+    private func isReady(_ fileState: FileState?) -> Bool {
+        if case .ready = fileState { return true }
+        return false
     }
 
     private mutating func classify(
@@ -598,6 +641,9 @@ private struct NumberedRevisionOrder {
             case .orderedDescending:
                 return false
             case .orderedSame:
+                if lhsRevision != rhsRevision {
+                    return lhsRevision < rhsRevision
+                }
                 return lhs.name < rhs.name
             }
         case (nil, nil):
