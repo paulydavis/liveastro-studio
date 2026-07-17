@@ -56,6 +56,9 @@ final class MockOBSSocket: OBSSocket {
     /// post-connect handshake must close the socket it opened).
     private(set) var closeCount = 0
 
+    /// Number of transport connect attempts observed.
+    private(set) var connectStartedCount = 0
+
     // MARK: - Private
 
     private let queue = InboundQueue()
@@ -64,11 +67,18 @@ final class MockOBSSocket: OBSSocket {
     /// the outbound frame. Returns a frame to inject as the next inbound, or
     /// `nil` to inject nothing.
     private var replyHook: ((String) -> String?)?
+    private var lastCloseTask: Task<Void, Never>?
 
     // MARK: - OBSSocket
 
     func connect(url: URL) async throws {
-        // No-op for the mock; tests drive the handshake by enqueueing frames.
+        connectStartedCount += 1
+        // A fresh connect attempt gets a fresh receive terminal state while
+        // preserving any Hello frame the test queued before calling connect.
+        await queue.resetForConnect()
+        if parkConnect {
+            await withCheckedContinuation { parkedConnects.append($0) }
+        }
     }
 
     func send(_ text: String) async throws {
@@ -93,7 +103,9 @@ final class MockOBSSocket: OBSSocket {
 
     func close() {
         closeCount += 1
-        Task { await queue.finish(throwing: CancellationError()) }
+        releaseParkedConnects()
+        let task = Task { await queue.finish(throwing: CancellationError()) }
+        lastCloseTask = task
     }
 
     // MARK: - Test-control API
@@ -120,6 +132,13 @@ final class MockOBSSocket: OBSSocket {
         Task { await queue.finish(throwing: CancellationError()) }
     }
 
+    /// Wait until the actor-side effects of the most recent `close()` have
+    /// landed. Tests that reconnect the same mock use this to avoid racing a
+    /// fresh connect against the previous close's async receive termination.
+    func waitForCloseEffects() async {
+        await lastCloseTask?.value
+    }
+
     // MARK: - Park-send knob (review11 finding 1)
 
     /// When set, `send(_:)` calls whose frame matches suspend before the
@@ -134,6 +153,21 @@ final class MockOBSSocket: OBSSocket {
     func releaseParkedSends() {
         let waiting = parkedSends
         parkedSends = []
+        for continuation in waiting { continuation.resume() }
+    }
+
+    // MARK: - Park-connect knob (Phase 3 transport-deadline regression)
+
+    /// When set, `connect(url:)` suspends before the OBS Hello/Identify
+    /// exchange begins, modeling a transport dial/WebSocket open that never
+    /// completes.
+    var parkConnect = false
+    private var parkedConnects: [CheckedContinuation<Void, Never>] = []
+
+    /// Resume every parked connect attempt.
+    func releaseParkedConnects() {
+        let waiting = parkedConnects
+        parkedConnects = []
         for continuation in waiting { continuation.resume() }
     }
 }
@@ -173,6 +207,10 @@ private actor InboundQueue {
             continuation.resume(throwing: error)
         }
         // Future dequeue() calls will throw via the terminalError path.
+    }
+
+    func resetForConnect() {
+        terminalError = nil
     }
 
     func dequeue() async throws -> String {

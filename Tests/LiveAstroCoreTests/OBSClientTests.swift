@@ -493,6 +493,47 @@ final class OBSClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    /// A parked send from a disconnected session must not poison the outbound
+    /// FIFO chain for a later connection. Pre-fix `disconnect()` cancelled the
+    /// tracked send task but left `sendChainTail` pointing at the parked task;
+    /// the first request after reconnect waited behind that stale tail until
+    /// its own timeout.
+    func testDisconnectAbandonsParkedSendChainSoReconnectRequestsAreNotPoisoned() async throws {
+        let mock = MockOBSSocket()
+        let client = OBSClient(socket: mock, requestTimeout: 0.1)
+        try await connect(client, mock)
+
+        mock.replyToLastSent(nil)
+        mock.parkSendsMatching = { $0.contains("\"requestType\":\"GetVersion\"") }
+        let poisoned = Task { try? await client.request("GetVersion", data: nil) }
+        try await waitUntil { mock.parkedSendCount == 1 }
+        await client.disconnect()
+        await mock.waitForCloseEffects()
+
+        mock.parkSendsMatching = nil
+        mock.enqueueInbound(helloFrame())
+        mock.replyToLastSent { [weak self, identifiedFrame] sent in
+            guard let self else { return nil }
+            if sent.contains("\"op\":1") { return identifiedFrame }
+            if sent.contains("\"requestType\":\"GetStats\"") {
+                return self.responseFrame(requestId: self.requestId(fromSent: sent),
+                                          requestType: "GetStats",
+                                          ok: true,
+                                          code: 100,
+                                          responseData: ["ok": true])
+            }
+            return nil
+        }
+
+        try await client.connect(url: url, password: nil)
+        let response = try await client.request("GetStats", data: nil)
+        XCTAssertEqual(response["ok"] as? Bool, true)
+
+        mock.releaseParkedSends()
+        _ = await poisoned.value
+        await client.disconnect()
+    }
+
     // MARK: - cold2 I-2: bounded handshake
 
     /// Lock-guarded outcome capture for a connect attempt that (pre-fix) never returns.
@@ -534,6 +575,35 @@ final class OBSClientTests: XCTestCase {
                        "the expiry is reported as a timeout — got \(String(describing: box.error))")
         XCTAssertGreaterThanOrEqual(mock.closeCount, 1,
                                     "the expired handshake must close the socket it opened")
+    }
+
+    /// The same deadline must cover the transport connect itself, not only
+    /// Hello→Identify after `socket.connect` returns. This is bounded so the
+    /// pre-fix hang fails quickly instead of waiting for XCTest's timeout.
+    func testConnectTimeoutCoversTransportConnectBeforeHello() async {
+        let mock = MockOBSSocket()
+        mock.parkConnect = true
+        let client = OBSClient(socket: mock, requestTimeout: 10, handshakeTimeout: 0.05)
+        let box = ConnectOutcomeBox()
+
+        Task { [url] in
+            do {
+                try await client.connect(url: url, password: nil)
+                box.finish(error: nil)
+            } catch {
+                box.finish(error: error)
+            }
+        }
+
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(box.isDone,
+                      "transport connect must be bounded by the OBS connect deadline")
+        XCTAssertEqual(box.error as? OBSClient.OBSError, .timeout,
+                       "transport wedge should report .timeout, got \(String(describing: box.error))")
+        XCTAssertEqual(mock.connectStartedCount, 1)
+        XCTAssertEqual(mock.closeCount, 1, "timeout closes the transport attempt")
+
+        mock.releaseParkedConnects()
     }
 
     /// The watchdog must not fire on a HEALTHY handshake: connect succeeds well inside
