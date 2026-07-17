@@ -548,6 +548,41 @@ final class OBSControllerTests: XCTestCase {
         controller.disconnect()
     }
 
+    // MARK: - cold2 I-2: a wedged handshake must not poison connect coalescing
+
+    /// Cold2 I-2 (red-first, controller level): a wedge (TCP accepts, no Hello) used to
+    /// park connectTask forever — and because `connect` coalesces onto any in-flight
+    /// attempt, EVERY later connect awaited the dead task; only a manual disconnect
+    /// unwedged the controller. Post-fix the first attempt fails within the handshake
+    /// bound, the epoch-guarded clearing releases `connectTask`, and a second attempt
+    /// runs a FRESH handshake that succeeds.
+    func testWedgedHandshakeFailsWithinBound_secondConnectDoesNotCoalesce() async {
+        let wedged = MockOBSSocket()                  // never sends Hello
+        let healthy = MockOBSSocket()
+        var sockets = [wedged, healthy]
+        let controller = OBSController(
+            makeClient: { OBSClient(socket: $0, requestTimeout: 0.2) },
+            makeSocket: { sockets.removeFirst() })
+
+        var firstResult: Bool?
+        Task { firstResult = await controller.connect(host: "localhost", port: 4455,
+                                                      password: nil) }
+        await waitUntil({ firstResult != nil }, timeout: 3)
+        XCTAssertEqual(firstResult, false, "the wedged handshake must fail within the bound")
+        XCTAssertEqual(controller.state, .disconnected)
+
+        healthy.enqueueInbound(helloFrame())
+        healthy.replyToLastSent(sessionResponder())
+        var secondResult: Bool?
+        Task { secondResult = await controller.connect(host: "localhost", port: 4455,
+                                                       password: nil) }
+        await waitUntil({ secondResult != nil }, timeout: 3)
+        XCTAssertEqual(secondResult, true,
+                       "the second attempt must start fresh, never coalesce onto the dead task")
+        XCTAssertEqual(controller.state, .connected)
+        controller.disconnect()
+    }
+
     /// connect failure (bad handshake) returns false and leaves .disconnected.
     func testConnectFailureReturnsFalse() async {
         let mock = MockOBSSocket()

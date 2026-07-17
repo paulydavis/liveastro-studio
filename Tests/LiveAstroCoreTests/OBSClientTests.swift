@@ -493,6 +493,61 @@ final class OBSClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    // MARK: - cold2 I-2: bounded handshake
+
+    /// Lock-guarded outcome capture for a connect attempt that (pre-fix) never returns.
+    private final class ConnectOutcomeBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _done = false
+        private var _error: Error?
+        func finish(error: Error?) { lock.withLock { _done = true; _error = error } }
+        var isDone: Bool { lock.withLock { _done } }
+        var error: Error? { lock.withLock { _error } }
+    }
+
+    /// Cold2 I-2 (P1, red-first): a wedge that ACCEPTS the connection but never sends
+    /// Hello parked `connect` forever — the caller sat in `.connecting` indefinitely,
+    /// auto-launch never engaged (its budget starts only after the first connect
+    /// returns), and the wedged attempt poisoned OBSController's connect coalescing for
+    /// every later attempt. The handshake is now BOUNDED (default: the request timeout);
+    /// on expiry the socket is CLOSED (the review10 failed-handshake-closes-socket
+    /// discipline) and connect throws `.timeout`.
+    func testConnectTimesOutWhenHelloNeverArrives_closesSocket() async {
+        let mock = MockOBSSocket()                     // accepts connect; Hello never comes
+        let client = OBSClient(socket: mock, requestTimeout: 0.2)
+        let box = ConnectOutcomeBox()
+        Task { [url] in
+            do {
+                try await client.connect(url: url, password: nil)
+                box.finish(error: nil)
+            } catch {
+                box.finish(error: error)
+            }
+        }
+        let deadline = Date().addingTimeInterval(3)   // >> the 0.2 s handshake bound
+        while !box.isDone && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(box.isDone,
+                      "connect must fail within the handshake bound — a missing Hello must not park it forever")
+        XCTAssertEqual(box.error as? OBSClient.OBSError, .timeout,
+                       "the expiry is reported as a timeout — got \(String(describing: box.error))")
+        XCTAssertGreaterThanOrEqual(mock.closeCount, 1,
+                                    "the expired handshake must close the socket it opened")
+    }
+
+    /// The watchdog must not fire on a HEALTHY handshake: connect succeeds well inside
+    /// the bound and the socket stays open for the session.
+    func testHandshakeWithinBoundConnectsAndSocketStaysOpen() async throws {
+        let mock = MockOBSSocket()
+        let client = OBSClient(socket: mock, requestTimeout: 0.5)
+        try await connect(client, mock)
+        try? await Task.sleep(nanoseconds: 700_000_000)   // past the (cancelled) watchdog
+        XCTAssertEqual(mock.closeCount, 0,
+                       "a completed handshake must never be closed by the expired watchdog")
+        await client.disconnect()
+    }
+
     // MARK: - Helpers
 
     /// Poll an async predicate until true or a deadline; fail the test on timeout.

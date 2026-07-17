@@ -340,18 +340,27 @@ public final class BroadcastController {
     /// in-flight attempt and returns its ACTUAL outcome, so awaiting it here
     /// never reports success from a half-open client (whose seed/reconcile
     /// queries would fail and tear down the connection being established).
-    private func connectOBS() async -> Bool {
+    private func connectOBS(gen: Int) async -> Bool {
         if obs.state == .connected || obs.state == .streaming { return true }
 
         var connected = await obs.connect(host: obsHost, port: obsPort,
                                           password: obsPassword.isEmpty ? nil : obsPassword)
 
         if !connected && obsAutoLaunch {
+            // Cold2 I-1: launching the OBS app is a SIDE EFFECT and obeys the
+            // same staleness rules as every state mutation — an attempt that
+            // was aborted (cancelled goLiveTask) or superseded (generation
+            // moved) while the failed connect was in flight must NOT launch
+            // OBS on its way out. Pre-fix the cancellation guards protected
+            // the retry loop and the caller, never the launch itself.
+            guard !Task.isCancelled && gen == broadcastGeneration else { return false }
             deps.launchOBS()
             // Retry connect every `launchRetryDelaySeconds` until success or
-            // the `launchRetryBudgetSeconds` budget elapses.
+            // the `launchRetryBudgetSeconds` budget elapses. Each iteration
+            // re-checks cancellation AND the generation (cold2 I-1).
             let deadline = Date().addingTimeInterval(launchRetryBudgetSeconds)
-            while !connected && Date() < deadline && !Task.isCancelled {
+            while !connected && Date() < deadline && !Task.isCancelled
+                    && gen == broadcastGeneration {
                 // Cancellation-aware sleep: a cancel throws here, which we treat
                 // as "stop retrying" — return false.
                 do {
@@ -566,7 +575,7 @@ public final class BroadcastController {
         connectingOrigin = origin   // review10 finding 4: teardown returns here
         broadcastState = .connecting
         goLiveTask = Task { @MainActor in
-            let connected = await connectOBS()
+            let connected = await connectOBS(gen: gen)
             guard gen == broadcastGeneration else { return }   // stale: cancelled/superseded
             guard connected else {
                 deps.presentError("OBS not reachable — is it installed and running?")

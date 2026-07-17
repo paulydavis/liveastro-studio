@@ -31,11 +31,24 @@ public actor OBSClient {
 
     private let socket: OBSSocket
     private let requestTimeout: TimeInterval
+    /// Bound on the WHOLE connect handshake (Hello → Identify → Identified) —
+    /// cold2 I-2. A wedge that accepts the TCP/WebSocket connection but never
+    /// sends Hello used to park `connect` forever: the caller sat in
+    /// `.connecting` indefinitely, auto-launch never engaged (its budget starts
+    /// only after the first connect returns), and OBSController's connect
+    /// coalescing was poisoned for every later attempt. Defaults to
+    /// `requestTimeout` — the handshake is a request-shaped exchange, so the
+    /// same patience applies unless the caller injects its own.
+    private let handshakeTimeout: TimeInterval
 
     // MARK: - State
 
     private var connected = false
     private var receiveLoop: Task<Void, Never>?
+    /// Set by the handshake watchdog when it expires a still-parked handshake
+    /// (cold2 I-2) so `connect` reports the failure as `.timeout` rather than
+    /// whatever error the forced socket close surfaced.
+    private var handshakeTimedOut = false
 
     /// Pending request continuations keyed by the requestId (UUID string) we sent.
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
@@ -79,9 +92,14 @@ public actor OBSClient {
     ///   - socket: transport seam.
     ///   - requestTimeout: seconds a `request(_:data:)` waits before throwing
     ///     `.timeout`. Defaults to 10 s; tests may inject a small value.
-    public init(socket: OBSSocket, requestTimeout: TimeInterval = 10) {
+    ///   - handshakeTimeout: seconds the connect handshake may take end to end
+    ///     before the attempt fails with `.timeout` and the socket is closed
+    ///     (cold2 I-2). nil (the default) uses `requestTimeout`.
+    public init(socket: OBSSocket, requestTimeout: TimeInterval = 10,
+                handshakeTimeout: TimeInterval? = nil) {
         self.socket = socket
         self.requestTimeout = requestTimeout
+        self.handshakeTimeout = handshakeTimeout ?? requestTimeout
         var cont: AsyncStream<(type: String, data: [String: Any])>.Continuation!
         self.eventStream = AsyncStream { cont = $0 }
         self.eventContinuation = cont
@@ -101,14 +119,42 @@ public actor OBSClient {
     /// auto-launch retry loop accumulated orphaned sockets.
     public func connect(url: URL, password: String?) async throws {
         try await socket.connect(url: url)
+        // Cold2 I-2: the handshake is BOUNDED. A wedge that accepts the
+        // connection but never sends Hello would otherwise park this await
+        // forever. The watchdog closes the socket on expiry — the same
+        // failed-handshake-closes-socket discipline as every other
+        // post-connect failure — which forces the parked receive to throw;
+        // the failure is then reported as `.timeout`. On a completed (or
+        // otherwise failed) handshake the watchdog is cancelled; the
+        // `connected` guard in expireHandshake covers the sleep-already-
+        // elapsed race so a healthy session is never closed late.
+        handshakeTimedOut = false
+        let watchdog = Task { [weak self, handshakeTimeout] in
+            try? await Task.sleep(nanoseconds: UInt64(handshakeTimeout * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await self?.expireHandshake()
+        }
+        defer { watchdog.cancel() }
         do {
             try await performHandshake(password: password)
         } catch {
             socket.close()   // single exit for every post-connect failure
-            throw error
+            throw handshakeTimedOut ? OBSError.timeout : error
         }
         connected = true
         startReceiveLoop()
+    }
+
+    /// Handshake watchdog body (cold2 I-2): if the handshake is still in
+    /// flight when the deadline lands, close the socket so the parked
+    /// receive fails NOW; `connect` maps the resulting error to `.timeout`.
+    /// A handshake that completed first set `connected` in the same actor —
+    /// this hop then touches nothing (each connect uses a fresh client, so
+    /// `connected` is still this attempt's flag).
+    private func expireHandshake() {
+        guard !connected else { return }
+        handshakeTimedOut = true
+        socket.close()
     }
 
     /// The handshake proper — factored out so `connect` can guarantee the

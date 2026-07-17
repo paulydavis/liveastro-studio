@@ -576,6 +576,43 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertTrue(h.box.errors.contains { $0.contains("OBS not reachable") })
     }
 
+    // MARK: - cold2 I-1: an aborted Go Live must never launch the OBS app
+
+    /// Cold2 I-1 (P1, red-first): goLive parks in its connect (wedge: the socket accepts
+    /// but Hello never arrives); the operator aborts with Disconnect. The abort makes the
+    /// connect FAIL — and pre-fix connectOBS's `!connected && obsAutoLaunch` branch then
+    /// launched the OBS app as a side effect of an attempt that was already dead: the
+    /// cancellation guards protected the retry loop and the caller, never the launch.
+    func testAbortedGoLiveNeverLaunchesOBS() async {
+        let h = await makeHarness(connect: false, requestTimeout: 10)
+        // Wedge: no Hello is ever enqueued — the connect parks inside the handshake.
+        h.controller.goLive()
+        await settle()
+        XCTAssertEqual(h.controller.broadcastState, .connecting)
+        XCTAssertEqual(h.box.launchRequests, 0)
+
+        h.controller.disconnect()                  // operator aborts the attempt
+        await settle()
+        await settle()
+        XCTAssertEqual(h.box.launchRequests, 0,
+                       "an aborted Go Live must never launch the OBS app")
+        XCTAssertEqual(h.controller.broadcastState, .unknown)
+    }
+
+    /// Cold2 I-2, the launch/retry composition: goLive against a wedge (TCP accepts,
+    /// no Hello). Pre-fix the handshake parked forever — `.connecting` indefinitely and
+    /// auto-launch NEVER engaged, because its budget starts only after the first connect
+    /// returns. Post-fix the bounded handshake fails the first connect, the launch is
+    /// requested, the retry loop burns its budget against the dead socket, and the
+    /// attempt fails honestly back to .unknown.
+    func testGoLiveAgainstWedgedHandshakeReachesLaunchPath() async {
+        let h = await makeHarness(connect: false, requestTimeout: 0.3)
+        h.controller.goLive()
+        await waitUntil({ h.box.launchRequests == 1 }, timeout: 5)
+        await waitUntil({ h.controller.broadcastState == .unknown }, timeout: 5)
+        XCTAssertTrue(h.box.errors.contains { $0.contains("OBS not reachable") })
+    }
+
     // MARK: - review7 FIX 2: .unknown initial state + connect-time reconcile
 
     /// The initial state is .unknown (never an unconfirmed idle claim), and a
