@@ -587,45 +587,10 @@ public final class StackFileWatcher {
         return String(name[digitsRange])
     }
 
-    /// Numeric order for digit strings without Int conversion (review10 item 6): leading
-    /// zeros are numerically insignificant, so they are stripped before the shorter-is-
-    /// smaller / lexicographic-on-equal-length comparison — the former RAW-length compare
-    /// sorted "10" before "002". Equal numeric VALUES with different padding ("007" vs "7")
-    /// tie-break on the raw string, so this stays a stable total order.
-    private static func digitStringLess(_ a: String, _ b: String) -> Bool {
-        switch numericCompare(a, b) {
-        case .orderedAscending:  return true
-        case .orderedDescending: return false
-        case .orderedSame:       return a < b
-        }
-    }
-
-    /// Numeric comparison of two digit strings with leading zeros stripped (an all-zeros
-    /// string strips to the empty suffix, which behaves as "0"). The ONE comparator behind
-    /// candidate ordering AND the emitted-revision high-water mark (review10 items 1+6) —
-    /// classification, ordering, and the order gate can never disagree.
-    private static func numericCompare(_ a: String, _ b: String) -> ComparisonResult {
-        let na = a.drop { $0 == "0" }, nb = b.drop { $0 == "0" }
-        if na.count != nb.count { return na.count < nb.count ? .orderedAscending : .orderedDescending }
-        if na == nb { return .orderedSame }
-        return na < nb ? .orderedAscending : .orderedDescending
-    }
-
-    /// Deterministic candidate order (review9 item 2): readdir order is POSIX-undefined, and
-    /// several revisions accumulating during a reconnect must replay in NUMERIC order — not
-    /// _00010 → _00008 → _00009, which visually regresses the replay. Numbered revisions sort
-    /// numerically (digit-string compare, full-name tiebreak); non-numbered names sort
-    /// lexicographically and BEFORE the revision series. Ties are impossible (names are
-    /// unique + full-name tiebreak), so this is a total order — no reliance on sort stability.
-    private static func orderedBefore(_ a: (name: String, revision: String?),
-                                      _ b: (name: String, revision: String?)) -> Bool {
-        switch (a.revision, b.revision) {
-        case let (ra?, rb?): return ra == rb ? a.name < b.name : digitStringLess(ra, rb)
-        case (nil, nil):     return a.name < b.name
-        case (nil, .some):   return true
-        case (.some, nil):   return false
-        }
-    }
+    // The digit-string comparator and candidate ordering (review9 item 2, review10 item 6)
+    // live in RevisionOrdering (WatcherFileState.swift) — the ONE comparator shared by this
+    // scan loop and the pure reducer, so classification, ordering, and the order gate can
+    // never disagree. Moved verbatim; behavior unchanged.
 
     private static let maxHeaderBlocks = 32  // generous ceiling; real headers are 1-10 blocks
 
@@ -942,7 +907,7 @@ public final class StackFileWatcher {
         // numerically, everything else lexicographically — see orderedBefore). The revision
         // suffix is parsed ONCE per name here and reused for the per-entry policy below.
         let candidates = names.map { (name: $0, revision: revisionSuffix(of: $0)) }
-            .sorted(by: Self.orderedBefore)
+            .sorted(by: RevisionOrdering.orderedBefore)
         // Review10 item 1 (HOLDBACK): true once a numbered revision in THIS scan proved not
         // yet emittable — every higher-numbered revision then advances its gates normally
         // but is not allowed to EMIT this scan (see the pre-emission check below).
@@ -981,7 +946,7 @@ public final class StackFileWatcher {
             // under the immutable policy order is irrelevant and nothing may be dropped.
             if revisionOrderingEnabled, let revision, lastEmittedDigest[name] == nil,
                let mark = emittedRevisionHighWater,
-               Self.numericCompare(revision, mark) != .orderedDescending {
+               RevisionOrdering.numericCompare(revision, mark) != .orderedDescending {
                 if outOfOrderDropLogged.insert(name).inserted {
                     onLog?("revision \(revision) arrived out of order — skipped (high-water \(mark))")
                 }
@@ -1256,7 +1221,7 @@ public final class StackFileWatcher {
             lastEmittedIdentity[name] = observed
             blockTracks[name] = nil             // review11: the blocker emitted — clock clears
             if revisionOrderingEnabled, let revision,
-               emittedRevisionHighWater.map({ Self.numericCompare(revision, $0) == .orderedDescending })
+               emittedRevisionHighWater.map({ RevisionOrdering.numericCompare(revision, $0) == .orderedDescending })
                     ?? true {
                 // Review10 item 1: advance the high-water mark at emission — the single
                 // point a revision becomes consumer-visible. Cold1 I3: the mark exists
