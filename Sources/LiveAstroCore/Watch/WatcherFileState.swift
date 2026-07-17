@@ -139,29 +139,43 @@ enum WatcherEffect: Equatable {
 }
 
 struct WatcherReducer {
+    static let blockerBudgetFloorNanos: UInt64 = 30_000_000_000
+    static let blockerBudgetQuietPeriods: UInt64 = 10
+    static let blockerBudgetPollIntervals: UInt64 = 5
+    static let maxBlockerGraceExtensions: UInt64 = 4
+
     private(set) var state: WatcherState
     let configuration: WatcherReducerConfiguration
-    private let revisionRegex: NSRegularExpression?
+    private let revisionOrder: NumberedRevisionOrder
+
+    var blockingBudgetNanos: UInt64 {
+        max(Self.blockerBudgetFloorNanos,
+            Self.blockerBudgetQuietPeriods &* configuration.quietPeriodNanos,
+            Self.blockerBudgetPollIntervals &* configuration.pollIntervalNanos)
+    }
+
+    var blockingGraceNanos: UInt64 { configuration.quietPeriodNanos }
+
+    var blockingCeilingNanos: UInt64 {
+        blockingBudgetNanos &+ Self.maxBlockerGraceExtensions &* blockingGraceNanos
+    }
+
+    private var revisionOrderingEnabled: Bool {
+        configuration.digestPolicy == .mutableStackerOutput
+    }
 
     init(state: WatcherState, configuration: WatcherReducerConfiguration) {
         self.state = state
         self.configuration = configuration
-        if let prefix = configuration.filePrefix, !prefix.isEmpty {
-            let escaped = NSRegularExpression.escapedPattern(for: prefix)
-            revisionRegex = try? NSRegularExpression(
-                pattern: "^\(escaped)_([0-9]+)\\.([^.]+)$",
-                options: [.caseInsensitive])
-        } else {
-            revisionRegex = nil
-        }
+        revisionOrder = NumberedRevisionOrder(prefix: configuration.filePrefix)
     }
 
     var emittedRevisionHighWater: String? {
         state.generation.files.reduce(nil as String?) { highWater, entry in
             guard case .settled(.emittedNow) = entry.value,
-                  let revision = revisionSuffix(of: entry.key) else { return highWater }
+                  let revision = revisionOrder.revision(in: entry.key) else { return highWater }
             guard let highWater else { return revision }
-            switch Self.numericCompare(revision, highWater) {
+            switch revisionOrder.compare(revision, highWater) {
             case .orderedDescending:
                 return revision
             case .orderedAscending:
@@ -183,11 +197,7 @@ struct WatcherReducer {
             return []
         case .observe(let batch):
             guard batch.generation == state.generation.id else { return [] }
-            var effects: [WatcherEffect] = []
-            for observation in batch.entries {
-                effects.append(contentsOf: reduce(observation, nowNanos: batch.nowNanos))
-            }
-            return effects
+            return reduce(batch)
         case .emissionFinished(let result):
             guard result.outcome == .yielded,
                   result.intent.generation == state.generation.id,
@@ -202,10 +212,183 @@ struct WatcherReducer {
         }
     }
 
-    private mutating func reduce(
-        _ observation: FileObservation,
+    private struct ClassifiedObservation {
+        let observation: FileObservation
+        let revision: String?
+        let isPresent: Bool
+        let isConverging: Bool
+    }
+
+    private mutating func reduce(_ batch: ObservationBatch) -> [WatcherEffect] {
+        var classifiedByName: [String: ClassifiedObservation] = [:]
+        for observation in batch.entries {
+            // Finish classification (including duplicate settlement) for the complete batch
+            // before either ordering evidence or victim roles are derived.
+            let isConverging = classify(observation, nowNanos: batch.nowNanos)
+            classifiedByName[observation.name] = ClassifiedObservation(
+                observation: observation,
+                revision: revisionOrder.revision(in: observation.name),
+                isPresent: observation.outcome.isPresent,
+                isConverging: isConverging)
+        }
+
+        let classified = classifiedByName.values.sorted {
+            revisionOrder.orderedBefore(
+                (name: $0.observation.name, revision: $0.revision),
+                (name: $1.observation.name, revision: $1.revision))
+        }
+        var effects = applyMarkDrops(in: classified)
+        effects.append(contentsOf: orderedEffects(
+            for: classified,
+            nowNanos: batch.nowNanos))
+        return effects
+    }
+
+    private mutating func applyMarkDrops(
+        in classified: [ClassifiedObservation]
+    ) -> [WatcherEffect] {
+        guard revisionOrderingEnabled, let mark = emittedRevisionHighWater else { return [] }
+        var effects: [WatcherEffect] = []
+        for item in classified where item.isPresent {
+            guard let revision = item.revision,
+                  !isTerminal(state.generation.files[item.observation.name]),
+                  revisionOrder.compare(revision, mark) != .orderedDescending
+            else { continue }
+            state.generation.files[item.observation.name] = .droppedOutOfOrder
+            effects.append(.log(
+                "revision \(revision) arrived out of order — skipped (high-water \(mark))"))
+        }
+        return effects
+    }
+
+    private mutating func orderedEffects(
+        for classified: [ClassifiedObservation],
         nowNanos: UInt64
     ) -> [WatcherEffect] {
+        var effects: [WatcherEffect] = []
+        var intentNames: Set<String> = []
+
+        func appendIntent(
+            named name: String,
+            state: WatcherState,
+            to effects: inout [WatcherEffect],
+            intentNames: inout Set<String>
+        ) {
+            guard intentNames.insert(name).inserted,
+                  case .ready(let candidate) = state.generation.files[name]
+            else { return }
+            effects.append(.emit(EmissionIntent(
+                generation: state.generation.id,
+                candidate: candidate)))
+        }
+
+        for item in classified
+        where item.isPresent && item.revision == nil {
+            appendIntent(
+                named: item.observation.name,
+                state: state,
+                to: &effects,
+                intentNames: &intentNames)
+        }
+
+        let numbered = classified.filter { item in
+            item.isPresent && item.revision != nil
+                && !isTerminal(state.generation.files[item.observation.name])
+        }
+        guard revisionOrderingEnabled else {
+            state.generation.ordering.activeBlocker = nil
+            for item in numbered {
+                appendIntent(
+                    named: item.observation.name,
+                    state: state,
+                    to: &effects,
+                    intentNames: &intentNames)
+            }
+            return effects
+        }
+
+        while true {
+            let potential = numbered.filter {
+                !isTerminal(state.generation.files[$0.observation.name])
+            }
+            guard let blockerIndex = potential.firstIndex(where: {
+                guard case .ready = state.generation.files[$0.observation.name] else {
+                    return true
+                }
+                return false
+            }) else {
+                state.generation.ordering.activeBlocker = nil
+                for item in potential {
+                    appendIntent(
+                        named: item.observation.name,
+                        state: state,
+                        to: &effects,
+                        intentNames: &intentNames)
+                }
+                return effects
+            }
+
+            for item in potential[..<blockerIndex] {
+                appendIntent(
+                    named: item.observation.name,
+                    state: state,
+                    to: &effects,
+                    intentNames: &intentNames)
+            }
+
+            let laterVictims = potential.index(after: blockerIndex) < potential.endIndex
+            guard laterVictims else {
+                state.generation.ordering.activeBlocker = nil
+                return effects
+            }
+
+            let blocker = potential[blockerIndex]
+            let blockerName = blocker.observation.name
+            if state.generation.ordering.activeBlocker?.blocker != blockerName {
+                state.generation.ordering.activeBlocker = BlockingEpisode(
+                    blocker: blockerName,
+                    startNanos: nowNanos,
+                    deadlineNanos: nowNanos &+ blockingBudgetNanos)
+                return effects
+            }
+
+            guard var episode = state.generation.ordering.activeBlocker else {
+                return effects
+            }
+            let ceiling = episode.startNanos &+ blockingCeilingNanos
+            if blocker.isConverging {
+                let renewed = min(nowNanos &+ blockingGraceNanos, ceiling)
+                if renewed > episode.deadlineNanos {
+                    episode.deadlineNanos = renewed
+                    state.generation.ordering.activeBlocker = episode
+                }
+            }
+            guard nowNanos >= min(episode.deadlineNanos, ceiling) else { return effects }
+
+            state.generation.files[blockerName] = .writtenOff
+            state.generation.ordering.activeBlocker = nil
+            let heldSeconds = Int(
+                (Double(nowNanos &- episode.startNanos) / 1_000_000_000).rounded())
+            effects.append(.log(
+                "revision \(blocker.revision ?? "") blocked emissions for \(heldSeconds)s "
+                + "without completing — abandoning it; later revisions proceed "
+                + "(frame lost: \(blockerName))"))
+        }
+    }
+
+    private func isTerminal(_ fileState: FileState?) -> Bool {
+        switch fileState {
+        case .settled, .droppedOutOfOrder, .writtenOff:
+            return true
+        case .observing, .digestPending, .ready, nil:
+            return false
+        }
+    }
+
+    private mutating func classify(
+        _ observation: FileObservation,
+        nowNanos: UInt64
+    ) -> Bool {
         let existing = state.generation.files[observation.name]
         switch observation.outcome {
         case .absent:
@@ -215,7 +398,7 @@ struct WatcherReducer {
             case .settled, .droppedOutOfOrder, .writtenOff, nil:
                 break
             }
-            return []
+            return false
 
         case .invalid:
             switch existing {
@@ -224,48 +407,53 @@ struct WatcherReducer {
             case .settled, .droppedOutOfOrder, .writtenOff, nil:
                 break
             }
-            return []
+            return false
 
         case .unstable(let identity):
             switch existing {
             case .droppedOutOfOrder, .writtenOff:
                 break
+            case .settled(.emittedNow) where revisionOrder.revision(in: observation.name) != nil:
+                break
             default:
                 state.generation.files[observation.name] = .observing(stat: identity)
             }
-            return []
+            return false
 
         case .identityUnchanged:
-            return []
+            return false
 
         case .digested(let identity, let digest, let byteCount):
+            if case .settled(.emittedNow) = existing,
+               revisionOrder.revision(in: observation.name) != nil {
+                return false
+            }
             switch existing {
             case nil:
                 state.generation.files[observation.name] = .observing(stat: identity)
-                return []
+                return false
             case .observing(let previousIdentity):
                 guard previousIdentity == identity else {
                     state.generation.files[observation.name] = .observing(stat: identity)
-                    return []
+                    return false
                 }
             case .digestPending(let pending):
                 guard pending.identity == identity else {
                     state.generation.files[observation.name] = .observing(stat: identity)
-                    return []
+                    return false
                 }
             case .settled(let settlement):
                 guard settlement.identity == identity else {
                     state.generation.files[observation.name] = .observing(stat: identity)
-                    return []
+                    return false
                 }
             case .ready(let candidate):
                 guard candidate.identity == identity else {
                     state.generation.files[observation.name] = .observing(stat: identity)
-                    return []
+                    return false
                 }
-                if candidate.digest == digest { return [] }
             case .droppedOutOfOrder, .writtenOff:
-                return []
+                return false
             }
             return reduceStableDigest(
                 observation,
@@ -282,11 +470,17 @@ struct WatcherReducer {
         digest: String,
         byteCount: Int,
         nowNanos: UInt64
-    ) -> [WatcherEffect] {
+    ) -> Bool {
         if state.lastEmittedDigestByName[observation.name] == digest {
             state.generation.files[observation.name] = .settled(
                 .duplicateOfLastEmission(identity: identity, digest: digest))
-            return []
+            return false
+        }
+
+        if case .ready(let candidate) = state.generation.files[observation.name],
+           candidate.identity == identity,
+           candidate.digest == digest {
+            return false
         }
 
         switch configuration.digestPolicy {
@@ -296,13 +490,13 @@ struct WatcherReducer {
                pending.digest == digest {
                 guard nowNanos >= pending.firstObservedNanos,
                       nowNanos - pending.firstObservedNanos >= configuration.quietPeriodNanos
-                else { return [] }
+                else { return true }
             } else {
                 state.generation.files[observation.name] = .digestPending(PendingDigest(
                     digest: digest,
                     identity: identity,
                     firstObservedNanos: nowNanos))
-                return []
+                return false
             }
         case .immutableAfterPublish:
             break
@@ -316,7 +510,7 @@ struct WatcherReducer {
             digest: digest,
             byteCount: byteCount)
         state.generation.files[observation.name] = .ready(candidate)
-        return [.emit(EmissionIntent(generation: state.generation.id, candidate: candidate))]
+        return false
     }
 
     func readPlan(for entries: [EnumeratedEntry]) -> [ReadRequest] {
@@ -341,7 +535,7 @@ struct WatcherReducer {
     }
 
     private func entryKind(for name: String) -> WatcherEntryKind {
-        if let revision = revisionSuffix(of: name) {
+        if let revision = revisionOrder.revision(in: name) {
             return .numbered(revision: revision)
         }
         switch configuration.digestPolicy {
@@ -352,10 +546,26 @@ struct WatcherReducer {
         }
     }
 
-    private func revisionSuffix(of name: String) -> String? {
-        guard let revisionRegex else { return nil }
+}
+
+private struct NumberedRevisionOrder {
+    private let regex: NSRegularExpression?
+
+    init(prefix: String?) {
+        if let prefix, !prefix.isEmpty {
+            let escaped = NSRegularExpression.escapedPattern(for: prefix)
+            regex = try? NSRegularExpression(
+                pattern: "^\(escaped)_([0-9]+)\\.([^.]+)$",
+                options: [.caseInsensitive])
+        } else {
+            regex = nil
+        }
+    }
+
+    func revision(in name: String) -> String? {
+        guard let regex else { return nil }
         let range = NSRange(name.startIndex..., in: name)
-        guard let match = revisionRegex.firstMatch(in: name, range: range),
+        guard let match = regex.firstMatch(in: name, range: range),
               let digitsRange = Range(match.range(at: 1), in: name),
               let extensionRange = Range(match.range(at: 2), in: name) else { return nil }
         let fileExtension = name[extensionRange].lowercased()
@@ -364,7 +574,7 @@ struct WatcherReducer {
         return String(name[digitsRange])
     }
 
-    private static func numericCompare(_ lhs: String, _ rhs: String) -> ComparisonResult {
+    func compare(_ lhs: String, _ rhs: String) -> ComparisonResult {
         let normalizedLHS = lhs.drop { $0 == "0" }
         let normalizedRHS = rhs.drop { $0 == "0" }
         if normalizedLHS.count != normalizedRHS.count {
@@ -374,6 +584,36 @@ struct WatcherReducer {
         }
         if normalizedLHS == normalizedRHS { return .orderedSame }
         return normalizedLHS < normalizedRHS ? .orderedAscending : .orderedDescending
+    }
+
+    func orderedBefore(
+        _ lhs: (name: String, revision: String?),
+        _ rhs: (name: String, revision: String?)
+    ) -> Bool {
+        switch (lhs.revision, rhs.revision) {
+        case let (lhsRevision?, rhsRevision?):
+            switch compare(lhsRevision, rhsRevision) {
+            case .orderedAscending:
+                return true
+            case .orderedDescending:
+                return false
+            case .orderedSame:
+                return lhs.name < rhs.name
+            }
+        case (nil, nil):
+            return lhs.name < rhs.name
+        case (nil, .some):
+            return true
+        case (.some, nil):
+            return false
+        }
+    }
+}
+
+private extension ObservationOutcome {
+    var isPresent: Bool {
+        if case .absent = self { return false }
+        return true
     }
 }
 
