@@ -825,7 +825,10 @@ public final class BroadcastController {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let confirmed = await self.confirmedStop()
-                guard gen == self.broadcastGeneration else { return }   // superseded mid-cleanup
+                guard gen == self.broadcastGeneration else {
+                    self.runDeferredReconcileIfNeeded()   // cold2 T-3
+                    return   // superseded mid-cleanup
+                }
                 self.settleAfterStop(confirmed: confirmed)
             }
         }
