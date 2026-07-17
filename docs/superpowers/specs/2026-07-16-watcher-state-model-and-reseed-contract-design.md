@@ -89,6 +89,7 @@ enum ReplacementProgress {
     case digestPending(digest: String, identity: FileIdentity,
                        firstObservedNanos: UInt64)
     case ready(candidate: EmissionCandidate)
+    case ignoredOutOfOrder(identity: FileIdentity)
 }
 ```
 
@@ -99,6 +100,13 @@ refresh the settlement identity and clear the nested progress without an
 emission; changed bytes may emit only after the nested state reaches `ready`.
 This avoids both a permanently stranded replacement and a regressing derived
 high-water mark, without introducing a parallel side table.
+
+`ignoredOutOfOrder` is terminal evidence for one replacement identity. It
+retains the immortal outer settlement and lets that exact rejected filesystem
+identity use the O(1) read-plan fast path, so an immutable numbered file below
+the mark is neither re-hashed nor re-logged on every scan. Absence clears the
+nested evidence; a later distinct identity starts replacement observation
+again.
 
 The scan becomes a reducer/effect cycle:
 
@@ -156,8 +164,11 @@ struct BlockingEpisode {
 ```
 
 **Episode invariant (required pin 1):** an episode exists **iff** the
-head-of-line numbered revision fails to emit **and at least one later,
-never-emitted (nonterminal potential victim) numbered revision is present**.
+head-of-line numbered revision fails to emit **and at least one later active
+numbered participant is present**. An active participant is either a top-level
+nonterminal state or a `ready` replacement nested in an outer settlement; the
+latter is a potential victim for new content even though its outer history is
+terminal.
 The lone-period teardown — no victims ⇒ episode destroyed — is the
 load-bearing rule (cold2 I1 was a blocker that neither changed nor disappeared
 while its victims vanished). A held revision that settles as
@@ -169,6 +180,16 @@ from. Budget, grace, and ceiling semantics are unchanged from cold2
 (budget = max(30 s, 10×quiet, 5×poll); grace = one quiet period per converging
 observation; hard total ceiling = budget + 4×quiet; churn never resets;
 write-off = honest log, `writtenOff` state, mark not advanced).
+
+Top-level and nested `ready` numbered candidates are the same kind of ordering
+participant. A nested candidate before the active blocker may emit; one after
+the blocker is a victim and remains held. High-water eligibility is likewise
+shared: ordinary candidates at or below the derived mark are rejected, while
+a replacement nested in that same name's `emittedNow` settlement may emit at
+its numerically equal current mark when no higher revision has emitted. That
+same-name/current-mark case is the sole equality exception; a strictly lower
+replacement, or an equal replacement nested in `duplicateOfLastEmission`, is
+rejected into `ignoredOutOfOrder`.
 
 ### 2.4 Per-state absence semantics (required pin 2)
 
@@ -196,7 +217,9 @@ Both `emittedNow` and `duplicateOfLastEmission` carry the observed
 immutable policy — the shipped code records `lastEmittedIdentity` in the dedup
 branch specifically so a re-published identical revision stops being re-hashed
 every scan; the cost-model test pins this. The classic fixed-name file is
-exempt (permanent full-rehash policy).
+exempt (permanent full-rehash policy). A nested `ignoredOutOfOrder` identity
+arms the same fast path without replacing the settlement identity or changing
+its outer emitted/duplicate outcome.
 
 ### 2.6 Classic-file transitions (required pin 4)
 
@@ -223,7 +246,9 @@ replacement, both settlement fast paths, classic A→(transient B)→A, and
 stale-generation effect rejection. Table/property tests assert that within one
 generation: the derived high-water never decreases; `activeBlocker` exists iff
 the episode invariant in §2.3 holds; no higher revision emits behind a blocker;
-and generation replacement preserves only `lastEmittedDigestByName`.
+ordinary candidates at or below the mark do not emit, with only the sanctioned
+same-name `emittedNow` replacement at its current mark excepted; and generation
+replacement preserves only `lastEmittedDigestByName`.
 
 ## 3. The reseed/master contract (kills P1-3)
 

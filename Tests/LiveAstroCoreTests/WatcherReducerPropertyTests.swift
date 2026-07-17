@@ -57,44 +57,102 @@ final class WatcherReducerPropertyTests: XCTestCase {
         }
     }
 
-    func testNoNumberedRevisionAtOrBelowMarkProducesEmissionIntent() {
-        let markName = revisionName("50")
-        var files: [String: FileState] = [
-            markName: .settled(.emittedNow(identity: makeIdentity(50), digest: "mark")),
-        ]
-        var revisions: [(name: String, revision: String, identity: FileIdentity)] = []
-        for transition in 0..<Self.transitionCount {
-            let value = transition % 50
-            let revision = String(repeating: "0", count: transition / 50) + String(value)
-            let name = revisionName(revision)
-            let identity = makeIdentity(Int64(1_000 + transition))
-            let candidate = makeCandidate(
-                name: name,
-                identity: identity,
-                digest: "late-\(transition)",
-                revision: revision)
-            files[name] = .ready(candidate)
-            revisions.append((name, revision, identity))
-        }
+    func testNumberedCandidatesRespectMarkAndBlockerEligibility() {
         var generator = SplitMix64(seed: Self.seed)
-        for index in stride(from: revisions.count - 1, through: 1, by: -1) {
-            revisions.swapAt(index, Int(generator.next() % UInt64(index + 1)))
-        }
-        var reducer = makeReducer(files: files)
 
-        for (transition, item) in revisions.enumerated() {
-            let effects = observe(
-                name: item.name,
-                revision: item.revision,
-                outcome: .identityUnchanged(identity: item.identity),
+        for transition in 0..<Self.transitionCount {
+            let markRevision = "050"
+            let markName = revisionName(markRevision)
+            let candidateValue = Int(generator.next() % 50) + 1
+            let candidateRevision = String(candidateValue)
+            let candidateName = revisionName(candidateRevision)
+            let candidateIdentity = makeIdentity(Int64(1_000 + transition))
+            let candidate = makeCandidate(
+                name: candidateName,
+                identity: candidateIdentity,
+                digest: "replacement-\(transition)",
+                revision: candidateRevision)
+            let outerWasEmitted = generator.next().isMultiple(of: 2)
+            let settlement: Settlement = outerWasEmitted
+                ? .emittedNow(
+                    identity: makeIdentity(Int64(10_000 + transition)),
+                    digest: "outer-emitted-\(transition)",
+                    replacement: .ready(candidate))
+                : .duplicateOfLastEmission(
+                    identity: makeIdentity(Int64(10_000 + transition)),
+                    digest: "outer-duplicate-\(transition)",
+                    replacement: .ready(candidate))
+            var markReducer = makeReducer(files: [
+                markName: .settled(.emittedNow(
+                    identity: makeIdentity(50),
+                    digest: "mark")),
+                candidateName: .settled(settlement),
+            ])
+
+            let markEffects = observe(
+                name: candidateName,
+                revision: candidateRevision,
+                outcome: .identityUnchanged(identity: candidateIdentity),
                 nowNanos: UInt64(transition),
-                reducer: &reducer)
+                reducer: &markReducer)
+            let markEmitted = markEffects.contains {
+                if case .emit(let intent) = $0 { return intent.candidate == candidate }
+                return false
+            }
+            let isSanctionedCurrentMarkReplacement = candidateValue == 50 && outerWasEmitted
+            XCTAssertEqual(
+                markEmitted,
+                isSanctionedCurrentMarkReplacement,
+                "seed=\(Self.seed) transition=\(transition) mark candidate=\(candidateRevision) "
+                    + "outerEmitted=\(outerWasEmitted)")
+            XCTAssertEqual(
+                markReducer.shouldExecuteEmission(EmissionIntent(
+                    generation: markReducer.state.generation.id,
+                    candidate: candidate)),
+                isSanctionedCurrentMarkReplacement,
+                "seed=\(Self.seed) transition=\(transition) mark approval")
 
-            XCTAssertFalse(
-                effects.contains(where: { if case .emit = $0 { return true }; return false }),
-                "seed=\(Self.seed) transition=\(transition) revision=\(item.revision)")
-            XCTAssertEqual(reducer.derivedRevisionHighWater, "50",
-                           "seed=\(Self.seed) transition=\(transition)")
+            let blockerRevision = "25"
+            var blockerCandidateValue = Int(generator.next() % 49) + 1
+            if blockerCandidateValue >= 25 { blockerCandidateValue += 1 }
+            let blockerCandidateRevision = String(blockerCandidateValue)
+            let blockerCandidateName = revisionName(blockerCandidateRevision)
+            let blockerCandidateIdentity = makeIdentity(Int64(20_000 + transition))
+            let blockerCandidate = makeCandidate(
+                name: blockerCandidateName,
+                identity: blockerCandidateIdentity,
+                digest: "blocked-\(transition)",
+                revision: blockerCandidateRevision)
+            var blockerReducer = makeReducer(files: [
+                blockerCandidateName: .settled(.duplicateOfLastEmission(
+                    identity: makeIdentity(Int64(30_000 + transition)),
+                    digest: "outer-\(transition)",
+                    replacement: .ready(blockerCandidate))),
+            ])
+            let blockerEffects = reduce([
+                invalidObservation(blockerRevision),
+                makeObservation(
+                    name: blockerCandidateName,
+                    revision: blockerCandidateRevision,
+                    outcome: .identityUnchanged(identity: blockerCandidateIdentity)),
+                invalidObservation("60"),
+            ], nowNanos: UInt64(transition), reducer: &blockerReducer)
+            let blockerEmitted = blockerEffects.contains {
+                if case .emit(let intent) = $0 { return intent.candidate == blockerCandidate }
+                return false
+            }
+            let candidatePrecedesBlocker = blockerCandidateValue < 25
+            XCTAssertEqual(
+                blockerEmitted,
+                candidatePrecedesBlocker,
+                "seed=\(Self.seed) transition=\(transition) blocker candidate="
+                    + "\(blockerCandidateRevision)")
+            XCTAssertEqual(
+                blockerReducer.shouldExecuteEmission(EmissionIntent(
+                    generation: blockerReducer.state.generation.id,
+                    candidate: blockerCandidate)),
+                candidatePrecedesBlocker,
+                "seed=\(Self.seed) transition=\(transition) blocker approval")
         }
     }
 

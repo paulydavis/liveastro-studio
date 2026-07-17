@@ -1043,6 +1043,117 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
     }
 
+    func testSettledReplacementBelowHigherMarkIsRejectedOnceWithoutEmission() {
+        let replacementName = "live_stack_7.fit"
+        let higherName = "live_stack_8.fit"
+        let settledIdentity = makeIdentity(7)
+        let replacementIdentity = makeIdentity(70)
+        let candidate = makeCandidate(
+            name: replacementName,
+            identity: replacementIdentity,
+            digest: "replacement-seven",
+            kind: .numbered(revision: "7"))
+        let intent = EmissionIntent(
+            generation: FolderGeneration(rawValue: 1),
+            candidate: candidate)
+        let replacementURL = URL(fileURLWithPath: "/watch/\(replacementName)")
+        let unchangedReplacement = FileObservation(
+            name: replacementName,
+            url: replacementURL,
+            kind: .numbered(revision: "7"),
+            outcome: .identityUnchanged(identity: replacementIdentity))
+        let unchangedHigher = FileObservation(
+            name: higherName,
+            url: URL(fileURLWithPath: "/watch/\(higherName)"),
+            kind: .numbered(revision: "8"),
+            outcome: .identityUnchanged(identity: makeIdentity(8)))
+        var reducer = makeReducer(files: [
+            replacementName: .settled(.emittedNow(
+                identity: settledIdentity,
+                digest: "seven",
+                replacement: .ready(candidate))),
+            higherName: .settled(.emittedNow(
+                identity: makeIdentity(8),
+                digest: "eight")),
+        ])
+
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "8")
+        XCTAssertEqual(reducer.reduce(.observe(ObservationBatch(
+            generation: reducer.state.generation.id,
+            entries: [unchangedReplacement, unchangedHigher],
+            nowNanos: 10))), [
+                .log("revision 7 arrived out of order — skipped (high-water 8)"),
+            ])
+        XCTAssertFalse(reducer.shouldExecuteEmission(intent))
+        let ignoredReplacement = FileState.settled(.emittedNow(
+            identity: settledIdentity,
+            digest: "seven",
+            replacement: .ignoredOutOfOrder(identity: replacementIdentity)))
+        XCTAssertEqual(reducer.state.generation.files[replacementName], ignoredReplacement)
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "8")
+        XCTAssertEqual(reducer.readPlan(for: [EnumeratedEntry(
+            name: replacementName,
+            url: replacementURL,
+            identity: replacementIdentity,
+            isFITS: true)]), [
+                .acceptIdentity(unchangedReplacement),
+            ])
+        XCTAssertTrue(reducer.reduce(.observe(ObservationBatch(
+            generation: reducer.state.generation.id,
+            entries: [unchangedReplacement, unchangedHigher],
+            nowNanos: 20))).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[replacementName], ignoredReplacement)
+    }
+
+    func testDuplicateSettlementReplacementBehindBlockerIsHeldWithoutEmission() {
+        let blockerName = "live_stack_1.fit"
+        let replacementName = "live_stack_2.fit"
+        let laterName = "live_stack_3.fit"
+        let replacementIdentity = makeIdentity(2)
+        let candidate = makeCandidate(
+            name: replacementName,
+            identity: replacementIdentity,
+            digest: "replacement-two",
+            kind: .numbered(revision: "2"))
+        let intent = EmissionIntent(
+            generation: FolderGeneration(rawValue: 1),
+            candidate: candidate)
+        let readyDuplicate = FileState.settled(.duplicateOfLastEmission(
+            identity: makeIdentity(20),
+            digest: "two",
+            replacement: .ready(candidate)))
+        var reducer = makeReducer(files: [replacementName: readyDuplicate])
+
+        let effects = reducer.reduce(.observe(ObservationBatch(
+            generation: reducer.state.generation.id,
+            entries: [
+                FileObservation(
+                    name: blockerName,
+                    url: URL(fileURLWithPath: "/watch/\(blockerName)"),
+                    kind: .numbered(revision: "1"),
+                    outcome: .invalid),
+                FileObservation(
+                    name: replacementName,
+                    url: URL(fileURLWithPath: "/watch/\(replacementName)"),
+                    kind: .numbered(revision: "2"),
+                    outcome: .identityUnchanged(identity: replacementIdentity)),
+                FileObservation(
+                    name: laterName,
+                    url: URL(fileURLWithPath: "/watch/\(laterName)"),
+                    kind: .numbered(revision: "3"),
+                    outcome: .invalid),
+            ],
+            nowNanos: 10)))
+
+        XCTAssertTrue(effects.isEmpty)
+        XCTAssertFalse(reducer.shouldExecuteEmission(intent))
+        XCTAssertEqual(reducer.state.generation.files[replacementName], readyDuplicate)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, blockerName)
+        XCTAssertEqual(
+            reducer.state.generation.ordering.activeBlocker?.victims,
+            Set([replacementName, laterName]))
+    }
+
     func testImmutableSettledReplacementChangedDigestBecomesReadyWithoutDigestDelay() {
         let name = "sub.fit"
         let oldIdentity = makeIdentity(1)

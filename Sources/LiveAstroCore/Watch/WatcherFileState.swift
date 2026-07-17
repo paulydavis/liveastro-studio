@@ -56,6 +56,7 @@ enum ReplacementProgress: Equatable {
     case observing(stat: FileIdentity)
     case digestPending(PendingDigest)
     case ready(EmissionCandidate)
+    case ignoredOutOfOrder(identity: FileIdentity)
 }
 
 struct BlockingEpisode: Equatable {
@@ -242,11 +243,26 @@ struct WatcherReducer {
             let candidate = result.intent.candidate
             if case .settled(let settlement) = state.generation.files[candidate.name],
                settlement.replacement == .ready(candidate) {
-                guard result.outcome == .yielded else { return [] }
+                if result.outcome == .rejected {
+                    guard revisionOrderingEnabled,
+                          case .numbered(let revision) = candidate.kind,
+                          let mark = derivedRevisionHighWater,
+                          !isEligibleAgainstDerivedHighWater(
+                            candidate,
+                            fileState: .settled(settlement))
+                    else { return [] }
+                    state.generation.files[candidate.name] = .settled(
+                        settlement.withReplacement(.ignoredOutOfOrder(
+                            identity: candidate.identity)))
+                    return [.log(
+                        "revision \(revision) arrived out of order — skipped "
+                            + "(high-water \(mark))")]
+                }
                 state.generation.files[candidate.name] = .settled(.emittedNow(
                     identity: candidate.identity,
                     digest: candidate.digest))
                 state.lastEmittedDigestByName[candidate.name] = candidate.digest
+                reconcileActiveBlocker(afterEmitting: candidate)
                 return []
             }
             guard state.generation.files[candidate.name] == .ready(candidate) else { return [] }
@@ -254,7 +270,9 @@ struct WatcherReducer {
                 guard revisionOrderingEnabled,
                       case .numbered(let revision) = candidate.kind,
                       let mark = derivedRevisionHighWater,
-                      revisionOrder.compare(revision, mark) != .orderedDescending
+                      !isEligibleAgainstDerivedHighWater(
+                        candidate,
+                        fileState: .ready(candidate))
                 else { return [] }
                 state.generation.files[candidate.name] = .droppedOutOfOrder
                 return [.log(
@@ -273,16 +291,59 @@ struct WatcherReducer {
     /// The driver asks immediately before performing the filesystem-facing yield.
     func shouldExecuteEmission(_ intent: EmissionIntent) -> Bool {
         guard intent.generation == state.generation.id else { return false }
-        if case .settled(let settlement) = state.generation.files[intent.candidate.name],
-           settlement.replacement == .ready(intent.candidate) {
+        let fileState = state.generation.files[intent.candidate.name]
+        guard readyCandidate(in: fileState) == intent.candidate else { return false }
+        return isEligibleAgainstDerivedHighWater(intent.candidate, fileState: fileState)
+            && isEligibleAgainstActiveBlocker(intent.candidate)
+    }
+
+    private func readyCandidate(in fileState: FileState?) -> EmissionCandidate? {
+        switch fileState {
+        case .ready(let candidate):
+            return candidate
+        case .settled(let settlement):
+            guard case .ready(let candidate) = settlement.replacement else { return nil }
+            return candidate
+        case .observing, .digestPending, .droppedOutOfOrder, .writtenOff, nil:
+            return nil
+        }
+    }
+
+    private func participatesInNumberedOrdering(_ fileState: FileState?) -> Bool {
+        readyCandidate(in: fileState) != nil || !isTerminal(fileState)
+    }
+
+    private func isEligibleAgainstDerivedHighWater(
+        _ candidate: EmissionCandidate,
+        fileState: FileState?
+    ) -> Bool {
+        guard revisionOrderingEnabled,
+              case .numbered(let revision) = candidate.kind,
+              let mark = derivedRevisionHighWater else { return true }
+        switch revisionOrder.compare(revision, mark) {
+        case .orderedDescending:
+            return true
+        case .orderedAscending:
+            return false
+        case .orderedSame:
+            guard case .settled(let settlement) = fileState,
+                  case .emittedNow = settlement,
+                  settlement.replacement == .ready(candidate)
+            else { return false }
             return true
         }
-        guard state.generation.files[intent.candidate.name] == .ready(intent.candidate)
-        else { return false }
+    }
+
+    private func isEligibleAgainstActiveBlocker(_ candidate: EmissionCandidate) -> Bool {
         guard revisionOrderingEnabled,
-              case .numbered(let revision) = intent.candidate.kind,
-              let mark = derivedRevisionHighWater else { return true }
-        return revisionOrder.compare(revision, mark) == .orderedDescending
+              case .numbered(let revision) = candidate.kind,
+              let episode = state.generation.ordering.activeBlocker,
+              let blockerRevision = revisionOrder.revision(in: episode.blocker)
+        else { return true }
+        if candidate.name == episode.blocker { return true }
+        return revisionOrder.orderedBefore(
+            (name: candidate.name, revision: revision),
+            (name: episode.blocker, revision: blockerRevision))
     }
 
     private mutating func reconcileActiveBlocker(afterEmitting candidate: EmissionCandidate) {
@@ -348,11 +409,25 @@ struct WatcherReducer {
         guard revisionOrderingEnabled, let mark = derivedRevisionHighWater else { return [] }
         var effects: [WatcherEffect] = []
         for item in classified where item.isPresent {
-            guard let revision = item.revision,
-                  !isTerminal(state.generation.files[item.observation.name]),
-                  revisionOrder.compare(revision, mark) != .orderedDescending
-            else { continue }
-            state.generation.files[item.observation.name] = .droppedOutOfOrder
+            guard let revision = item.revision else { continue }
+            let name = item.observation.name
+            let fileState = state.generation.files[name]
+            if let candidate = readyCandidate(in: fileState) {
+                guard !isEligibleAgainstDerivedHighWater(candidate, fileState: fileState)
+                else { continue }
+                if case .settled(let settlement) = fileState {
+                    state.generation.files[name] = .settled(
+                        settlement.withReplacement(.ignoredOutOfOrder(
+                            identity: candidate.identity)))
+                } else {
+                    state.generation.files[name] = .droppedOutOfOrder
+                }
+            } else {
+                guard !isTerminal(fileState),
+                      revisionOrder.compare(revision, mark) != .orderedDescending
+                else { continue }
+                state.generation.files[name] = .droppedOutOfOrder
+            }
             effects.append(.log(
                 "revision \(revision) arrived out of order — skipped (high-water \(mark))"))
         }
@@ -373,25 +448,13 @@ struct WatcherReducer {
             intentNames: inout Set<String>
         ) {
             guard intentNames.insert(name).inserted else { return }
-            let candidate: EmissionCandidate
-            switch state.generation.files[name] {
-            case .ready(let readyCandidate):
-                candidate = readyCandidate
-            case .settled(let settlement):
-                guard case .ready(let replacementCandidate) = settlement.replacement
-                else { return }
-                candidate = replacementCandidate
-            default:
-                return
-            }
+            guard let candidate = readyCandidate(in: state.generation.files[name]) else { return }
             effects.append(.emit(EmissionIntent(
                 generation: state.generation.id,
                 candidate: candidate)))
         }
 
-        for item in classified where item.isPresent && (
-            item.revision == nil
-                || hasReadyReplacement(state.generation.files[item.observation.name])) {
+        for item in classified where item.isPresent && item.revision == nil {
             appendIntent(
                 named: item.observation.name,
                 state: state,
@@ -401,7 +464,8 @@ struct WatcherReducer {
 
         let numbered = classified.filter { item in
             item.isPresent && item.revision != nil
-                && !isTerminal(state.generation.files[item.observation.name])
+                && participatesInNumberedOrdering(
+                    state.generation.files[item.observation.name])
         }
         guard revisionOrderingEnabled else {
             state.generation.ordering.activeBlocker = nil
@@ -417,13 +481,11 @@ struct WatcherReducer {
 
         while true {
             let potential = numbered.filter {
-                !isTerminal(state.generation.files[$0.observation.name])
+                participatesInNumberedOrdering(
+                    state.generation.files[$0.observation.name])
             }
             guard let blockerIndex = potential.firstIndex(where: {
-                guard case .ready = state.generation.files[$0.observation.name] else {
-                    return true
-                }
-                return false
+                readyCandidate(in: state.generation.files[$0.observation.name]) == nil
             }) else {
                 state.generation.ordering.activeBlocker = nil
                 for item in potential {
@@ -596,12 +658,6 @@ struct WatcherReducer {
         }
     }
 
-    private func hasReadyReplacement(_ fileState: FileState?) -> Bool {
-        guard case .settled(let settlement) = fileState,
-              case .ready = settlement.replacement else { return false }
-        return true
-    }
-
     private mutating func reduceSettledReplacementDigest(
         _ observation: FileObservation,
         settlement: Settlement,
@@ -713,13 +769,20 @@ struct WatcherReducer {
         entries.map { entry in
             let kind = entryKind(for: entry.name)
             if kind != .classicMutable,
-               case .settled(let settlement) = state.generation.files[entry.name],
-               settlement.identity == entry.identity {
-                return .acceptIdentity(FileObservation(
-                    name: entry.name,
-                    url: entry.url,
-                    kind: kind,
-                    outcome: .identityUnchanged(identity: entry.identity)))
+               case .settled(let settlement) = state.generation.files[entry.name] {
+                let matchesIgnoredReplacement: Bool
+                if case .ignoredOutOfOrder(let identity) = settlement.replacement {
+                    matchesIgnoredReplacement = identity == entry.identity
+                } else {
+                    matchesIgnoredReplacement = false
+                }
+                if settlement.identity == entry.identity || matchesIgnoredReplacement {
+                    return .acceptIdentity(FileObservation(
+                        name: entry.name,
+                        url: entry.url,
+                        kind: kind,
+                        outcome: .identityUnchanged(identity: entry.identity)))
+                }
             }
             guard hasMatchingStatEvidence(
                 state.generation.files[entry.name],
@@ -913,6 +976,8 @@ private extension ReplacementProgress {
             return pending.identity
         case .ready(let candidate):
             return candidate.identity
+        case .ignoredOutOfOrder(let identity):
+            return identity
         }
     }
 }
