@@ -20,6 +20,20 @@ final class SessionPipelineShutdownTests: XCTestCase {
         func stop() {}
     }
 
+    final class WedgingFiniteSource: FrameSource {
+        let frames: AsyncStream<RawFrame>
+        var isFinite: Bool { true }
+        var totalCount: Int? { nil }
+        init(seed: RawFrame) {
+            frames = AsyncStream { cont in
+                cont.yield(seed)
+                // Never finish: finite import drain must eventually time out.
+            }
+        }
+        func start() throws {}
+        func stop() {}
+    }
+
     /// A ≥15-star seed frame so the engine accepts it and fires onUpdate (our block point).
     private func seedFrame() -> RawFrame {
         let w = 256, h = 256
@@ -133,6 +147,8 @@ final class SessionPipelineShutdownTests: XCTestCase {
                        "end() inside a frame callback must fail fast with .reentrantEnd")
         XCTAssertLessThan(elapsed, 3.0,
                           "the rejection must be prompt — never a drain-timeout wait")
+        XCTAssertEqual(pipeline.reseed(), .reseeded,
+                       "a rejected reentrant end() must not claim the finalization barrier")
         // The rejection left the pipeline fully functional: a normal end() succeeds.
         XCTAssertNoThrow(try pipeline.end(),
                          "a subsequent end() from outside the delivery context must succeed")
@@ -237,5 +253,82 @@ final class SessionPipelineShutdownTests: XCTestCase {
         source.shouldThrow = false
         XCTAssertNoThrow(try pipeline.start(),
                          "after a rolled-back start, a retry must succeed (not alreadyRunning)")
+    }
+
+    func testNeverStartedEndThrowsNotRunningAndDoesNotClaimFinalizationBarrier() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "Never Started", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let pipeline = SessionPipeline(nativeSource: FinishableLiveSource(seed: seedFrame()),
+                                       engine: StackEngine(), profile: profile,
+                                       rootDirectory: sessions)
+
+        XCTAssertThrowsError(try pipeline.end()) { error in
+            XCTAssertEqual(error as? SessionError, .notRunning)
+        }
+        XCTAssertEqual(pipeline.reseed(), .reseeded,
+                       "a never-started end() rejection must not claim the finalization barrier")
+    }
+
+    func testShutdownTimeoutClaimsStickyFinalizationBarrierBeforeRetry() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "Sticky Timeout", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let pipeline = SessionPipeline(nativeSource: WedgingLiveSource(seed: seedFrame()),
+                                       engine: StackEngine(), profile: profile, rootDirectory: sessions)
+        let wedged = DispatchSemaphore(value: 0)
+        pipeline.onUpdate = { _, _ in wedged.wait() }
+        pipeline.drainPrimaryTimeout = .milliseconds(200)
+        pipeline.drainGraceTimeout = .milliseconds(200)
+        try pipeline.start()
+        Thread.sleep(forTimeInterval: 0.3)
+
+        XCTAssertThrowsError(try pipeline.end()) { error in
+            XCTAssertEqual(error as? SessionPipelineError, .shutdownTimeout)
+        }
+        XCTAssertEqual(pipeline.reseed(), .finalizationInProgress,
+                       "shutdownTimeout happens after a valid running end() claims finalization")
+        XCTAssertEqual(pipeline.reseed(), .finalizationInProgress,
+                       "the claimed finalization barrier must remain sticky before a retry")
+        wedged.signal()
+    }
+
+    func testFiniteShutdownTimeoutReportsFinalizationInProgressBeforeImportUnavailability() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "Finite Sticky Timeout", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let pipeline = SessionPipeline(nativeSource: WedgingFiniteSource(seed: seedFrame()),
+                                       engine: StackEngine(), profile: profile, rootDirectory: sessions)
+        let wedged = DispatchSemaphore(value: 0)
+        pipeline.onUpdate = { _, _ in wedged.wait() }
+        pipeline.drainPrimaryTimeout = .milliseconds(200)
+        pipeline.drainGraceTimeout = .milliseconds(200)
+        try pipeline.start()
+        Thread.sleep(forTimeInterval: 0.3)
+
+        XCTAssertThrowsError(try pipeline.end()) { error in
+            XCTAssertEqual(error as? SessionPipelineError, .shutdownTimeout)
+        }
+        XCTAssertEqual(pipeline.reseed(), .finalizationInProgress,
+                       "a claimed finalization barrier must outrank finite-import reseed refusal")
+        wedged.signal()
     }
 }

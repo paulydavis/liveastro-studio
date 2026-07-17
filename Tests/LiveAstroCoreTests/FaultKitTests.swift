@@ -159,6 +159,120 @@ final class FaultKitTests: XCTestCase {
         }
     }
 
+    func testOracleClause5ValidatesTypedMasterOutcomesAndLegacyFallback() throws {
+        let fs = try TempFS("oracle-master-outcomes")
+        defer { fs.tearDown() }
+
+        let written = try buildEndedSession(
+            under: fs, name: "written-good", snapshotCount: 1,
+            masterExpected: true, masterOutcome: .written, stackFrameCount: 2)
+        try writeMaster(in: written, stackCount: 2)
+        assertSessionOracle(sessionRoot: written, log: [],
+                            OracleExpectations(lossLogPattern: nil,
+                                               laterFramesApplicable: false,
+                                               expectedAcceptedCount: 1))
+
+        let awaitingSeed = try buildEndedSession(
+            under: fs, name: "awaiting-seed-good", snapshotCount: 1,
+            masterExpected: true, masterOutcome: .awaitingSeed, stackFrameCount: 0)
+        assertSessionOracle(
+            sessionRoot: awaitingSeed,
+            log: ["reference cleared by reseed (manual or automatic) and never re-seeded — no master available (1 snapshots retained)"],
+            OracleExpectations(lossLogPattern: nil,
+                               laterFramesApplicable: false,
+                               expectedAcceptedCount: 1))
+
+        let noFrames = try buildEndedSession(
+            under: fs, name: "no-frames-good", snapshotCount: 0,
+            masterExpected: true, masterOutcome: .noFrames, stackFrameCount: 0)
+        assertSessionOracle(sessionRoot: noFrames, log: ["no frames accepted — no master written"],
+                            OracleExpectations(lossLogPattern: nil,
+                                               laterFramesApplicable: false,
+                                               expectedAcceptedCount: 0))
+
+        let ancient = try buildEndedSession(
+            under: fs, name: "ancient-master-expected-nil", snapshotCount: 1,
+            masterExpected: nil, masterOutcome: nil, stackFrameCount: nil)
+        assertSessionOracle(sessionRoot: ancient, log: [],
+                            OracleExpectations(lossLogPattern: nil,
+                                               laterFramesApplicable: false,
+                                               expectedAcceptedCount: 1))
+
+        let missingWrittenMaster = try buildEndedSession(
+            under: fs, name: "written-missing-master", snapshotCount: 1,
+            masterExpected: true, masterOutcome: .written, stackFrameCount: 2)
+        XCTExpectFailure(".written must require a real master.fit, not just an ended manifest") {
+            assertSessionOracle(sessionRoot: missingWrittenMaster, log: [],
+                                OracleExpectations(lossLogPattern: nil,
+                                                   laterFramesApplicable: false,
+                                                   expectedAcceptedCount: 1))
+        }
+
+        let garbageWrittenMaster = try buildEndedSession(
+            under: fs, name: "written-garbage-master", snapshotCount: 1,
+            masterExpected: true, masterOutcome: .written, stackFrameCount: 2)
+        try Data("not a FITS master".utf8)
+            .write(to: garbageWrittenMaster.appendingPathComponent("master.fit"))
+        XCTExpectFailure(".written must require a decodable FITS master, not nonempty bytes") {
+            assertSessionOracle(sessionRoot: garbageWrittenMaster, log: [],
+                                OracleExpectations(lossLogPattern: nil,
+                                                   laterFramesApplicable: false,
+                                                   expectedAcceptedCount: 1))
+        }
+
+        let mismatchedStackCount = try buildEndedSession(
+            under: fs, name: "written-mismatched-stackcnt", snapshotCount: 1,
+            masterExpected: true, masterOutcome: .written, stackFrameCount: 2)
+        try writeMaster(in: mismatchedStackCount, stackCount: 3)
+        XCTExpectFailure(".written STACKCNT must exactly match manifest.stackFrameCount") {
+            assertSessionOracle(sessionRoot: mismatchedStackCount, log: [],
+                                OracleExpectations(lossLogPattern: nil,
+                                                   laterFramesApplicable: false,
+                                                   expectedAcceptedCount: 1))
+        }
+
+        let missingAwaitingSeedLog = try buildEndedSession(
+            under: fs, name: "awaiting-seed-missing-log", snapshotCount: 1,
+            masterExpected: true, masterOutcome: .awaitingSeed, stackFrameCount: 0)
+        XCTExpectFailure(".awaitingSeed must carry the honest never-re-seeded log") {
+            assertSessionOracle(sessionRoot: missingAwaitingSeedLog, log: [],
+                                OracleExpectations(lossLogPattern: nil,
+                                                   laterFramesApplicable: false,
+                                                   expectedAcceptedCount: 1))
+        }
+
+        let missingNoFramesLog = try buildEndedSession(
+            under: fs, name: "no-frames-missing-log", snapshotCount: 0,
+            masterExpected: true, masterOutcome: .noFrames, stackFrameCount: 0)
+        XCTExpectFailure(".noFrames must carry the honest no-frames log") {
+            assertSessionOracle(sessionRoot: missingNoFramesLog, log: [],
+                                OracleExpectations(lossLogPattern: nil,
+                                                   laterFramesApplicable: false,
+                                                   expectedAcceptedCount: 0))
+        }
+
+        let inexactNoFramesLog = try buildEndedSession(
+            under: fs, name: "no-frames-inexact-log", snapshotCount: 0,
+            masterExpected: true, masterOutcome: .noFrames, stackFrameCount: 0)
+        XCTExpectFailure(".noFrames must require the exact no-master log, not a substring match") {
+            assertSessionOracle(sessionRoot: inexactNoFramesLog,
+                                log: ["prefix no frames accepted — no master written suffix"],
+                                OracleExpectations(lossLogPattern: nil,
+                                                   laterFramesApplicable: false,
+                                                   expectedAcceptedCount: 0))
+        }
+
+        let legacyFallback = try buildEndedSession(
+            under: fs, name: "legacy-fallback-missing-master", snapshotCount: 1,
+            masterExpected: true, masterOutcome: nil, stackFrameCount: nil)
+        XCTExpectFailure("ended native legacy fallback must still require master.fit when snapshots are nonempty") {
+            assertSessionOracle(sessionRoot: legacyFallback, log: [],
+                                OracleExpectations(lossLogPattern: nil,
+                                                   laterFramesApplicable: false,
+                                                   expectedAcceptedCount: 1))
+        }
+    }
+
     // MARK: - Local helpers
 
     /// The single session subdirectory created by a faulthelper run.
@@ -201,6 +315,39 @@ final class FaultKitTests: XCTestCase {
         try ManifestCoding.encoder().encode(manifest)
             .write(to: root.appendingPathComponent("manifest.json"))
         return root
+    }
+
+    private func buildEndedSession(under fs: TempFS, name: String, snapshotCount count: Int,
+                                   masterExpected: Bool?, masterOutcome: MasterOutcome?,
+                                   stackFrameCount: Int?) throws -> URL {
+        let root = try fs.dir(name)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("snapshots"),
+                                                withIntermediateDirectories: true)
+        var records: [SnapshotRecord] = []
+        for i in 0..<count {
+            let file = String(format: "snapshots/%04d.png", i)
+            try Self.tinyPNGData().write(to: root.appendingPathComponent(file))
+            records.append(SnapshotRecord(index: i, timestamp: Date(), sourceFile: "sub.fit",
+                                          snapshotFile: file, estimatedIntegrationSeconds: 60,
+                                          width: 2, height: 2, mean: 0.1, median: 0.08, stddev: 0.02))
+        }
+        var manifest = SessionManifest(
+            sessionId: name, targetName: "Test", startTime: Date(), endTime: Date(),
+            subExposureSeconds: 60, bortle: 5, locationLabel: "L", telescope: "T", camera: "C",
+            mount: "M", filter: "F", notes: "", snapshots: records, masterExpected: masterExpected)
+        manifest.masterOutcome = masterOutcome
+        manifest.stackFrameCount = stackFrameCount
+        try ManifestCoding.encoder().encode(manifest)
+            .write(to: root.appendingPathComponent("manifest.json"))
+        return root
+    }
+
+    private func writeMaster(in sessionRoot: URL, stackCount: Int) throws {
+        let data = FITSWriter.float32(width: 2, height: 2, channels: 1,
+                                      pixels: [0.1, 0.2, 0.3, 0.4],
+                                      stackCount: stackCount,
+                                      totalExposureSeconds: Double(stackCount) * 60)
+        try data.write(to: sessionRoot.appendingPathComponent("master.fit"))
     }
 
     /// Copy a session tree to a fresh corruptible location, run `mutate`, return.

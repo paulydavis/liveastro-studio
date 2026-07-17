@@ -389,9 +389,17 @@ final class AppModel {
 
     /// Reseeds the stacking engine reference frame (native mode only).
     func reseedReference() {
-        guard isRunning && sourceMode == .nativeStack && !importer.isGeneratingReplay else { return }
-        pipeline?.reseed()
-        log.append("reference reseeded")
+        guard isRunning && sourceMode == .nativeStack else { return }
+        guard !importer.isGeneratingReplay else {
+            log.append("reseed refused — session finalization has begun")
+            return
+        }
+        switch pipeline?.reseed() {
+        case .reseeded?: log.append("reference reseeded")
+        case .unavailableDuringImport?: log.append("reseed unavailable while an import is running")
+        case .finalizationInProgress?: log.append("reseed refused — session finalization has begun")
+        case .notNative?, nil: log.append("reseed unavailable — no native stack is active")
+        }
     }
 
     func endSession() {
@@ -415,6 +423,7 @@ final class AppModel {
 
         Task.detached { [weak self] in
             guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
+            let shouldCompleteSession: Bool
             do {
                 let url = try p.end()
                 await MainActor.run {
@@ -422,9 +431,26 @@ final class AppModel {
                     self.lastSessionDirectory = url.deletingLastPathComponent()
                     self.log.append("Replay ready: \(url.lastPathComponent)")
                 }
+                shouldCompleteSession = true
             } catch {
-                await MainActor.run { self.errorMessage = "Replay failed: \(error)" }
+                shouldCompleteSession = await MainActor.run {
+                    if p.session.state == .running {
+                        // Core finalization failed before the manifest commit point (for example:
+                        // master.fit or manifest persistence could not complete). The End Session
+                        // click has already stopped relay/scene-automation side effects, but the
+                        // durable finalization itself is deliberately still retryable through the
+                        // same pipeline; dropping it here would turn an honest retryable failure
+                        // into an unrecoverable UI lie.
+                        self.errorMessage = "End Session failed: \(error)"
+                        self.log.append("End Session failed before final commit — finalization remains retryable; fix the error and try End Session again")
+                        self.importer.isGeneratingReplay = false
+                        return false
+                    }
+                    self.errorMessage = "Replay failed: \(error)"
+                    return true
+                }
             }
+            guard shouldCompleteSession else { return }
             await MainActor.run {
                 self.isRunning = false
                 self.importer.isGeneratingReplay = false

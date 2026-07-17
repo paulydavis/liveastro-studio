@@ -43,8 +43,11 @@ final class AutoReseedTests: XCTestCase {
                            .rejected(.noTransform), "B\(i) should not match A")
         }
         XCTAssertEqual(engine.autoReseedCount, 1)
+        XCTAssertEqual(try engine.finalizationState().stackState,
+                       .awaitingSeedAfterReseed(manual: 0, auto: 1))
         // Reference was cleared → the next B frame re-seeds onto B.
         XCTAssertEqual(engine.process(cfaFrame(stars: fieldB, name: "seedB.fit")), .becameReference)
+        XCTAssertEqual(try engine.finalizationState().stackState, .active)
         // Subsequent B frames now stack against the B reference.
         if case .stacked = engine.process(cfaFrame(stars: fieldB, name: "b_ok.fit")) {} else {
             XCTFail("expected B to stack against the new B reference")

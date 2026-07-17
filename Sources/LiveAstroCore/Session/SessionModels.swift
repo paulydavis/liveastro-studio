@@ -43,6 +43,27 @@ public struct SnapshotRecord: Codable, Equatable {
     }
 }
 
+public enum MasterOutcome: String, Codable, Equatable {
+    case written
+    case awaitingSeed = "awaiting_seed"
+    case noFrames = "no_frames"
+}
+
+public struct SessionFinalizationFacts: Codable, Equatable {
+    public let masterOutcome: MasterOutcome
+    public let stackFrameCount: Int
+    public let sessionAcceptedCount: Int
+    public let sessionRejectedCount: Int
+
+    public init(masterOutcome: MasterOutcome, stackFrameCount: Int,
+                sessionAcceptedCount: Int, sessionRejectedCount: Int) {
+        self.masterOutcome = masterOutcome
+        self.stackFrameCount = stackFrameCount
+        self.sessionAcceptedCount = sessionAcceptedCount
+        self.sessionRejectedCount = sessionRejectedCount
+    }
+}
+
 public struct SessionManifest: Codable, Equatable {
     public let sessionId: String
     public var targetName: String
@@ -66,6 +87,37 @@ public struct SessionManifest: Codable, Equatable {
     /// pre-schema session carries no mode marker, so a missing master cannot be distinguished
     /// from an honest watcher session; see OracleAssert clause 5).
     public var masterExpected: Bool? = nil
+
+    /// Final-only stack/session facts, persisted atomically with `endTime`. Optional for backward
+    /// compatibility: legacy manifests decode with these absent and current callers that do not
+    /// finalize a native stack leave them nil.
+    public internal(set) var masterOutcome: MasterOutcome? = nil
+    public internal(set) var stackFrameCount: Int? = nil
+    public internal(set) var sessionAcceptedCount: Int? = nil
+    public internal(set) var sessionRejectedCount: Int? = nil
+
+    /// Grouped view over the flat JSON schema. The manifest keeps top-level keys for backward
+    /// compatibility, but production code writes them as one value so outcome/count drift has a
+    /// single choke point.
+    var finalizationFacts: SessionFinalizationFacts? {
+        get {
+            guard let masterOutcome, let stackFrameCount,
+                  let sessionAcceptedCount, let sessionRejectedCount else {
+                return nil
+            }
+            return SessionFinalizationFacts(
+                masterOutcome: masterOutcome,
+                stackFrameCount: stackFrameCount,
+                sessionAcceptedCount: sessionAcceptedCount,
+                sessionRejectedCount: sessionRejectedCount)
+        }
+        set {
+            masterOutcome = newValue?.masterOutcome
+            stackFrameCount = newValue?.stackFrameCount
+            sessionAcceptedCount = newValue?.sessionAcceptedCount
+            sessionRejectedCount = newValue?.sessionRejectedCount
+        }
+    }
 }
 
 public enum ManifestCoding {
