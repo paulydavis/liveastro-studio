@@ -34,6 +34,26 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(reducer.state.lastEmittedDigestByName, digests)
     }
 
+    func testEqualGenerationReplacementLeavesEntireWatcherStateUnchanged() {
+        let original = makePopulatedWatcherState(generation: 42)
+        var reducer = WatcherReducer(state: original, configuration: makeConfiguration())
+
+        let effects = reducer.reduce(.replaceGeneration(FolderGeneration(rawValue: 42)))
+
+        XCTAssertTrue(effects.isEmpty)
+        assertWatcherState(reducer.state, equals: original)
+    }
+
+    func testRegressiveGenerationReplacementLeavesEntireWatcherStateUnchanged() {
+        let original = makePopulatedWatcherState(generation: 42)
+        var reducer = WatcherReducer(state: original, configuration: makeConfiguration())
+
+        let effects = reducer.reduce(.replaceGeneration(FolderGeneration(rawValue: 41)))
+
+        XCTAssertTrue(effects.isEmpty)
+        assertWatcherState(reducer.state, equals: original)
+    }
+
     func testAbsenceSemantics() {
         let identity = makeIdentity(1)
         let candidate = makeCandidate(name: "file.fit", identity: identity, digest: "ready")
@@ -174,6 +194,107 @@ final class WatcherReducerTests: XCTestCase {
                     identity: currentIdentity,
                     isFITS: true),
             ])
+    }
+
+    func testRevisionReadPlanClassificationIsAnchoredEscapedAndPrefixAware() {
+        struct ClassificationCase {
+            let label: String
+            let prefix: String?
+            let name: String
+            let isFITS: Bool
+            let expectedKind: WatcherEntryKind
+        }
+
+        let escapedPrefix = "live.stack+(v1)"
+        let cases = [
+            ClassificationCase(
+                label: "escaped metacharacters",
+                prefix: escapedPrefix,
+                name: "live.stack+(v1)_00001.fit",
+                isFITS: true,
+                expectedKind: .numbered(revision: "00001")),
+            ClassificationCase(
+                label: "anchored at start",
+                prefix: escapedPrefix,
+                name: "xlive.stack+(v1)_00001.fit",
+                isFITS: true,
+                expectedKind: .classicMutable),
+            ClassificationCase(
+                label: "anchored at end",
+                prefix: escapedPrefix,
+                name: "live.stack+(v1)_00001.fit.bak",
+                isFITS: false,
+                expectedKind: .classicMutable),
+            ClassificationCase(
+                label: "case insensitive",
+                prefix: escapedPrefix,
+                name: "LIVE.STACK+(V1)_00002.FIT",
+                isFITS: true,
+                expectedKind: .numbered(revision: "00002")),
+            ClassificationCase(
+                label: "unsupported extension",
+                prefix: escapedPrefix,
+                name: "live.stack+(v1)_00003.txt",
+                isFITS: false,
+                expectedKind: .classicMutable),
+            ClassificationCase(
+                label: "empty prefix",
+                prefix: "",
+                name: "live_stack_00004.fit",
+                isFITS: true,
+                expectedKind: .classicMutable),
+            ClassificationCase(
+                label: "nil prefix",
+                prefix: nil,
+                name: "live_stack_00005.fit",
+                isFITS: true,
+                expectedKind: .classicMutable),
+        ]
+        let identity = makeIdentity(1)
+
+        for testCase in cases {
+            let reducer = makeReducer(filePrefix: testCase.prefix)
+            let url = URL(fileURLWithPath: "/watch/\(testCase.name)")
+            XCTAssertEqual(reducer.readPlan(for: [EnumeratedEntry(
+                name: testCase.name,
+                url: url,
+                identity: identity,
+                isFITS: testCase.isFITS)]), [
+                    .readContent(
+                        name: testCase.name,
+                        url: url,
+                        kind: testCase.expectedKind,
+                        identity: identity,
+                        isFITS: testCase.isFITS),
+                ], testCase.label)
+        }
+    }
+
+    func testThirtyDigitRevisionClassifiesAndDerivesHighWaterWithoutIntConversion() {
+        let identity = makeIdentity(1)
+        let smallerRevision = "99999999999999999999999999999"
+        let thirtyDigitRevision = "123456789012345678901234567890"
+        let name = "live_stack_\(thirtyDigitRevision).fit"
+        let reducer = makeReducer(files: [
+            "live_stack_\(smallerRevision).fit": .settled(.emittedNow(
+                identity: identity, digest: "smaller")),
+            name: .settled(.emittedNow(identity: identity, digest: "larger")),
+        ])
+        let url = URL(fileURLWithPath: "/watch/\(name)")
+
+        XCTAssertEqual(reducer.readPlan(for: [EnumeratedEntry(
+            name: name,
+            url: url,
+            identity: makeIdentity(2),
+            isFITS: true)]), [
+                .readContent(
+                    name: name,
+                    url: url,
+                    kind: .numbered(revision: thirtyDigitRevision),
+                    identity: makeIdentity(2),
+                    isFITS: true),
+            ])
+        XCTAssertEqual(reducer.emittedRevisionHighWater, thirtyDigitRevision)
     }
 
     func testClassicTransientDigestReturnsToLastEmissionWithoutYield() {
@@ -455,6 +576,47 @@ final class WatcherReducerTests: XCTestCase {
             filePrefix: filePrefix,
             quietPeriodNanos: 100,
             pollIntervalNanos: 1_000)
+    }
+
+    private func makePopulatedWatcherState(generation: UInt64) -> WatcherState {
+        let identity = makeIdentity(9)
+        return WatcherState(
+            generation: GenerationState(
+                id: FolderGeneration(rawValue: generation),
+                files: [
+                    "live_stack.fit": .digestPending(PendingDigest(
+                        digest: "pending",
+                        identity: identity,
+                        firstObservedNanos: 123)),
+                    "settled.fit": .settled(.emittedNow(
+                        identity: identity,
+                        digest: "settled")),
+                ],
+                ordering: RevisionOrderingState(activeBlocker: BlockingEpisode(
+                    blocker: "live_stack.fit",
+                    startNanos: 1_000,
+                    deadlineNanos: 2_000))),
+            lastEmittedDigestByName: ["settled.fit": "settled"])
+    }
+
+    private func assertWatcherState(
+        _ actual: WatcherState,
+        equals expected: WatcherState,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(actual.generation.id, expected.generation.id, file: file, line: line)
+        XCTAssertEqual(actual.generation.files, expected.generation.files, file: file, line: line)
+        XCTAssertEqual(
+            actual.generation.ordering.activeBlocker,
+            expected.generation.ordering.activeBlocker,
+            file: file,
+            line: line)
+        XCTAssertEqual(
+            actual.lastEmittedDigestByName,
+            expected.lastEmittedDigestByName,
+            file: file,
+            line: line)
     }
 
     private func makeReducer(

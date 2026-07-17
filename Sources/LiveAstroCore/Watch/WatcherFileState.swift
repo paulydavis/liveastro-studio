@@ -175,6 +175,7 @@ struct WatcherReducer {
     mutating func reduce(_ command: WatcherCommand) -> [WatcherEffect] {
         switch command {
         case .replaceGeneration(let generation):
+            guard generation.rawValue > state.generation.id.rawValue else { return [] }
             state.generation = GenerationState(
                 id: generation,
                 files: [:],
