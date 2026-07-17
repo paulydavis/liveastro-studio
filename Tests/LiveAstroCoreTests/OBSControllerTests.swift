@@ -66,6 +66,11 @@ final class OBSControllerTests: XCTestCase {
         )
     }
 
+    private final class WeakBox<T: AnyObject> {
+        weak var value: T?
+        init(_ value: T?) { self.value = value }
+    }
+
     /// Script Hello + a full session responder, then connect.
     private func connect(_ controller: OBSController,
                          _ mock: MockOBSSocket,
@@ -182,6 +187,23 @@ final class OBSControllerTests: XCTestCase {
         let sawStopStream = mock.sentFrames.contains { $0.contains("StopStream") }
         XCTAssertFalse(sawStopStream,
                        "disconnect() must never send StopStream — the stream keeps running")
+    }
+
+    /// Phase 3 teardown fallback: if a connected controller is dropped without
+    /// an explicit disconnect, it must still tear down its OBSClient/socket.
+    /// Otherwise the receive loop and WebSocket can outlive the UI owner.
+    func testDroppingConnectedControllerDisconnectsClient() async {
+        let mock = MockOBSSocket()
+        var controller: OBSController? = makeController(mock)
+        let weakController = WeakBox(controller)
+        _ = await connect(controller!, mock)
+
+        controller = nil
+        await waitUntil { weakController.value == nil }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertGreaterThanOrEqual(mock.closeCount, 1,
+                                    "deinit must close the current OBS client/socket")
     }
 
     /// Reconnect convergence: after a scripted drop the controller converges to
@@ -522,6 +544,40 @@ final class OBSControllerTests: XCTestCase {
                        "the seeded program scene is OLDER than the scene-change event — the event wins")
         XCTAssertEqual(controller.sceneNames.sorted(), ["Scope", "Stack"],
                        "the scene NAMES still seed — only the superseded field is skipped")
+        controller.disconnect()
+    }
+
+    /// Scene-list flavor: a SceneListChanged event triggers a newer
+    /// refreshScenes() while the seed's GetSceneList answer is still parked.
+    /// The newer refresh's list/current scene must win; the older seed answer
+    /// must not roll either field back.
+    func testSeedSceneListAnswerNeverOverwritesNewerSceneListRefresh() async {
+        let (controller, mock, server, connectTask) =
+            await makeSeedParkedController(parking: "GetSceneList") {
+                $0.scenes = ["Old"]
+                $0.currentScene = "Old"
+            }
+
+        server.parkTypes = []
+        server.scenes = ["New A", "New B"]
+        server.currentScene = "New B"
+        mock.enqueueInbound(eventFrame(type: "SceneListChanged", data: [:]))
+        await waitUntil {
+            controller.sceneNames == ["New A", "New B"] &&
+            controller.currentScene == "New B"
+        }
+
+        mock.enqueueInbound(responseFrame(requestId: server.parked[0].id, ok: true,
+                                          responseData: [
+                                              "currentProgramSceneName": "Old",
+                                              "scenes": [["sceneName": "Old"]]
+                                          ]))
+        let ok = await connectTask.value
+        XCTAssertTrue(ok)
+        XCTAssertEqual(controller.sceneNames, ["New A", "New B"],
+                       "the newer scene-list refresh must beat the older seed answer")
+        XCTAssertEqual(controller.currentScene, "New B",
+                       "the newer scene-list refresh's current scene must also win")
         controller.disconnect()
     }
 

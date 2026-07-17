@@ -82,7 +82,8 @@ public final class OBSController: ObservableObject {
     /// unseeded with nothing to repair it either.
     private var streamStateVersion = 0
     private var recordStateVersion = 0
-    private var sceneStateVersion = 0
+    private var sceneListStateVersion = 0
+    private var currentSceneStateVersion = 0
 
     // MARK: - Init
 
@@ -90,6 +91,14 @@ public final class OBSController: ObservableObject {
                 makeSocket: @escaping () -> OBSSocket = { URLSessionOBSSocket() }) {
         self.makeClient = makeClient
         self.makeSocket = makeSocket
+    }
+
+    deinit {
+        connectTask?.cancel()
+        eventsTask?.cancel()
+        if let client {
+            Task { await client.disconnect() }
+        }
     }
 
     // MARK: - Connect / disconnect
@@ -246,20 +255,23 @@ public final class OBSController: ObservableObject {
     /// Fetch the scene list and current program scene.
     public func refreshScenes() async {
         let epoch = connectionEpoch
-        let sceneStamp = sceneStateVersion   // review11 finding 3
+        let sceneListStamp = sceneListStateVersion
+        let currentSceneStamp = currentSceneStateVersion
         guard let data = await requestData("GetSceneList", nil) else { return }
         guard epoch == connectionEpoch else { return }   // answered by a dead session
 
         if let scenes = data["scenes"] as? [[String: Any]] {
-            // OBS returns scenes top-of-list first; UI convention lists them in
-            // the natural order OBS presents, reversed to bottom→top display.
-            // No event carries scene NAMES (SceneListChanged only triggers a
-            // re-fetch), so the list itself has no event to lose against.
-            let names = scenes.compactMap { $0["sceneName"] as? String }
-            sceneNames = names.reversed()
+            if sceneListStamp == sceneListStateVersion {
+                // OBS returns scenes top-of-list first; UI convention lists them in
+                // the natural order OBS presents, reversed to bottom→top display.
+                let names = scenes.compactMap { $0["sceneName"] as? String }
+                sceneNames = names.reversed()
+            } else {
+                log("scene refresh: a newer scene-list event superseded the answer — keeping the newer list")
+            }
         }
         if let current = data["currentProgramSceneName"] as? String {
-            if sceneStamp == sceneStateVersion {
+            if currentSceneStamp == currentSceneStateVersion {
                 currentScene = current
             } else {
                 log("scene refresh: a newer scene-change event superseded the answer — keeping the event's scene")
@@ -517,7 +529,7 @@ public final class OBSController: ObservableObject {
         switch type {
         case "CurrentProgramSceneChanged":
             if let name = data["sceneName"] as? String {
-                sceneStateVersion += 1   // review11 finding 3: the event outranks in-flight answers
+                currentSceneStateVersion += 1   // review11 finding 3: the event outranks in-flight answers
                 currentScene = name
             }
 
@@ -536,7 +548,12 @@ public final class OBSController: ObservableObject {
             onOutputEvent?()   // review8 item 3: reconcile broadcast state
 
         case "SceneListChanged":
-            // Scene set changed under us — re-fetch names.
+            // Scene set changed under us — re-fetch names. GetSceneList also
+            // carries currentProgramSceneName, so this event invalidates both
+            // older in-flight fields; the refresh it triggers will repopulate
+            // them from the newer OBS truth.
+            sceneListStateVersion += 1
+            currentSceneStateVersion += 1
             Task { [weak self] in await self?.refreshScenes() }
 
         default:
