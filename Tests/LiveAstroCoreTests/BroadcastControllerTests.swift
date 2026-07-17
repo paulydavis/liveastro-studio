@@ -26,6 +26,11 @@ final class BroadcastControllerTests: XCTestCase {
         var launchRequests = 0
     }
 
+    final class WeakBox<T: AnyObject> {
+        weak var value: T?
+        init(_ value: T?) { self.value = value }
+    }
+
     struct Harness {
         let controller: BroadcastController
         let obs: OBSController
@@ -1652,11 +1657,11 @@ final class BroadcastControllerTests: XCTestCase {
         await waitUntil { h!.controller.broadcastState == .live }
         await waitUntil { h!.controller.streamHealth != nil }   // the poll is running
 
-        weak var controller = h!.controller
+        let controller = WeakBox(h!.controller)
         let mock = h!.mock
         h = nil   // drop the only strong reference while LIVE
 
-        await waitUntil { controller == nil }   // pre-fix: self-retained forever
+        await waitUntil { controller.value == nil }   // pre-fix: self-retained forever
 
         // The poll must actually stop once the controller is gone.
         await settle()

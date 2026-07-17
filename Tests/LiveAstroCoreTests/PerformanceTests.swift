@@ -74,7 +74,7 @@ final class PerformanceTests: XCTestCase {
     func testProcess26MPPerformanceGate() throws {
         #if DEBUG
         throw XCTSkip("perf gate is meaningful only with optimizations — run: swift test -c release --filter PerformanceTests")
-        #endif
+        #else
         let width = 6248, height = 4176   // even dimensions, GRBG-safe
 
         // Build reference and shifted frames (outside the timed region).
@@ -110,6 +110,7 @@ final class PerformanceTests: XCTestCase {
         case .becameReference:
             XCTFail("Unexpected .becameReference on second frame")
         }
+        #endif
     }
 
     // MARK: – RCD vs Bilinear perf pin
@@ -119,7 +120,7 @@ final class PerformanceTests: XCTestCase {
     func testRCDWithin5xBilinear() throws {
         #if DEBUG
         throw XCTSkip("perf pin is meaningful only with optimizations — run: swift test -c release --filter PerformanceTests")
-        #endif
+        #else
         let width = 3840, height = 2160
         // Random CFA (not star-synthesized — just measures demosaic, not detection).
         var rng: UInt64 = 0xDEAD_BEEF_CAFE_BABE
@@ -155,5 +156,6 @@ final class PerformanceTests: XCTestCase {
         XCTAssertLessThanOrEqual(ratio, 5.0,
             String(format: "RCD perf pin FAILED: rcd=%.3fs bilinear=%.3fs ratio=%.2f× (limit 5×)",
                    rcdElapsed, bilinearElapsed, ratio))
+        #endif
     }
 }

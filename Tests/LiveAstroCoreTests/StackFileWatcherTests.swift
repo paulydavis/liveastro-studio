@@ -1,5 +1,5 @@
 import XCTest
-@testable import LiveAstroCore
+@preconcurrency @testable import LiveAstroCore
 
 final class StackFileWatcherTests: XCTestCase {
     var tmp: URL!

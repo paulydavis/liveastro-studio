@@ -102,7 +102,7 @@ final class ReplayServiceTests: XCTestCase {
     }
 
     func testEmptySnapshotsReturnsURLWithoutCreatingFile() throws {
-        let dir = try buildSessionDir(snapshots: 0)
+        _ = try buildSessionDir(snapshots: 0)
         // buildSessionDir with 0 writes records for max(1,0)=1, so we need a clean empty manifest
         let emptyManifest = SessionManifest(
             sessionId: "2026-07-05-empty",

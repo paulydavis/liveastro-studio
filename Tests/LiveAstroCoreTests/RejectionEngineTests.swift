@@ -43,7 +43,7 @@ final class RejectionEngineTests: XCTestCase {
 
     func testReseedResetsRejectionState() {
         let engine = StackEngine(rejection: WinsorizedSigmaClip(kappa: 3, warmUp: 8))
-        for i in 0..<12 { _ = engine.process(frame(streakRow: -1)) }
+        for _ in 0..<12 { _ = engine.process(frame(streakRow: -1)) }
         engine.reseed()
         // after reseed the next frame becomes the reference (fresh stats); no crash, stacks cleanly
         _ = engine.process(frame(streakRow: -1))

@@ -178,7 +178,6 @@ final class DebayerRCDTests: XCTestCase {
         let pattern = BayerPattern.grbg
         var cfaPx = [Float](repeating: 0, count: w * h)
         for y in 0..<h { for x in 0..<w {
-            let ch = pattern.channel(row: y, col: x)
             // truth is achromatic (all channels equal)
             cfaPx[y*w+x] = truth[y][x]
         }}
@@ -209,4 +208,3 @@ final class DebayerRCDTests: XCTestCase {
             "RCD (MSE=\(mseRCD)) should be sharper than bilinear (MSE=\(mseBil)) on star core")
     }
 }
-

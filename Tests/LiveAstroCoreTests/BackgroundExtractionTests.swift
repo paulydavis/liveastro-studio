@@ -16,7 +16,7 @@ final class BackgroundExtractionTests: XCTestCase {
     }
     // background spread over a central sky region (avoids edge tiles).
     func skySpread(_ img: AstroImage) -> Float {
-        let w = img.width, h = img.height, plane = w * h
+        let w = img.width, h = img.height
         var lo: Float = .greatestFiniteMagnitude, hi: Float = -.greatestFiniteMagnitude
         for y in (h/4)..<(3*h/4) { for x in (w/4)..<(3*w/4) {
             let v = img.pixels[y*w + x]; lo = min(lo, v); hi = max(hi, v)
