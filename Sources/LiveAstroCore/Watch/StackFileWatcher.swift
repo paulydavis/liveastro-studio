@@ -207,9 +207,6 @@ public final class StackFileWatcher {
 
     private let folder: URL
     private let quietPeriod: TimeInterval
-    /// `quietPeriod` in nanoseconds — the digest-stability gate's minimum monotonic
-    /// separation between the two observations of a new digest (review8 finding 1).
-    private var quietPeriodNanos: UInt64 { UInt64((quietPeriod * 1_000_000_000).rounded()) }
     private let pollInterval: TimeInterval
     private let queue = DispatchQueue(label: "liveastro.watcher")
     private var continuation: AsyncStream<StackUpdate>.Continuation!
@@ -283,7 +280,7 @@ public final class StackFileWatcher {
     ///
     /// This closes the mid-scan TOCTOU structurally: `scan()` validates the path's (dev, ino)
     /// identity once at the top, and a swap landing between that check and a PATH-based enumeration
-    /// would apply old `lastSeenStat` observations to the NEW directory's files. Enumerating through
+    /// would apply old-generation observations to the NEW directory's files. Enumerating through
     /// the armed fd pins the OLD inode instead — a rename-over unlinks the old directory from the
     /// namespace, but the open fd keeps it readable — so a mid-scan swap is harmless BY
     /// CONSTRUCTION: this scan observes only old-directory contents, and the NEXT scan's identity
@@ -316,41 +313,6 @@ public final class StackFileWatcher {
         return names
     }
 
-    /// Per-file state for stability + dedupe. Stability tracks the FULL file identity
-    /// (dev, ino, size, mtime at ns precision — digest nil at this stage) so a
-    /// preallocated-but-still-filling FITS (full size, advancing mtime) is not emitted early,
-    /// and a same-name REPLACEMENT (new inode) re-earns stability even when its (size, mtime)
-    /// happen to match the old file's last observation.
-    private var lastSeenStat: [String: FileIdentity] = [:]
-    private var lastEmittedDigest: [String: String] = [:]
-
-    /// Digest-stability gate state (review8 finding 1, `.mutableStackerOutput`
-    /// only): a NEW digest observed on a stat-stable file, the stat identity it
-    /// was observed under, and WHEN it was first observed (monotonic ns). The
-    /// digest is emitted only once a later scan observes the SAME digest under
-    /// the SAME stat identity at least `quietPeriod` later — the two-tick stat
-    /// philosophy mirrored at the content level. The gate restarts whenever the
-    /// digest changes, the stat identity changes, or the folder generation
-    /// changes (disappear/replace/re-arm — cleared with the pending stat map).
-    private struct PendingContent {
-        let digest: String
-        let identity: FileIdentity
-        let firstObservedNanos: UInt64
-    }
-    private var pendingContent: [String: PendingContent] = [:]
-    /// Stat identity (digest nil) of the version whose digest currently sits in
-    /// `lastEmittedDigest[name]` (review7 P2). Under `.immutableAfterPublish`,
-    /// a candidate whose observed identity equals this entry skips ALL content
-    /// work. CLEARED on every folder disappear/replace/re-arm (review8 finding
-    /// 2) — the asymmetry with `lastEmittedDigest` is deliberate: identities
-    /// are LOCATION-BOUND and die with the folder generation (a remounted
-    /// share or reused inode can reproduce the same dev/ino/size/cached
-    /// mtime-ns for different bytes, which would silently suppress a genuinely
-    /// new sub), while digests are CONTENT-BOUND and survive it (dedup stays
-    /// safe). The cost is one rehash per file after a reconnect — the honest
-    /// price of not trusting a dead generation's identities.
-    private var lastEmittedIdentity: [String: FileIdentity] = [:]
-
     /// Count of full content digests computed by this watcher (review7 P2) —
     /// test-visible so the hashing cost model is pinned: flat after emission
     /// under `.immutableAfterPublish` (and for emitted numbered revisions under
@@ -380,222 +342,26 @@ public final class StackFileWatcher {
     internal func scanNow() { onQueueSync { scan() } }
 
     private let fileNamePrefix: String?
-    private let digestPolicy: DigestPolicy
 
-    // MARK: Revision order gate (review10 item 1)
-    //
-    // The review9 sort makes emission order deterministic WITHIN one scan, but revisions
-    // earn their gates independently ACROSS scans: an incomplete _00001 (unstable, mid
-    // digest-gate, invalid) was skipped while a complete _00002 emitted, and _00001 then
-    // emitted on a later scan — the consumer saw [2, 1] and the replay regressed. Two
-    // rules close this, both riding the single numericCompare comparator:
-    //  (a) HOLDBACK — within a scan, once a numbered revision is found NOT yet emittable,
-    //      no higher-numbered revision emits this scan; a held revision keeps its gate
-    //      evidence and emits as soon as the blocker clears. Non-numbered entries sort
-    //      before the revision series and are unaffected.
-    //  (b) REJECT BELOW THE MARK — a never-emitted numbered revision at or below the
-    //      high-water mark of emitted revisions arrived out of order and is dropped
-    //      permanently with one honest log line: the FRAME is lost, the session preserved
-    //      (the invariant), and the consumer's replay never regresses.
+    /// The reducer is the sole semantic state owner once scan integration is complete.
+    private var reducer: WatcherReducer
 
-    /// Highest numbered revision EMITTED this folder generation (digit string, compared
-    /// with numericCompare). Advanced at emission — the single point revisions become
-    /// consumer-visible — and cleared with the per-generation state on folder
-    /// disappear/replace. Emitted DIGESTS survive generations (dedup stays content-bound);
-    /// the mark governs ORDER only.
-    private var emittedRevisionHighWater: String?
+    /// Deterministic integration seam: tests may replace the watched folder after a complete
+    /// observation batch has reduced, but before its ordered effects execute.
+    internal var afterObservationBatchForTesting: (() -> Void)?
 
-    /// Names already dropped+logged as out-of-order this folder generation, so the honest
-    /// drop line fires once per file, not on every poll tick while the file sits there.
-    private var outOfOrderDropLogged: Set<String> = []
+    /// Queue-confined reducer snapshot for integration assertions. Internal test access only.
+    internal var reducerStateSnapshot: WatcherState { onQueueSync { reducer.state } }
 
-    // MARK: Blocking-deadline write-off (review11 findings 1+4 — replaces the cold1 C1 counter)
-    //
-    // The review10 holdback means ONE numbered revision can gate every later revision. Cold1
-    // C1 added an escape valve, but its trigger was a count of CONSECUTIVE structurally-invalid
-    // SCANS (5), with two fatal properties (outside review #11): (1) any stat-identity change
-    // reset the count ("a rewrite is a new attempt"), so a repeatedly-touched _00001 — or
-    // oscillating SMB metadata — NEVER accrued a write-off and silently starved every higher
-    // revision forever: the churn that most needs the valve was exactly what disarmed it;
-    // (2) the count was scan-denominated, so at the supported 10 ms poll (or event-driven
-    // rescans) the threshold elapsed in ~100 ms of wall time, discarding a recoverable paused
-    // write.
-    //
-    // Redesign: a HARD MONOTONIC DEADLINE on blocking-without-emitting. When a numbered
-    // revision first becomes the BLOCKER — it fails to emit while a later, not-yet-emitted
-    // numbered revision is present to be held — its blockStart is recorded from the monotonic
-    // clock. The budget runs REGARDLESS of the blocker's churn: identity changes and digest
-    // changes do NOT reset it. CONVERGING progress — defined narrowly as the digest-stability
-    // gate ADVANCING for a stable identity (the SAME pending digest observed again while the
-    // quiet-period clock runs) — renews a short grace of one quiet period, but renewal is
-    // CAPPED by a hard total ceiling (budget + maxBlockerGraceExtensions × quietPeriod,
-    // enforced as a TOTAL-deadline check, never per-grace logic alone): indefinite renewal
-    // through digest or identity churn is impossible. At the deadline the blocker is written
-    // off exactly like the old valve: one honest log line, it joins the dropped set, the hold
-    // releases, later revisions proceed (the frame is lost, the session preserved). The
-    // high-water mark is NOT advanced (only real emissions advance it). The track clears when
-    // the blocker emits, vanishes from the scan, the folder generation changes, or — cold2 I1 —
-    // the blocking EPISODE ends (no later unemitted revision is present to be held: the budget
-    // charges blocking-without-emitting time only, so lone in-progress time never counts and a
-    // returning blocker starts a fresh clock; the ceiling caps each CONTINUOUS episode).
-    // Structural invalidity is no longer separately counted — the DEADLINE is the mechanism.
-
-    /// Budget floor: 30 s. Rationale: >> the default 0.5 s quiet period plus several 2 s
-    /// poll/stability cycles (no plausible healthy writer is misjudged), << a night (a corpse
-    /// cannot starve a session).
-    static let blockerBudgetFloorNanos: UInt64 = 30_000_000_000
-    /// Budget scale terms: the budget must dominate one full gate-earning cycle even for
-    /// clamped-extreme configurations (quietPeriod/pollInterval are capped at 3600 s by
-    /// sanitizedInterval) — a fixed 30 s would otherwise write off every blocker before its
-    /// digest gate could possibly confirm under a large quiet period.
-    static let blockerBudgetQuietPeriods: UInt64 = 10
-    static let blockerBudgetPollIntervals: UInt64 = 5
-    /// Cap on converging-grace renewal: total hold for one blocker never exceeds
-    /// budget + maxBlockerGraceExtensions × quietPeriod (the hard ceiling).
-    static let maxBlockerGraceExtensions: UInt64 = 4
-
-    private var pollIntervalNanos: UInt64 { UInt64((pollInterval * 1_000_000_000).rounded()) }
-    /// The blocking budget (internal so tests pin the wall-clock semantics, not scan counts).
-    internal var blockingBudgetNanos: UInt64 {
-        max(Self.blockerBudgetFloorNanos,
-            Self.blockerBudgetQuietPeriods &* quietPeriodNanos,
-            Self.blockerBudgetPollIntervals &* pollIntervalNanos)
-    }
-    /// One converging-grace renewal: one quiet period (the time the digest gate itself needs).
-    internal var blockingGraceNanos: UInt64 { quietPeriodNanos }
-    /// The hard ceiling on total hold for one blocker — the total-deadline check.
-    internal var blockingCeilingNanos: UInt64 {
-        blockingBudgetNanos &+ Self.maxBlockerGraceExtensions &* blockingGraceNanos
-    }
-
-    /// Per-blocker deadline state: when it first became the blocker, and the current
-    /// write-off deadline (start + budget, possibly grace-extended, never past the ceiling).
-    private struct BlockTrack {
-        let startNanos: UInt64
-        var deadlineNanos: UInt64
-    }
-    private var blockTracks: [String: BlockTrack] = [:]
-    /// Numbered revisions permanently written off this folder generation.
-    private var writtenOffRevisions: Set<String> = []
-
-    /// Cold1 I3: the ordering machinery — high-water mark, reject-below, holdback, and the
-    /// blocking-deadline write-off that rides the holdback — exists for REPLAY/REVISION semantics, i.e.
-    /// `.mutableStackerOutput` only. Under `.immutableAfterPublish` numbered files are just
-    /// files (order is irrelevant to stacking): no hold, no drop — a bulk copy arriving out
-    /// of numeric order loses nothing. Numeric SORTING stays for both policies (harmless
-    /// determinism within a scan).
-    private var revisionOrderingEnabled: Bool { digestPolicy == .mutableStackerOutput }
-
-    /// Record that a numbered revision FAILED TO EMIT this scan — any cause: open/stat
-    /// failure, stat instability, invalid/incomplete FITS, digest failure or churn, or a
-    /// mid-quiet digest gate. Returns true when the revision (still) holds higher revisions
-    /// back this scan, false when it exerts no hold: not a numbered revision, ordering not
-    /// in force (I3), already written off, or written off RIGHT NOW at its blocking deadline
-    /// — in which case the one honest log line fires and the name joins the out-of-order
-    /// dropped set (so a later mark-drop of a recovered file does not log twice).
-    ///
-    /// `holdAlreadySet`: an earlier (lower) revision already blocks this scan — this one is a
-    /// queued VICTIM, not the blocker; it holds but its own deadline does not run (it becomes
-    /// the blocker, with a fresh clock, only once everything below it has cleared).
-    /// `blocksLater`: some LATER candidate carries a not-yet-emitted numbered revision — only
-    /// then does the deadline run (a lone in-progress revision starves nobody and may take
-    /// all night; review11: the budget is on BLOCKING-without-emitting, not on slowness).
-    /// `converging`: the digest-stability gate is ADVANCING for a stable identity (the SAME
-    /// pending digest observed again, quiet-period clock running) — the ONLY progress that
-    /// renews grace; identity churn and digest churn are NOT converging.
-    private func revisionFailedToEmit(name: String, revision: String?, converging: Bool,
-                                      holdAlreadySet: Bool, blocksLater: Bool) -> Bool {
-        guard revisionOrderingEnabled, let revision else { return false }
-        guard !writtenOffRevisions.contains(name) else { return false }
-        if holdAlreadySet {
-            // Cold2 I1: a queued VICTIM's own deadline never runs — and any track it
-            // still carries from an earlier episode dies here, so it "becomes the
-            // blocker, with a fresh clock, only once everything below it has cleared"
-            // (the documented rule, now enforced).
-            blockTracks[name] = nil
-            return true
-        }
-        guard blocksLater else {
-            // Cold2 I1 (P1): the deadline is EPISODE-scoped — it charges only
-            // blocking-without-emitting time. With no later unemitted revision present,
-            // nobody is blocked: the episode is over and its clock DIES with it (a lone
-            // in-progress revision starves nobody and may take all night). Pre-fix the
-            // track survived lone periods, so the next blocking episode inherited a
-            // spent deadline (an instant write-off) and the write-off log charged lone
-            // wall time as "blocked" — factually wrong. A returning blocker now starts
-            // a fresh clock; the ceiling still caps any single CONTINUOUS episode.
-            blockTracks[name] = nil
-            return true
-        }
-        let now = monotonicNowNanos()
-        guard var track = blockTracks[name] else {
-            blockTracks[name] = BlockTrack(startNanos: now,
-                                           deadlineNanos: now &+ blockingBudgetNanos)
-            return true
-        }
-        let ceiling = track.startNanos &+ blockingCeilingNanos
-        if converging {
-            // One quiet period of grace per converging observation, clamped at the ceiling —
-            // renewal can never push the total hold past budget + maxGrace×grace.
-            let renewed = min(now &+ blockingGraceNanos, ceiling)
-            if renewed > track.deadlineNanos {
-                track.deadlineNanos = renewed
-                blockTracks[name] = track
-            }
-        }
-        guard now >= min(track.deadlineNanos, ceiling) else { return true }
-        // Deadline passed: written off. The hold releases, later revisions proceed, the frame
-        // is lost — honestly. The high-water mark is NOT advanced (only real emissions do).
-        blockTracks[name] = nil
-        writtenOffRevisions.insert(name)
-        outOfOrderDropLogged.insert(name)
-        let heldSeconds = Int((Double(now &- track.startNanos) / 1_000_000_000).rounded())
-        onLog?("revision \(revision) blocked emissions for \(heldSeconds)s without completing "
-               + "— abandoning it; later revisions proceed (frame lost: \(name))")
-        return false
-    }
-
-    // MARK: Numbered-revision parser (review9 items 1+2)
-    //
-    // The SINGLE source of truth for both CLASSIFYING a numbered stacker revision
-    // (`<prefix>_(\d+).<ext>` — Siril 1.4+ writes live_stack_00001.fit, live_stack_00002.fit, …
-    // once each and never rewrites them) and ORDERING candidates. Anchored
-    // `^<escapedPrefix>_(\d+)\.<ext>$` semantics: the user-supplied prefix is DATA, not
-    // pattern (escaped), the whole match is case-insensitive (mirroring the prefix filter in
-    // scan()), and the extension must belong to the supported image sets. The captured
-    // revision stays a DIGIT STRING with numeric-aware comparison (length, then
-    // lexicographic) — never an Int conversion, so a 30-digit suffix classifies and sorts
-    // identically instead of overflowing into a different path.
-
-    /// Compiled once per watcher from the configured prefix; nil when no prefix is set
-    /// (no prefix → no revision series to recognize; every candidate is non-numbered).
-    private let revisionRegex: NSRegularExpression?
-
-    /// The digit-string revision of `name` when it is a numbered revision of the configured
-    /// prefix (supported image extension required); nil for everything else — including the
-    /// classic fixed-name file (`live_stack.fit`) and near-misses like
-    /// `live_stack_extra_00001.fit`, which conservatively keep full mutable-policy re-hashing.
-    private func revisionSuffix(of name: String) -> String? {
-        guard let regex = revisionRegex else { return nil }
-        let range = NSRange(name.startIndex..., in: name)
-        guard let m = regex.firstMatch(in: name, options: [], range: range),
-              let digitsRange = Range(m.range(at: 1), in: name),
-              let extRange = Range(m.range(at: 2), in: name) else { return nil }
-        let ext = name[extRange].lowercased()
-        guard ImageLoader.fitsExtensions.contains(ext) || ImageLoader.bitmapExtensions.contains(ext)
-        else { return nil }
-        return String(name[digitsRange])
-    }
-
-    // The digit-string comparator and candidate ordering (review9 item 2, review10 item 6)
-    // live in RevisionOrdering (WatcherFileState.swift) — the ONE comparator shared by this
-    // scan loop and the pure reducer, so classification, ordering, and the order gate can
-    // never disagree. Moved verbatim; behavior unchanged.
+    /// Test-visible timing values remain at the watcher boundary, sourced from reducer config.
+    internal var blockingBudgetNanos: UInt64 { reducer.blockingBudgetNanos }
+    internal var blockingGraceNanos: UInt64 { reducer.blockingGraceNanos }
+    internal var blockingCeilingNanos: UInt64 { reducer.blockingCeilingNanos }
 
     private static let maxHeaderBlocks = 32  // generous ceiling; real headers are 1-10 blocks
 
-    /// Review10 item 7: `quietPeriod`/`pollInterval` are public Doubles that feed an
-    /// unchecked UInt64 conversion (`quietPeriodNanos`) and DispatchTime arithmetic — a
+    /// Review10 item 7: `quietPeriod`/`pollInterval` are public Doubles that feed reducer
+    /// nanosecond configuration and DispatchTime arithmetic — a
     /// negative, NaN, infinite, or huge value trapped there at scan/schedule time. Sanitize
     /// at the construction boundary instead: non-finite values take the documented default;
     /// finite values clamp into [0.01 s, 3600 s].
@@ -614,17 +380,18 @@ public final class StackFileWatcher {
         self.quietPeriod = Self.sanitizedInterval(quietPeriod, default: 0.5)
         self.pollInterval = Self.sanitizedInterval(pollInterval, default: 2.0)
         self.fileNamePrefix = fileNamePrefix
-        self.digestPolicy = digestPolicy
-        if let prefix = fileNamePrefix, !prefix.isEmpty {
-            let escaped = NSRegularExpression.escapedPattern(for: prefix)
-            // The pattern is built from escaped data + fixed syntax; it cannot fail to
-            // compile, but a nil regex would only mean "no numbered revisions recognized" —
-            // strictly more conservative (full re-hash), never wrong.
-            self.revisionRegex = try? NSRegularExpression(
-                pattern: "^\(escaped)_([0-9]+)\\.([^.]+)$", options: [.caseInsensitive])
-        } else {
-            self.revisionRegex = nil
-        }
+        self.reducer = WatcherReducer(
+            state: WatcherState(
+                generation: GenerationState(
+                    id: FolderGeneration(rawValue: 0),
+                    files: [:],
+                    ordering: RevisionOrderingState(activeBlocker: nil)),
+                lastEmittedDigestByName: [:]),
+            configuration: WatcherReducerConfiguration(
+                digestPolicy: digestPolicy,
+                filePrefix: fileNamePrefix,
+                quietPeriodNanos: UInt64((self.quietPeriod * 1_000_000_000).rounded()),
+                pollIntervalNanos: UInt64((self.pollInterval * 1_000_000_000).rounded())))
         queue.setSpecific(key: queueKey, value: true)
         var cont: AsyncStream<StackUpdate>.Continuation!
         self.updates = AsyncStream { cont = $0 }
@@ -769,61 +536,22 @@ public final class StackFileWatcher {
     }
 
     private func scan() {
-        // Review9 item 4: a scan parked across stop() (debounced work, a queued poll tick,
-        // a test-seam replay) must observe the terminal state and no-op — never re-arm or
-        // emit. Review10 item 3: the atomic stop flag covers the window where stop()'s
-        // teardown is still queued behind earlier work and `state` has not flipped yet.
+        // A queued/debounced scan may outlive stop(). The atomic flag also covers a stop whose
+        // queue-confined teardown is waiting behind this scan.
         guard state == .running, !stopRequested.isSet else { return }
         let fm = FileManager.default
 
-        // --- Folder presence check (disappearance + return detection) ---
-        // P2 (review3): presence requires an actual DIRECTORY. fileExists(atPath:) accepts any
-        // node and open(O_EVTONLY) succeeds on a regular file, so a file sitting at the folder
-        // path would otherwise be "recovered" against (arming a source on a file and logging
-        // "resuming" while directory enumeration can never work). A non-directory node is treated
-        // as still-missing: stay folderMissing, no "resuming" claim, and log the impostor once
-        // (not every tick) so the degradation appears honestly.
         var isDirectory: ObjCBool = false
         let nodeExists = fm.fileExists(atPath: folder.path, isDirectory: &isDirectory)
         let folderExists = nodeExists && isDirectory.boolValue
-
         if !folderExists {
             if !folderMissing {
-                // First tick to notice the folder is gone: log once and set flag.
                 folderMissing = true
                 onLog?("watched folder disappeared — waiting for it to return: \(folder.path)")
-                // Cancel the stale DispatchSource fd (bound to the deleted inode).
                 cancelSource()
-                // F2 (review2): clear the PENDING stability observations. Otherwise a recreated,
-                // same-name file whose (size, mtime) happen to match the vanished file's last
-                // observation would pass the two-tick stability gate on its very FIRST sighting
-                // after return — publishing a still-in-progress FITS. Recreated files must re-earn
-                // stability across ticks. The emitted-digest map is RETAINED so dedup survives a
-                // disappear→return (a truly identical, already-emitted file is not re-emitted).
-                lastSeenStat.removeAll()
-                // Review8 finding 1: pending content observations belong to the folder
-                // generation they were made in — the gate restarts after a return.
-                pendingContent.removeAll()
-                // Review8 finding 2: the identity FAST-PATH dies with the folder
-                // generation — identities are location-bound (a remounted share or
-                // reused inode can present the same dev/ino/size/cached mtime-ns for
-                // different bytes), digests are content-bound and are retained above.
-                lastEmittedIdentity.removeAll()
-                // Review10 item 1: revision ORDER state is per-generation like the pending
-                // maps. Emitted digests survive (above), so re-sightings of already-emitted
-                // revisions still dedup; only the ordering gate restarts.
-                emittedRevisionHighWater = nil
-                outOfOrderDropLogged.removeAll()
-                // Review11 findings 1+4: the write-off state is per-generation too — a
-                // persisting corpse re-earns its blocking deadline (and is written off
-                // again, honestly) after a reconnect.
-                blockTracks.removeAll()
-                writtenOffRevisions.removeAll()
+                replaceGeneration()
             }
             if nodeExists {
-                // Something non-directory occupies the watched path. Log once per occupation
-                // (gated like folderMissing) — the poll keeps ticking and recovery waits for a
-                // real directory.
                 if !nonDirectoryAtPathLogged {
                     nonDirectoryAtPathLogged = true
                     onLog?("watched path exists but is not a directory — still waiting for a directory: \(folder.path)")
@@ -831,40 +559,20 @@ public final class StackFileWatcher {
             } else {
                 nonDirectoryAtPathLogged = false
             }
-            // While missing, keep the timer running (it will notice the return).
             return
         }
         nonDirectoryAtPathLogged = false
 
-        // P1 (review3): the folder can be REPLACED atomically (rename(2) of another directory over
-        // the same path) with NO missing interval — fileExists never reports false, but the
-        // DispatchSource is still attached to the OLD inode (events from the new directory reach us
-        // only via the poll fallback) and lastSeenStat still holds observations of files that no
-        // longer exist (a recreated same-name/size/coarse-mtime file would pass the two-tick
-        // stability gate on its first sighting). Compare the path's current (dev, ino) against the
-        // identity captured when the source was armed; on mismatch, treat it exactly like a
-        // disappear+return in one tick: log honestly, cancel the stale source, clear the pending
-        // stability observations (emitted digests RETAINED for dedup), and fall into the recovery
-        // branch below — which re-arms BEFORE claiming recovery and retries on later polls if the
-        // re-arm fails (mirrors the existing return path).
         if !folderMissing, let armed = armedIdentity,
            let current = Self.nodeIdentity(atPath: folder.path), current != armed {
             handleFolderReplaced()
         }
 
         if folderMissing {
-            // Review9 item 4: a reentrant stop() (an onLog callback above — the disappearance
-            // or replacement log — runs on this queue and may stop the watcher inline) must
-            // prevent the re-arm below: re-arming after stop() is resurrection.
             guard state == .running else { return }
-            // Folder just came back. F4 (review2): attempt the re-arm FIRST, and only claim recovery
-            // (log "resuming" + clear folderMissing) once it SUCCEEDS. Previously "resuming" was logged
-            // and the flag cleared BEFORE armSource(), whose failure was silently swallowed — the
-            // watcher claimed it had recovered while the DispatchSource was dead. On failure, log once
-            // (gated by rearmFailed to avoid per-tick spam) and stay folderMissing so a later poll
-            // retries. The poll timer keeps ticking regardless, so scans continue either way.
             do {
                 try armSource()
+                replaceGeneration()
                 onLog?("watched folder returned — resuming: \(folder.path)")
                 folderMissing = false
                 rearmFailed = false
@@ -873,403 +581,193 @@ public final class StackFileWatcher {
                     rearmFailed = true
                     onLog?("watched folder returned but re-arm failed — retrying on later polls: \(folder.path) (\(error))")
                 }
-                // Stay folderMissing; the poll scan still runs below via the timer, and the next
-                // poll re-enters this branch to retry the re-arm.
             }
         }
 
-        // Review4 P2: enumerate + stat through the ARMED fd, never by path. The identity check
-        // above and this enumeration are not atomic; a swap landing between them must not let this
-        // pass apply old lastSeenStat observations to the new directory's files. The fd pins the
-        // inode the identity check approved, so this scan structurally observes only that
-        // directory's contents; the NEXT scan detects the swap and resets state. When no source is
-        // armed (folderFD < 0, i.e. a failed re-arm while folderMissing), there is nothing safe to
-        // enumerate — skip this tick; the poll timer retries the re-arm on the next tick.
         guard folderFD >= 0, let names = Self.enumerateDirectory(fd: folderFD) else { return }
-        // Review10 item 2: PENDING (unemitted) evidence for a file ABSENT this scan dies
-        // now — a file that vanishes mid-gate and returns with a manufactured matching
-        // identity must re-earn stability and the digest gate from zero, not resume off
-        // observations of an entry that demonstrably stopped existing. Emitted digests and
-        // identities are untouched: dedup governs re-emission, not pending evidence.
-        let present = Set(names)
-        if !lastSeenStat.isEmpty { lastSeenStat = lastSeenStat.filter { present.contains($0.key) } }
-        if !pendingContent.isEmpty {
-            pendingContent = pendingContent.filter { present.contains($0.key) }
-        }
-        // Review11 findings 1+4: an ABSENT blocker holds nothing — during its absence the
-        // higher revisions it was holding proceed, so its deadline dies with it (a returning
-        // file that blocks again starts a fresh clock). The write-off SET is retained: a
-        // written-off corpse being briefly invisible does not resurrect it.
-        if !blockTracks.isEmpty {
-            blockTracks = blockTracks.filter { present.contains($0.key) }
-        }
-        // Review9 item 2: process candidates in a deterministic order (numbered revisions
-        // numerically, everything else lexicographically — see orderedBefore). The revision
-        // suffix is parsed ONCE per name here and reused for the per-entry policy below.
-        let candidates = names.map { (name: $0, revision: revisionSuffix(of: $0)) }
-            .sorted(by: RevisionOrdering.orderedBefore)
-        // Review10 item 1 (HOLDBACK): true once a numbered revision in THIS scan proved not
-        // yet emittable — every higher-numbered revision then advances its gates normally
-        // but is not allowed to EMIT this scan (see the pre-emission check below).
-        var holdRevisionsAbove = false
-        // Review11 findings 1+4: a failing revision only runs the blocking deadline when it
-        // actually BLOCKS someone — i.e. some LATER candidate carries a not-yet-emitted
-        // numbered revision. Precomputed as a suffix flag over the sorted candidates.
-        var laterUnemittedRevision = [Bool](repeating: false, count: candidates.count)
-        if revisionOrderingEnabled {
-            var seen = false
-            for i in stride(from: candidates.count - 1, through: 0, by: -1) {
-                laterUnemittedRevision[i] = seen
-                let c = candidates[i]
-                if c.revision != nil, lastEmittedDigest[c.name] == nil,
-                   !writtenOffRevisions.contains(c.name) { seen = true }
-            }
-        }
-        for (candidateIndex, candidate) in candidates.enumerated() {
-            let (name, revision) = candidate
-            // Review10 item 3: a stop() waiting out its bounded deadline sees this scan
-            // yield at the next per-file boundary — never park behind the rest of the folder.
+        let trackedNames = reducer.orderedNamesForScan(names.filter(isTrackedFileName))
+        var observations: [FileObservation] = []
+        observations.reserveCapacity(trackedNames.count + reducer.state.generation.files.count)
+
+        for name in trackedNames {
             if stopRequested.isSet { return }
-            guard !name.hasPrefix("."), !name.lowercased().hasSuffix(".tmp") else { continue }
-            if let prefix = fileNamePrefix, !prefix.isEmpty,
-               !name.lowercased().hasPrefix(prefix.lowercased()) { continue }
-            let ext = (name as NSString).pathExtension.lowercased()
-            let isFITS = ImageLoader.fitsExtensions.contains(ext)
-            guard isFITS || ImageLoader.bitmapExtensions.contains(ext) else { continue }
+            guard let observation = observeFile(named: name) else { return }
+            observations.append(observation)
+        }
 
-            // Review10 item 1 (REJECT BELOW THE MARK): a never-emitted numbered revision at
-            // or below the emitted high-water mark arrived out of order — emitting it now
-            // would regress the consumer's replay. Drop the frame permanently, keep the
-            // session, log once. Names that already emitted are exempt: their re-sightings
-            // are governed by the identity fast-path and digest dedup below (the mark
-            // governs ORDER, never re-emission). Cold1 I3: `.mutableStackerOutput` only —
-            // under the immutable policy order is irrelevant and nothing may be dropped.
-            if revisionOrderingEnabled, let revision, lastEmittedDigest[name] == nil,
-               let mark = emittedRevisionHighWater,
-               RevisionOrdering.numericCompare(revision, mark) != .orderedDescending {
-                if outOfOrderDropLogged.insert(name).inserted {
-                    onLog?("revision \(revision) arrived out of order — skipped (high-water \(mark))")
-                }
-                continue
-            }
+        let present = Set(trackedNames)
+        let absentNames = reducer.orderedNamesForScan(
+            reducer.state.generation.files.keys.filter { !present.contains($0) })
+        observations.append(contentsOf: absentNames.map { name in
+            FileObservation(
+                name: name,
+                url: folder.appendingPathComponent(name),
+                kind: reducer.entryKind(for: name),
+                outcome: .absent)
+        })
 
-            // Review11 findings 1+4: a revision written off at its blocking deadline is dead
-            // for this folder generation — it exerts no hold and must never emit (recovering
-            // later does not resurrect it; the honest frame loss was already logged).
-            if revisionOrderingEnabled, revision != nil, writtenOffRevisions.contains(name) {
-                continue
-            }
+        let nowNanos = monotonicNowNanos()
+        guard state == .running, !stopRequested.isSet else { return }
+        let effects = reducer.reduce(.observe(ObservationBatch(
+            generation: reducer.state.generation.id,
+            entries: observations,
+            nowNanos: nowNanos)))
+        afterObservationBatchForTesting?()
+        execute(effects)
+    }
 
-            let url = folder.appendingPathComponent(name)
+    private func isTrackedFileName(_ name: String) -> Bool {
+        guard !name.hasPrefix("."), !name.lowercased().hasSuffix(".tmp") else { return false }
+        if let prefix = fileNamePrefix, !prefix.isEmpty,
+           !name.lowercased().hasPrefix(prefix.lowercased()) { return false }
+        let ext = (name as NSString).pathExtension.lowercased()
+        return ImageLoader.fitsExtensions.contains(ext)
+            || ImageLoader.bitmapExtensions.contains(ext)
+    }
 
-            // ONE pinned descriptor per candidate file (review5 item 1). Everything the WATCHER
-            // DECIDES with — the (size, mtime) stability observation via fstat(fd), the FITS
-            // header + header-declared-size completeness check, the content digest, and the
-            // identity attached to the emitted update — comes from THIS descriptor, opened
-            // fd-relative to the pinned directory (never by path) BEFORE any stat. A swap
-            // landing after the open can therefore never mix observations of two different
-            // files (previously the OLD inode's size gated the completeness of a truncated NEW
-            // replacement read by path). openat failure (ENOENT — the entry vanished since
-            // enumeration; ELOOP — a symlinked entry, refused by O_NOFOLLOW) skips the file
-            // this tick, exactly like a failed stat before.
-            guard let handle = Self.openFile(directoryFD: folderFD, name: name) else {
-                clearPendingEvidence(for: name)                    // review10 item 2
-                // Review10 item 1 + review11: holds until the blocking deadline.
-                if revisionFailedToEmit(name: name, revision: revision, converging: false,
-                                        holdAlreadySet: holdRevisionsAbove,
-                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
-                    holdRevisionsAbove = true
-                }
-                continue
-            }
-            // Exactly-once close on every path out of this iteration: this explicit close pairs
-            // with closeOnDealloc as a backstop (FileHandle tracks closed state — no double close).
-            defer { try? handle.close() }
+    /// Build exactly one immutable observation from one pinned descriptor. A nil return means
+    /// the streaming digest observed stopRequested and the entire scan must abort.
+    private func observeFile(named name: String) -> FileObservation? {
+        let url = folder.appendingPathComponent(name)
+        let invalid: () -> FileObservation = {
+            FileObservation(
+                name: name,
+                url: url,
+                kind: self.reducer.entryKind(for: name),
+                outcome: .invalid)
+        }
 
-            let statResult = Self.statFile(handle)
-            guard let observed = statResult, observed.size > 0 else {
-                clearPendingEvidence(for: name)                    // review10 item 2
-                // Review10 item 1 + review11: invalid (stat failure or zero size) — holds
-                // until the blocking deadline.
-                if revisionFailedToEmit(name: name, revision: revision, converging: false,
-                                        holdAlreadySet: holdRevisionsAbove,
-                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
-                    holdRevisionsAbove = true
-                }
-                continue
-            }
+        guard let handle = Self.openFile(directoryFD: folderFD, name: name) else {
+            return invalid()
+        }
+        defer { try? handle.close() }
 
-            let previous = lastSeenStat[name]
-            lastSeenStat[name] = observed
+        guard let observed = Self.statFile(handle), observed.size > 0 else {
+            return invalid()
+        }
+        let ext = (name as NSString).pathExtension.lowercased()
+        let entry = EnumeratedEntry(
+            name: name,
+            url: url,
+            identity: observed,
+            isFITS: ImageLoader.fitsExtensions.contains(ext))
+        guard let request = reducer.readPlan(for: [entry]).first else {
+            return invalid()
+        }
 
-            // Review7 P2 (identity-gated hashing): this exact published version — same
-            // (dev, ino, size, mtime-ns) as the emission that produced
-            // `lastEmittedDigest[name]` — was already emitted, so when the file is
-            // trusted immutable AFTER emission, skip ALL content work: one fstat per
-            // poll instead of a full-file SHA-256. That trust holds for every file
-            // under `.immutableAfterPublish` (native relay folders accumulate every
-            // sub; at 1000 subs the unconditional rehash burned tens of seconds per
-            // 2 s scan), and — review9 item 1 — for NUMBERED REVISIONS under
-            // `.mutableStackerOutput` (Siril 1.4+ writes live_stack_00001.fit once
-            // and never rewrites it; without the fast-path, 1000 × 50 MB accumulated
-            // revisions meant 50 GB hashed per 2 s scan, starving new updates).
-            // Numbered revisions may be written NON-ATOMICALLY before publication,
-            // so pre-emission they take the full mutable path — stat stability AND
-            // the two-observation digest gate below — and only their CONFIRMED first
-            // emission arms this shortcut: post-emission trust is the single
-            // divergence point. The CLASSIC in-place fixed-name file (revision nil)
-            // never takes the shortcut: a coarse/cached-filesystem rewrite can
-            // collide the whole identity, and only the digest sees the change.
-            let identityTrustedAfterEmission =
-                digestPolicy == .immutableAfterPublish || revision != nil
-            if identityTrustedAfterEmission,
-               lastEmittedIdentity[name] == observed { continue }
+        switch request {
+        case .acceptIdentity(let observation):
+            return observation
 
-            // Stability gate (P1-2): require the identity (dev, ino, size, mtime ns) unchanged
-            // across two consecutive scans for BOTH file kinds. A writer that preallocates the
-            // full declared size and then fills pixels in place satisfies size>=declared on the
-            // first sighting; the stability requirement holds it back until the in-place writes
-            // stop. A same-name replacement (new inode) re-earns stability from scratch.
-            guard previous == observed else {
-                // Review8 finding 1: a stat-identity change restarts the digest-stability
-                // gate — a pending content observation is only meaningful under the exact
-                // identity it was observed with.
-                pendingContent[name] = nil
-                // Review10 item 1 + review11: unstable. Instability is NOT converging (an
-                // oscillating identity must never renew the deadline) — the blocker holds
-                // only until its blocking budget runs out.
-                if revisionFailedToEmit(name: name, revision: revision, converging: false,
-                                        holdAlreadySet: holdRevisionsAbove,
-                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
-                    holdRevisionsAbove = true
-                }
-                continue
-            }
+        case .observeWithoutContent(let observation):
+            return observation
 
+        case .readContent(let requestName, let requestURL, let kind,
+                          let identity, let isFITS):
             if isFITS {
-                // Bulletproof completeness: header declares exact expected data length (spec §5.2),
-                // and BOTH sides of the comparison come from the pinned descriptor — the header
-                // bytes and the fstat size describe the same inode. Combined with the stability
-                // gate above, this rejects both truncated files (size<declared) and
-                // preallocated-but-unfilled files (stable check).
-                guard let head = try? Self.readHead(handle, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
+                guard let head = try? Self.readHead(
+                    handle, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
                       let header = try? FITSReader.readHeader(head),
-                      observed.size >= header.minimumFileSize else {
-                    clearPendingEvidence(for: name)                    // review10 item 2
-                    // Review10 item 1 + review11: invalid (malformed/incomplete FITS).
-                    if revisionFailedToEmit(name: name, revision: revision, converging: false,
-                                            holdAlreadySet: holdRevisionsAbove,
-                                            blocksLater: laterUnemittedRevision[candidateIndex]) {
-                        holdRevisionsAbove = true
-                    }
-                    continue
+                      identity.size >= header.minimumFileSize else {
+                    return FileObservation(
+                        name: requestName,
+                        url: requestURL,
+                        kind: kind,
+                        outcome: .invalid)
                 }
             }
 
             _digestComputations += 1
-            // Review10 item 3: the streaming hash checks the stop flag between 64 KB
-            // chunks, so a stop() never waits behind a full-file read stalled on a dead
-            // share. An aborted digest is a stop, not an invalidity — return outright.
             let stopFlag = stopRequested
-            guard let digest = FileIdentity.contentDigest(handle: handle, size: observed.size,
-                                                          shouldAbort: { stopFlag.isSet })
-            else {
-                if stopRequested.isSet { return }                  // review10 item 3: aborted by stop()
-                clearPendingEvidence(for: name)                    // review10 item 2
-                // Review10 item 1 + review11: invalid (digest failure).
-                if revisionFailedToEmit(name: name, revision: revision, converging: false,
-                                        holdAlreadySet: holdRevisionsAbove,
-                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
-                    holdRevisionsAbove = true
-                }
-                continue
+            guard let digest = FileIdentity.contentDigest(
+                handle: handle,
+                size: identity.size,
+                shouldAbort: { stopFlag.isSet }) else {
+                if stopRequested.isSet { return nil }
+                return FileObservation(
+                    name: requestName,
+                    url: requestURL,
+                    kind: kind,
+                    outcome: .invalid)
             }
 
-            // Final revalidation on the pinned descriptor (review6 finding 1): the header/
-            // completeness read and the digest read above take time, and an in-place writer
-            // active DURING them moves size/mtime — the digest would then describe torn bytes.
-            // Require the identity unchanged from the initial fstat; otherwise treat the file as
-            // unstable this tick (record the latest clean observation, no emit, no dedup update,
-            // no log spam) and let it re-earn stability on later ticks.
             guard let finalStat = Self.statFile(handle) else {
-                clearPendingEvidence(for: name)                    // review10 item 2
-                // Review10 item 1 + review11: invalid (revalidation stat failure).
-                if revisionFailedToEmit(name: name, revision: revision, converging: false,
-                                        holdAlreadySet: holdRevisionsAbove,
-                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
-                    holdRevisionsAbove = true
-                }
-                continue
+                return FileObservation(
+                    name: requestName,
+                    url: requestURL,
+                    kind: kind,
+                    outcome: .invalid)
             }
-            guard finalStat == observed else {
-                // Not an invalidity, an in-flight writer: record the LATEST clean stat so
-                // stability re-earns from what the file is now (review10 item 2 keeps this
-                // branch's existing shape — stat recorded, pending content cleared).
-                lastSeenStat[name] = finalStat
-                // Review8 finding 1: the identity moved mid-scan — restart the
-                // digest-stability gate along with stat stability.
-                pendingContent[name] = nil
-                // Review10 item 1 + review11: unstable mid-scan — not converging.
-                if revisionFailedToEmit(name: name, revision: revision, converging: false,
-                                        holdAlreadySet: holdRevisionsAbove,
-                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
-                    holdRevisionsAbove = true
-                }
-                continue
+            guard finalStat == identity else {
+                return FileObservation(
+                    name: requestName,
+                    url: requestURL,
+                    kind: kind,
+                    outcome: .unstable(identity: finalStat))
             }
-
-            guard lastEmittedDigest[name] != digest else {
-                // Identical content re-published under a NEW identity (in-place
-                // rewrite of the same bytes): record the new identity as the
-                // emitted version so `.immutableAfterPublish` stops re-hashing it.
-                lastEmittedIdentity[name] = observed
-                // Review8 finding 1: an already-emitted digest supersedes any pending
-                // observation — the file settled back onto known content, and the
-                // pending digest was never observed long enough to count.
-                pendingContent[name] = nil
-                continue
-            }
-
-            // Digest-stability gate (review8 finding 1, `.mutableStackerOutput` only).
-            // Stat stability cannot see an in-place rewriter that PAUSES mid-rewrite:
-            // the size is unchanged and a coarse or restored mtime can collide, so the
-            // digest just computed may describe a temporary A/B hybrid — and consumer-
-            // side digest verification would then faithfully verify that exact hybrid,
-            // because it proves byte identity, not producer completeness. Mirror the
-            // two-tick stat philosophy at the content level: a NEW digest is emitted
-            // only after the SAME digest is observed again, under the SAME stat
-            // identity, at least `quietPeriod` of MONOTONIC time later. The elapsed-
-            // time requirement matters because the event debounce and the poll timer
-            // share this queue: two scans can land almost back-to-back, and two
-            // near-simultaneous sightings prove nothing. A DIFFERENT digest replaces
-            // the pending one (still unemitted); a stat-identity change or a folder-
-            // generation change restarts the gate. THE ACCEPTED DESIGN BOUNDARY
-            // (review9 item 5): passing this gate proves only that the content
-            // remained unchanged for the quiet period — it does NOT prove the
-            // producer's transaction ended. A writer that pauses on a hybrid through
-            // BOTH observations therefore EMITS that hybrid: from this side of the
-            // filesystem a long pause is indistinguishable from a finished write, and
-            // no polling scheme can tell them apart. Only PRODUCER-SIDE atomic
-            // publication (temp name + rename into place) is absolute. Pinned by
-            // testMutablePolicy_pauseSpansBothObservations_hybridEmits_acceptedBoundary.
-            // Cost: one extra poll tick of latency per live_stack update.
-            // `.immutableAfterPublish` is unchanged — its files are immutable once
-            // published by policy, and the identity gate above already governs them.
-            if digestPolicy == .mutableStackerOutput {
-                let now = monotonicNowNanos()
-                if let pending = pendingContent[name], pending.digest == digest,
-                   pending.identity == observed {
-                    guard now >= pending.firstObservedNanos,
-                          now - pending.firstObservedNanos >= quietPeriodNanos else {
-                        // Review10 item 1 + review11: mid-gate, and the ONLY branch that is
-                        // CONVERGING — the same pending digest observed again under a stable
-                        // identity with the quiet-period clock running. Converging progress
-                        // renews one quiet period of grace, capped by the hard ceiling.
-                        if revisionFailedToEmit(name: name, revision: revision, converging: true,
-                                                holdAlreadySet: holdRevisionsAbove,
-                                                blocksLater: laterUnemittedRevision[candidateIndex]) {
-                            holdRevisionsAbove = true
-                        }
-                        continue
-                    }
-                    // Gate satisfied. The pending observation is cleared at EMISSION below,
-                    // not here — a held-back revision (review10 item 1) keeps its evidence
-                    // and re-qualifies immediately once the lower revision clears.
-                } else {
-                    pendingContent[name] = PendingContent(digest: digest, identity: observed,
-                                                          firstObservedNanos: now)
-                    // Review10 item 1 + review11: mid-gate; a NEW/CHANGED digest is churn,
-                    // not convergence — it must never renew the blocking deadline.
-                    if revisionFailedToEmit(name: name, revision: revision, converging: false,
-                                            holdAlreadySet: holdRevisionsAbove,
-                                            blocksLater: laterUnemittedRevision[candidateIndex]) {
-                        holdRevisionsAbove = true
-                    }
-                    continue
-                }
-                // NOTE (cold1 I3): these two mid-gate holds need no revisionOrderingEnabled
-                // guard — this whole gate only runs under `.mutableStackerOutput`.
-            }
-
-            // Review10 item 1 (HOLDBACK): every gate passed, but a LOWER-numbered revision
-            // earlier in this scan is still earning its gates — emitting above it would
-            // hand the consumer an order regression. This emission waits; its evidence is
-            // intact, so it goes out on the first scan after the blocker clears. Cold1 I3:
-            // mutable policy only (holdRevisionsAbove is never set otherwise; the guard
-            // makes the scoping explicit).
-            if revisionOrderingEnabled, revision != nil, holdRevisionsAbove { continue }
-
-            // Yield-time revalidation (review5 item 1): the emitted URL is still a PATH the
-            // consumer resolves later, so before publishing, re-check that the watched path still
-            // resolves to the directory this scan pinned. If it was swapped mid-scan, do NOT emit
-            // a path that now names a different directory's file — trigger the same replacement
-            // handling as the top-of-scan check (the next tick re-arms and rescans) and stop.
-            // The residual consumer-side race (path re-resolved at read time) is closed by the
-            // identity carried on the update: consumers verify (dev, ino, size, mtime, digest)
-            // on THEIR OWN descriptor via FileIdentity.read(url:verifying:) before decoding.
-            guard let armed = armedIdentity, Self.nodeIdentity(atPath: folder.path) == armed else {
-                handleFolderReplaced()
-                return
-            }
-            // Review9 item 4: nothing may be emitted after stop() — a reentrant stop from an
-            // onLog callback earlier in this scan lands here as a terminal-state no-op.
-            // Review10 item 3: the atomic flag covers a stop() from ANOTHER thread whose
-            // teardown is still queued behind this very scan (state not yet .stopped).
-            guard state == .running, !stopRequested.isSet else { return }
-            pendingContent[name] = nil          // the emission consumes the gate evidence
-            lastEmittedDigest[name] = digest
-            lastEmittedIdentity[name] = observed
-            blockTracks[name] = nil             // review11: the blocker emitted — clock clears
-            if revisionOrderingEnabled, let revision,
-               emittedRevisionHighWater.map({ RevisionOrdering.numericCompare(revision, $0) == .orderedDescending })
-                    ?? true {
-                // Review10 item 1: advance the high-water mark at emission — the single
-                // point a revision becomes consumer-visible. Cold1 I3: the mark exists
-                // only where ordering does (`.mutableStackerOutput`).
-                emittedRevisionHighWater = revision
-            }
-            continuation.yield(StackUpdate(
-                url: url, fileSize: observed.size,
-                identity: observed.withDigest(digest)))
+            return FileObservation(
+                name: requestName,
+                url: requestURL,
+                kind: kind,
+                outcome: .digested(
+                    identity: identity,
+                    digest: digest,
+                    byteCount: identity.size))
         }
     }
 
-    /// Review10 item 2: one observed per-file invalidity — open/fstat failure (incl. a
-    /// rejected non-regular node), zero size, malformed or incomplete FITS header, digest
-    /// failure — resets EVERYTHING pending for the entry. Stability and content evidence
-    /// must be re-earned from zero: a file that vanished or truncated during the quiet
-    /// window and returned with a manufactured matching identity (restored bytes +
-    /// utimensat'd mtime, or a reused inode) must never emit off evidence gathered for a
-    /// version that demonstrably stopped being valid. Emitted digests/identities are
-    /// untouched — dedup is content-bound and survives invalidity; only UNEMITTED evidence
-    /// dies.
-    private func clearPendingEvidence(for name: String) {
-        lastSeenStat.removeValue(forKey: name)
-        pendingContent.removeValue(forKey: name)
+    private func execute(_ effects: [WatcherEffect]) {
+        for effect in effects {
+            switch effect {
+            case .log(let message):
+                onLog?(message)
+
+            case .emit(let intent):
+                guard reducer.shouldExecuteEmission(intent) else {
+                    let followupEffects = reducer.reduce(.emissionFinished(EmissionResult(
+                        intent: intent,
+                        outcome: .rejected)))
+                    execute(followupEffects)
+                    continue
+                }
+                guard let armed = armedIdentity,
+                      Self.nodeIdentity(atPath: folder.path) == armed else {
+                    handleFolderReplaced()
+                    _ = reducer.reduce(.emissionFinished(EmissionResult(
+                        intent: intent,
+                        outcome: .rejected)))
+                    return
+                }
+                guard state == .running, !stopRequested.isSet else {
+                    _ = reducer.reduce(.emissionFinished(EmissionResult(
+                        intent: intent,
+                        outcome: .rejected)))
+                    return
+                }
+                continuation.yield(StackUpdate(
+                    url: intent.candidate.url,
+                    fileSize: intent.candidate.byteCount,
+                    identity: intent.candidate.identity.withDigest(intent.candidate.digest)))
+                let followupEffects = reducer.reduce(.emissionFinished(EmissionResult(
+                    intent: intent,
+                    outcome: .yielded)))
+                execute(followupEffects)
+            }
+        }
     }
 
-    /// Mid-tick folder replacement handling — shared by the top-of-scan identity check and the
-    /// yield-time revalidation: log honestly, drop the stale source, clear PENDING stability
-    /// observations AND the location-bound identity fast-path (emitted digests RETAINED for
-    /// dedup — content-bound, they survive the generation change), and mark missing so the
-    /// next tick re-arms via the recovery branch.
+    private func replaceGeneration() {
+        let current = reducer.state.generation.id.rawValue
+        precondition(current < UInt64.max, "watcher folder generation exhausted")
+        _ = reducer.reduce(.replaceGeneration(FolderGeneration(rawValue: current + 1)))
+    }
+
+    /// Mid-tick replacement handling shared by the top-of-scan and pre-yield identity checks.
+    /// Whole-generation replacement retains only the reducer's content-bound digest table.
     private func handleFolderReplaced() {
         onLog?("watched folder was replaced — re-arming: \(folder.path)")
         cancelSource()
-        lastSeenStat.removeAll()
-        // Review8 finding 1: the digest-stability gate restarts with the folder generation.
-        pendingContent.removeAll()
-        // Review8 finding 2: identities die with the folder generation (see the
-        // lastEmittedIdentity declaration for the digest/identity asymmetry).
-        lastEmittedIdentity.removeAll()
-        // Review10 item 1: the revision order gate is per-generation too (emitted digests
-        // above still dedup any re-sighting of an already-emitted revision).
-        emittedRevisionHighWater = nil
-        outOfOrderDropLogged.removeAll()
-        // Review11 findings 1+4: write-off state dies with the generation (see the
-        // disappear branch).
-        blockTracks.removeAll()
-        writtenOffRevisions.removeAll()
+        replaceGeneration()
         folderMissing = true
     }
 

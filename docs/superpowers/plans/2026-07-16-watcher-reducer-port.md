@@ -471,7 +471,11 @@ they are observability, not semantic evidence.
   implementation report:
   `swift test 2>&1 | tee /tmp/liveastro-phase1-test.log` followed by
   `rg -n "warning:" /tmp/liveastro-phase1-test.log`.
-  Expected: no warning matches.
+  Expected for phase 1: no warnings in either phase-1 touched source file and
+  no warnings newly introduced by this branch. The clean baseline already has
+  unrelated test-target warnings; the approved three-phase sequence assigns
+  their cleanup to the later conventional wave, and the zero-warning test-build
+  gate remains binding for the combined phase-3 handoff.
 
 - [ ] Review the final diff against every §2 requirement and explicitly report:
   state ownership, generation replacement, derived ordering evidence, episode
