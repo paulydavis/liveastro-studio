@@ -548,6 +548,49 @@ final class OBSControllerTests: XCTestCase {
         controller.disconnect()
     }
 
+    // MARK: - cold2 M-3: connect resets published output state before seeding
+
+    /// Cold2 M-3 (red-first): isRecording/sceneNames/currentScene were never reset at
+    /// connect — a NON-FATAL seed failure (requests answered ok:false; the link stays
+    /// up) left the PREVIOUS session's values published behind a fresh .connected.
+    /// Post-fix connect resets all three to neutral defaults at connect start (under
+    /// the new epoch, before seeding), so a failed seed shows neutral, never stale.
+    func testConnectResetsPublishedStateBeforeSeeding_failedSeedNeverShowsStale() async {
+        let mock1 = MockOBSSocket()
+        var current = mock1
+        let controller = OBSController(
+            makeClient: { OBSClient(socket: $0, requestTimeout: 1) },
+            makeSocket: { current })
+
+        _ = await connect(controller, mock1, scenes: ["A", "B"], currentScene: "A",
+                          recording: true)
+        XCTAssertEqual(controller.sceneNames, ["A", "B"])
+        XCTAssertEqual(controller.currentScene, "A")
+        XCTAssertTrue(controller.isRecording)
+        controller.disconnect()
+
+        // Second session: the handshake succeeds but EVERY seed request fails
+        // non-fatally (ok:false — no liveness convergence, the link stays up).
+        let mock2 = MockOBSSocket()
+        current = mock2
+        mock2.enqueueInbound(helloFrame())
+        mock2.replyToLastSent { sent in
+            if sent.contains("\"op\":1") { return identifiedFrame }
+            guard sent.contains("\"op\":6") else { return nil }
+            return responseFrame(requestId: requestId(fromSent: sent), ok: false, code: 500)
+        }
+        let ok = await controller.connect(host: "localhost", port: 4455, password: nil)
+        XCTAssertTrue(ok, "the control link itself connected")
+        XCTAssertEqual(controller.state, .connected)
+        XCTAssertFalse(controller.isRecording,
+                       "the previous session's recording flag must not survive a failed seed")
+        XCTAssertEqual(controller.sceneNames, [],
+                       "the previous session's scene list must not survive a failed seed")
+        XCTAssertNil(controller.currentScene,
+                     "the previous session's program scene must not survive a failed seed")
+        controller.disconnect()
+    }
+
     // MARK: - cold2 I-2: a wedged handshake must not poison connect coalescing
 
     /// Cold2 I-2 (red-first, controller level): a wedge (TCP accepts, no Hello) used to

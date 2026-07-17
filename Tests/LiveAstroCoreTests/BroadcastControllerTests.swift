@@ -613,6 +613,26 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertTrue(h.box.errors.contains { $0.contains("OBS not reachable") })
     }
 
+    // MARK: - cold2 M-1: one honesty policy for connect failure
+
+    /// Cold2 M-1 (red-first): goLive from a CONFIRMED .idle whose control link has since
+    /// been (deliberately) disconnected; the reconnect fails. Pre-fix goLive restored the
+    /// origin .idle verbatim while runConnectAndReconcile demoted .idle → .unknown under
+    /// the same provably-down link ("confirmed idle no longer confirmable"). One policy
+    /// now: a connect failure demotes .idle to .unknown on the goLive path too.
+    func testGoLiveConnectFailureFromConfirmedIdleDemotesToUnknown() async {
+        let h = await makeHarness()                     // confirmed .idle
+        h.controller.disconnect()                       // deliberate: link down, .idle kept
+        XCTAssertEqual(h.controller.broadcastState, .idle)
+        h.controller.obsAutoLaunch = false              // single-shot failure, no launch
+
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .unknown }
+        XCTAssertTrue(h.box.errors.contains { $0.contains("OBS not reachable") })
+        XCTAssertTrue(h.box.logs.contains { $0.contains("no longer confirmable") },
+                      "the demotion must be logged with the reconnect-failure rationale — got \(h.box.logs)")
+    }
+
     // MARK: - review7 FIX 2: .unknown initial state + connect-time reconcile
 
     /// The initial state is .unknown (never an unconfirmed idle claim), and a

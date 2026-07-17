@@ -617,8 +617,14 @@ public final class BroadcastController {
             guard gen == broadcastGeneration else { return }   // stale: cancelled/superseded
             guard connected else {
                 deps.presentError("OBS not reachable — is it installed and running?")
-                // A confirmed .idle stays confirmed; from .unknown stay honest.
-                broadcastState = origin
+                // Cold2 M-1: ONE honesty policy with runConnectAndReconcile's
+                // failure landing — the link is provably down, so a previously
+                // CONFIRMED .idle is no longer confirmable and demotes to
+                // .unknown (goLive's only origins are .idle and .unknown).
+                if origin == .idle {
+                    deps.log("OBS: connect failed — the confirmed idle is no longer confirmable")
+                }
+                broadcastState = .unknown
                 return
             }
             // Review7 P1: reconcile with ACTUAL OBS output state before starting

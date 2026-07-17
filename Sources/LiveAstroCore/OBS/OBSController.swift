@@ -118,6 +118,16 @@ public final class OBSController: ObservableObject {
         connectionEpoch += 1                 // connect start
         let epoch = connectionEpoch
         state = .connecting
+        // Cold2 M-3: published output/scene state resets to NEUTRAL at connect
+        // start — under the new epoch, before any seeding. A NON-FATAL seed
+        // failure (requests answered but failing) previously left the PREVIOUS
+        // session's isRecording/sceneNames/currentScene published behind a
+        // fresh .connected. Events of this epoch flow only after the handshake,
+        // so nothing of the new session can be overwritten by this reset; any
+        // in-flight old-epoch answer is already epoch/stamp-guarded.
+        isRecording = false
+        sceneNames = []
+        currentScene = nil
         let socket = makeSocket()
         let client = makeClient(socket)
         self.client = client
