@@ -166,59 +166,106 @@ edits only.
   (`stackFrameCount × profile.subExposureSeconds`), not a fourth ledger
   (amendment 4).
 
-### 3.2 Master decision and atomic snapshot (amendment 1)
+### 3.2 Stored `CurrentStackState`, event-driven — never derived (refinement 1)
 
-`end()` writes `master.fit` **iff the current stack has frames**. It reads one
-**atomic engine snapshot** — `currentStackSnapshot() -> (image, coverage,
-frameCount)?` under a single lock acquisition — once, after the drain
-completes, before the write. Header `STACKCNT`, `TOTALEXP`, and the manifest's
-`stack_frame_count` all derive from that single value; today's three separate
-lock acquisitions can tear against a racing public `reseed()` (masked only by
-app-side UI gating). `masterExpected` stays session-semantic and immutable
-(review-11, unchanged); the master-before-`endSession()` commit ordering is
-untouched.
+The engine stores an explicit stack state, transitioned **only on named
+events** (seed, commit-of-seed, manual reseed, auto-reseed):
 
-### 3.3 Honest logging, three cases (amendment 3)
+```
+enum CurrentStackState {
+    case initialEmpty                                  // no seed yet this session
+    case active                                        // stack has frames
+    case awaitingSeedAfterReseed(manual: Int, auto: Int)  // cleared, not re-seeded
+}
+```
 
-At `end()` with `masterExpected` and no master written:
+It must **not** be derived from `accumulator == nil && reseedCount > 0` — a
+derived state self-exempts on accidental accumulator loss. Stored state vs.
+reality disagreement is the *breach signal*: stored `.active` with a nil
+accumulator (or `accepted > 0` under stored `.initialEmpty`) means the engine
+is corrupt — `end()` **throws and does not stamp `end_time`** (the session
+stays recoverable, per the invariant). Auto-reseed is a first-class door to
+`awaitingSeedAfterReseed` (refinement 2): the counts distinguish manual from
+automatic, and no persisted outcome or log line may claim an operator action
+when auto-reseed did it.
 
-- session accepted == 0 → `"no frames accepted — no master written"` (the
-  existing line, now only for its true case);
-- session accepted > 0, current stack empty → `"reference cleared by reseed
-  (manual or automatic) and never re-seeded — no master available
-  (N snapshots retained)"` — auto-reseed clears the accumulator too and must
-  be covered;
+### 3.3 Master decision, atomic snapshot, finalization barrier (amendment 1 + refinement 3)
+
+`end()` writes `master.fit` **iff `CurrentStackState == .active`**. It reads
+one **atomic engine snapshot** — `finalizationState()` returning (image,
+coverage, frameCount, stackState, session accepted/rejected finals) under a
+single lock acquisition — once, after the drain completes, before the write.
+Header `STACKCNT`, the manifest facts, and the outcome all derive from that
+single value; today's three separate lock acquisitions tear against a racing
+public `reseed()` (masked only by app-side UI gating).
+
+**Finalization barrier:** `end()` claims a barrier that `reseed()` respects
+(a reseed after finalization begins is refused with an honest log). Claim
+order: reentrancy guard → session-state guard → **then** the barrier — a
+rejected reentrant or not-running call must not poison reseed for a live
+session. Across a **failed** `end()` (`shutdownTimeout`: session stays
+`.running`, `end()` retryable) the barrier **stays claimed** — a reseed
+between a failed end and its retry has no legitimate use and reopens the
+race. `masterExpected` stays session-semantic and immutable (review-11,
+unchanged); the master-before-`endSession()` commit ordering is untouched.
+
+### 3.4 Honest outcomes: `master_outcome` manifest field + logs
+
+The manifest records `master_outcome` at end, from the atomic snapshot:
+`written` | `awaiting_seed` | `no_frames` (and watcher sessions'
+`masterExpected == false` needs no outcome). Logs match:
+
+- `.initialEmpty` → `"no frames accepted — no master written"` (the existing
+  line, now only for its true case);
+- `.awaitingSeedAfterReseed` → `"reference cleared by reseed (manual or
+  automatic) and never re-seeded — no master available (N snapshots
+  retained)"` — wording covers both doors, and the outcome/log must not
+  attribute auto-reseed to the operator;
 - `masterExpected == false` → the watcher-mode line, unchanged.
 
-### 3.4 Header truth
+**Product note (ledger, not contract):** a reseed near session end now
+provably discards the night's durable master (snapshots survive). A future
+UI affordance — "checkpoint master before reseed" — can restore that without
+touching this contract.
 
-`STACKCNT` = current-stack frame count; `TOTALEXP` = current-stack derived
-exposure. Today's header mixes provenance (`STACKCNT` = session total at
-SessionPipeline.swift:583 while `TOTALEXP` is already current-stack at :578);
-the change is one provenance flip. The manifest retains session-level counts
-via snapshot records, unchanged.
+### 3.5 Header and manifest truth: store the count, derive the exposure (refinement 4)
 
-### 3.5 Manifest fact + oracle clause 5 (non-circular)
+`STACKCNT` = current-stack frame count from the atomic snapshot; `TOTALEXP`
+is **derived** at its consumers as `stack_frame_count × subExposureSeconds`
+(the manifest already carries `subExposureSeconds` — persisting a separate
+exposure field would recreate the derivable-drift pair eliminated for the
+high-water mark). Today's header mixes provenance (`STACKCNT` = session total
+at SessionPipeline.swift:583 while `TOTALEXP` is already current-stack at
+:578); the change is one provenance flip. The manifest stores
+`stack_frame_count` plus the session accepted/rejected finals from the same
+`finalizationState()` snapshot; snapshot records retain session history,
+unchanged.
 
-The manifest records `stack_frame_count` at end — a fact (the atomic
-snapshot's count), never an echo of write success. Clause 5 becomes:
-`end_time set && masterExpected && stack_frame_count > 0` ⇒ `master.fit`
-durable **and decodes** and its `STACKCNT == stack_frame_count`. The
-reseed-then-end case records 0 and is satisfied via the honest log (clause 6
-pattern matches §3.3's wording). A failed native master write still trips
-clause 5 (count > 0, end_time absent by the review-2 ordering). Legacy
-manifests without the field fall back to the review-11 rule
+### 3.6 Oracle clause 5 (non-circular)
+
+Clause 5 becomes: `end_time set && masterExpected` ⇒ `master_outcome`
+present and consistent: `written` ⇒ `master.fit` durable **and decodes** and
+its `STACKCNT == stack_frame_count`; `awaiting_seed` / `no_frames` ⇒ honest
+log line matches (clause 6 patterns per §3.4) and no master required. The
+outcome is a recorded fact from the atomic snapshot, never an echo of write
+success — a failed native master write still trips clause 5 (`.active` count
+> 0, `end_time` absent by the review-2 ordering, so a stamped end with
+outcome `written` and no decodable master is dishonest by construction).
+Legacy manifests without the fields fall back to the review-11 rule
 (`!snapshots.isEmpty`), era-documented, decoding never throws.
 
 **Deliberate contract change (sanctioned test-drift exception):** the STACKCNT
 provenance flip. Sweep result: **zero existing tests pin the old semantics**
 (FITSWriterMetadataTests pins an explicit passed value; CleanExportPipelineTests
 pins presence only; NativePipelineTests' integration pin already rides
-`stackFrameCount`). The implementation owes the missing pins: reseed → accept
-K frames → end ⇒ master `STACKCNT == K`, manifest `stack_frame_count == K`,
-snapshots retain the session total; the no-reseed case stays byte-identical.
+`stackFrameCount`). The implementation owes these pins: reseed → accept K
+frames → end ⇒ master `STACKCNT == K`, manifest `stack_frame_count == K`,
+session finals retained; reseed → never re-seeded → end ⇒ no master,
+`master_outcome == awaiting_seed`, oracle passes; zero-frame ⇒
+`initialEmpty`/`no_frames`, oracle passes; the breach case ⇒ `end()` refuses
+to commit (`end_time` nil); the no-reseed case stays byte-identical.
 
-### 3.6 Reseed enforcement on finite imports (amendment 2)
+### 3.7 Reseed enforcement on finite imports (amendment 2)
 
 `SessionPipeline.reseed()` no-ops with an honest log when
 `source?.isFinite == true`. The batch contract ("MUST NOT mutate the engine
