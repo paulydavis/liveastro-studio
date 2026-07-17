@@ -659,16 +659,11 @@ public final class StackFileWatcher {
         case .acceptIdentity(let observation):
             return observation
 
+        case .observeWithoutContent(let observation):
+            return observation
+
         case .readContent(let requestName, let requestURL, let kind,
                           let identity, let isFITS):
-            guard previousIdentity(for: requestName) == identity else {
-                return FileObservation(
-                    name: requestName,
-                    url: requestURL,
-                    kind: kind,
-                    outcome: .unstable(identity: identity))
-            }
-
             if isFITS {
                 guard let head = try? Self.readHead(
                     handle, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
@@ -718,24 +713,6 @@ public final class StackFileWatcher {
                     identity: identity,
                     digest: digest,
                     byteCount: identity.size))
-        }
-    }
-
-    /// Reducer state is read only to honor the existing stat-before-content cost boundary;
-    /// every semantic transition still occurs in reduce(.observe).
-    private func previousIdentity(for name: String) -> FileIdentity? {
-        switch reducer.state.generation.files[name] {
-        case .observing(let stat):
-            return stat
-        case .digestPending(let pending):
-            return pending.identity
-        case .ready(let candidate):
-            return candidate.identity
-        case .settled(.emittedNow(let identity, _)),
-             .settled(.duplicateOfLastEmission(let identity, _)):
-            return identity
-        case .droppedOutOfOrder, .writtenOff, nil:
-            return nil
         }
     }
 

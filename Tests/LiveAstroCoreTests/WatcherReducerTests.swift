@@ -771,6 +771,155 @@ final class WatcherReducerTests: XCTestCase {
         ])
     }
 
+    func testReadPlanFirstSightingReturnsNoContentObservationForEveryEntryKind() {
+        struct TestCase {
+            let label: String
+            let reducer: WatcherReducer
+            let name: String
+            let kind: WatcherEntryKind
+        }
+        let identity = makeIdentity(1)
+        let cases = [
+            TestCase(
+                label: "classic mutable",
+                reducer: makeReducer(filePrefix: nil),
+                name: "live_stack.fit",
+                kind: .classicMutable),
+            TestCase(
+                label: "numbered mutable",
+                reducer: makeReducer(filePrefix: "live_stack"),
+                name: "live_stack_00001.fit",
+                kind: .numbered(revision: "00001")),
+            TestCase(
+                label: "immutable",
+                reducer: makeReducer(
+                    digestPolicy: .immutableAfterPublish,
+                    filePrefix: nil),
+                name: "sub.fit",
+                kind: .immutable),
+        ]
+
+        for testCase in cases {
+            let url = URL(fileURLWithPath: "/watch/\(testCase.name)")
+            XCTAssertEqual(testCase.reducer.readPlan(for: [EnumeratedEntry(
+                name: testCase.name,
+                url: url,
+                identity: identity,
+                isFITS: true)]), [
+                    .observeWithoutContent(FileObservation(
+                        name: testCase.name,
+                        url: url,
+                        kind: testCase.kind,
+                        outcome: .unstable(identity: identity))),
+                ], testCase.label)
+        }
+    }
+
+    func testReadPlanChangedIdentityReturnsNoContentObservationAcrossEveryFileState() {
+        let name = "live_stack.fit"
+        let url = URL(fileURLWithPath: "/watch/\(name)")
+        let oldIdentity = makeIdentity(1)
+        let currentIdentity = makeIdentity(2)
+        let cases: [(label: String, state: FileState)] = [
+            ("observing", .observing(stat: oldIdentity)),
+            ("digest pending", .digestPending(PendingDigest(
+                digest: "old", identity: oldIdentity, firstObservedNanos: 10))),
+            ("ready", .ready(makeCandidate(
+                name: name, identity: oldIdentity, digest: "old"))),
+            ("emitted settlement", .settled(.emittedNow(
+                identity: oldIdentity, digest: "old"))),
+            ("duplicate settlement", .settled(.duplicateOfLastEmission(
+                identity: oldIdentity, digest: "old"))),
+            ("dropped", .droppedOutOfOrder),
+            ("written off", .writtenOff),
+        ]
+
+        for testCase in cases {
+            let reducer = makeReducer(files: [name: testCase.state], filePrefix: nil)
+            XCTAssertEqual(reducer.readPlan(for: [EnumeratedEntry(
+                name: name,
+                url: url,
+                identity: currentIdentity,
+                isFITS: true)]), [
+                    .observeWithoutContent(FileObservation(
+                        name: name,
+                        url: url,
+                        kind: .classicMutable,
+                        outcome: .unstable(identity: currentIdentity))),
+                ], testCase.label)
+        }
+    }
+
+    func testReadPlanMatchingEvidenceAllowsContentAndPreservesSettledFastPaths() {
+        let name = "live_stack.fit"
+        let url = URL(fileURLWithPath: "/watch/\(name)")
+        let identity = makeIdentity(1)
+        let contentStates: [(label: String, state: FileState)] = [
+            ("observing", .observing(stat: identity)),
+            ("digest pending", .digestPending(PendingDigest(
+                digest: "pending", identity: identity, firstObservedNanos: 10))),
+            ("ready", .ready(makeCandidate(
+                name: name, identity: identity, digest: "ready"))),
+            ("emitted settlement", .settled(.emittedNow(
+                identity: identity, digest: "emitted"))),
+            ("duplicate settlement", .settled(.duplicateOfLastEmission(
+                identity: identity, digest: "duplicate"))),
+        ]
+
+        for testCase in contentStates {
+            let reducer = makeReducer(files: [name: testCase.state], filePrefix: nil)
+            XCTAssertEqual(reducer.readPlan(for: [EnumeratedEntry(
+                name: name,
+                url: url,
+                identity: identity,
+                isFITS: true)]), [
+                    .readContent(
+                        name: name,
+                        url: url,
+                        kind: .classicMutable,
+                        identity: identity,
+                        isFITS: true),
+                ], testCase.label)
+        }
+
+        let numberedName = "live_stack_00001.fit"
+        let numberedURL = URL(fileURLWithPath: "/watch/\(numberedName)")
+        let immutableName = "sub.fit"
+        let immutableURL = URL(fileURLWithPath: "/watch/\(immutableName)")
+        let reducer = makeReducer(
+            files: [
+                numberedName: .settled(.emittedNow(
+                    identity: identity, digest: "numbered")),
+                immutableName: .settled(.duplicateOfLastEmission(
+                    identity: identity, digest: "immutable")),
+            ],
+            digestPolicy: .immutableAfterPublish)
+
+        XCTAssertEqual(reducer.readPlan(for: [
+            EnumeratedEntry(
+                name: numberedName,
+                url: numberedURL,
+                identity: identity,
+                isFITS: true),
+            EnumeratedEntry(
+                name: immutableName,
+                url: immutableURL,
+                identity: identity,
+                isFITS: true),
+        ]), [
+            .acceptIdentity(FileObservation(
+                name: numberedName,
+                url: numberedURL,
+                kind: .numbered(revision: "00001"),
+                outcome: .identityUnchanged(identity: identity))),
+            .acceptIdentity(FileObservation(
+                name: immutableName,
+                url: immutableURL,
+                kind: .immutable,
+                outcome: .identityUnchanged(identity: identity))),
+        ])
+    }
+
     func testClassicMutableSettlementStillRequestsContentRead() {
         let identity = makeIdentity(1)
         let url = URL(fileURLWithPath: "/watch/live_stack.fit")
@@ -792,7 +941,7 @@ final class WatcherReducerTests: XCTestCase {
             ])
     }
 
-    func testSettledFastPathRequiresCurrentIdentityToMatchSettlement() {
+    func testSettledFastPathRejectsChangedIdentityWithoutContentRead() {
         let settledIdentity = makeIdentity(1)
         let currentIdentity = makeIdentity(2)
         let name = "live_stack_00001.fit"
@@ -806,12 +955,11 @@ final class WatcherReducerTests: XCTestCase {
             url: url,
             identity: currentIdentity,
             isFITS: true)]), [
-                .readContent(
+                .observeWithoutContent(FileObservation(
                     name: name,
                     url: url,
                     kind: .numbered(revision: "00001"),
-                    identity: currentIdentity,
-                    isFITS: true),
+                    outcome: .unstable(identity: currentIdentity))),
             ])
     }
 
@@ -872,7 +1020,9 @@ final class WatcherReducerTests: XCTestCase {
         let identity = makeIdentity(1)
 
         for testCase in cases {
-            let reducer = makeReducer(filePrefix: testCase.prefix)
+            let reducer = makeReducer(
+                files: [testCase.name: .observing(stat: identity)],
+                filePrefix: testCase.prefix)
             let url = URL(fileURLWithPath: "/watch/\(testCase.name)")
             XCTAssertEqual(reducer.readPlan(for: [EnumeratedEntry(
                 name: testCase.name,
@@ -935,12 +1085,11 @@ final class WatcherReducerTests: XCTestCase {
             url: url,
             identity: makeIdentity(2),
             isFITS: true)]), [
-                .readContent(
+                .observeWithoutContent(FileObservation(
                     name: name,
                     url: url,
                     kind: .numbered(revision: thirtyDigitRevision),
-                    identity: makeIdentity(2),
-                    isFITS: true),
+                    outcome: .unstable(identity: makeIdentity(2)))),
             ])
         XCTAssertEqual(reducer.emittedRevisionHighWater, thirtyDigitRevision)
     }

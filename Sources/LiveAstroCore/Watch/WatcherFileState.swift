@@ -99,6 +99,7 @@ struct EnumeratedEntry: Equatable {
 
 enum ReadRequest: Equatable {
     case acceptIdentity(FileObservation)
+    case observeWithoutContent(FileObservation)
     case readContent(
         name: String,
         url: URL,
@@ -604,12 +605,39 @@ struct WatcherReducer {
                     kind: kind,
                     outcome: .identityUnchanged(identity: entry.identity)))
             }
+            guard hasMatchingStatEvidence(
+                state.generation.files[entry.name],
+                identity: entry.identity) else {
+                return .observeWithoutContent(FileObservation(
+                    name: entry.name,
+                    url: entry.url,
+                    kind: kind,
+                    outcome: .unstable(identity: entry.identity)))
+            }
             return .readContent(
                 name: entry.name,
                 url: entry.url,
                 kind: kind,
                 identity: entry.identity,
                 isFITS: entry.isFITS)
+        }
+    }
+
+    private func hasMatchingStatEvidence(
+        _ fileState: FileState?,
+        identity: FileIdentity
+    ) -> Bool {
+        switch fileState {
+        case .observing(let previousIdentity):
+            return previousIdentity == identity
+        case .digestPending(let pending):
+            return pending.identity == identity
+        case .ready(let candidate):
+            return candidate.identity == identity
+        case .settled(let settlement):
+            return settlement.identity == identity
+        case .droppedOutOfOrder, .writtenOff, nil:
+            return false
         }
     }
 
