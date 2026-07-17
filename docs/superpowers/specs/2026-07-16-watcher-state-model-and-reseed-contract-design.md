@@ -36,6 +36,34 @@ OBS layer. The seven review-12 P2s are a separate conventional wave (§4).
 
 ### 2.1 One authoritative state per file
 
+The cross-generation survival rule is represented by the type boundary, not
+by coordinated clearing calls:
+
+```
+struct WatcherState {
+    var generation: GenerationState
+    var lastEmittedDigestByName: [String: String]  // the sole survivor
+}
+
+struct GenerationState {
+    let id: FolderGeneration
+    var files: [String: FileState]
+    var ordering: RevisionOrderingState
+}
+
+struct RevisionOrderingState {
+    var activeBlocker: BlockingEpisode?
+}
+```
+
+`FolderGeneration` is a monotonically increasing token, not merely the current
+directory `(dev, ino)`: disappear/return must invalidate old intents even when
+the filesystem later reports a reused identity.
+
+A disappear/return, re-arm, or `(dev, ino)` replacement event constructs a
+fresh `GenerationState`; it never clears generation fields individually. The
+outer `lastEmittedDigestByName` map is retained unchanged.
+
 Each filename in the current folder generation carries exactly one state:
 
 ```
@@ -43,29 +71,45 @@ enum FileState {
     case observing(stat: StatEvidence)                 // earning two-tick stability
     case digestPending(digest: String, identity: FileIdentity,
                        firstObservedNanos: UInt64)     // mutable-policy content gate
-    case ready                                         // all gates passed, awaiting order
+    case ready(candidate: EmissionCandidate)           // all gates passed, awaiting order
     case settled(Settlement)                           // emittedNow | duplicateOfLastEmission
     case droppedOutOfOrder                             // ≤ high-water on first sight; log-once
     case writtenOff                                    // blocker deadline expired; log-once
 }
 
 enum Settlement {
-    case emittedNow(identity: FileIdentity)
-    case duplicateOfLastEmission(identity: FileIdentity)
+    case emittedNow(identity: FileIdentity, digest: String)
+    case duplicateOfLastEmission(identity: FileIdentity, digest: String)
 }
 ```
 
-The scan becomes two phases: **observe** (pure filesystem reads on the pinned
-descriptors — stat, header, digest; no state mutation) and **reduce** (one
-synchronous pass applying the complete observations to the state table). All
-mutation happens in the reducer. This is the reducer/effect split from the
-ledgered simplification constraints, applied to the watcher.
+The scan becomes a reducer/effect cycle:
+
+1. The reducer derives a read plan from current state. Settled numbered and
+   immutable entries with a matching current-generation identity retain the
+   O(1) fast path; the classic mutable file still requests a full digest.
+2. The effect layer gathers one complete immutable observation batch through
+   the pinned directory/file descriptors (enumeration, stat, header, digest).
+   It never mutates semantic state.
+3. The reducer applies the complete batch synchronously, after every later
+   candidate has been classified as changed, duplicate, incomplete, or absent.
+   It returns ordered log, lifecycle, and emission intents tagged with the
+   folder-generation id.
+4. Before yielding an emission, the driver performs the existing folder-
+   identity revalidation. The yield result returns to the reducer as an event;
+   only a successful yield transitions `ready` to `settled(.emittedNow)` and
+   updates `lastEmittedDigestByName`. A generation mismatch discards the old
+   intent and replaces `GenerationState` wholesale.
+
+No semantic mutation occurs outside the reducer. Consumer-side verification
+of the emitted file identity/digest remains unchanged and continues to close
+the residual path-resolution race after yield.
 
 ### 2.2 Type-separated evidence (kills P1-1)
 
-- `emittedThisGeneration: Set<String>` — **ordering evidence**. Derived from
-  states (`settled(.emittedNow)`); dies with the folder generation; drives
-  blocker accounting and the high-water mark.
+- `emittedThisGeneration` — a **derived projection**, never a stored set. It
+  consists of names in `settled(.emittedNow)`; it dies with the folder
+  generation and drives blocker accounting and the derived high-water mark.
 - `lastEmittedDigestByName: [String: String]` — **dedup evidence**. Latest
   digest per name, overwritten at each emission; **survives folder
   generations** (content-bound, per the documented asymmetry with
@@ -75,9 +119,9 @@ ledgered simplification constraints, applied to the watcher.
 Latest-per-name is deliberate and test-pinned: A→B→A re-emits A (a stacker
 legitimately returning to earlier content must not freeze the broadcast), and
 a global digest set would suppress Siril's byte-identical consecutive
-revisions, punching holes the order machinery would then fight. The name
-`contentDigestsEverEmitted` must not appear anywhere — it reads as set
-semantics.
+revisions, punching holes the order machinery would then fight. No plural or
+"ever emitted" alternative name is permitted; either would imply set semantics
+rather than the approved latest-per-name contract.
 
 - `lastEmittedIdentity` (the immutable fast-path) is carried in the
   `Settlement` payloads (§2.5) and dies with the generation, unchanged.
@@ -154,13 +198,25 @@ cost-model test — plus the full watcher suite. The sanctioned exceptions are
 listed in §3.5 (deliberate reseed-contract changes) and harness-mechanical
 edits only.
 
+The reducer additionally gets deterministic pins for both review-12 P1 traces,
+victim disappearance/reappearance, state-specific absence, whole-generation
+replacement, both settlement fast paths, classic A→(transient B)→A, and
+stale-generation effect rejection. Table/property tests assert that within one
+generation: the derived high-water never decreases; `activeBlocker` exists iff
+the episode invariant in §2.3 holds; no higher revision emits behind a blocker;
+and generation replacement preserves only `lastEmittedDigestByName`.
+
 ## 3. The reseed/master contract (kills P1-3)
 
 ### 3.1 Two ledgers, explicitly named
 
 - **Session history** (monotone; reseed never touches it): accepted/rejected
-  counts, snapshot records, integration wall-time. Already structured this way
-  in `StackEngine` (`acceptedCount` etc. documented session-monotone).
+  engine counts and snapshot records. Engine accepted count, engine rejected
+  count, and durable `snapshots.count` are three distinct facts: a snapshot
+  persistence failure can make accepted count exceed snapshot count, and no
+  rejected count is persisted today. The final manifest therefore gains
+  explicit optional session accepted/rejected totals; snapshots remain their
+  own durable ledger. Fields are optional for legacy decoding.
 - **Current stack** (reset by manual or automatic reseed): accumulator,
   reference, `stackFrameCount`. Current-stack **exposure is derived**
   (`stackFrameCount × profile.subExposureSeconds`), not a fourth ledger
@@ -207,7 +263,10 @@ session. Across a **failed** `end()` (`shutdownTimeout`: session stays
 `.running`, `end()` retryable) the barrier **stays claimed** — a reseed
 between a failed end and its retry has no legitimate use and reopens the
 race. `masterExpected` stays session-semantic and immutable (review-11,
-unchanged); the master-before-`endSession()` commit ordering is untouched.
+unchanged); under this contract it means that the native current-stack master
+policy applies, not that every ended native session unconditionally has an
+artifact. `master_outcome` supplies the exhaustive final requirement. The
+master-before-`endSession()` commit ordering is untouched.
 
 ### 3.4 Honest outcomes: `master_outcome` manifest field + logs
 
@@ -223,11 +282,6 @@ The manifest records `master_outcome` at end, from the atomic snapshot:
   attribute auto-reseed to the operator;
 - `masterExpected == false` → the watcher-mode line, unchanged.
 
-**Product note (ledger, not contract):** a reseed near session end now
-provably discards the night's durable master (snapshots survive). A future
-UI affordance — "checkpoint master before reseed" — can restore that without
-touching this contract.
-
 ### 3.5 Header and manifest truth: store the count, derive the exposure (refinement 4)
 
 `STACKCNT` = current-stack frame count from the atomic snapshot; `TOTALEXP`
@@ -236,16 +290,18 @@ is **derived** at its consumers as `stack_frame_count × subExposureSeconds`
 exposure field would recreate the derivable-drift pair eliminated for the
 high-water mark). Today's header mixes provenance (`STACKCNT` = session total
 at SessionPipeline.swift:583 while `TOTALEXP` is already current-stack at
-:578); the change is one provenance flip. The manifest stores
-`stack_frame_count` plus the session accepted/rejected finals from the same
-`finalizationState()` snapshot; snapshot records retain session history,
-unchanged.
+:578); the change is one provenance flip. The manifest stores optional
+`stack_frame_count` plus optional session accepted/rejected finals from the
+same `finalizationState()` snapshot; snapshot records retain their separate
+durable history, unchanged. Running and legacy manifests may omit these
+final-only fields.
 
 ### 3.6 Oracle clause 5 (non-circular)
 
 Clause 5 becomes: `end_time set && masterExpected` ⇒ `master_outcome`
-present and consistent: `written` ⇒ `master.fit` durable **and decodes** and
-its `STACKCNT == stack_frame_count`; `awaiting_seed` / `no_frames` ⇒ honest
+present and consistent: `written` ⇒ `master.fit` is a regular, nonempty file,
+**decodes structurally as FITS**, and its `STACKCNT == stack_frame_count`;
+`awaiting_seed` / `no_frames` ⇒ honest
 log line matches (clause 6 patterns per §3.4) and no master required. The
 outcome is a recorded fact from the atomic snapshot, never an echo of write
 success — a failed native master write still trips clause 5 (`.active` count
@@ -267,8 +323,10 @@ to commit (`end_time` nil); the no-reseed case stays byte-identical.
 
 ### 3.7 Reseed enforcement on finite imports (amendment 2)
 
-`SessionPipeline.reseed()` no-ops with an honest log when
-`source?.isFinite == true`. The batch contract ("MUST NOT mutate the engine
+`SessionPipeline.reseed()` rejects the request with a typed
+`reseedUnavailableDuringImport` result/error (and an honest app-level log) when
+`source?.isFinite == true`; a caller must not have to infer rejection from a
+silent no-op. The batch contract ("MUST NOT mutate the engine
 during the concurrent phase") is today documentation plus UI gating only;
 violating it is a genuine data race (`register()` reads reference state
 lock-free). This converts the documented contract into a checked one; live
@@ -276,8 +334,9 @@ mode is unchanged.
 
 ## 4. The review-12 P2 wave (separate, conventional, after this lands)
 
-Oracle decodes `master.fit` (clause 5 currently passes a directory/empty/garbage
-file); handshake watchdog extended to cover transport connect; send-chain
+The oracle master validation is part of §3 because the reseed/master contract
+depends on it. The remaining conventional wave is: handshake watchdog extended
+to cover transport connect; send-chain
 abandon on reconnect (one stuck send must not poison Retry — BroadcastController
 must not skip reconnecting while claiming connected); import enumeration errors
 surface instead of becoming `[]` (an unreadable folder must not end as a
