@@ -513,11 +513,15 @@ final class FaultMatrixLifecycleTests: XCTestCase {
         let record = SnapshotRecord(index: 0, timestamp: Date(), sourceFile: "sub_000.fit",
                                     snapshotFile: pngName, estimatedIntegrationSeconds: 120,
                                     width: 2, height: 2, mean: 0.1, median: 0.08, stddev: 0.02)
-        let dishonest = SessionManifest(
+        var dishonest = SessionManifest(
             sessionId: "dishonest", targetName: "T", startTime: Date(), endTime: Date(),
             subExposureSeconds: 120, bortle: 7, locationLabel: "L", telescope: "T",
             camera: "C", mount: "M", filter: "F", notes: "", snapshots: [record],
             masterExpected: true)
+        dishonest.masterOutcome = .written
+        dishonest.stackFrameCount = 1
+        dishonest.sessionAcceptedCount = 1
+        dishonest.sessionRejectedCount = 0
         try ManifestCoding.encoder().encode(dishonest)
             .write(to: root.appendingPathComponent("manifest.json"))
         XCTExpectFailure("clause 5 must trip: ended + masterExpected + frames recorded, but no master.fit") {

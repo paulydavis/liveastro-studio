@@ -25,18 +25,15 @@ struct OracleExpectations {
 ///   (4) finalization inputs are readable AND decodable: every listed snapshot PNG opens as a real
 ///       image (CGImageSource decodes at least one frame) — non-empty bytes are not enough; a listed
 ///       snapshot that is garbage/text fails here (recoverable output path).
-///   (5) unpersisted work is never reported successful: a manifest with `end_time` set (claims the
-///       session ended) that PROMISED a master (`master_expected == true`, set immutably at session
-///       START from session semantics — native ⇒ true, watcher ⇒ false; review11 finding 2) and
-///       recorded at least one frame MUST have a durable `master.fit`. Watcher sessions honestly
-///       expect none (the stack lives with the external stacker). A zero-frame native session
-///       writes no master and says so in the log — the clause keys on masterExpected && frames
-///       recorded, so the empty session is exempt while a failed native master write still trips
-///       (the field is immutable; a failure can never exempt itself). LEGACY manifests (field
-///       absent → nil) are decodable and SKIP this clause: a pre-schema session carries no mode
-///       marker, so a missing master cannot be distinguished from an honest watcher session —
-///       assuming native would retroactively fail every archived watcher session. A running
-///       session — end_time nil — is exempt.
+///   (5) unpersisted work is never reported successful: an ended native manifest
+///       (`master_expected == true`) must make one typed claim. `.written` requires a durable,
+///       decodable `master.fit` whose FITS `STACKCNT` matches `stack_frame_count`; `.awaiting_seed`
+///       and `.no_frames` require `stack_frame_count == 0` plus the matching honest log. Watcher
+///       sessions honestly expect none (the stack lives with the external stacker). LEGACY ended
+///       native manifests with `master_expected == true` but no typed outcome fall back to the
+///       review-11 rule: snapshots imply a required master. Ancient manifests with no
+///       `master_expected` remain era-exempt because mode is unknowable. A running session
+///       (`end_time == nil`) is exempt.
 ///   (6) the log matches `lossLogPattern` when set.
 func assertSessionOracle(sessionRoot: URL, log: [String],
                          _ e: OracleExpectations,
@@ -86,17 +83,50 @@ func assertSessionOracle(sessionRoot: URL, log: [String],
         }
     }
 
-    // Clause 5: unpersisted work never reported successful — an ended claim that PROMISED a
-    // master (masterExpected, immutable since session start) and recorded frames needs the
-    // durable master.fit. Watcher sessions (false) and legacy manifests (nil — pre-schema,
-    // mode unknowable) are exempt by documented policy; zero-frame sessions wrote no master
-    // and recorded that fact (empty snapshots + honest log).
-    if manifest.endTime != nil, manifest.masterExpected == true, !manifest.snapshots.isEmpty {
-        let master = sessionRoot.appendingPathComponent("master.fit")
-        XCTAssertTrue(fm.fileExists(atPath: master.path),
-                      "oracle clause 5: manifest has end_time (claims ended), promised a master "
-                      + "(master_expected), and recorded frames — but no persisted master.fit",
-                      file: file, line: line)
+    // Clause 5: unpersisted work never reported successful — typed post-schema outcomes are
+    // checked against the actual durable artifact/log, while documented legacy eras keep their
+    // compatibility behavior.
+    if manifest.endTime != nil, manifest.masterExpected == true {
+        switch manifest.masterOutcome {
+        case .written?:
+            guard let stackFrameCount = manifest.stackFrameCount else {
+                XCTFail("oracle clause 5: written master outcome lacks stack_frame_count",
+                        file: file, line: line)
+                break
+            }
+            assertDecodableMaster(
+                sessionRoot: sessionRoot,
+                expectedStackCount: stackFrameCount,
+                file: file,
+                line: line)
+        case .awaitingSeed?:
+            XCTAssertEqual(manifest.stackFrameCount, 0,
+                           "oracle clause 5: awaiting_seed outcome must record stack_frame_count == 0",
+                           file: file, line: line)
+            assertLogContains(
+                "reference cleared by reseed (manual or automatic) and never re-seeded",
+                log: log,
+                message: "oracle clause 5: awaiting_seed outcome lacks honest reseed/no-master log",
+                file: file,
+                line: line)
+        case .noFrames?:
+            XCTAssertEqual(manifest.stackFrameCount, 0,
+                           "oracle clause 5: no_frames outcome must record stack_frame_count == 0",
+                           file: file, line: line)
+            assertLogContainsExactly(
+                "no frames accepted — no master written",
+                log: log,
+                message: "oracle clause 5: no_frames outcome lacks honest no-master log",
+                file: file,
+                line: line)
+        case nil:
+            if !manifest.snapshots.isEmpty {
+                let master = sessionRoot.appendingPathComponent("master.fit")
+                XCTAssertTrue(fm.fileExists(atPath: master.path),
+                              "oracle clause 5: legacy ended native manifest has snapshots but no persisted master.fit",
+                              file: file, line: line)
+            }
+        }
     }
 
     // Clause 6: the log identifies the loss/degradation when one is expected.
@@ -107,4 +137,56 @@ func assertSessionOracle(sessionRoot: URL, log: [String],
                       "oracle clause 6: log does not match loss pattern /\(pattern)/\nlog:\n\(joined)",
                       file: file, line: line)
     }
+}
+
+private func assertDecodableMaster(sessionRoot: URL,
+                                   expectedStackCount: Int,
+                                   file: StaticString,
+                                   line: UInt) {
+    let master = sessionRoot.appendingPathComponent("master.fit")
+    let values = try? master.resourceValues(forKeys: [.isRegularFileKey])
+    XCTAssertEqual(values?.isRegularFile, true,
+                   "oracle clause 5: written outcome master.fit is not a regular file",
+                   file: file, line: line)
+    guard let bytes = try? Data(contentsOf: master), !bytes.isEmpty else {
+        XCTFail("oracle clause 5: written outcome has no readable master.fit",
+                file: file, line: line)
+        return
+    }
+    guard let header = try? FITSReader.readHeader(bytes) else {
+        XCTFail("oracle clause 5: master.fit header is not decodable FITS",
+                file: file, line: line)
+        return
+    }
+    guard (try? FITSReader.read(bytes)) != nil else {
+        XCTFail("oracle clause 5: master.fit pixels are not decodable FITS",
+                file: file, line: line)
+        return
+    }
+    guard let raw = header.keywords["STACKCNT"], let stackCount = Int(raw) else {
+        XCTFail("oracle clause 5: written master lacks integer STACKCNT",
+                file: file, line: line)
+        return
+    }
+    XCTAssertEqual(stackCount, expectedStackCount,
+                   "oracle clause 5: master STACKCNT \(stackCount) != manifest stack_frame_count \(expectedStackCount)",
+                   file: file, line: line)
+}
+
+private func assertLogContains(_ needle: String,
+                               log: [String],
+                               message: String,
+                               file: StaticString,
+                               line: UInt) {
+    let matched = log.contains { $0.contains(needle) }
+    XCTAssertTrue(matched, "\(message)\nlog:\n\(log.joined(separator: "\n"))", file: file, line: line)
+}
+
+private func assertLogContainsExactly(_ expected: String,
+                                      log: [String],
+                                      message: String,
+                                      file: StaticString,
+                                      line: UInt) {
+    let matched = log.contains { $0 == expected }
+    XCTAssertTrue(matched, "\(message)\nlog:\n\(log.joined(separator: "\n"))", file: file, line: line)
 }
