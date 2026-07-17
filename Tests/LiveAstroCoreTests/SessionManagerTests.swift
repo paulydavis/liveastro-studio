@@ -65,6 +65,55 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertNotNil(loaded.endTime)
     }
 
+    func testEndSessionPersistsFinalizationFactsWithEndTime() throws {
+        let mgr = SessionManager(rootDirectory: tmp)
+        let dir = try mgr.startSession(profile: profile)
+        let end = ISO8601DateFormatter().date(from: "2026-07-06T04:15:00Z")!
+        let facts = SessionFinalizationFacts(masterOutcome: .written, stackFrameCount: 3,
+                                             sessionAcceptedCount: 7, sessionRejectedCount: 2)
+
+        try mgr.endSession(at: end, finalization: facts)
+
+        XCTAssertEqual(mgr.state, .ended)
+        let loaded = try ManifestCoding.decoder()
+            .decode(SessionManifest.self, from: Data(contentsOf: dir.appendingPathComponent("manifest.json")))
+        XCTAssertEqual(loaded.endTime, end)
+        XCTAssertEqual(loaded.masterOutcome, .written)
+        XCTAssertEqual(loaded.stackFrameCount, 3)
+        XCTAssertEqual(loaded.sessionAcceptedCount, 7)
+        XCTAssertEqual(loaded.sessionRejectedCount, 2)
+    }
+
+    func testLegacyManifestWithoutFinalizationFactsDecodesWithNilFields() throws {
+        let legacy = """
+        {
+          "session_id": "legacy-session",
+          "target_name": "NGC 6888",
+          "start_time": "2026-07-05T22:15:00Z",
+          "end_time": null,
+          "sub_exposure_seconds": 120,
+          "bortle": 7,
+          "location_label": "Round Rock, TX",
+          "telescope": "120 APO",
+          "camera": "ASI2600MC Air",
+          "mount": "AM5N",
+          "filter": "Dual-band",
+          "notes": "",
+          "snapshots": [],
+          "master_expected": true
+        }
+        """
+
+        let decoded = try ManifestCoding.decoder()
+            .decode(SessionManifest.self, from: Data(legacy.utf8))
+
+        XCTAssertEqual(decoded.masterExpected, true)
+        XCTAssertNil(decoded.masterOutcome)
+        XCTAssertNil(decoded.stackFrameCount)
+        XCTAssertNil(decoded.sessionAcceptedCount)
+        XCTAssertNil(decoded.sessionRejectedCount)
+    }
+
     func testRecordBeforeStartThrows() {
         let mgr = SessionManager(rootDirectory: tmp)
         let rec = SnapshotRecord(index: 1, timestamp: Date(), sourceFile: "a", snapshotFile: "b",
@@ -129,6 +178,23 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertThrowsError(try mgr.endSession())
         XCTAssertEqual(mgr.state, .running, "failed end must not mark the session ended")
         XCTAssertNil(mgr.manifest?.endTime, "failed end must not set endTime in memory")
+    }
+
+    func testEndSessionFinalizationPersistFailureLeavesInMemoryManifestUnchanged() throws {
+        let mgr = SessionManager(rootDirectory: tmp)
+        _ = try mgr.startSession(profile: profile)
+        mgr.manifestWriter = { _, _ in throw CocoaError(.fileWriteUnknown) }
+        let facts = SessionFinalizationFacts(masterOutcome: .written, stackFrameCount: 3,
+                                             sessionAcceptedCount: 7, sessionRejectedCount: 2)
+
+        XCTAssertThrowsError(try mgr.endSession(finalization: facts))
+
+        XCTAssertEqual(mgr.state, .running, "failed end must not mark the session ended")
+        XCTAssertNil(mgr.manifest?.endTime, "failed end must not set endTime in memory")
+        XCTAssertNil(mgr.manifest?.masterOutcome, "failed end must not set masterOutcome in memory")
+        XCTAssertNil(mgr.manifest?.stackFrameCount, "failed end must not set stackFrameCount in memory")
+        XCTAssertNil(mgr.manifest?.sessionAcceptedCount, "failed end must not set accepted count in memory")
+        XCTAssertNil(mgr.manifest?.sessionRejectedCount, "failed end must not set rejected count in memory")
     }
 
     func testCaptionFormat() {

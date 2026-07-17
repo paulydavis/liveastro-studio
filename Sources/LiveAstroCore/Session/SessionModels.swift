@@ -43,6 +43,27 @@ public struct SnapshotRecord: Codable, Equatable {
     }
 }
 
+public enum MasterOutcome: String, Codable, Equatable {
+    case written
+    case awaitingSeed = "awaiting_seed"
+    case noFrames = "no_frames"
+}
+
+public struct SessionFinalizationFacts: Equatable {
+    public let masterOutcome: MasterOutcome
+    public let stackFrameCount: Int
+    public let sessionAcceptedCount: Int
+    public let sessionRejectedCount: Int
+
+    public init(masterOutcome: MasterOutcome, stackFrameCount: Int,
+                sessionAcceptedCount: Int, sessionRejectedCount: Int) {
+        self.masterOutcome = masterOutcome
+        self.stackFrameCount = stackFrameCount
+        self.sessionAcceptedCount = sessionAcceptedCount
+        self.sessionRejectedCount = sessionRejectedCount
+    }
+}
+
 public struct SessionManifest: Codable, Equatable {
     public let sessionId: String
     public var targetName: String
@@ -66,6 +87,14 @@ public struct SessionManifest: Codable, Equatable {
     /// pre-schema session carries no mode marker, so a missing master cannot be distinguished
     /// from an honest watcher session; see OracleAssert clause 5).
     public var masterExpected: Bool? = nil
+
+    /// Final-only stack/session facts, persisted atomically with `endTime`. Optional for backward
+    /// compatibility: legacy manifests decode with these absent and current callers that do not
+    /// finalize a native stack leave them nil.
+    public var masterOutcome: MasterOutcome? = nil
+    public var stackFrameCount: Int? = nil
+    public var sessionAcceptedCount: Int? = nil
+    public var sessionRejectedCount: Int? = nil
 }
 
 public enum ManifestCoding {
