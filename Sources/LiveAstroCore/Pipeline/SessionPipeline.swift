@@ -107,6 +107,8 @@ public final class SessionPipeline {
     private var recorder: SnapshotRecorder?
     private var consumeTask: Task<Void, Never>?
     private let consumeDone = DispatchSemaphore(value: 0)
+    private let finalizationLock = NSLock()
+    private var finalizationClaimed = false
     /// Drain deadlines for end() (P1-3). Internal so tests can shrink them; production uses 10s/5s.
     var drainPrimaryTimeout: DispatchTimeInterval = .seconds(10)
     var drainGraceTimeout: DispatchTimeInterval = .seconds(5)
@@ -170,8 +172,21 @@ public final class SessionPipeline {
         watcher?.stop()
     }
 
+    public enum ReseedResult: Equatable {
+        case reseeded, notNative, unavailableDuringImport, finalizationInProgress
+    }
+
     /// Reseeds the stacking engine, discarding the current reference frame (native mode only).
-    public func reseed() { engine?.reseed() }
+    @discardableResult
+    public func reseed() -> ReseedResult {
+        guard let engine else { return .notNative }
+        return finalizationLock.withLock {
+            guard !finalizationClaimed else { return .finalizationInProgress }
+            guard source?.isFinite != true else { return .unavailableDuringImport }
+            engine.reseed()
+            return .reseeded
+        }
+    }
 
     /// Cancel an in-progress import: stops feeding new frames; end() finalizes
     /// whatever completed into a valid master.fit + replay (not a hard abort).
@@ -529,6 +544,7 @@ public final class SessionPipeline {
         // threw notRunning from endSession(). A FAILED first end() (shutdownTimeout,
         // master-write failure) leaves the session .running, so retry is unaffected.
         guard session.state == .running else { throw SessionError.notRunning }
+        finalizationLock.withLock { finalizationClaimed = true }
         if source != nil {
             if source?.isFinite ?? false {
                 // Import: the stream ends on its own; drain it completely while frames
@@ -576,28 +592,45 @@ public final class SessionPipeline {
         // (display path uses additive+multiplicative; the saved master gets additive-only so
         // colour ratios stay physically calibratable). Crop happens BEFORE balance so balance
         // operates on the final spatial extent.
+        var finalization: SessionFinalizationFacts?
         if let eng = engine {
-            if let master0 = eng.currentStack() {
-                let master = cropMaster(master0, coverage: eng.currentCoverage())   // crop BEFORE balance
+            let final = try eng.finalizationState()
+            let outcome: MasterOutcome
+            switch final.stackState {
+            case .active:
+                guard let master0 = final.image else {
+                    throw StackEngine.FinalizationError.invariantBreach
+                }
+                let master = cropMaster(master0, coverage: final.coverage)   // crop BEFORE balance
                 let balanced = neutralizeBackground
                     ? AutoStretch.neutralizeBackgroundAdditive(master)
                     : master
-                let totalExp = Double(eng.stackFrameCount) * profile.subExposureSeconds
+                let totalExp = Double(final.frameCount) * profile.subExposureSeconds
                 let masterData = FITSWriter.float32(
                     width: balanced.width, height: balanced.height,
                     channels: balanced.channels, pixels: balanced.pixels,
                     metadata: sourceMetadata,
-                    stackCount: eng.acceptedCount,
+                    stackCount: final.frameCount,
                     totalExposureSeconds: totalExp)
                 try masterData.write(to: dir.appendingPathComponent("master.fit"))
-            } else {
+                outcome = .written
+            case .awaitingSeedAfterReseed:
+                onLog?("reference cleared by reseed (manual or automatic) and never re-seeded — no master available (\(final.sessionAcceptedCount) snapshots retained)")
+                outcome = .awaitingSeed
+            case .initialEmpty:
                 // Review11 finding 2, empty native session: zero accepted frames — there is
                 // no stack to persist. `masterExpected` stays true (immutable since start);
                 // the manifest records the zero-frame fact (empty snapshots) and the oracle's
                 // clause 5 keys on masterExpected && frames recorded, so ending without a
                 // master here is honest — and it is SAID, not silent.
                 onLog?("no frames accepted — no master written")
+                outcome = .noFrames
             }
+            finalization = SessionFinalizationFacts(
+                masterOutcome: outcome,
+                stackFrameCount: final.frameCount,
+                sessionAcceptedCount: final.sessionAcceptedCount,
+                sessionRejectedCount: final.sessionRejectedCount)
         } else {
             // Review11 finding 2, watcher mode: the stack is the external stacker's artifact;
             // this session never promises a master (masterExpected == false since start).
@@ -605,7 +638,7 @@ public final class SessionPipeline {
             onLog?("watcher session — the stack lives with the external stacker; no master.fit")
         }
         // Commit point: master.fit is durable (native mode), so stamping end_time is now honest.
-        try session.endSession()
+        try session.endSession(finalization: finalization)
         return try ReplayService.regenerate(sessionDirectory: dir,
                                             replaySettings: replaySettings,
                                             maxKeyframes: maxKeyframes)

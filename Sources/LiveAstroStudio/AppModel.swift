@@ -389,9 +389,17 @@ final class AppModel {
 
     /// Reseeds the stacking engine reference frame (native mode only).
     func reseedReference() {
-        guard isRunning && sourceMode == .nativeStack && !importer.isGeneratingReplay else { return }
-        pipeline?.reseed()
-        log.append("reference reseeded")
+        guard isRunning && sourceMode == .nativeStack else { return }
+        guard !importer.isGeneratingReplay else {
+            log.append("reseed refused — session finalization has begun")
+            return
+        }
+        switch pipeline?.reseed() {
+        case .reseeded?: log.append("reference reseeded")
+        case .unavailableDuringImport?: log.append("reseed unavailable while an import is running")
+        case .finalizationInProgress?: log.append("reseed refused — session finalization has begun")
+        case .notNative?, nil: log.append("reseed unavailable — no native stack is active")
+        }
     }
 
     func endSession() {
