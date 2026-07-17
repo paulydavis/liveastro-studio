@@ -28,6 +28,19 @@ internal final class LiveDecodeSeams: @unchecked Sendable {
     var decodeCount: Int { lock.withLock { decodes } }
 }
 
+/// Lock-guarded log relay (review11 finding 5): lets a closure created in init log through
+/// whatever sink is CURRENTLY assigned to `onLog` (assigned after init; may change; may be
+/// read from the consumer's pull task while the owner reassigns it).
+internal final class LogRelayBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sink: ((String) -> Void)?
+    var current: ((String) -> Void)? {
+        get { lock.withLock { sink } }
+        set { lock.withLock { sink = newValue } }
+    }
+    func emit(_ line: String) { current?(line) }
+}
+
 /// Reads raw frames from a folder, either as a one-shot import or by watching for new files.
 ///
 /// BOTH modes are PULL-based (`AsyncStream(unfolding:)`): one file is decoded per consumer
@@ -45,11 +58,19 @@ public final class FolderFrameSource: FrameSource {
     public var isFinite: Bool { mode == .importOnce }
     public let totalCount: Int?
     /// Logging seam (mirrors FrameRelay.onLog). Forwarded to the inner StackFileWatcher
-    /// when in live mode so folder-disappearance events surface in the app log, and to
-    /// the pull-time decoder so identity-mismatch skips surface there too.
+    /// when in live mode so folder-disappearance events surface in the app log, to the
+    /// pull-time decoder so identity-mismatch and drop skips surface there too, and to the
+    /// import pull closure (review11 finding 5) so import-mode drops are never silent.
     public var onLog: ((String) -> Void)? {
-        didSet { livePull?.log = onLog }
+        didSet {
+            livePull?.log = onLog
+            importLog?.current = onLog
+        }
     }
+    /// Import mode only (review11 finding 5): lock-guarded relay behind the pull closure —
+    /// the AsyncStream unfolding closure is created in init, BEFORE `onLog` can be assigned,
+    /// so it logs through this box and the didSet above keeps it current.
+    private let importLog: LogRelayBox?
     /// Live mode only: continuation of the LIGHT update buffer (never RawFrames).
     private let liveUpdateContinuation: AsyncStream<StackUpdate>.Continuation?
     /// Live mode only: the pull-time decoder behind `frames`.
@@ -113,12 +134,19 @@ public final class FolderFrameSource: FrameSource {
             self.totalCount = cursor.fileCount
             self.liveUpdateContinuation = nil
             self.livePull = nil
-            // One file is read per pull; unreadable files are skipped without buffering.
+            let logBox = LogRelayBox()
+            self.importLog = logBox
+            // One file is read per pull; a file that cannot be loaded (deleted, unreadable,
+            // corrupt, undecodable) is skipped WITH an honest log line naming the file and
+            // the reason (review11 finding 5 — pre-fix `try?` dropped frames silently), and
+            // the pull advances to the next file: one frame lost, never the session.
             self.frames = AsyncStream(unfolding: {
                 while !Task.isCancelled {
                     guard let url = cursor.next() else { return nil }
-                    if let frame = try? FolderFrameSource.loadRawFrame(url: url) {
-                        return frame
+                    do {
+                        return try FolderFrameSource.loadRawFrame(url: url)
+                    } catch {
+                        logBox.emit("Skipped frame (\(url.lastPathComponent)): \(error)")
                     }
                 }
                 return nil
@@ -127,6 +155,7 @@ public final class FolderFrameSource: FrameSource {
         case .live:
             self.importCursor = nil
             self.totalCount = nil
+            self.importLog = nil
             var cont: AsyncStream<StackUpdate>.Continuation!
             // AsyncStream's init runs this closure synchronously; cont is non-nil here.
             let updates = AsyncStream<StackUpdate> { cont = $0 }
@@ -354,9 +383,11 @@ public final class FolderFrameSource: FrameSource {
     /// Load one watcher-emitted update into a RawFrame, enforcing the identity the watcher
     /// captured on its pinned per-file descriptor (review5 item 1). Returns nil when the frame
     /// must be skipped: an identity mismatch (the file changed between the watcher's validation
-    /// and this read — logged honestly; a boundary failure may lose one frame, never the
-    /// session) or an unreadable/undecodable file (pre-existing silent-skip behavior).
-    /// Internal seam so the skip-vs-deliver decision is deterministically unit-testable.
+    /// and this read) or an unreadable/undecodable file (deleted between emit and pull,
+    /// permission failure, corruption, decode failure). EVERY skip is logged with the filename
+    /// and the reason (review11 finding 5 — the generic path used to be silent): a boundary
+    /// failure may lose one frame, never the session, and the loss must appear honestly in
+    /// the log. Internal seam so the skip-vs-deliver decision is deterministically testable.
     static func frame(for update: StackUpdate, log: ((String) -> Void)?) -> RawFrame? {
         do {
             return try loadRawFrame(url: update.url, expectedIdentity: update.identity)
@@ -364,6 +395,7 @@ public final class FolderFrameSource: FrameSource {
             log?("file changed between validation and read — skipping \(mismatch.fileName)")
             return nil
         } catch {
+            log?("Skipped frame (\(update.url.lastPathComponent)): \(error)")
             return nil
         }
     }

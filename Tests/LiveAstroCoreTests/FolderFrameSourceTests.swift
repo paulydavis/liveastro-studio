@@ -193,6 +193,139 @@ final class FolderFrameSourceTests: XCTestCase {
         }
     }
 
+    // MARK: - review11 finding 5: no silent frame loss — every drop is logged with a reason
+
+    /// Review11 finding 5 (P2, red-first): import mode swallowed every non-identity load
+    /// error with `try?` — a file DELETED between the snapshot and the pull lost a frame
+    /// with NO log line (pre-fix this test's log assertions failed: the drop was silent).
+    /// Every drop must log the FILENAME and a REASON, and the following valid frame must
+    /// still be delivered — a boundary failure loses one frame, never the session.
+    func testImportMode_deletedFile_loggedWithFilenameAndReason_nextFrameDelivered() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let doomed = try writeFITS(dir, name: "Light_1.fit", value: 0.1)
+        _ = try writeFITS(dir, name: "Light_2.fit", value: 0.2)
+
+        // The cursor snapshots eagerly at init; the file vanishes before the pull.
+        let source = FolderFrameSource(folder: dir, mode: .importOnce, fileNamePrefix: "Light_")
+        let logs = LogBox()
+        source.onLog = { logs.append($0) }
+        try FileManager.default.removeItem(at: doomed)
+        try source.start()
+
+        var names: [String] = []
+        for await frame in source.frames { names.append(frame.sourceName) }
+        XCTAssertEqual(names, ["Light_2.fit"],
+                       "the deleted frame is lost; the following valid frame is still delivered")
+        let dropLines = logs.all.filter { $0.contains("Light_1.fit") }
+        XCTAssertEqual(dropLines.count, 1,
+                       "the drop must appear in the log exactly once, naming the file — got \(logs.all)")
+        XCTAssertTrue(dropLines.first?.contains("Skipped frame (Light_1.fit): ") == true,
+                      "the log must carry the thrown error as the reason — got \(dropLines)")
+    }
+
+    /// Review11 finding 5, import × undecodable: garbage bytes wearing a .fit extension are
+    /// dropped WITH a logged filename + reason, and the next valid frame is delivered.
+    /// Pre-fix: silent (`try?`).
+    func testImportMode_undecodableFile_loggedWithFilenameAndReason_nextFrameDelivered() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try Data("this is not a FITS file at all — corrupt garbage".utf8)
+            .write(to: dir.appendingPathComponent("Light_1.fit"))
+        _ = try writeFITS(dir, name: "Light_2.fit", value: 0.2)
+
+        let source = FolderFrameSource(folder: dir, mode: .importOnce, fileNamePrefix: "Light_")
+        let logs = LogBox()
+        source.onLog = { logs.append($0) }
+        try source.start()
+
+        var names: [String] = []
+        for await frame in source.frames { names.append(frame.sourceName) }
+        XCTAssertEqual(names, ["Light_2.fit"],
+                       "the undecodable frame is lost; the session continues to the next frame")
+        let dropLines = logs.all.filter { $0.contains("Light_1.fit") }
+        XCTAssertEqual(dropLines.count, 1,
+                       "the drop must appear in the log exactly once, naming the file — got \(logs.all)")
+        XCTAssertTrue(dropLines.first?.contains("Skipped frame (Light_1.fit): ") == true,
+                      "the log must carry the decode error as the reason — got \(dropLines)")
+    }
+
+    /// Review11 finding 5, live × unreadable: a buffered update whose file is DELETED
+    /// between the watcher's emit and the consumer's pull. Pre-fix only the identity-
+    /// MISMATCH path logged; the open failure fell into a silent `return nil`. The drop
+    /// must log filename + reason and the next update must still be delivered.
+    func testLiveMode_fileDeletedBeforePull_loggedWithFilenameAndReason_nextDelivered() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let a = try writeFITS(dir, name: "Light_a.fit", value: 0.1)
+        _ = try writeFITS(dir, name: "Light_b.fit", value: 0.2)
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        defer { source.stop() }
+        let logs = LogBox()
+        source.onLog = { logs.append($0) }
+        let buffered = expectation(description: "2 light updates buffered")
+        buffered.expectedFulfillmentCount = 2
+        source.liveSeams.onUpdateBuffered = { _ in buffered.fulfill() }
+        try source.start()
+        await fulfillment(of: [buffered], timeout: 15)
+
+        // The file vanishes AFTER the watcher validated it, BEFORE the consumer pulls.
+        try FileManager.default.removeItem(at: a)
+
+        var it = source.frames.makeAsyncIterator()
+        let got = await it.next()
+        XCTAssertEqual(got?.sourceName, "Light_b.fit",
+                       "the vanished frame is skipped and the NEXT update delivered — " +
+                       "a lost frame must never end a live stream")
+        let dropLines = logs.all.filter { $0.contains("Light_a.fit") }
+        XCTAssertEqual(dropLines.count, 1,
+                       "the drop must appear in the log exactly once, naming the file — got \(logs.all)")
+        XCTAssertTrue(dropLines.first?.contains("Skipped frame (Light_a.fit): ") == true,
+                      "the log must carry the open error as the reason — got \(dropLines)")
+    }
+
+    /// Review11 finding 5, live × undecodable: garbage bytes wearing a .png extension pass
+    /// the watcher's gates (bitmaps have no header/completeness check — only stability and
+    /// digest), so the corruption is discovered at pull-time decode. Pre-fix that drop was
+    /// silent. It must log filename + reason; the following valid FITS is still delivered.
+    func testLiveMode_undecodableFile_loggedWithFilenameAndReason_nextDelivered() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // Sorts before Light_b.fit, so it is emitted (and pulled) first.
+        try Data("garbage that is neither PNG nor FITS".utf8)
+            .write(to: dir.appendingPathComponent("Light_a.png"))
+        _ = try writeFITS(dir, name: "Light_b.fit", value: 0.2)
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        defer { source.stop() }
+        let logs = LogBox()
+        source.onLog = { logs.append($0) }
+        let buffered = expectation(description: "2 light updates buffered")
+        buffered.expectedFulfillmentCount = 2
+        source.liveSeams.onUpdateBuffered = { _ in buffered.fulfill() }
+        try source.start()
+        await fulfillment(of: [buffered], timeout: 15)
+
+        var it = source.frames.makeAsyncIterator()
+        let got = await it.next()
+        XCTAssertEqual(got?.sourceName, "Light_b.fit",
+                       "the undecodable frame is skipped and the valid one delivered")
+        let dropLines = logs.all.filter { $0.contains("Light_a.png") }
+        XCTAssertEqual(dropLines.count, 1,
+                       "the drop must appear in the log exactly once, naming the file — got \(logs.all)")
+        XCTAssertTrue(dropLines.first?.contains("Skipped frame (Light_a.png): ") == true,
+                      "the log must carry the decode error as the reason — got \(dropLines)")
+    }
+
     // MARK: - review11 finding 3: atomic lifecycle (.starting reserved under the lock)
 
     /// Lock-guarded capture of concurrent start() outcomes.
