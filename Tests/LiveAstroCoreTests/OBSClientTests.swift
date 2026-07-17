@@ -500,6 +500,7 @@ final class OBSClientTests: XCTestCase {
     /// its own timeout.
     func testDisconnectAbandonsParkedSendChainSoReconnectRequestsAreNotPoisoned() async throws {
         let mock = MockOBSSocket()
+        mock.clearsTerminalOnConnect = true
         let client = OBSClient(socket: mock, requestTimeout: 0.1)
         try await connect(client, mock)
 

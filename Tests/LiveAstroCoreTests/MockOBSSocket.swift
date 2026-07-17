@@ -73,9 +73,13 @@ final class MockOBSSocket: OBSSocket {
 
     func connect(url: URL) async throws {
         connectStartedCount += 1
-        // A fresh connect attempt gets a fresh receive terminal state while
-        // preserving any Hello frame the test queued before calling connect.
-        await queue.resetForConnect()
+        // Most tests use terminal errors to model a dead socket that stays
+        // dead. A few OBSClient-level reconnect tests deliberately reuse the
+        // same mock as a fresh transport; they opt in to clearing the receive
+        // terminal state while preserving any queued Hello frame.
+        if clearsTerminalOnConnect {
+            await queue.resetForConnect()
+        }
         if parkConnect {
             await withCheckedContinuation { parkedConnects.append($0) }
         }
@@ -138,6 +142,9 @@ final class MockOBSSocket: OBSSocket {
     func waitForCloseEffects() async {
         await lastCloseTask?.value
     }
+
+    /// Test seam: let a single mock model a fresh transport after close.
+    var clearsTerminalOnConnect = false
 
     // MARK: - Park-send knob (review11 finding 1)
 
