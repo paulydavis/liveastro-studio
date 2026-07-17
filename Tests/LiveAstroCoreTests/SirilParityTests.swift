@@ -74,6 +74,63 @@ enum SirilParityMetrics {
     }
 }
 
+struct SirilParityDataset {
+    let root: URL
+    let lightFolder: URL
+    let lights: [URL]
+    let darks: [URL]
+    let flats: [URL]
+    let biases: [URL]
+    let sirilMaster: URL
+
+    static func fromEnvironment(environment: [String: String] = ProcessInfo.processInfo.environment) throws -> SirilParityDataset {
+        guard let rawPath = environment["LIVEASTRO_PARITY_DATASET"], !rawPath.isEmpty else {
+            throw XCTSkip("Set LIVEASTRO_PARITY_DATASET to a local Siril parity corpus to run this benchmark.")
+        }
+
+        let root = URL(fileURLWithPath: rawPath, isDirectory: true)
+        let lightFolder = root.appendingPathComponent("Brutes_180s", isDirectory: true)
+        let darkFolder = root.appendingPathComponent("Darks_180s", isDirectory: true)
+        let flatFolder = root.appendingPathComponent("Flats_3s", isDirectory: true)
+        let biasFolder = root.appendingPathComponent("Offsets_3s", isDirectory: true)
+        let sirilMaster = root.appendingPathComponent("resultat.fit")
+
+        let lights = try fitsFiles(in: lightFolder, label: "Brutes_180s")
+        let darks = try fitsFiles(in: darkFolder, label: "Darks_180s")
+        let flats = try fitsFiles(in: flatFolder, label: "Flats_3s")
+        let biases = try fitsFiles(in: biasFolder, label: "Offsets_3s")
+        guard FileManager.default.fileExists(atPath: sirilMaster.path) else {
+            throw XCTSkip("Siril parity corpus is missing resultat.fit at \(sirilMaster.path).")
+        }
+
+        return SirilParityDataset(root: root, lightFolder: lightFolder, lights: lights,
+                                  darks: darks, flats: flats, biases: biases,
+                                  sirilMaster: sirilMaster)
+    }
+
+    private static func fitsFiles(in folder: URL, label: String) throws -> [URL] {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: folder.path, isDirectory: &isDir), isDir.boolValue else {
+            throw XCTSkip("Siril parity corpus is missing \(label) at \(folder.path).")
+        }
+        let names: [String]
+        do {
+            names = try fm.contentsOfDirectory(atPath: folder.path)
+        } catch {
+            throw XCTSkip("Siril parity corpus cannot enumerate \(label): \(error)")
+        }
+        let urls = names
+            .filter { ($0 as NSString).pathExtension.lowercased() == "fit" }
+            .sorted()
+            .map { folder.appendingPathComponent($0) }
+        guard !urls.isEmpty else {
+            throw XCTSkip("Siril parity corpus has no FITS files in \(label).")
+        }
+        return urls
+    }
+}
+
 final class SirilParityMetricTests: XCTestCase {
     func testPearsonDetectsLinearAgreementAndDisagreement() {
         XCTAssertGreaterThan(SirilParityMetrics.pearson([1, 2, 3, 4], [2, 4, 6, 8]), 0.999)
@@ -94,5 +151,37 @@ final class SirilParityMetricTests: XCTestCase {
         XCTAssertEqual(lum.width, 2)
         XCTAssertEqual(lum.height, 1)
         XCTAssertEqual(lum.pixels, [Float(1.0 / 3.0), Float(1.0 / 3.0)])
+    }
+}
+
+final class SirilParityDatasetTests: XCTestCase {
+    func testDatasetLoaderReportsSkipWhenEnvMissing() {
+        XCTAssertThrowsError(try SirilParityDataset.fromEnvironment(environment: [:])) { error in
+            guard error is XCTSkip else {
+                return XCTFail("expected XCTSkip, got \(error)")
+            }
+        }
+    }
+
+    func testDatasetLoaderFindsExpectedFolders() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for name in ["Brutes_180s", "Darks_180s", "Flats_3s", "Offsets_3s"] {
+            let dir = root.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Data().write(to: dir.appendingPathComponent("one.fit"))
+        }
+        try Data().write(to: root.appendingPathComponent("resultat.fit"))
+
+        let dataset = try SirilParityDataset.fromEnvironment(
+            environment: ["LIVEASTRO_PARITY_DATASET": root.path]
+        )
+        XCTAssertEqual(dataset.lights.count, 1)
+        XCTAssertEqual(dataset.darks.count, 1)
+        XCTAssertEqual(dataset.flats.count, 1)
+        XCTAssertEqual(dataset.biases.count, 1)
+        XCTAssertEqual(dataset.sirilMaster.lastPathComponent, "resultat.fit")
     }
 }
