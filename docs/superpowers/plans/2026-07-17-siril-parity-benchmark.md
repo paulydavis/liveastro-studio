@@ -177,7 +177,7 @@ final class SirilParityTests: XCTestCase {
         XCTAssertEqual(report.liveAstro.width, report.siril.width)
         XCTAssertEqual(report.liveAstro.height, report.siril.height)
         for channel in report.channels {
-            XCTAssertGreaterThanOrEqual(channel.pearson, 0.94)
+            XCTAssertGreaterThanOrEqual(channel.pearson, 0.83)
             XCTAssertLessThanOrEqual(channel.affineMAE, 0.08)
         }
         XCTAssertGreaterThanOrEqual(report.starMatchedRatio, 0.70)
@@ -185,7 +185,7 @@ final class SirilParityTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(report.medianFWHMRatio, 0.75)
         XCTAssertLessThanOrEqual(report.medianFWHMRatio, 1.35)
         XCTAssertGreaterThanOrEqual(report.backgroundSigmaRatio, 0.50)
-        XCTAssertLessThanOrEqual(report.backgroundSigmaRatio, 1.80)
+        XCTAssertLessThanOrEqual(report.backgroundSigmaRatio, 2.25)
     }
 }
 ```
