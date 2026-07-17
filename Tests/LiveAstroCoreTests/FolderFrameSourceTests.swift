@@ -45,6 +45,23 @@ final class FolderFrameSourceTests: XCTestCase {
         XCTAssertEqual(names, ["Light_1.fit", "Light_2.fit", "Light_10.fit"])
     }
 
+    /// Phase 3: an import folder that cannot be enumerated must not become a
+    /// successful empty session. The source may still construct (init is
+    /// non-throwing), but start() is the honest failure boundary.
+    func testImportModeMissingFolderThrowsInsteadOfSuccessfulEmptyImport() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let source = FolderFrameSource(folder: dir, mode: .importOnce)
+
+        XCTAssertThrowsError(try source.start(),
+                             "missing import folder must fail loudly, not import zero frames") { error in
+            guard case FolderFrameSourceError.enumerationFailed(let message) = error else {
+                return XCTFail("expected enumerationFailed, got \(error)")
+            }
+            XCTAssertTrue(message.contains(dir.path), "error should name the folder: \(message)")
+        }
+    }
+
     func testStopMidImportEndsStreamWithoutYieldingAllFiles() async throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

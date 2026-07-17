@@ -9,6 +9,8 @@ public enum FolderFrameSourceError: Error, Equatable {
     case alreadyStarted
     /// start() after stop() — construct a new source instead.
     case stopped
+    /// importOnce could not enumerate its source folder.
+    case enumerationFailed(String)
 }
 
 /// Lock-guarded test seams for the live path (cold1 I2): a hook that fires when a LIGHT
@@ -134,8 +136,11 @@ public final class FolderFrameSource: FrameSource {
         switch mode {
         case .importOnce:
             let cursor = ImportCursor(folder: folder, fileNamePrefix: fileNamePrefix)
-            // Snapshot eagerly so totalCount is available before start() is called.
-            cursor.snapshotIfNeeded()
+            // Snapshot eagerly so totalCount is available before start() is called. If the
+            // folder cannot be enumerated, init still succeeds (API compatibility) but the
+            // cursor remembers the failure so start() can fail honestly instead of recording
+            // a successful empty import.
+            cursor.snapshotForInit()
             self.importCursor = cursor
             self.totalCount = cursor.fileCount
             self.liveUpdateContinuation = nil
@@ -149,11 +154,19 @@ public final class FolderFrameSource: FrameSource {
             // the pull advances to the next file: one frame lost, never the session.
             self.frames = AsyncStream(unfolding: {
                 while !Task.isCancelled {
-                    guard let url = cursor.next() else { return nil }
                     do {
-                        return try FolderFrameSource.loadRawFrame(url: url)
+                        guard let url = try cursor.next() else { return nil }
+                        do {
+                            return try FolderFrameSource.loadRawFrame(url: url)
+                        } catch {
+                            logBox.emit("Skipped frame (\(url.lastPathComponent)): \(error)")
+                        }
+                    } catch let error as FolderFrameSourceError {
+                        logBox.emit("Import enumeration failed (\(folder.path)): \(error)")
+                        return nil
                     } catch {
-                        logBox.emit("Skipped frame (\(url.lastPathComponent)): \(error)")
+                        logBox.emit("Import enumeration failed (\(folder.path)): \(error)")
+                        return nil
                     }
                 }
                 return nil
@@ -204,7 +217,12 @@ public final class FolderFrameSource: FrameSource {
         case .importOnce:
             // Pull-based: just snapshot the sorted file list (I/O — outside the lock);
             // loading happens per pull.
-            importCursor?.snapshotIfNeeded()
+            do {
+                try importCursor?.snapshotIfNeeded()
+            } catch {
+                stateLock.withLock { if state == .starting { state = .initial } }
+                throw error
+            }
             // Commit (or bow to a stop() that won meanwhile; the cursor is already stopped).
             try commitRunning(onCommit: {}, tearDownOnStop: {})
 
@@ -357,6 +375,7 @@ public final class FolderFrameSource: FrameSource {
         private let folder: URL
         private let fileNamePrefix: String?
         private var files: [URL]?   // nil until first snapshot
+        private var snapshotError: FolderFrameSourceError?
         private var index = 0
         private var stopped = false
 
@@ -365,8 +384,12 @@ public final class FolderFrameSource: FrameSource {
             self.fileNamePrefix = fileNamePrefix
         }
 
-        func snapshotIfNeeded() {
-            lock.withLock { snapshotLocked() }
+        func snapshotForInit() {
+            try? snapshotIfNeeded()
+        }
+
+        func snapshotIfNeeded() throws {
+            try lock.withLock { try snapshotLocked() }
         }
 
         /// Number of files in the snapshot; 0 before snapshotIfNeeded() is called.
@@ -379,10 +402,10 @@ public final class FolderFrameSource: FrameSource {
         }
 
         /// Next file to load, or nil at end of list / after stop().
-        func next() -> URL? {
-            lock.withLock {
+        func next() throws -> URL? {
+            try lock.withLock {
                 guard !stopped else { return nil }
-                snapshotLocked()
+                try snapshotLocked()
                 guard let files, index < files.count else { return nil }
                 let url = files[index]
                 index += 1
@@ -390,12 +413,20 @@ public final class FolderFrameSource: FrameSource {
             }
         }
 
-        private func snapshotLocked() {
+        private func snapshotLocked() throws {
             guard files == nil else { return }
+            if let snapshotError { throw snapshotError }
             let fm = FileManager.default
-            // An unreadable folder yields a silent empty import (stream ends with no
-            // frames); the folder's existence is validated upstream by the caller's UI.
-            let names = (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
+            let names: [String]
+            do {
+                names = try fm.contentsOfDirectory(atPath: folder.path)
+            } catch {
+                let failure = FolderFrameSourceError.enumerationFailed(
+                    "\(folder.path): \(error.localizedDescription)"
+                )
+                snapshotError = failure
+                throw failure
+            }
             files = names
                 .filter { name in
                     let ext = (name as NSString).pathExtension.lowercased()
