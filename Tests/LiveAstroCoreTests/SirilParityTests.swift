@@ -82,13 +82,13 @@ enum SirilParityMetrics {
     }
 
     static func matchedStarMetrics(reference: AstroImage,
-                                   candidate: AstroImage) throws -> (matchedRatio: Double, medianFWHMRatio: Double, backgroundSigmaRatio: Double) {
+                                   candidate: AstroImage) throws -> (starCountRatio: Double, medianFWHMRatio: Double, backgroundSigmaRatio: Double) {
         let refLum = luminance(reference)
         let candLum = luminance(candidate)
         let refStats = StarDetector.detectWithStats(luminance: refLum.pixels, width: refLum.width, height: refLum.height)
         let candStats = StarDetector.detectWithStats(luminance: candLum.pixels, width: candLum.width, height: candLum.height)
         guard !refStats.stars.isEmpty, !candStats.stars.isEmpty else {
-            throw XCTSkip("Siril parity star metrics require detectable stars in both masters.")
+            throw SirilParityBenchmarkError.noDetectableStars
         }
 
         var usedCandidate = Set<Int>()
@@ -114,11 +114,11 @@ enum SirilParityMetrics {
             }
         }
         guard !fwhmRatios.isEmpty else {
-            throw XCTSkip("Siril parity star metrics found stars but no centroid matches within 8 px.")
+            throw SirilParityBenchmarkError.noCentroidMatches
         }
 
         return (
-            matchedRatio: Double(candStats.stars.count) / Double(refStats.stars.count),
+            starCountRatio: Double(candStats.stars.count) / Double(refStats.stars.count),
             medianFWHMRatio: median(fwhmRatios),
             backgroundSigmaRatio: Double(candStats.backgroundSigma / max(refStats.backgroundSigma, 1e-9))
         )
@@ -157,6 +157,35 @@ enum SirilParityMetrics {
         let sorted = values.sorted()
         let mid = sorted.count / 2
         return sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+    }
+}
+
+enum SirilParityBenchmarkError: Error, CustomStringConvertible {
+    case noCurrentStack
+    case sirilMasterUnreadable(String)
+    case dimensionMismatch(liveWidth: Int, liveHeight: Int, sirilWidth: Int, sirilHeight: Int)
+    case channelMismatch(live: Int, siril: Int)
+    case noComparableChannels
+    case noDetectableStars
+    case noCentroidMatches
+
+    var description: String {
+        switch self {
+        case .noCurrentStack:
+            return "LiveAstro parity import produced no current stack."
+        case .sirilMasterUnreadable(let message):
+            return "Siril master could not be read: \(message)"
+        case .dimensionMismatch(let liveWidth, let liveHeight, let sirilWidth, let sirilHeight):
+            return "LiveAstro master \(liveWidth)×\(liveHeight) does not match Siril \(sirilWidth)×\(sirilHeight)."
+        case .channelMismatch(let live, let siril):
+            return "LiveAstro channel count \(live) does not match Siril channel count \(siril)."
+        case .noComparableChannels:
+            return "Parity masters have no comparable channels."
+        case .noDetectableStars:
+            return "Siril parity star metrics require detectable stars in both masters."
+        case .noCentroidMatches:
+            return "Siril parity star metrics found stars but no centroid matches within 8 px."
+        }
     }
 }
 
@@ -230,7 +259,7 @@ struct SirilParityReport {
     let acceptedCount: Int
     let rejectedCount: Int
     let channels: [SirilParityChannelReport]
-    let starMatchedRatio: Double
+    let starCountRatio: Double
     let medianFWHMRatio: Double
     let backgroundSigmaRatio: Double
 }
@@ -283,21 +312,48 @@ enum SirilParityRunner {
         stage("import complete accepted=\(engine.acceptedCount) rejected=\(engine.rejectedCount)")
 
         guard let liveAstro = engine.currentStack() else {
-            throw XCTSkip("LiveAstro parity import produced no current stack.")
+            let error = SirilParityBenchmarkError.noCurrentStack
+            _ = try writeReport(dataset: dataset, committed: committed, rejected: rejected,
+                                liveAstro: nil, siril: nil, channels: [],
+                                starCountRatio: nil, medianFWHMRatio: nil,
+                                backgroundSigmaRatio: nil, validationNotes: [error.description])
+            throw error
         }
         stage("loading Siril master")
-        let sirilData = try Data(contentsOf: dataset.sirilMaster)
-        let sirilRead = try FITSReader.read(sirilData, normalizeRowOrder: true)
+        let sirilRead: FITSImage
+        do {
+            let sirilData = try Data(contentsOf: dataset.sirilMaster)
+            sirilRead = try FITSReader.read(sirilData, normalizeRowOrder: true)
+        } catch {
+            let parityError = SirilParityBenchmarkError.sirilMasterUnreadable(String(describing: error))
+            _ = try writeReport(dataset: dataset, committed: committed, rejected: rejected,
+                                liveAstro: liveAstro, siril: nil, channels: [],
+                                starCountRatio: nil, medianFWHMRatio: nil,
+                                backgroundSigmaRatio: nil, validationNotes: [parityError.description])
+            throw parityError
+        }
         let siril = AstroImage(width: sirilRead.width, height: sirilRead.height,
                                channels: sirilRead.channels, pixels: sirilRead.pixels,
                                sourceIsLinear: true)
         guard liveAstro.width == siril.width, liveAstro.height == siril.height else {
-            throw XCTSkip("LiveAstro master \(liveAstro.width)×\(liveAstro.height) does not match Siril \(siril.width)×\(siril.height).")
+            let error = SirilParityBenchmarkError.dimensionMismatch(liveWidth: liveAstro.width, liveHeight: liveAstro.height,
+                                                                    sirilWidth: siril.width, sirilHeight: siril.height)
+            _ = try writeReport(dataset: dataset, committed: committed, rejected: rejected,
+                                liveAstro: liveAstro, siril: siril, channels: [],
+                                starCountRatio: nil, medianFWHMRatio: nil,
+                                backgroundSigmaRatio: nil, validationNotes: [error.description])
+            throw error
         }
 
-        let channelCount = min(liveAstro.channels, siril.channels)
-        guard channelCount > 0 else {
-            throw XCTSkip("Parity masters have no comparable channels.")
+        let channelCount: Int
+        do {
+            channelCount = try comparableChannelCount(liveAstro: liveAstro, siril: siril)
+        } catch {
+            _ = try writeReport(dataset: dataset, committed: committed, rejected: rejected,
+                                liveAstro: liveAstro, siril: siril, channels: [],
+                                starCountRatio: nil, medianFWHMRatio: nil,
+                                backgroundSigmaRatio: nil, validationNotes: [String(describing: error)])
+            throw error
         }
         stage("computing channel metrics")
         var channels: [SirilParityChannelReport] = []
@@ -312,32 +368,53 @@ enum SirilParityRunner {
         }
 
         stage("computing star/background metrics")
-        let star = try SirilParityMetrics.matchedStarMetrics(reference: siril, candidate: liveAstro)
+        let star: (starCountRatio: Double, medianFWHMRatio: Double, backgroundSigmaRatio: Double)
+        do {
+            star = try SirilParityMetrics.matchedStarMetrics(reference: siril, candidate: liveAstro)
+        } catch {
+            _ = try writeReport(dataset: dataset, committed: committed, rejected: rejected,
+                                liveAstro: liveAstro, siril: siril, channels: channels,
+                                starCountRatio: nil, medianFWHMRatio: nil,
+                                backgroundSigmaRatio: nil, validationNotes: [String(describing: error)])
+            throw error
+        }
         stage("writing report")
         let reportURL = try writeReport(dataset: dataset, committed: committed, rejected: rejected,
                                         liveAstro: liveAstro, siril: siril, channels: channels,
-                                        starMatchedRatio: star.matchedRatio,
+                                        starCountRatio: star.starCountRatio,
                                         medianFWHMRatio: star.medianFWHMRatio,
-                                        backgroundSigmaRatio: star.backgroundSigmaRatio)
+                                        backgroundSigmaRatio: star.backgroundSigmaRatio,
+                                        validationNotes: [])
         stage("done")
         return SirilParityReport(reportURL: reportURL, liveAstro: liveAstro, siril: siril,
                                  acceptedCount: engine.acceptedCount,
                                  rejectedCount: engine.rejectedCount,
                                  channels: channels,
-                                 starMatchedRatio: star.matchedRatio,
+                                 starCountRatio: star.starCountRatio,
                                  medianFWHMRatio: star.medianFWHMRatio,
                                  backgroundSigmaRatio: star.backgroundSigmaRatio)
+    }
+
+    static func comparableChannelCount(liveAstro: AstroImage, siril: AstroImage) throws -> Int {
+        guard liveAstro.channels == siril.channels else {
+            throw SirilParityBenchmarkError.channelMismatch(live: liveAstro.channels, siril: siril.channels)
+        }
+        guard liveAstro.channels > 0 else {
+            throw SirilParityBenchmarkError.noComparableChannels
+        }
+        return liveAstro.channels
     }
 
     private static func writeReport(dataset: SirilParityDataset,
                                     committed: [BatchImporter.Committed],
                                     rejected: [String],
-                                    liveAstro: AstroImage,
-                                    siril: AstroImage,
+                                    liveAstro: AstroImage?,
+                                    siril: AstroImage?,
                                     channels: [SirilParityChannelReport],
-                                    starMatchedRatio: Double,
-                                    medianFWHMRatio: Double,
-                                    backgroundSigmaRatio: Double) throws -> URL {
+                                    starCountRatio: Double?,
+                                    medianFWHMRatio: Double?,
+                                    backgroundSigmaRatio: Double?,
+                                    validationNotes: [String]) throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("liveastro-siril-parity-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -351,8 +428,8 @@ enum SirilParityRunner {
             "- Flats: \(dataset.flats.count)",
             "- Bias/offsets: \(dataset.biases.count)",
             "- Siril master: `\(dataset.sirilMaster.lastPathComponent)`",
-            "- LiveAstro dimensions: \(liveAstro.width)×\(liveAstro.height)×\(liveAstro.channels)",
-            "- Siril dimensions: \(siril.width)×\(siril.height)×\(siril.channels)",
+            "- LiveAstro dimensions: \(dimensionSummary(liveAstro))",
+            "- Siril dimensions: \(dimensionSummary(siril))",
             "- Accepted: \(committed.count)",
             "- Rejected: \(rejected.count)",
             "",
@@ -364,13 +441,16 @@ enum SirilParityRunner {
         for channel in channels {
             lines.append("| \(channel.index) | \(String(format: "%.6f", channel.pearson)) | \(String(format: "%.6f", channel.affineMAE)) |")
         }
+        if channels.isEmpty {
+            lines.append("| unavailable | unavailable | unavailable |")
+        }
         lines.append(contentsOf: [
             "",
             "## Star / Background Metrics",
             "",
-            "- Star count ratio: \(String(format: "%.6f", starMatchedRatio))",
-            "- Median FWHM ratio: \(String(format: "%.6f", medianFWHMRatio))",
-            "- Background sigma ratio: \(String(format: "%.6f", backgroundSigmaRatio))",
+            "- Star count ratio: \(formatMetric(starCountRatio))",
+            "- Median FWHM ratio: \(formatMetric(medianFWHMRatio))",
+            "- Background sigma ratio: \(formatMetric(backgroundSigmaRatio))",
             "",
             "## Thresholds",
             "",
@@ -380,6 +460,12 @@ enum SirilParityRunner {
             "- Median FWHM ratio within 0.75...1.35",
             "- Background sigma ratio within 0.50...2.25",
         ])
+        if !validationNotes.isEmpty {
+            lines.append("")
+            lines.append("## Validation Notes")
+            lines.append("")
+            for note in validationNotes { lines.append("- \(note)") }
+        }
         if !rejected.isEmpty {
             lines.append("")
             lines.append("## Rejected Frames")
@@ -388,6 +474,16 @@ enum SirilParityRunner {
         }
         try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
         return url
+    }
+
+    private static func dimensionSummary(_ image: AstroImage?) -> String {
+        guard let image else { return "unavailable" }
+        return "\(image.width)×\(image.height)×\(image.channels)"
+    }
+
+    private static func formatMetric(_ value: Double?) -> String {
+        guard let value else { return "unavailable" }
+        return String(format: "%.6f", value)
     }
 }
 
@@ -411,6 +507,18 @@ final class SirilParityMetricTests: XCTestCase {
         XCTAssertEqual(lum.width, 2)
         XCTAssertEqual(lum.height, 1)
         XCTAssertEqual(lum.pixels, [Float(1.0 / 3.0), Float(1.0 / 3.0)])
+    }
+
+    func testStarMetricPrerequisiteFailuresAreBenchmarkErrorsNotSkips() {
+        let blank = AstroImage(width: 8, height: 8, channels: 1,
+                               pixels: [Float](repeating: 0, count: 64),
+                               sourceIsLinear: true)
+        XCTAssertThrowsError(try SirilParityMetrics.matchedStarMetrics(reference: blank, candidate: blank)) { error in
+            XCTAssertFalse(error is XCTSkip)
+            guard case SirilParityBenchmarkError.noDetectableStars = error else {
+                return XCTFail("expected noDetectableStars, got \(error)")
+            }
+        }
     }
 }
 
@@ -447,6 +555,19 @@ final class SirilParityDatasetTests: XCTestCase {
 }
 
 final class SirilParityTests: XCTestCase {
+    func testComparableChannelsRequireEqualChannelCounts() {
+        let mono = AstroImage(width: 1, height: 1, channels: 1, pixels: [1], sourceIsLinear: true)
+        let rgb = AstroImage(width: 1, height: 1, channels: 3, pixels: [1, 1, 1], sourceIsLinear: true)
+
+        XCTAssertThrowsError(try SirilParityRunner.comparableChannelCount(liveAstro: mono, siril: rgb)) { error in
+            guard case SirilParityBenchmarkError.channelMismatch(let live, let siril) = error else {
+                return XCTFail("expected channelMismatch, got \(error)")
+            }
+            XCTAssertEqual(live, 1)
+            XCTAssertEqual(siril, 3)
+        }
+    }
+
     func testLiveAstroNativeStackMatchesSirilReference() async throws {
         let dataset = try SirilParityDataset.fromEnvironment()
         let report = try await SirilParityRunner.run(dataset: dataset)
@@ -455,6 +576,7 @@ final class SirilParityTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(report.acceptedCount, 10)
         XCTAssertEqual(report.liveAstro.width, report.siril.width)
         XCTAssertEqual(report.liveAstro.height, report.siril.height)
+        XCTAssertEqual(report.liveAstro.channels, report.siril.channels)
         for channel in report.channels {
             // First real M8/M20 parity run (15× ASI2600 lights, Siril resultat.fit)
             // measured Pearson [0.847918, 0.989489, 0.983172]. Red is the loose
@@ -464,8 +586,8 @@ final class SirilParityTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(channel.pearson, 0.83)
             XCTAssertLessThanOrEqual(channel.affineMAE, 0.08)
         }
-        XCTAssertGreaterThanOrEqual(report.starMatchedRatio, 0.70)
-        XCTAssertLessThanOrEqual(report.starMatchedRatio, 1.30)
+        XCTAssertGreaterThanOrEqual(report.starCountRatio, 0.70)
+        XCTAssertLessThanOrEqual(report.starCountRatio, 1.30)
         XCTAssertGreaterThanOrEqual(report.medianFWHMRatio, 0.75)
         XCTAssertLessThanOrEqual(report.medianFWHMRatio, 1.35)
         XCTAssertGreaterThanOrEqual(report.backgroundSigmaRatio, 0.50)
