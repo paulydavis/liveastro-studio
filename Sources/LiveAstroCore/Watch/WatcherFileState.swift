@@ -42,8 +42,20 @@ struct PendingDigest: Equatable {
 }
 
 enum Settlement: Equatable {
-    case emittedNow(identity: FileIdentity, digest: String)
-    case duplicateOfLastEmission(identity: FileIdentity, digest: String)
+    case emittedNow(
+        identity: FileIdentity,
+        digest: String,
+        replacement: ReplacementProgress? = nil)
+    case duplicateOfLastEmission(
+        identity: FileIdentity,
+        digest: String,
+        replacement: ReplacementProgress? = nil)
+}
+
+enum ReplacementProgress: Equatable {
+    case observing(stat: FileIdentity)
+    case digestPending(PendingDigest)
+    case ready(EmissionCandidate)
 }
 
 struct BlockingEpisode: Equatable {
@@ -226,10 +238,18 @@ struct WatcherReducer {
             guard batch.generation == state.generation.id else { return [] }
             return reduce(batch)
         case .emissionFinished(let result):
-            guard result.intent.generation == state.generation.id,
-                  state.generation.files[result.intent.candidate.name]
-                    == .ready(result.intent.candidate) else { return [] }
+            guard result.intent.generation == state.generation.id else { return [] }
             let candidate = result.intent.candidate
+            if case .settled(let settlement) = state.generation.files[candidate.name],
+               settlement.replacement == .ready(candidate) {
+                guard result.outcome == .yielded else { return [] }
+                state.generation.files[candidate.name] = .settled(.emittedNow(
+                    identity: candidate.identity,
+                    digest: candidate.digest))
+                state.lastEmittedDigestByName[candidate.name] = candidate.digest
+                return []
+            }
+            guard state.generation.files[candidate.name] == .ready(candidate) else { return [] }
             if result.outcome == .rejected {
                 guard revisionOrderingEnabled,
                       case .numbered(let revision) = candidate.kind,
@@ -252,8 +272,12 @@ struct WatcherReducer {
     /// An intent may be invalidated by feedback from an earlier effect in the same batch.
     /// The driver asks immediately before performing the filesystem-facing yield.
     func shouldExecuteEmission(_ intent: EmissionIntent) -> Bool {
-        guard intent.generation == state.generation.id,
-              state.generation.files[intent.candidate.name] == .ready(intent.candidate)
+        guard intent.generation == state.generation.id else { return false }
+        if case .settled(let settlement) = state.generation.files[intent.candidate.name],
+           settlement.replacement == .ready(intent.candidate) {
+            return true
+        }
+        guard state.generation.files[intent.candidate.name] == .ready(intent.candidate)
         else { return false }
         guard revisionOrderingEnabled,
               case .numbered(let revision) = intent.candidate.kind,
@@ -348,16 +372,26 @@ struct WatcherReducer {
             to effects: inout [WatcherEffect],
             intentNames: inout Set<String>
         ) {
-            guard intentNames.insert(name).inserted,
-                  case .ready(let candidate) = state.generation.files[name]
-            else { return }
+            guard intentNames.insert(name).inserted else { return }
+            let candidate: EmissionCandidate
+            switch state.generation.files[name] {
+            case .ready(let readyCandidate):
+                candidate = readyCandidate
+            case .settled(let settlement):
+                guard case .ready(let replacementCandidate) = settlement.replacement
+                else { return }
+                candidate = replacementCandidate
+            default:
+                return
+            }
             effects.append(.emit(EmissionIntent(
                 generation: state.generation.id,
                 candidate: candidate)))
         }
 
-        for item in classified
-        where item.isPresent && item.revision == nil {
+        for item in classified where item.isPresent && (
+            item.revision == nil
+                || hasReadyReplacement(state.generation.files[item.observation.name])) {
             appendIntent(
                 named: item.observation.name,
                 state: state,
@@ -475,7 +509,10 @@ struct WatcherReducer {
             switch existing {
             case .observing, .digestPending, .ready:
                 state.generation.files.removeValue(forKey: observation.name)
-            case .settled, .droppedOutOfOrder, .writtenOff, nil:
+            case .settled(let settlement):
+                state.generation.files[observation.name] = .settled(
+                    settlement.withReplacement(nil))
+            case .droppedOutOfOrder, .writtenOff, nil:
                 break
             }
             return false
@@ -484,7 +521,10 @@ struct WatcherReducer {
             switch existing {
             case .observing, .digestPending, .ready:
                 state.generation.files.removeValue(forKey: observation.name)
-            case .settled, .droppedOutOfOrder, .writtenOff, nil:
+            case .settled(let settlement):
+                state.generation.files[observation.name] = .settled(
+                    settlement.withReplacement(nil))
+            case .droppedOutOfOrder, .writtenOff, nil:
                 break
             }
             return false
@@ -493,20 +533,32 @@ struct WatcherReducer {
             switch existing {
             case .droppedOutOfOrder, .writtenOff:
                 break
-            case .settled(.emittedNow) where revisionOrder.revision(in: observation.name) != nil:
-                break
+            case .settled(let settlement) where observation.kind != .classicMutable:
+                state.generation.files[observation.name] = .settled(
+                    settlement.withReplacement(.observing(stat: identity)))
             default:
                 state.generation.files[observation.name] = .observing(stat: identity)
             }
             return false
 
-        case .identityUnchanged:
+        case .identityUnchanged(let identity):
+            if case .settled(let settlement) = existing,
+               settlement.identity == identity {
+                state.generation.files[observation.name] = .settled(
+                    settlement.withReplacement(nil))
+            }
             return false
 
         case .digested(let identity, let digest, let byteCount):
-            if case .settled(.emittedNow) = existing,
-               revisionOrder.revision(in: observation.name) != nil {
-                return false
+            if case .settled(let settlement) = existing,
+               observation.kind != .classicMutable {
+                return reduceSettledReplacementDigest(
+                    observation,
+                    settlement: settlement,
+                    identity: identity,
+                    digest: digest,
+                    byteCount: byteCount,
+                    nowNanos: nowNanos)
             }
             switch existing {
             case nil:
@@ -542,6 +594,70 @@ struct WatcherReducer {
                 byteCount: byteCount,
                 nowNanos: nowNanos)
         }
+    }
+
+    private func hasReadyReplacement(_ fileState: FileState?) -> Bool {
+        guard case .settled(let settlement) = fileState,
+              case .ready = settlement.replacement else { return false }
+        return true
+    }
+
+    private mutating func reduceSettledReplacementDigest(
+        _ observation: FileObservation,
+        settlement: Settlement,
+        identity: FileIdentity,
+        digest: String,
+        byteCount: Int,
+        nowNanos: UInt64
+    ) -> Bool {
+        guard settlement.replacement?.identity == identity else {
+            state.generation.files[observation.name] = .settled(
+                settlement.withReplacement(.observing(stat: identity)))
+            return false
+        }
+
+        if settlement.digest == digest {
+            state.generation.files[observation.name] = .settled(
+                settlement.refreshingIdentity(identity))
+            return false
+        }
+
+        if case .ready(let candidate) = settlement.replacement,
+           candidate.identity == identity,
+           candidate.digest == digest {
+            return false
+        }
+
+        switch configuration.digestPolicy {
+        case .mutableStackerOutput:
+            if case .digestPending(let pending) = settlement.replacement,
+               pending.identity == identity,
+               pending.digest == digest {
+                guard nowNanos >= pending.firstObservedNanos,
+                      nowNanos - pending.firstObservedNanos >= configuration.quietPeriodNanos
+                else { return true }
+            } else {
+                state.generation.files[observation.name] = .settled(
+                    settlement.withReplacement(.digestPending(PendingDigest(
+                        digest: digest,
+                        identity: identity,
+                        firstObservedNanos: nowNanos))))
+                return false
+            }
+        case .immutableAfterPublish:
+            break
+        }
+
+        let candidate = EmissionCandidate(
+            name: observation.name,
+            url: observation.url,
+            kind: observation.kind,
+            identity: identity,
+            digest: digest,
+            byteCount: byteCount)
+        state.generation.files[observation.name] = .settled(
+            settlement.withReplacement(.ready(candidate)))
+        return false
     }
 
     private mutating func reduceStableDigest(
@@ -636,6 +752,7 @@ struct WatcherReducer {
             return candidate.identity == identity
         case .settled(let settlement):
             return settlement.identity == identity
+                || settlement.replacement?.identity == identity
         case .droppedOutOfOrder, .writtenOff, nil:
             return false
         }
@@ -740,8 +857,62 @@ private extension ObservationOutcome {
 private extension Settlement {
     var identity: FileIdentity {
         switch self {
-        case .emittedNow(let identity, _), .duplicateOfLastEmission(let identity, _):
+        case .emittedNow(let identity, _, _),
+             .duplicateOfLastEmission(let identity, _, _):
             return identity
+        }
+    }
+
+    var replacement: ReplacementProgress? {
+        switch self {
+        case .emittedNow(_, _, let replacement),
+             .duplicateOfLastEmission(_, _, let replacement):
+            return replacement
+        }
+    }
+
+    var digest: String {
+        switch self {
+        case .emittedNow(_, let digest, _),
+             .duplicateOfLastEmission(_, let digest, _):
+            return digest
+        }
+    }
+
+    func refreshingIdentity(_ identity: FileIdentity) -> Settlement {
+        switch self {
+        case .emittedNow(_, let digest, _):
+            return .emittedNow(identity: identity, digest: digest)
+        case .duplicateOfLastEmission(_, let digest, _):
+            return .duplicateOfLastEmission(identity: identity, digest: digest)
+        }
+    }
+
+    func withReplacement(_ replacement: ReplacementProgress?) -> Settlement {
+        switch self {
+        case .emittedNow(let identity, let digest, _):
+            return .emittedNow(
+                identity: identity,
+                digest: digest,
+                replacement: replacement)
+        case .duplicateOfLastEmission(let identity, let digest, _):
+            return .duplicateOfLastEmission(
+                identity: identity,
+                digest: digest,
+                replacement: replacement)
+        }
+    }
+}
+
+private extension ReplacementProgress {
+    var identity: FileIdentity {
+        switch self {
+        case .observing(let identity):
+            return identity
+        case .digestPending(let pending):
+            return pending.identity
+        case .ready(let candidate):
+            return candidate.identity
         }
     }
 }

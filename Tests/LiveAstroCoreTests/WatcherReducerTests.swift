@@ -626,7 +626,10 @@ final class WatcherReducerTests: XCTestCase {
             "pending.fit": .digestPending(PendingDigest(
                 digest: "pending", identity: identity, firstObservedNanos: 10)),
             "ready.fit": .ready(candidate),
-            "settled.fit": .settled(.emittedNow(identity: identity, digest: "settled")),
+            "settled.fit": .settled(.emittedNow(
+                identity: identity,
+                digest: "settled",
+                replacement: .observing(stat: makeIdentity(2)))),
             "dropped.fit": .droppedOutOfOrder,
             "written-off.fit": .writtenOff,
         ]
@@ -918,6 +921,390 @@ final class WatcherReducerTests: XCTestCase {
                 kind: .immutable,
                 outcome: .identityUnchanged(identity: identity))),
         ])
+    }
+
+    func testSettledNumberedReplacementReearnsStatStabilityWithoutRegressingHighWater() {
+        let name = "live_stack_00007.fit"
+        let url = URL(fileURLWithPath: "/watch/\(name)")
+        let oldIdentity = makeIdentity(1)
+        let replacementIdentity = makeIdentity(2)
+        var reducer = makeReducer(
+            files: [
+                name: .settled(.emittedNow(
+                    identity: oldIdentity,
+                    digest: "old")),
+            ],
+            digests: [name: "old"])
+        let replacementEntry = EnumeratedEntry(
+            name: name,
+            url: url,
+            identity: replacementIdentity,
+            isFITS: true)
+
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        let firstPlan = reducer.readPlan(for: [replacementEntry])
+        XCTAssertEqual(firstPlan, [
+            .observeWithoutContent(FileObservation(
+                name: name,
+                url: url,
+                kind: .numbered(revision: "00007"),
+                outcome: .unstable(identity: replacementIdentity))),
+        ])
+        guard case .observeWithoutContent(let observation) = firstPlan[0] else {
+            return XCTFail("first replacement sighting must not request content")
+        }
+
+        XCTAssertTrue(reducer.reduce(.observe(ObservationBatch(
+            generation: reducer.state.generation.id,
+            entries: [observation],
+            nowNanos: 10))).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
+            identity: oldIdentity,
+            digest: "old",
+            replacement: .observing(stat: replacementIdentity))))
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+
+        XCTAssertEqual(reducer.readPlan(for: [replacementEntry]), [
+            .readContent(
+                name: name,
+                url: url,
+                kind: .numbered(revision: "00007"),
+                identity: replacementIdentity,
+                isFITS: true),
+        ])
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+    }
+
+    func testSettledNumberedReplacementChangedDigestPassesGateAndYieldsAsNewEmission() {
+        let name = "live_stack_00007.fit"
+        let oldIdentity = makeIdentity(1)
+        let replacementIdentity = makeIdentity(2)
+        let candidate = makeCandidate(
+            name: name,
+            identity: replacementIdentity,
+            digest: "new",
+            kind: .numbered(revision: "00007"))
+        var reducer = makeReducer(
+            files: [
+                name: .settled(.emittedNow(
+                    identity: oldIdentity,
+                    digest: "old",
+                    replacement: .observing(stat: replacementIdentity))),
+            ],
+            digests: [name: "old"],
+            quietPeriodNanos: 100)
+
+        XCTAssertTrue(observe(
+            name: name,
+            kind: .numbered(revision: "00007"),
+            outcome: .digested(
+                identity: replacementIdentity,
+                digest: "new",
+                byteCount: replacementIdentity.size),
+            nowNanos: 10,
+            reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
+            identity: oldIdentity,
+            digest: "old",
+            replacement: .digestPending(PendingDigest(
+                digest: "new",
+                identity: replacementIdentity,
+                firstObservedNanos: 10)))))
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+
+        let intent = EmissionIntent(
+            generation: reducer.state.generation.id,
+            candidate: candidate)
+        XCTAssertEqual(observe(
+            name: name,
+            kind: .numbered(revision: "00007"),
+            outcome: .digested(
+                identity: replacementIdentity,
+                digest: "new",
+                byteCount: replacementIdentity.size),
+            nowNanos: 110,
+            reducer: &reducer), [
+                .emit(intent),
+            ])
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
+            identity: oldIdentity,
+            digest: "old",
+            replacement: .ready(candidate))))
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertTrue(reducer.shouldExecuteEmission(intent))
+
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: intent,
+            outcome: .yielded))).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
+            identity: replacementIdentity,
+            digest: "new")))
+        XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "new")
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+    }
+
+    func testImmutableSettledReplacementChangedDigestBecomesReadyWithoutDigestDelay() {
+        let name = "sub.fit"
+        let oldIdentity = makeIdentity(1)
+        let replacementIdentity = makeIdentity(2)
+        let candidate = makeCandidate(
+            name: name,
+            identity: replacementIdentity,
+            digest: "new",
+            kind: .immutable)
+        var reducer = makeReducer(
+            files: [
+                name: .settled(.emittedNow(
+                    identity: oldIdentity,
+                    digest: "old",
+                    replacement: .observing(stat: replacementIdentity))),
+            ],
+            digests: [name: "old"],
+            digestPolicy: .immutableAfterPublish,
+            filePrefix: nil)
+        let intent = EmissionIntent(
+            generation: reducer.state.generation.id,
+            candidate: candidate)
+
+        XCTAssertEqual(observe(
+            name: name,
+            kind: .immutable,
+            outcome: .digested(
+                identity: replacementIdentity,
+                digest: "new",
+                byteCount: replacementIdentity.size),
+            nowNanos: 10,
+            reducer: &reducer), [.emit(intent)])
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
+            identity: oldIdentity,
+            digest: "old",
+            replacement: .ready(candidate))))
+        XCTAssertTrue(reducer.shouldExecuteEmission(intent))
+    }
+
+    func testSettledNumberedReplacementIdenticalDigestRefreshesIdentityWithoutEmission() {
+        let name = "live_stack_00007.fit"
+        let url = URL(fileURLWithPath: "/watch/\(name)")
+        let oldIdentity = makeIdentity(1)
+        let replacementIdentity = makeIdentity(2)
+        var reducer = makeReducer(
+            files: [
+                name: .settled(.emittedNow(
+                    identity: oldIdentity,
+                    digest: "same",
+                    replacement: .observing(stat: replacementIdentity))),
+            ],
+            digests: [name: "same"])
+
+        XCTAssertTrue(observe(
+            name: name,
+            kind: .numbered(revision: "00007"),
+            outcome: .digested(
+                identity: replacementIdentity,
+                digest: "same",
+                byteCount: replacementIdentity.size),
+            nowNanos: 10,
+            reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
+            identity: replacementIdentity,
+            digest: "same")))
+        XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "same")
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.readPlan(for: [EnumeratedEntry(
+            name: name,
+            url: url,
+            identity: replacementIdentity,
+            isFITS: true)]), [
+                .acceptIdentity(FileObservation(
+                    name: name,
+                    url: url,
+                    kind: .numbered(revision: "00007"),
+                    outcome: .identityUnchanged(identity: replacementIdentity))),
+        ])
+    }
+
+    func testSettledReplacementAbsenceClearsOnlyNestedProgressAndPreservesHighWater() {
+        let name = "live_stack_00007.fit"
+        let oldIdentity = makeIdentity(1)
+        let replacementIdentity = makeIdentity(2)
+        var reducer = makeReducer(
+            files: [
+                name: .settled(.emittedNow(
+                    identity: oldIdentity,
+                    digest: "old",
+                    replacement: .digestPending(PendingDigest(
+                        digest: "new",
+                        identity: replacementIdentity,
+                        firstObservedNanos: 10)))),
+            ],
+            digests: [name: "old"])
+
+        XCTAssertTrue(observe(
+            name: name,
+            kind: .numbered(revision: "00007"),
+            outcome: .absent,
+            nowNanos: 20,
+            reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
+            identity: oldIdentity,
+            digest: "old")))
+        XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "old")
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+    }
+
+    func testDuplicateSettlementReplacementPreservesOutcomeUntilNewContentYields() {
+        let name = "live_stack_00007.fit"
+        let url = URL(fileURLWithPath: "/watch/\(name)")
+        let oldIdentity = makeIdentity(1)
+        let identicalIdentity = makeIdentity(2)
+        let changedIdentity = makeIdentity(3)
+        var reducer = makeReducer(
+            files: [
+                name: .settled(.duplicateOfLastEmission(
+                    identity: oldIdentity,
+                    digest: "same",
+                    replacement: .observing(stat: identicalIdentity))),
+            ],
+            digests: [name: "same"],
+            quietPeriodNanos: 100)
+
+        XCTAssertTrue(observe(
+            name: name,
+            kind: .numbered(revision: "00007"),
+            outcome: .digested(
+                identity: identicalIdentity,
+                digest: "same",
+                byteCount: identicalIdentity.size),
+            nowNanos: 10,
+            reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(
+            .duplicateOfLastEmission(identity: identicalIdentity, digest: "same")))
+        XCTAssertEqual(reducer.readPlan(for: [EnumeratedEntry(
+            name: name,
+            url: url,
+            identity: identicalIdentity,
+            isFITS: true)]), [
+                .acceptIdentity(FileObservation(
+                    name: name,
+                    url: url,
+                    kind: .numbered(revision: "00007"),
+                    outcome: .identityUnchanged(identity: identicalIdentity))),
+            ])
+        XCTAssertNil(reducer.emittedRevisionHighWater)
+
+        XCTAssertTrue(observe(
+            name: name,
+            kind: .numbered(revision: "00007"),
+            outcome: .unstable(identity: changedIdentity),
+            nowNanos: 20,
+            reducer: &reducer).isEmpty)
+        XCTAssertTrue(observe(
+            name: name,
+            kind: .numbered(revision: "00007"),
+            outcome: .digested(
+                identity: changedIdentity,
+                digest: "new",
+                byteCount: changedIdentity.size),
+            nowNanos: 20,
+            reducer: &reducer).isEmpty)
+
+        let candidate = makeCandidate(
+            name: name,
+            identity: changedIdentity,
+            digest: "new",
+            kind: .numbered(revision: "00007"))
+        let intent = EmissionIntent(
+            generation: reducer.state.generation.id,
+            candidate: candidate)
+        XCTAssertEqual(observe(
+            name: name,
+            kind: .numbered(revision: "00007"),
+            outcome: .digested(
+                identity: changedIdentity,
+                digest: "new",
+                byteCount: changedIdentity.size),
+            nowNanos: 120,
+            reducer: &reducer), [.emit(intent)])
+        let readyDuplicate = FileState.settled(.duplicateOfLastEmission(
+            identity: identicalIdentity,
+            digest: "same",
+            replacement: .ready(candidate)))
+        XCTAssertEqual(reducer.state.generation.files[name], readyDuplicate)
+        XCTAssertNil(reducer.emittedRevisionHighWater)
+        XCTAssertTrue(reducer.shouldExecuteEmission(intent))
+
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: intent,
+            outcome: .rejected))).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[name], readyDuplicate)
+        XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "same")
+        XCTAssertNil(reducer.emittedRevisionHighWater)
+
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: intent,
+            outcome: .yielded))).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
+            identity: changedIdentity,
+            digest: "new")))
+        XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "new")
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+    }
+
+    func testSettledReplacementOuterIdentityReturnClearsNestedProgress() {
+        let name = "live_stack_00007.fit"
+        let settledIdentity = makeIdentity(1)
+        let replacementIdentity = makeIdentity(2)
+        var reducer = makeReducer(
+            files: [
+                name: .settled(.emittedNow(
+                    identity: settledIdentity,
+                    digest: "old",
+                    replacement: .digestPending(PendingDigest(
+                        digest: "new",
+                        identity: replacementIdentity,
+                        firstObservedNanos: 10)))),
+            ],
+            digests: [name: "old"])
+
+        XCTAssertTrue(observe(
+            name: name,
+            kind: .numbered(revision: "00007"),
+            outcome: .identityUnchanged(identity: settledIdentity),
+            nowNanos: 20,
+            reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
+            identity: settledIdentity,
+            digest: "old")))
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+    }
+
+    func testSettledReplacementInvalidObservationClearsNestedProgress() {
+        let name = "live_stack_00007.fit"
+        let settledIdentity = makeIdentity(1)
+        let replacementIdentity = makeIdentity(2)
+        var reducer = makeReducer(
+            files: [
+                name: .settled(.emittedNow(
+                    identity: settledIdentity,
+                    digest: "old",
+                    replacement: .digestPending(PendingDigest(
+                        digest: "new",
+                        identity: replacementIdentity,
+                        firstObservedNanos: 10)))),
+            ],
+            digests: [name: "old"])
+
+        XCTAssertTrue(observe(
+            name: name,
+            kind: .numbered(revision: "00007"),
+            outcome: .invalid(reason: "torn replacement"),
+            nowNanos: 20,
+            reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
+            identity: settledIdentity,
+            digest: "old")))
+        XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "old")
+        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
     }
 
     func testClassicMutableSettlementStillRequestsContentRead() {

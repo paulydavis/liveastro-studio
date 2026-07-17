@@ -1061,7 +1061,7 @@ final class StackFileWatcherTests: XCTestCase {
         XCTAssertEqual(itemsAfterDedup.count, 1,
                        "retained latest-digest evidence suppresses the identical replacement")
 
-        guard case .settled(.duplicateOfLastEmission(_, let digest)) =
+        guard case .settled(.duplicateOfLastEmission(_, let digest, _)) =
                 watcher.reducerStateSnapshot.generation.files[name] else {
             return XCTFail("the replacement generation must settle through latest-digest dedup")
         }
