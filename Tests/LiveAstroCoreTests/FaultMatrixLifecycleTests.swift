@@ -423,6 +423,9 @@ final class FaultMatrixLifecycleTests: XCTestCase {
             .decode(SessionManifest.self, from: Data(contentsOf: dir.appendingPathComponent("manifest.json")))
         XCTAssertNil(manifest.endTime,
                      "F1: end_time must NOT be persisted when the master write fails (manifest stays truthful)")
+        XCTAssertEqual(manifest.masterExpected, true,
+                       "review11 finding 2: a failed master write must NEVER flip masterExpected — " +
+                       "the field is immutable after session start (a failure cannot exempt itself)")
         // No real master.fit file exists (the path is a directory, not a FITS file).
         var isDir: ObjCBool = false
         XCTAssertTrue(FileManager.default.fileExists(atPath: masterPath.path, isDirectory: &isDir))
@@ -436,6 +439,169 @@ final class FaultMatrixLifecycleTests: XCTestCase {
                             OracleExpectations(lossLogPattern: nil,
                                                laterFramesApplicable: false,
                                                expectedAcceptedCount: manifest.snapshots.count))
+    }
+
+    // ============================================================================================
+    // MARK: Oracle clause 5 — master expectation (review11 finding 2)
+    // ============================================================================================
+
+    /// Review11 finding 2 (P1, red-first — the reviewer's repro): a COMPLETED WATCHER session.
+    /// SessionPipeline.end() stamps end_time unconditionally, but master.fit is only ever
+    /// written by a native engine — so pre-fix every successful watcher session "ended" without
+    /// master.fit, which the oracle's clause 5 declared dishonest (this test failed clause 5).
+    /// Post-fix the manifest carries `masterExpected` (set at session START from session
+    /// semantics: watcher ⇒ false, native ⇒ true; IMMUTABLE thereafter), end() logs the
+    /// watcher-mode line once, and the oracle passes honestly.
+    func testPipelineEnd_watcherSession_endsHonestly_oracleClause5Passes() throws {
+        let fs = try TempFS("pipe-watcher-end"); defer { fs.tearDown() }
+        let sessions = try fs.dir("sessions")
+        let watch = try fs.dir("watch")
+        var replay = ReplaySettings()
+        replay.duration = 1; replay.fps = 10; replay.width = 160; replay.height = 90
+        let pipeline = SessionPipeline(watchFolder: watch, profile: profile("WatcherEnd"),
+                                       rootDirectory: sessions, replaySettings: replay,
+                                       maxKeyframes: 5)
+        var log: [String] = []
+        let logLock = NSLock()
+        pipeline.onLog = { msg in logLock.withLock { log.append(msg) } }
+        let accepted = expectation(description: "one watcher update accepted")
+        accepted.assertForOverFulfill = false
+        pipeline.onUpdate = { _, _ in accepted.fulfill() }
+        try pipeline.start()
+        let px = (0..<(32 * 32)).map { Float($0 % 32) / 64.0 }
+        try FITSWriter.float32(width: 32, height: 32, channels: 1, pixels: px)
+            .write(to: watch.appendingPathComponent("live_stack.fit"))
+        wait(for: [accepted], timeout: 15)
+        _ = try pipeline.end()
+
+        let dir = pipeline.session.sessionDirectory!
+        let manifest = try ManifestCoding.decoder().decode(
+            SessionManifest.self,
+            from: Data(contentsOf: dir.appendingPathComponent("manifest.json")))
+        XCTAssertNotNil(manifest.endTime, "the watcher session really ended")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("master.fit").path),
+            "watcher sessions never write master.fit — the stack lives with the external stacker")
+        XCTAssertEqual(manifest.masterExpected, false,
+                       "watcher-mode sessions record at START that no master is promised")
+        let captured = logLock.withLock { log }
+        XCTAssertEqual(captured.filter { $0.contains("watcher session — the stack lives with the external stacker; no master.fit") }.count, 1,
+                       "end() states the watcher-mode master expectation once — got \(captured)")
+        // The reviewer's repro line: pre-fix this oracle call FAILED clause 5 (end_time set,
+        // no master.fit); post-fix it passes because masterExpected == false is honest.
+        assertSessionOracle(sessionRoot: dir, log: captured,
+                            OracleExpectations(lossLogPattern: nil,
+                                               laterFramesApplicable: false,
+                                               expectedAcceptedCount: manifest.snapshots.count))
+    }
+
+    /// Review11 finding 2, immutability pin: `masterExpected` is set ONCE at session start and
+    /// NEVER changed — in particular a FAILED native master write must not exempt itself by
+    /// flipping the field. Two legs: (a) through the real pipeline, the failed-master-write
+    /// session keeps masterExpected == true; (b) the exact dishonest aftermath a flipped field
+    /// would whitewash — end_time set, masterExpected true, frames recorded, no master.fit —
+    /// STILL trips oracle clause 5 (pinned with XCTExpectFailure).
+    func testFailedNativeMasterWrite_masterExpectedImmutable_clause5StillTrips() throws {
+        let fs = try TempFS("clause5-immutable"); defer { fs.tearDown() }
+
+        // (b) Construct the dishonest aftermath directly and pin that the oracle REFUSES it.
+        let root = try fs.dir("dishonest-session")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("snapshots"),
+                                                withIntermediateDirectories: true)
+        let pngName = "snapshots/0000.png"
+        try FaultKitTests.tinyPNGData().write(to: root.appendingPathComponent(pngName))
+        let record = SnapshotRecord(index: 0, timestamp: Date(), sourceFile: "sub_000.fit",
+                                    snapshotFile: pngName, estimatedIntegrationSeconds: 120,
+                                    width: 2, height: 2, mean: 0.1, median: 0.08, stddev: 0.02)
+        let dishonest = SessionManifest(
+            sessionId: "dishonest", targetName: "T", startTime: Date(), endTime: Date(),
+            subExposureSeconds: 120, bortle: 7, locationLabel: "L", telescope: "T",
+            camera: "C", mount: "M", filter: "F", notes: "", snapshots: [record],
+            masterExpected: true)
+        try ManifestCoding.encoder().encode(dishonest)
+            .write(to: root.appendingPathComponent("manifest.json"))
+        XCTExpectFailure("clause 5 must trip: ended + masterExpected + frames recorded, but no master.fit") {
+            assertSessionOracle(sessionRoot: root, log: [],
+                                OracleExpectations(lossLogPattern: nil,
+                                                   laterFramesApplicable: false,
+                                                   expectedAcceptedCount: 1))
+        }
+    }
+
+    /// Review11 finding 2, backward compatibility (reviewer-pinned): manifests written BEFORE
+    /// the masterExpected schema must decode (optional field — decoding never throws) and the
+    /// oracle treats them under their era's semantics: clause 5 is SKIPPED for legacy
+    /// manifests, because a pre-schema session carries no mode marker — a missing master
+    /// cannot be distinguished from an honest watcher session, and assuming native would
+    /// retroactively fail every archived watcher session.
+    func testLegacyManifestWithoutMasterExpected_decodesAndOracleSkipsClause5() throws {
+        let fs = try TempFS("clause5-legacy"); defer { fs.tearDown() }
+        let root = try fs.dir("legacy-session")
+        // Hand-written legacy JSON: end_time SET, no master_expected key, no master.fit.
+        let legacy = """
+        {
+          "session_id": "legacy-session",
+          "target_name": "NGC 6888",
+          "start_time": "2026-07-05T22:15:00Z",
+          "end_time": "2026-07-06T03:10:00Z",
+          "sub_exposure_seconds": 120,
+          "bortle": 7,
+          "location_label": "Test",
+          "telescope": "120 APO",
+          "camera": "ASI2600MC",
+          "mount": "AM5N",
+          "filter": "Dual-band",
+          "notes": "",
+          "snapshots": []
+        }
+        """
+        try legacy.data(using: .utf8)!.write(to: root.appendingPathComponent("manifest.json"))
+        let decoded = try ManifestCoding.decoder().decode(
+            SessionManifest.self,
+            from: Data(contentsOf: root.appendingPathComponent("manifest.json")))
+        XCTAssertNil(decoded.masterExpected, "legacy manifests decode with the field absent (nil)")
+        XCTAssertNotNil(decoded.endTime)
+        // Oracle: legacy + ended + no master → clause 5 skipped by documented policy.
+        assertSessionOracle(sessionRoot: root, log: [],
+                            OracleExpectations(lossLogPattern: nil,
+                                               laterFramesApplicable: false,
+                                               expectedAcceptedCount: 0))
+    }
+
+    /// Review11 finding 2, empty native session: zero accepted frames at end(). masterExpected
+    /// stays true (immutable, set at start) BUT no master is written — end() states the
+    /// zero-frame fact honestly in the log, and the oracle keys clause 5 on
+    /// masterExpected && frames recorded, so the aftermath passes without a master.
+    func testEmptyNativeSession_endsHonestly_logsNoMaster_oraclePasses() throws {
+        let fs = try TempFS("clause5-empty-native"); defer { fs.tearDown() }
+        let sessions = try fs.dir("sessions")
+        let pipeline = SessionPipeline(nativeSource: FaultMatrixLifecycleTests.ArrayFrameSource([]),
+                                       engine: StackEngine(), profile: profile("EmptyNative"),
+                                       rootDirectory: sessions)
+        var log: [String] = []
+        let logLock = NSLock()
+        pipeline.onLog = { msg in logLock.withLock { log.append(msg) } }
+        try pipeline.start()
+        _ = try pipeline.end()
+
+        let dir = pipeline.session.sessionDirectory!
+        let manifest = try ManifestCoding.decoder().decode(
+            SessionManifest.self,
+            from: Data(contentsOf: dir.appendingPathComponent("manifest.json")))
+        XCTAssertNotNil(manifest.endTime, "the empty session really ended")
+        XCTAssertEqual(manifest.masterExpected, true,
+                       "an empty NATIVE session still promised a master at start — the field is immutable")
+        XCTAssertTrue(manifest.snapshots.isEmpty, "the zero-frame fact is recorded in the manifest")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("master.fit").path),
+            "no frames → no master written")
+        let captured = logLock.withLock { log }
+        XCTAssertEqual(captured.filter { $0.contains("no frames accepted — no master written") }.count, 1,
+                       "the zero-frame end states itself honestly, once — got \(captured)")
+        assertSessionOracle(sessionRoot: dir, log: captured,
+                            OracleExpectations(lossLogPattern: nil,
+                                               laterFramesApplicable: false,
+                                               expectedAcceptedCount: 0))
     }
 
     // ============================================================================================

@@ -26,9 +26,17 @@ struct OracleExpectations {
 ///       image (CGImageSource decodes at least one frame) — non-empty bytes are not enough; a listed
 ///       snapshot that is garbage/text fails here (recoverable output path).
 ///   (5) unpersisted work is never reported successful: a manifest with `end_time` set (claims the
-///       session ended) MUST have a durable `master.fit` — an ended claim without the persisted end
-///       artifact is dishonest. (SessionManifest has no separate status field; `end_time` + master.fit
-///       is the durable end. A running session — end_time nil — is exempt.)
+///       session ended) that PROMISED a master (`master_expected == true`, set immutably at session
+///       START from session semantics — native ⇒ true, watcher ⇒ false; review11 finding 2) and
+///       recorded at least one frame MUST have a durable `master.fit`. Watcher sessions honestly
+///       expect none (the stack lives with the external stacker). A zero-frame native session
+///       writes no master and says so in the log — the clause keys on masterExpected && frames
+///       recorded, so the empty session is exempt while a failed native master write still trips
+///       (the field is immutable; a failure can never exempt itself). LEGACY manifests (field
+///       absent → nil) are decodable and SKIP this clause: a pre-schema session carries no mode
+///       marker, so a missing master cannot be distinguished from an honest watcher session —
+///       assuming native would retroactively fail every archived watcher session. A running
+///       session — end_time nil — is exempt.
 ///   (6) the log matches `lossLogPattern` when set.
 func assertSessionOracle(sessionRoot: URL, log: [String],
                          _ e: OracleExpectations,
@@ -78,11 +86,16 @@ func assertSessionOracle(sessionRoot: URL, log: [String],
         }
     }
 
-    // Clause 5: unpersisted work never reported successful — an ended claim needs the durable end.
-    if manifest.endTime != nil {
+    // Clause 5: unpersisted work never reported successful — an ended claim that PROMISED a
+    // master (masterExpected, immutable since session start) and recorded frames needs the
+    // durable master.fit. Watcher sessions (false) and legacy manifests (nil — pre-schema,
+    // mode unknowable) are exempt by documented policy; zero-frame sessions wrote no master
+    // and recorded that fact (empty snapshots + honest log).
+    if manifest.endTime != nil, manifest.masterExpected == true, !manifest.snapshots.isEmpty {
         let master = sessionRoot.appendingPathComponent("master.fit")
         XCTAssertTrue(fm.fileExists(atPath: master.path),
-                      "oracle clause 5: manifest has end_time (claims ended) but no persisted master.fit",
+                      "oracle clause 5: manifest has end_time (claims ended), promised a master "
+                      + "(master_expected), and recorded frames — but no persisted master.fit",
                       file: file, line: line)
     }
 

@@ -57,6 +57,15 @@ public struct SessionManifest: Codable, Equatable {
     public var filter: String
     public var notes: String
     public var snapshots: [SnapshotRecord]
+    /// Review11 finding 2 — the manifest's master expectation, SET FROM SESSION SEMANTICS AT
+    /// SESSION START (native stacking ⇒ true, watcher mode ⇒ false) and IMMUTABLE thereafter:
+    /// a failed native master write must still trip oracle clause 5, never exempt itself by
+    /// flipping this field. Optional for BACKWARD COMPATIBILITY: manifests written before this
+    /// schema decode with the field absent (nil — synthesized Codable uses decodeIfPresent),
+    /// and the oracle treats nil under the legacy era's semantics (clause 5 skipped — a
+    /// pre-schema session carries no mode marker, so a missing master cannot be distinguished
+    /// from an honest watcher session; see OracleAssert clause 5).
+    public var masterExpected: Bool? = nil
 }
 
 public enum ManifestCoding {

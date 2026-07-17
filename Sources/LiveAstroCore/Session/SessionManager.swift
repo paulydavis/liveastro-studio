@@ -50,8 +50,14 @@ public final class SessionManager {
         return "\(Self.sessionIdDateFormatter.string(from: date))-\(String(slug.prefix(24)))"
     }
 
+    /// `masterExpected` (review11 finding 2): whether this session PROMISES a durable
+    /// master.fit at end — decided by the CALLER's session semantics at start and immutable
+    /// thereafter (SessionPipeline passes true for native stacking, false for watcher mode).
+    /// Defaults to false: a bare SessionManager never writes a master itself — only the
+    /// native pipeline does — so a standalone manager session honestly promises none.
     @discardableResult
-    public func startSession(profile: SessionProfile, at date: Date = .init()) throws -> URL {
+    public func startSession(profile: SessionProfile, at date: Date = .init(),
+                             masterExpected: Bool = false) throws -> URL {
         // Intentional: an ended manager may start a fresh session (watcher-mode reuse).
         guard state != .running else { throw SessionError.alreadyRunning }
         let baseId = Self.sessionId(date: date, targetName: profile.targetName)
@@ -73,7 +79,7 @@ public final class SessionManager {
             subExposureSeconds: profile.subExposureSeconds, bortle: profile.bortle,
             locationLabel: profile.locationLabel, telescope: profile.telescope,
             camera: profile.camera, mount: profile.mount, filter: profile.filter,
-            notes: profile.notes, snapshots: [])
+            notes: profile.notes, snapshots: [], masterExpected: masterExpected)
         try persist(proposed, to: dir)
         manifest = proposed
         sessionDirectory = dir

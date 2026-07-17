@@ -221,7 +221,11 @@ public final class SessionPipeline {
     }
 
     public func start() throws {
-        let dir = try session.startSession(profile: profile)
+        // Review11 finding 2: the master expectation is decided HERE, from session semantics,
+        // at session start — native stacking promises a durable master.fit at end(); watcher
+        // mode never writes one (the stack lives with the external stacker). The field is
+        // immutable thereafter: a failed master write must trip the oracle, not exempt itself.
+        let dir = try session.startSession(profile: profile, masterExpected: engine != nil)
         // Transactional startup (P2-3): if anything after session creation throws (e.g. the
         // source/watcher fails to start), roll back the just-created running session so a
         // retry is clean (not blocked by alreadyRunning) and no stray dir stays marked running.
@@ -509,7 +513,10 @@ public final class SessionPipeline {
     /// In native (importOnce) mode, drains any in-flight frame processing before finalizing.
     /// Writes master.fit into the session directory BEFORE `endSession()` stamps `end_time` —
     /// that ordering is the commit point (F1): a manifest claiming an ended session always has
-    /// its durable master; a failed master write throws with `end_time` still nil (truthful).
+    /// the durable master it PROMISED (masterExpected, review11 finding 2 — native sessions
+    /// with accepted frames); a failed master write throws with `end_time` still nil
+    /// (truthful). Watcher sessions and zero-frame native sessions promise/write no master and
+    /// log that fact honestly.
     /// In watcher mode, stops the watcher first so the stream terminates, then drains.
     public func end() throws -> URL {
         // Review10 item 4: fail fast — this thread is currently DELIVERING a callback from
@@ -562,19 +569,33 @@ public final class SessionPipeline {
         // (display path uses additive+multiplicative; the saved master gets additive-only so
         // colour ratios stay physically calibratable). Crop happens BEFORE balance so balance
         // operates on the final spatial extent.
-        if let eng = engine, let master0 = eng.currentStack() {
-            let master = cropMaster(master0, coverage: eng.currentCoverage())   // crop BEFORE balance
-            let balanced = neutralizeBackground
-                ? AutoStretch.neutralizeBackgroundAdditive(master)
-                : master
-            let totalExp = Double(eng.stackFrameCount) * profile.subExposureSeconds
-            let masterData = FITSWriter.float32(
-                width: balanced.width, height: balanced.height,
-                channels: balanced.channels, pixels: balanced.pixels,
-                metadata: sourceMetadata,
-                stackCount: eng.acceptedCount,
-                totalExposureSeconds: totalExp)
-            try masterData.write(to: dir.appendingPathComponent("master.fit"))
+        if let eng = engine {
+            if let master0 = eng.currentStack() {
+                let master = cropMaster(master0, coverage: eng.currentCoverage())   // crop BEFORE balance
+                let balanced = neutralizeBackground
+                    ? AutoStretch.neutralizeBackgroundAdditive(master)
+                    : master
+                let totalExp = Double(eng.stackFrameCount) * profile.subExposureSeconds
+                let masterData = FITSWriter.float32(
+                    width: balanced.width, height: balanced.height,
+                    channels: balanced.channels, pixels: balanced.pixels,
+                    metadata: sourceMetadata,
+                    stackCount: eng.acceptedCount,
+                    totalExposureSeconds: totalExp)
+                try masterData.write(to: dir.appendingPathComponent("master.fit"))
+            } else {
+                // Review11 finding 2, empty native session: zero accepted frames — there is
+                // no stack to persist. `masterExpected` stays true (immutable since start);
+                // the manifest records the zero-frame fact (empty snapshots) and the oracle's
+                // clause 5 keys on masterExpected && frames recorded, so ending without a
+                // master here is honest — and it is SAID, not silent.
+                onLog?("no frames accepted — no master written")
+            }
+        } else {
+            // Review11 finding 2, watcher mode: the stack is the external stacker's artifact;
+            // this session never promises a master (masterExpected == false since start).
+            // State the expectation once so the ended-without-master manifest reads honestly.
+            onLog?("watcher session — the stack lives with the external stacker; no master.fit")
         }
         // Commit point: master.fit is durable (native mode), so stamping end_time is now honest.
         try session.endSession()
