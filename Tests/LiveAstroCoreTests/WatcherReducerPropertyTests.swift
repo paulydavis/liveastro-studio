@@ -48,7 +48,7 @@ final class WatcherReducerPropertyTests: XCTestCase {
                     reducer: &reducer)
             }
 
-            let mark = reducer.emittedRevisionHighWater.flatMap(UInt64.init) ?? 0
+            let mark = reducer.derivedRevisionHighWater.flatMap(UInt64.init) ?? 0
             XCTAssertGreaterThanOrEqual(
                 mark,
                 previousMark,
@@ -93,7 +93,7 @@ final class WatcherReducerPropertyTests: XCTestCase {
             XCTAssertFalse(
                 effects.contains(where: { if case .emit = $0 { return true }; return false }),
                 "seed=\(Self.seed) transition=\(transition) revision=\(item.revision)")
-            XCTAssertEqual(reducer.emittedRevisionHighWater, "50",
+            XCTAssertEqual(reducer.derivedRevisionHighWater, "50",
                            "seed=\(Self.seed) transition=\(transition)")
         }
     }
@@ -245,8 +245,8 @@ final class WatcherReducerPropertyTests: XCTestCase {
                 reducerB.state.generation.files,
                 "seed=\(Self.seed) transition=\(transition) duplicate classification diverged")
             XCTAssertEqual(
-                reducerA.emittedRevisionHighWater,
-                reducerB.emittedRevisionHighWater,
+                reducerA.derivedRevisionHighWater,
+                reducerB.derivedRevisionHighWater,
                 "seed=\(Self.seed) transition=\(transition)")
             XCTAssertEqual(
                 reducerA.state.generation.ordering.activeBlocker,

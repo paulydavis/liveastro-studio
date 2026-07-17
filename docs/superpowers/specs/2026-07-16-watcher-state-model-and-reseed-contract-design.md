@@ -78,10 +78,27 @@ enum FileState {
 }
 
 enum Settlement {
-    case emittedNow(identity: FileIdentity, digest: String)
-    case duplicateOfLastEmission(identity: FileIdentity, digest: String)
+    case emittedNow(identity: FileIdentity, digest: String,
+                    replacement: ReplacementProgress? = nil)
+    case duplicateOfLastEmission(identity: FileIdentity, digest: String,
+                                 replacement: ReplacementProgress? = nil)
+}
+
+enum ReplacementProgress {
+    case observing(stat: StatEvidence)
+    case digestPending(digest: String, identity: FileIdentity,
+                       firstObservedNanos: UInt64)
+    case ready(candidate: EmissionCandidate)
 }
 ```
+
+The nested replacement progress is deliberate. If the same numbered filename
+is replaced in place, its outer settlement remains the generation's ordering
+evidence while the replacement re-earns stat and digest gates. Identical bytes
+refresh the settlement identity and clear the nested progress without an
+emission; changed bytes may emit only after the nested state reaches `ready`.
+This avoids both a permanently stranded replacement and a regressing derived
+high-water mark, without introducing a parallel side table.
 
 The scan becomes a reducer/effect cycle:
 
@@ -159,6 +176,8 @@ On a scan where a tracked name is absent from the (fd-pinned) enumeration:
 
 - `observing`, `digestPending`, `ready` — **die** (pending evidence dies;
   review-10 item 2 unchanged).
+- Replacement progress nested in a `settled` state also **dies**, while its
+  outer settlement remains immortal and continues to anchor ordering evidence.
 - `settled`, `droppedOutOfOrder`, `writtenOff` — **immortal within the
   generation**: a briefly-invisible corpse must not resurrect (pinned); dropped
   stays dropped, log-once; and the high-water mark, being derived from

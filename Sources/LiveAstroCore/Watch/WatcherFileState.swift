@@ -208,7 +208,7 @@ struct WatcherReducer {
         revisionOrder = NumberedRevisionOrder(prefix: configuration.filePrefix)
     }
 
-    var emittedRevisionHighWater: String? {
+    var derivedRevisionHighWater: String? {
         guard revisionOrderingEnabled else { return nil }
         return state.generation.files.reduce(nil as String?) { highWater, entry in
             guard case .settled(.emittedNow) = entry.value,
@@ -253,7 +253,7 @@ struct WatcherReducer {
             if result.outcome == .rejected {
                 guard revisionOrderingEnabled,
                       case .numbered(let revision) = candidate.kind,
-                      let mark = emittedRevisionHighWater,
+                      let mark = derivedRevisionHighWater,
                       revisionOrder.compare(revision, mark) != .orderedDescending
                 else { return [] }
                 state.generation.files[candidate.name] = .droppedOutOfOrder
@@ -281,7 +281,7 @@ struct WatcherReducer {
         else { return false }
         guard revisionOrderingEnabled,
               case .numbered(let revision) = intent.candidate.kind,
-              let mark = emittedRevisionHighWater else { return true }
+              let mark = derivedRevisionHighWater else { return true }
         return revisionOrder.compare(revision, mark) == .orderedDescending
     }
 
@@ -304,7 +304,7 @@ struct WatcherReducer {
         guard state.generation.ordering.activeBlocker != nil,
               revisionOrder.revision(in: candidate.name) != nil,
               let blockerRevision = revisionOrder.revision(in: episode.blocker),
-              let mark = emittedRevisionHighWater,
+              let mark = derivedRevisionHighWater,
               revisionOrder.compare(blockerRevision, mark) != .orderedDescending
         else { return }
         state.generation.ordering.activeBlocker = nil
@@ -345,7 +345,7 @@ struct WatcherReducer {
     private mutating func applyMarkDrops(
         in classified: [ClassifiedObservation]
     ) -> [WatcherEffect] {
-        guard revisionOrderingEnabled, let mark = emittedRevisionHighWater else { return [] }
+        guard revisionOrderingEnabled, let mark = derivedRevisionHighWater else { return [] }
         var effects: [WatcherEffect] = []
         for item in classified where item.isPresent {
             guard let revision = item.revision,

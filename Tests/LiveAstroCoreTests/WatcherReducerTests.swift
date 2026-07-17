@@ -291,7 +291,7 @@ final class WatcherReducerTests: XCTestCase {
             + "— abandoning it; later revisions proceed (frame lost: \(blocker))")])
         XCTAssertEqual(reducer.state.generation.files[blocker], .writtenOff)
         XCTAssertNil(reducer.state.generation.ordering.activeBlocker)
-        XCTAssertEqual(reducer.emittedRevisionHighWater, nil,
+        XCTAssertEqual(reducer.derivedRevisionHighWater, nil,
                        "write-off must never advance the derived mark")
     }
 
@@ -355,7 +355,7 @@ final class WatcherReducerTests: XCTestCase {
                 intent: intent,
                 outcome: .yielded))).isEmpty)
         }
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "007",
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "007",
                        "the raw-digit-first revision remains the derived tie survivor")
     }
 
@@ -371,10 +371,10 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(observeBatch(batch, nowNanos: 10, reducer: &reducer), [.log(
             "revision 00002 arrived out of order — skipped (high-water 00003)")])
         XCTAssertEqual(reducer.state.generation.files[late], .droppedOutOfOrder)
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00003")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00003")
 
         XCTAssertTrue(observeBatch(batch, nowNanos: 20, reducer: &reducer).isEmpty)
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00003")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00003")
     }
 
     func testOnlyYieldedEmissionAdvancesDerivedHighWater() {
@@ -387,16 +387,16 @@ final class WatcherReducerTests: XCTestCase {
         var reducer = makeReducer(files: [name: .ready(candidate)])
         let intent = EmissionIntent(generation: reducer.state.generation.id, candidate: candidate)
 
-        XCTAssertNil(reducer.emittedRevisionHighWater)
+        XCTAssertNil(reducer.derivedRevisionHighWater)
         XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
             intent: intent,
             outcome: .rejected))).isEmpty)
-        XCTAssertNil(reducer.emittedRevisionHighWater)
+        XCTAssertNil(reducer.derivedRevisionHighWater)
 
         XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
             intent: intent,
             outcome: .yielded))).isEmpty)
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
     }
 
     func testImmutableNumberedEmissionSettlesWithoutDerivedHighWater() {
@@ -418,7 +418,7 @@ final class WatcherReducerTests: XCTestCase {
             identity: candidate.identity,
             digest: candidate.digest)))
         XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], candidate.digest)
-        XCTAssertNil(reducer.emittedRevisionHighWater,
+        XCTAssertNil(reducer.derivedRevisionHighWater,
                      "revision ordering and its derived mark are mutable-policy-only")
     }
 
@@ -730,7 +730,7 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(
             reducer.state.generation.emittedThisGeneration,
             Set(["live_stack.fit", "live_stack_00002.fit", "live_stack_10.fit"]))
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "10")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "10")
     }
 
     func testBothSettlementVariantsRetainIdentityAndDigestForFastPath() {
@@ -941,7 +941,7 @@ final class WatcherReducerTests: XCTestCase {
             identity: replacementIdentity,
             isFITS: true)
 
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
         let firstPlan = reducer.readPlan(for: [replacementEntry])
         XCTAssertEqual(firstPlan, [
             .observeWithoutContent(FileObservation(
@@ -962,7 +962,7 @@ final class WatcherReducerTests: XCTestCase {
             identity: oldIdentity,
             digest: "old",
             replacement: .observing(stat: replacementIdentity))))
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
 
         XCTAssertEqual(reducer.readPlan(for: [replacementEntry]), [
             .readContent(
@@ -972,7 +972,7 @@ final class WatcherReducerTests: XCTestCase {
                 identity: replacementIdentity,
                 isFITS: true),
         ])
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
     }
 
     func testSettledNumberedReplacementChangedDigestPassesGateAndYieldsAsNewEmission() {
@@ -1010,7 +1010,7 @@ final class WatcherReducerTests: XCTestCase {
                 digest: "new",
                 identity: replacementIdentity,
                 firstObservedNanos: 10)))))
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
 
         let intent = EmissionIntent(
             generation: reducer.state.generation.id,
@@ -1030,7 +1030,7 @@ final class WatcherReducerTests: XCTestCase {
             identity: oldIdentity,
             digest: "old",
             replacement: .ready(candidate))))
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
         XCTAssertTrue(reducer.shouldExecuteEmission(intent))
 
         XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
@@ -1040,7 +1040,7 @@ final class WatcherReducerTests: XCTestCase {
             identity: replacementIdentity,
             digest: "new")))
         XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "new")
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
     }
 
     func testImmutableSettledReplacementChangedDigestBecomesReadyWithoutDigestDelay() {
@@ -1109,7 +1109,7 @@ final class WatcherReducerTests: XCTestCase {
             identity: replacementIdentity,
             digest: "same")))
         XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "same")
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
         XCTAssertEqual(reducer.readPlan(for: [EnumeratedEntry(
             name: name,
             url: url,
@@ -1149,7 +1149,7 @@ final class WatcherReducerTests: XCTestCase {
             identity: oldIdentity,
             digest: "old")))
         XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "old")
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
     }
 
     func testDuplicateSettlementReplacementPreservesOutcomeUntilNewContentYields() {
@@ -1190,7 +1190,7 @@ final class WatcherReducerTests: XCTestCase {
                     kind: .numbered(revision: "00007"),
                     outcome: .identityUnchanged(identity: identicalIdentity))),
             ])
-        XCTAssertNil(reducer.emittedRevisionHighWater)
+        XCTAssertNil(reducer.derivedRevisionHighWater)
 
         XCTAssertTrue(observe(
             name: name,
@@ -1230,7 +1230,7 @@ final class WatcherReducerTests: XCTestCase {
             digest: "same",
             replacement: .ready(candidate)))
         XCTAssertEqual(reducer.state.generation.files[name], readyDuplicate)
-        XCTAssertNil(reducer.emittedRevisionHighWater)
+        XCTAssertNil(reducer.derivedRevisionHighWater)
         XCTAssertTrue(reducer.shouldExecuteEmission(intent))
 
         XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
@@ -1238,7 +1238,7 @@ final class WatcherReducerTests: XCTestCase {
             outcome: .rejected))).isEmpty)
         XCTAssertEqual(reducer.state.generation.files[name], readyDuplicate)
         XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "same")
-        XCTAssertNil(reducer.emittedRevisionHighWater)
+        XCTAssertNil(reducer.derivedRevisionHighWater)
 
         XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
             intent: intent,
@@ -1247,7 +1247,7 @@ final class WatcherReducerTests: XCTestCase {
             identity: changedIdentity,
             digest: "new")))
         XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "new")
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
     }
 
     func testSettledReplacementOuterIdentityReturnClearsNestedProgress() {
@@ -1275,7 +1275,7 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(reducer.state.generation.files[name], .settled(.emittedNow(
             identity: settledIdentity,
             digest: "old")))
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
     }
 
     func testSettledReplacementInvalidObservationClearsNestedProgress() {
@@ -1304,7 +1304,7 @@ final class WatcherReducerTests: XCTestCase {
             identity: settledIdentity,
             digest: "old")))
         XCTAssertEqual(reducer.state.lastEmittedDigestByName[name], "old")
-        XCTAssertEqual(reducer.emittedRevisionHighWater, "00007")
+        XCTAssertEqual(reducer.derivedRevisionHighWater, "00007")
     }
 
     func testClassicMutableSettlementStillRequestsContentRead() {
@@ -1478,7 +1478,7 @@ final class WatcherReducerTests: XCTestCase {
                     kind: .numbered(revision: thirtyDigitRevision),
                     outcome: .unstable(identity: makeIdentity(2)))),
             ])
-        XCTAssertEqual(reducer.emittedRevisionHighWater, thirtyDigitRevision)
+        XCTAssertEqual(reducer.derivedRevisionHighWater, thirtyDigitRevision)
     }
 
     func testClassicTransientDigestReturnsToLastEmissionWithoutYield() {
