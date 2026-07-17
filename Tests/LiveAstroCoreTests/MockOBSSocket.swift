@@ -72,6 +72,15 @@ final class MockOBSSocket: OBSSocket {
     }
 
     func send(_ text: String) async throws {
+        // Park-send knob (review11 finding 1): a matching frame suspends
+        // HERE — in flight inside the socket, not yet on the wire — until
+        // `releaseParkedSends()`. On release it completes normally (recorded
+        // + reply hook): a frame whose `socket.send` began cannot be
+        // retracted, mirroring URLSessionWebSocketTask semantics.
+        if let match = parkSendsMatching, match(text) {
+            parkedSendCount += 1
+            await withCheckedContinuation { parkedSends.append($0) }
+        }
         sentFrames.append(text)
         if let hook = replyHook, let reply = hook(text) {
             await queue.enqueue(reply)
@@ -109,6 +118,23 @@ final class MockOBSSocket: OBSSocket {
     /// Make the next (or pending) `receive()` throw `CancellationError`.
     func finish() {
         Task { await queue.finish(throwing: CancellationError()) }
+    }
+
+    // MARK: - Park-send knob (review11 finding 1)
+
+    /// When set, `send(_:)` calls whose frame matches suspend before the
+    /// frame is recorded/answered, until `releaseParkedSends()` runs —
+    /// deterministic "send in flight, delivery pending" parking.
+    var parkSendsMatching: ((String) -> Bool)?
+    /// Number of sends currently or ever parked (monotonic).
+    private(set) var parkedSendCount = 0
+    private var parkedSends: [CheckedContinuation<Void, Never>] = []
+
+    /// Resume every parked send: the frames reach the wire in call order.
+    func releaseParkedSends() {
+        let waiting = parkedSends
+        parkedSends = []
+        for continuation in waiting { continuation.resume() }
     }
 }
 

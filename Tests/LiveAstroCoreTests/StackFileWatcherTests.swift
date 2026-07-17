@@ -1373,18 +1373,86 @@ final class StackFileWatcherTests: XCTestCase {
         }
     }
 
-    // MARK: - cold1 C1: permanently-invalid revision write-off (the starvation escape valve)
+    // MARK: - review11 findings 1+4: blocking-deadline write-off (redesigned cold1 C1 valve)
 
-    /// Cold1 C1 (CRITICAL, red-first — the reviewer's exact starvation repro): one
-    /// permanently-invalid numbered revision (truncated _00001, a producer crash) fails
-    /// validity on EVERY scan, sets the holdback, and pre-fix silently starved ALL higher
-    /// revisions forever — no emission, no log line, ever. The escape valve: a blocker
-    /// that is INVALID (structural — not merely mid-gate) accrues a per-name consecutive-
-    /// invalid-scan counter; at `invalidRevisionWriteOffScans` consecutive invalid scans
-    /// it is permanently written off with ONE honest log line, its hold releases, and the
-    /// healthy higher revisions proceed in order. The write-off does NOT advance the
-    /// high-water mark (only real emissions do).
-    func testMutablePolicy_permanentlyInvalidRevision_writtenOff_higherRevisionsProceed() async throws {
+    /// Review11 finding 1 (P1, red-first — the reviewer's exact oscillator): _00001's stat
+    /// identity changes on EVERY scan (touched/rewritten in place — the oscillating-SMB-
+    /// metadata shape) while healthy _00002/_00003 wait behind it. Pre-fix every identity
+    /// change reset the invalid write-off counter ("a rewrite is a new attempt"), so the
+    /// oscillator never accrued a write-off and starved the whole session FOREVER, silently
+    /// — this test's clock runs far past any plausible budget and pre-fix saw zero emissions
+    /// and zero log lines. Post-fix the blocking deadline runs REGARDLESS of churn: identity
+    /// changes do not reset it, the oscillator is written off once the budget elapses (one
+    /// honest log line), and the healthy revisions emit in numeric order that same scan.
+    func testMutablePolicy_oscillatingBlocker_identityChurnNeverResetsDeadline_writtenOff() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
+        try makeFITS(0.1, size: 16).write(to: url1)
+        try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
+        try makeFITS(0.3).write(to: tmp.appendingPathComponent("live_stack_00003.fit"))
+        let budget = Double(watcher.blockingBudgetNanos) / 1e9
+
+        watcher.scanNow()   // sighting: _00001 fails to emit while blocking — its clock starts
+        // Oscillate: rewrite _00001 before EVERY scan so its identity changes every scan,
+        // stopping just short of the budget. No write-off, no emission — the hold is legal.
+        var elapsed: TimeInterval = 0
+        var i = 0
+        while elapsed + 3601 < budget {
+            i += 1
+            try makeFITS(0.1 + Float(i % 7 + 1) * 0.01, size: 16).write(to: url1)
+            clock.advance(seconds: 3601)
+            elapsed += 3601
+            watcher.scanNow()
+        }
+        let starvedWithinBudget = await collector.waitForCount(1, timeout: 0.3)
+        XCTAssertFalse(starvedWithinBudget,
+                       "within the budget the oscillating blocker legitimately holds the series")
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "no write-off within the budget — got \(logs.all)")
+
+        // Cross the deadline — the identity is STILL churning, and churn must not extend it.
+        try makeFITS(0.9, size: 16).write(to: url1)
+        clock.advance(seconds: 3602)
+        watcher.scanNow()   // deadline passed → write-off → _00002/_00003 emit THIS scan
+        let got = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(got, "the oscillator must be written off at the deadline; higher revisions proceed")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00002.fit", "live_stack_00003.fit"],
+                       "the healthy revisions emit in numeric order; the oscillator never does")
+        let writeOffs = logs.all.filter { $0.contains("abandoning") }
+        XCTAssertEqual(writeOffs.count, 1,
+                       "the write-off must appear honestly in the log exactly once — got \(logs.all)")
+        let writeOffLine = writeOffs.first ?? ""
+        XCTAssertTrue(writeOffLine.contains("revision 00001 blocked emissions for")
+                        && writeOffLine.contains("frame lost: live_stack_00001.fit"),
+                      "the log names the revision, the blocked duration, and the frame loss — got \(writeOffs)")
+
+        // Even if the oscillator settles later, it stays written off: no late emission,
+        // no repeat log line.
+        watcher.scanNow()
+        clock.advance(seconds: 3601)
+        watcher.scanNow()
+        let after = await collector.items
+        XCTAssertEqual(after.count, 2, "the written-off oscillator must never emit")
+        XCTAssertEqual(logs.all.filter { $0.contains("abandoning") }.count, 1,
+                       "the write-off line fires once, not per tick")
+    }
+
+    /// Review11 findings 1+4 (redesigned cold1 C1 corpse case): a permanently-invalid
+    /// numbered revision (truncated _00001 — a producer crash) blocks _00002/_00003. The
+    /// write-off is a HARD MONOTONIC DEADLINE on blocking-without-emitting: scan counts are
+    /// irrelevant, only monotonic time counts. Inside the budget the corpse holds the series;
+    /// past it the corpse is written off (one honest log line), the hold releases, the
+    /// healthy revisions emit in order, and the high-water mark is NOT advanced by the
+    /// write-off.
+    func testMutablePolicy_permanentlyInvalidRevision_writtenOffAtDeadline_higherRevisionsProceed() async throws {
         let clock = ManualClock()
         watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
                                         prefix: "live_stack")
@@ -1399,32 +1467,32 @@ final class StackFileWatcherTests: XCTestCase {
             .write(to: tmp.appendingPathComponent("live_stack_00001.fit"))
         try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
         try makeFITS(0.3).write(to: tmp.appendingPathComponent("live_stack_00003.fit"))
+        let budget = Double(watcher.blockingBudgetNanos) / 1e9
 
-        watcher.scanNow()                 // sighting — stats recorded, nothing invalid yet
-        watcher.scanNow()                 // stable: _00001 invalid #1; _00002/_00003 digests pending
-        clock.advance(seconds: 3601)      // the healthy pendings are confirmable from here on
-        // Each invalid observation clears _00001's evidence (review10 item 2), so it
-        // re-earns stability on the following scan — observations #2…#(N-1) land every
-        // OTHER scan: 2×(N-2)+1 scans leave the count at N-1 with the hold still up.
-        for _ in 0..<(2 * (StackFileWatcher.invalidRevisionWriteOffScans - 2) + 1) {
-            watcher.scanNow()
-        }
-        let heldThroughout = await collector.waitForCount(1, timeout: 0.3)
-        XCTAssertFalse(heldThroughout,
-                       "before the write-off threshold the invalid _00001 still holds the series")
+        watcher.scanNow()                 // sighting — _00001 becomes the blocker, clock starts
+        watcher.scanNow()                 // stable: _00001 invalid; _00002/_00003 digests pending
+        clock.advance(seconds: 3601)      // healthy pendings confirmable; deadline NOT reached
+        watcher.scanNow()
+        let heldWithinBudget = await collector.waitForCount(1, timeout: 0.3)
+        XCTAssertFalse(heldWithinBudget,
+                       "within the blocking budget the invalid _00001 still holds the series")
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "no write-off within the budget — got \(logs.all)")
 
-        watcher.scanNow()                 // invalid #N → written off → _00002/_00003 emit THIS scan
+        clock.advance(seconds: budget)    // now safely past blockStart + budget
+        watcher.scanNow()                 // deadline passed → write-off → _00002/_00003 emit
         let got = await collector.waitForCount(2, timeout: 2)
-        XCTAssertTrue(got, "healthy revisions must proceed once the invalid blocker is written off")
+        XCTAssertTrue(got, "healthy revisions must proceed once the corpse is written off")
         let items = await collector.items
         XCTAssertEqual(items.map(\.url.lastPathComponent),
                        ["live_stack_00002.fit", "live_stack_00003.fit"],
-                       "the healthy revisions emit in numeric order; the invalid one never does")
+                       "the healthy revisions emit in numeric order; the corpse never does")
         let writeOffLines = logs.all.filter { $0.contains("abandoning") }
         XCTAssertEqual(writeOffLines.count, 1,
                        "the write-off must appear honestly in the log exactly once — got \(logs.all)")
         let line = writeOffLines.first ?? ""
-        XCTAssertTrue(line.contains("revision 00001") && line.contains("frame lost"),
+        XCTAssertTrue(line.contains("revision 00001 blocked emissions for")
+                        && line.contains("frame lost"),
                       "the log names the revision and admits the frame loss — got \(writeOffLines)")
 
         // Post-write-off scans stay silent: no repeat log, no late emission of _00001.
@@ -1437,11 +1505,13 @@ final class StackFileWatcherTests: XCTestCase {
                        "the write-off line fires once, not per tick")
     }
 
-    /// Cold1 C1 counterpart (mid-gate is NOT invalid): a lower revision that is merely
-    /// STILL STABILIZING — stat identity moving every scan, i.e. making progress — holds
-    /// higher revisions indefinitely, well past the write-off threshold, and is never
-    /// written off. When it finally completes, both emit in numeric order.
-    func testMutablePolicy_stillStabilizingRevision_neverWrittenOff_emitsInOrder() async throws {
+    /// Review11 finding 1, hard ceiling: a blocker that repeatedly reaches CONVERGING grace
+    /// (the SAME pending digest observed again under a stable identity, quiet-period clock
+    /// running) and then churns — over and over — is STILL written off by the total ceiling
+    /// (budget + maxBlockerGraceExtensions × quietPeriod). Convergence renews only a short
+    /// bounded grace; indefinite renewal through cycles of convergence and churn must be
+    /// impossible, because the ceiling is enforced as a TOTAL-deadline check.
+    func testMutablePolicy_convergingGraceRenewalCapped_writtenOffAtHardCeiling() async throws {
         let clock = ManualClock()
         watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
                                         prefix: "live_stack")
@@ -1452,36 +1522,92 @@ final class StackFileWatcherTests: XCTestCase {
         let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
         try makeFITS(0.1, size: 16).write(to: url1)
         try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
-        watcher.scanNow()                 // sighting
+        let budget = Double(watcher.blockingBudgetNanos) / 1e9
+        let ceiling = Double(watcher.blockingCeilingNanos) / 1e9
 
-        // _00001 is rewritten before every scan (same size, new mtime): stat-unstable —
-        // a mid-gate blocker for MORE scans than the write-off threshold.
-        for i in 0..<(StackFileWatcher.invalidRevisionWriteOffScans + 2) {
-            try makeFITS(0.1 + Float(i + 1) * 0.01, size: 16).write(to: url1)
-            clock.advance(seconds: 3601)
-            watcher.scanNow()
+        watcher.scanNow()   // sighting: the blocker's clock starts
+        // Cycle forever-converging churn: (1) stable scan records a fresh pending digest;
+        // (2) the SAME digest is observed again inside the quiet period — CONVERGING, grace
+        // renews; (3) the "writer" churns the file (new identity + digest). 1800 s per scan
+        // keeps step (2) inside the 3600 s quiet period.
+        var elapsed: TimeInterval = 0
+        var cycle = 0
+        while logs.all.filter({ $0.contains("abandoning") }).isEmpty, elapsed < ceiling + 4 * 5400 {
+            cycle += 1
+            clock.advance(seconds: 1800); elapsed += 1800
+            watcher.scanNow()             // stable → pending recorded
+            if !logs.all.filter({ $0.contains("abandoning") }).isEmpty { break }
+            clock.advance(seconds: 1800); elapsed += 1800
+            watcher.scanNow()             // same digest, quiet not elapsed → CONVERGING grace
+            if !logs.all.filter({ $0.contains("abandoning") }).isEmpty { break }
+            try makeFITS(0.1 + Float(cycle % 5 + 1) * 0.01, size: 16).write(to: url1)
+            clock.advance(seconds: 1800); elapsed += 1800
+            watcher.scanNow()             // churn: identity + digest changed
         }
-        let premature = await collector.waitForCount(1, timeout: 0.3)
-        XCTAssertFalse(premature, "_00002 stays held while _00001 is still stabilizing")
-        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
-                      "a still-progressing blocker must NEVER be written off — got \(logs.all)")
-
-        // _00001 settles → earns stability + the digest gate → both emit in order.
-        watcher.scanNow()                 // stable → digest pending
-        clock.advance(seconds: 3601)
-        watcher.scanNow()                 // confirmed → _00001 emits; _00002 follows in order
-        let got = await collector.waitForCount(2, timeout: 2)
-        XCTAssertTrue(got, "both revisions emit once the blocker completes")
+        let writeOffs = logs.all.filter { $0.contains("abandoning") }
+        XCTAssertEqual(writeOffs.count, 1,
+                       "the hard ceiling must fire despite repeated converging grace — got \(logs.all)")
+        XCTAssertGreaterThanOrEqual(elapsed, budget,
+                                    "never written off before the budget (grace was honored)")
+        XCTAssertLessThanOrEqual(elapsed, ceiling + 5400,
+                                 "written off no later than the ceiling (+ one scan cycle of slack)")
+        // The healthy _00002 proceeds once the capped blocker is written off.
+        let got = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(got, "_00002 must emit once the ceiling writes the blocker off")
         let items = await collector.items
-        XCTAssertEqual(items.map(\.url.lastPathComponent),
-                       ["live_stack_00001.fit", "live_stack_00002.fit"],
-                       "order preserved — the hold was the point, the write-off must not fire")
+        XCTAssertEqual(items.map(\.url.lastPathComponent), ["live_stack_00002.fit"])
     }
 
-    /// Cold1 C1, recovery-before-threshold: an invalid revision that becomes valid before
-    /// accruing the write-off count emits normally (counter reset on passing validity),
-    /// in order, with no write-off log.
-    func testMutablePolicy_invalidRevisionRecoversBeforeThreshold_emitsNormally() async throws {
+    /// Review11 finding 1 (the healthy counterpart): a genuinely progressing blocker that
+    /// COMPLETES WITHIN THE BUDGET is never written off, and order holds — [1, 2, 3].
+    /// (Replaces the cold1 pin that a churning blocker "holds indefinitely": churn is no
+    /// longer unbounded-hold progress; the hold is bounded by the blocking budget.)
+    func testMutablePolicy_blockerCompletesWithinBudget_neverWrittenOff_emitsInOrder() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
+        try makeFITS(0.1, size: 16).write(to: url1)
+        try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
+        try makeFITS(0.3).write(to: tmp.appendingPathComponent("live_stack_00003.fit"))
+        let budget = Double(watcher.blockingBudgetNanos) / 1e9
+        watcher.scanNow()                 // sighting
+
+        // _00001 is rewritten before a few scans (an in-progress write), all within budget.
+        var elapsed: TimeInterval = 0
+        for i in 0..<3 {
+            try makeFITS(0.1 + Float(i + 1) * 0.01, size: 16).write(to: url1)
+            clock.advance(seconds: 3601)
+            elapsed += 3601
+            watcher.scanNow()
+        }
+        XCTAssertLessThan(elapsed + 2 * 3601, budget,
+                          "arrange: the whole completion fits inside the blocking budget")
+        let premature = await collector.waitForCount(1, timeout: 0.3)
+        XCTAssertFalse(premature, "_00002/_00003 stay held while _00001 is in progress")
+
+        // _00001 settles → earns stability + the digest gate → all three emit in order.
+        watcher.scanNow()                 // stable → digest pending
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                 // confirmed → [1, 2, 3]
+        let got = await collector.waitForCount(3, timeout: 2)
+        XCTAssertTrue(got, "all three revisions emit once the blocker completes within budget")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00001.fit", "live_stack_00002.fit", "live_stack_00003.fit"],
+                       "order preserved — the hold was the point; no write-off inside the budget")
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "a blocker that completes within the budget is never written off — got \(logs.all)")
+    }
+
+    /// Review11 findings 1+4, recovery-before-deadline: an invalid revision that becomes
+    /// valid well inside the blocking budget emits normally, in order, with no write-off log
+    /// (the deadline never fires; nothing resets it either — it simply is not reached).
+    func testMutablePolicy_invalidRevisionRecoversBeforeDeadline_emitsNormally() async throws {
         let clock = ManualClock()
         watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
                                         prefix: "live_stack")
@@ -1493,16 +1619,18 @@ final class StackFileWatcherTests: XCTestCase {
         let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
         try full.prefix(full.count / 2).write(to: url1)   // truncated — invalid while stable
         try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
+        let budget = Double(watcher.blockingBudgetNanos) / 1e9
 
-        watcher.scanNow()                 // sighting
-        watcher.scanNow()                 // _00001 invalid #1; _00002 pending
+        watcher.scanNow()                 // sighting — the blocker's clock starts
+        watcher.scanNow()                 // _00001 invalid; _00002 pending
         clock.advance(seconds: 3601)
-        watcher.scanNow()                 // invalid #2 — still under the threshold
+        watcher.scanNow()                 // still blocked — but well inside the budget
 
-        try full.write(to: url1)          // the producer finishes the file — a new attempt
-        watcher.scanNow()                 // identity changed → re-earns stability (not invalid)
+        try full.write(to: url1)          // the producer finishes the file
+        watcher.scanNow()                 // identity changed → re-earns stability
         watcher.scanNow()                 // stable → digest pending
         clock.advance(seconds: 3601)
+        XCTAssertLessThan(2 * 3601.0, budget, "arrange: the recovery completes inside the budget")
         watcher.scanNow()                 // confirmed → _00001 emits, _00002 follows
         let got = await collector.waitForCount(2, timeout: 2)
         XCTAssertTrue(got, "a recovered revision emits normally")
@@ -1510,7 +1638,170 @@ final class StackFileWatcherTests: XCTestCase {
         XCTAssertEqual(items.map(\.url.lastPathComponent),
                        ["live_stack_00001.fit", "live_stack_00002.fit"])
         XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
-                      "no write-off for a file that recovered under the threshold — got \(logs.all)")
+                      "no write-off for a file that recovered inside the budget — got \(logs.all)")
+    }
+
+    /// Review11 finding 4 (P2, red-first): the old write-off counted 5 consecutive invalid
+    /// SCANS — at the supported 10 ms poll that elapsed in ~100 ms of wall time, discarding a
+    /// recoverable paused write. Post-fix the write-off is monotonic-time-denominated: with a
+    /// REAL 10 ms poll timer racing dozens of scans while the injected monotonic clock stands
+    /// still, the paused (truncated) _00001 must NOT be written off — scan count is
+    /// irrelevant — and once the producer resumes and completes the file inside the budget,
+    /// both revisions emit in order.
+    func testMutablePolicy_tinyPollInterval_pausedWriteNotWrittenOffByScanCount() async throws {
+        let clock = ManualClock()
+        let w = StackFileWatcher(folder: tmp, quietPeriod: 0.05, pollInterval: 0.01,
+                                 fileNamePrefix: "live_stack",
+                                 digestPolicy: .mutableStackerOutput)
+        w.monotonicNowNanos = { clock.now() }
+        watcher = w
+        let logs = LogBox()
+        w.onLog = { logs.append($0) }
+        let collector = collect(w)
+        let full = makeFITS(0.5, size: 64)
+        let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
+        try full.prefix(full.count / 2).write(to: url1)   // the paused mid-write
+        try makeFITS(0.2).write(to: tmp.appendingPathComponent("live_stack_00002.fit"))
+        try w.start()
+
+        // Let the 10 ms poll run MANY scans (far beyond the old 5-scan threshold) while the
+        // monotonic clock stands still: no write-off may occur — the budget has not elapsed.
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "scan count is irrelevant — no write-off before the monotonic budget elapses; got \(logs.all)")
+        let heldItems = await collector.items
+        XCTAssertTrue(heldItems.isEmpty, "_00002 stays held while the paused _00001 blocks")
+
+        // The producer resumes and completes the file — well inside the 30 s budget.
+        try full.write(to: url1)
+        try await Task.sleep(nanoseconds: 300_000_000)   // stability re-earned on real scans
+        clock.advance(seconds: 1)                        // ≥ quietPeriod, << budget → gates confirm
+        let got = await collector.waitForCount(2, timeout: 5)
+        XCTAssertTrue(got, "the recovered write emits — nothing was written off")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00001.fit", "live_stack_00002.fit"],
+                       "the paused write recovers and order holds")
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "no write-off at any point — got \(logs.all)")
+    }
+
+    // MARK: - cold2 I1: the blocking deadline is EPISODE-scoped — lone time is never charged
+
+    /// Cold2 I1 (P1, red-first — the reviewer's exact repro): _00001 blocks _00002 only
+    /// BRIEFLY; _00002 vanishes; a long LONE period follows (nobody is blocked — the
+    /// budget is on blocking-without-emitting, not on slowness, so a lone in-progress
+    /// revision may take all night); then _00003 appears. Pre-fix the BlockTrack survived
+    /// the lone period (cleared only on emission/absence/generation), so the lone wall
+    /// time was charged to the deadline and _00001 was written off THE INSTANT _00003
+    /// appeared. Post-fix each blocking episode runs a fresh clock: while blocksLater is
+    /// false the track is cleared, so _00001 gets a full fresh budget, completes inside
+    /// it, and emits in order — no write-off, no frame loss.
+    func testMutablePolicy_loneBlockerPeriodNotCharged_freshClockPerBlockingEpisode() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        let full = makeFITS(0.5, size: 64)
+        let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
+        let url2 = tmp.appendingPathComponent("live_stack_00002.fit")
+        try full.prefix(full.count / 2).write(to: url1)   // in-progress (invalid while stable)
+        try makeFITS(0.2).write(to: url2)
+        let ceiling = Double(watcher.blockingCeilingNanos) / 1e9
+
+        watcher.scanNow()                 // _00001 blocks _00002 — its episode clock starts
+        watcher.scanNow()                 // still blocking, briefly
+        try FileManager.default.removeItem(at: url2)   // _00002 vanishes — nobody is blocked
+        watcher.scanNow()                 // lone: blocksLater false → the episode is over
+
+        // Long lone period, far past budget AND ceiling — this wall time must not count.
+        clock.advance(seconds: ceiling + 10_000)
+        watcher.scanNow()
+        clock.advance(seconds: ceiling + 10_000)
+        watcher.scanNow()
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "a lone in-progress revision starves nobody — never written off; got \(logs.all)")
+
+        // A new blocking episode begins: _00003 appears. _00001 must get a FRESH budget,
+        // not be written off instantly off the lone period's stale clock.
+        try makeFITS(0.3).write(to: tmp.appendingPathComponent("live_stack_00003.fit"))
+        watcher.scanNow()                 // episode 2 starts — fresh clock
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "the returning blocker starts a fresh clock — no instant write-off; got \(logs.all)")
+
+        // The producer completes _00001 well inside the fresh budget → [1, 3] in order.
+        try full.write(to: url1)
+        watcher.scanNow()                 // identity changed → re-earns stability
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                 // stable → digest pending (and _00003 confirmable)
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                 // digest confirmed → _00001 emits, _00003 follows
+        let got = await collector.waitForCount(2, timeout: 2)
+        XCTAssertTrue(got, "the blocker completes inside its FRESH budget and emits")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent),
+                       ["live_stack_00001.fit", "live_stack_00003.fit"],
+                       "order preserved — the fresh episode budget was honored")
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "no write-off anywhere in this run — got \(logs.all)")
+    }
+
+    /// Cold2 I1, log-honesty half: when a fresh episode DOES exhaust its budget, the
+    /// write-off log reports the TRUE blocking duration — the current episode's hold,
+    /// never the lone period's wall time (pre-fix heldSeconds spanned the lone period
+    /// and was factually wrong).
+    func testMutablePolicy_writeOffLogReportsEpisodeDuration_notLoneWallTime() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        let full = makeFITS(0.5, size: 64)
+        let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
+        let url2 = tmp.appendingPathComponent("live_stack_00002.fit")
+        try full.prefix(full.count / 2).write(to: url1)   // permanently truncated corpse
+        try makeFITS(0.2).write(to: url2)
+        let budget = Double(watcher.blockingBudgetNanos) / 1e9
+        let ceiling = Double(watcher.blockingCeilingNanos) / 1e9
+        let loneSeconds = 2 * ceiling + 20_000            // far larger than any budget
+
+        watcher.scanNow()                 // episode 1: blocks _00002 briefly
+        try FileManager.default.removeItem(at: url2)
+        watcher.scanNow()                 // lone — episode over
+        clock.advance(seconds: loneSeconds)
+        watcher.scanNow()                 // still lone; the clock must not be charged
+
+        try makeFITS(0.3).write(to: tmp.appendingPathComponent("live_stack_00003.fit"))
+        watcher.scanNow()                 // episode 2 starts — fresh clock
+        // The corpse never completes: run episode 2 past its own budget.
+        var episodeElapsed: TimeInterval = 0
+        while episodeElapsed <= budget + 3601,
+              logs.all.filter({ $0.contains("abandoning") }).isEmpty {
+            clock.advance(seconds: 3601)
+            episodeElapsed += 3601
+            watcher.scanNow()
+        }
+        let writeOffs = logs.all.filter { $0.contains("abandoning") }
+        XCTAssertEqual(writeOffs.count, 1,
+                       "episode 2 exhausts its own budget — exactly one write-off; got \(logs.all)")
+        // Parse "blocked emissions for <N>s" and pin the duration to the EPISODE.
+        let line = writeOffs.first ?? ""
+        let held = Int(line.components(separatedBy: "blocked emissions for ").last?
+            .components(separatedBy: "s ").first ?? "") ?? -1
+        XCTAssertGreaterThanOrEqual(Double(held), budget,
+                                    "the write-off honors the full episode budget — got \(line)")
+        XCTAssertLessThan(Double(held), loneSeconds,
+                          "heldSeconds must report the EPISODE's hold, never the lone wall time — got \(line)")
+        // The healthy revision proceeds once the corpse is written off.
+        let got = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(got, "_00003 must emit once the corpse is written off")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent), ["live_stack_00003.fit"])
     }
 
     // MARK: - cold1 I3: ordering machinery is .mutableStackerOutput-only

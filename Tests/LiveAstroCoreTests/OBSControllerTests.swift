@@ -429,6 +429,203 @@ final class OBSControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .disconnected)
     }
 
+    // MARK: - review11 finding 3: connect seeding must never overwrite
+    // NEWER OBS events (per-field order stamps)
+
+    /// Build a long-timeout controller connected against a ScriptedOBSServer
+    /// with `parkTypes` pre-set, parked mid-seed on the given request type.
+    /// Returns once the seed is parked. The caller resumes the parked
+    /// request and awaits the connect task.
+    private func makeSeedParkedController(
+        parking type: String,
+        configure: (ScriptedOBSServer) -> Void = { _ in }
+    ) async -> (OBSController, MockOBSSocket, ScriptedOBSServer, Task<Bool, Never>) {
+        let mock = MockOBSSocket()
+        let controller = OBSController(
+            makeClient: { OBSClient(socket: $0, requestTimeout: 10) },
+            makeSocket: { mock })
+        let server = ScriptedOBSServer()
+        configure(server)
+        server.parkTypes = [type]
+        mock.enqueueInbound(helloFrame())
+        mock.replyToLastSent(server.responder())
+        let connectTask = Task { await controller.connect(host: "localhost", port: 4455,
+                                                          password: nil) }
+        await waitUntil { server.parked.count == 1 }
+        return (controller, mock, server, connectTask)
+    }
+
+    /// A stream-started EVENT lands while the seed's GetStreamStatus answer
+    /// is still in flight; the (older) seed answer then resumes with
+    /// outputActive:false. Pre-fix the stale seed overwrote the event —
+    /// .connected over an actually-streaming OBS, with nothing to repair the
+    /// published state. The event must win.
+    func testSeedStreamAnswerNeverOverwritesNewerStreamEvent() async {
+        let (controller, mock, server, connectTask) =
+            await makeSeedParkedController(parking: "GetStreamStatus")
+        XCTAssertEqual(controller.state, .connected)
+
+        // Newer truth arrives as an event while the seed answer is parked.
+        mock.enqueueInbound(eventFrame(type: "StreamStateChanged",
+                                       data: ["outputActive": true]))
+        await waitUntil { controller.state == .streaming }
+
+        // Resume the STALE seed answer (snapshot taken before the start).
+        mock.enqueueInbound(responseFrame(requestId: server.parked[0].id, ok: true,
+                                          responseData: ["outputActive": false]))
+        let ok = await connectTask.value
+        XCTAssertTrue(ok)
+        XCTAssertEqual(controller.state, .streaming,
+                       "the seed snapshot is OLDER than the event — the event wins")
+        controller.disconnect()
+    }
+
+    /// Record flavor: a RecordStateChanged(active) event lands while the
+    /// seed's GetRecordStatus answer is in flight — the stale answer must
+    /// not clear isRecording.
+    func testSeedRecordAnswerNeverOverwritesNewerRecordEvent() async {
+        let (controller, mock, server, connectTask) =
+            await makeSeedParkedController(parking: "GetRecordStatus")
+
+        mock.enqueueInbound(eventFrame(type: "RecordStateChanged",
+                                       data: ["outputActive": true]))
+        await waitUntil { controller.isRecording }
+
+        mock.enqueueInbound(responseFrame(requestId: server.parked[0].id, ok: true,
+                                          responseData: ["outputActive": false]))
+        let ok = await connectTask.value
+        XCTAssertTrue(ok)
+        XCTAssertTrue(controller.isRecording,
+                      "the seed snapshot is OLDER than the record event — the event wins")
+        controller.disconnect()
+    }
+
+    /// Scene flavor: a CurrentProgramSceneChanged event lands while the
+    /// seed's GetSceneList answer is in flight — the stale answer must not
+    /// roll currentScene back (sceneNames, which only fetches carry, still
+    /// seed normally).
+    func testSeedSceneListAnswerNeverOverwritesNewerSceneChangeEvent() async {
+        let (controller, mock, server, connectTask) =
+            await makeSeedParkedController(parking: "GetSceneList")
+
+        mock.enqueueInbound(eventFrame(type: "CurrentProgramSceneChanged",
+                                       data: ["sceneName": "Scope"]))
+        await waitUntil { controller.currentScene == "Scope" }
+
+        mock.enqueueInbound(responseFrame(requestId: server.parked[0].id, ok: true,
+                                          responseData: [
+                                              "currentProgramSceneName": "Stack",
+                                              "scenes": [["sceneName": "Scope"], ["sceneName": "Stack"]]]))
+        let ok = await connectTask.value
+        XCTAssertTrue(ok)
+        XCTAssertEqual(controller.currentScene, "Scope",
+                       "the seeded program scene is OLDER than the scene-change event — the event wins")
+        XCTAssertEqual(controller.sceneNames.sorted(), ["Scope", "Stack"],
+                       "the scene NAMES still seed — only the superseded field is skipped")
+        controller.disconnect()
+    }
+
+    /// Per-FIELD stamps, not one global version: an UNRELATED event (a scene
+    /// change) during the stream seed must not void the stream seed — a
+    /// skipped-but-untouched field would stay unseeded with nothing to
+    /// repair it.
+    func testUnrelatedEventDoesNotVoidStreamSeed() async {
+        let (controller, mock, server, connectTask) =
+            await makeSeedParkedController(parking: "GetStreamStatus") { $0.streamActive = true }
+
+        mock.enqueueInbound(eventFrame(type: "CurrentProgramSceneChanged",
+                                       data: ["sceneName": "Scope"]))
+        await waitUntil { controller.currentScene == "Scope" }
+
+        // Resume the stream seed: OBS is streaming — the seed must apply.
+        mock.enqueueInbound(responseFrame(requestId: server.parked[0].id, ok: true,
+                                          responseData: ["outputActive": true]))
+        let ok = await connectTask.value
+        XCTAssertTrue(ok)
+        XCTAssertEqual(controller.state, .streaming,
+                       "an unrelated event must not void the stream seed")
+        XCTAssertEqual(controller.currentScene, "Scope")
+        controller.disconnect()
+    }
+
+    // MARK: - cold2 M-3: connect resets published output state before seeding
+
+    /// Cold2 M-3 (red-first): isRecording/sceneNames/currentScene were never reset at
+    /// connect — a NON-FATAL seed failure (requests answered ok:false; the link stays
+    /// up) left the PREVIOUS session's values published behind a fresh .connected.
+    /// Post-fix connect resets all three to neutral defaults at connect start (under
+    /// the new epoch, before seeding), so a failed seed shows neutral, never stale.
+    func testConnectResetsPublishedStateBeforeSeeding_failedSeedNeverShowsStale() async {
+        let mock1 = MockOBSSocket()
+        var current = mock1
+        let controller = OBSController(
+            makeClient: { OBSClient(socket: $0, requestTimeout: 1) },
+            makeSocket: { current })
+
+        _ = await connect(controller, mock1, scenes: ["A", "B"], currentScene: "A",
+                          recording: true)
+        XCTAssertEqual(controller.sceneNames, ["A", "B"])
+        XCTAssertEqual(controller.currentScene, "A")
+        XCTAssertTrue(controller.isRecording)
+        controller.disconnect()
+
+        // Second session: the handshake succeeds but EVERY seed request fails
+        // non-fatally (ok:false — no liveness convergence, the link stays up).
+        let mock2 = MockOBSSocket()
+        current = mock2
+        mock2.enqueueInbound(helloFrame())
+        mock2.replyToLastSent { sent in
+            if sent.contains("\"op\":1") { return identifiedFrame }
+            guard sent.contains("\"op\":6") else { return nil }
+            return responseFrame(requestId: requestId(fromSent: sent), ok: false, code: 500)
+        }
+        let ok = await controller.connect(host: "localhost", port: 4455, password: nil)
+        XCTAssertTrue(ok, "the control link itself connected")
+        XCTAssertEqual(controller.state, .connected)
+        XCTAssertFalse(controller.isRecording,
+                       "the previous session's recording flag must not survive a failed seed")
+        XCTAssertEqual(controller.sceneNames, [],
+                       "the previous session's scene list must not survive a failed seed")
+        XCTAssertNil(controller.currentScene,
+                     "the previous session's program scene must not survive a failed seed")
+        controller.disconnect()
+    }
+
+    // MARK: - cold2 I-2: a wedged handshake must not poison connect coalescing
+
+    /// Cold2 I-2 (red-first, controller level): a wedge (TCP accepts, no Hello) used to
+    /// park connectTask forever — and because `connect` coalesces onto any in-flight
+    /// attempt, EVERY later connect awaited the dead task; only a manual disconnect
+    /// unwedged the controller. Post-fix the first attempt fails within the handshake
+    /// bound, the epoch-guarded clearing releases `connectTask`, and a second attempt
+    /// runs a FRESH handshake that succeeds.
+    func testWedgedHandshakeFailsWithinBound_secondConnectDoesNotCoalesce() async {
+        let wedged = MockOBSSocket()                  // never sends Hello
+        let healthy = MockOBSSocket()
+        var sockets = [wedged, healthy]
+        let controller = OBSController(
+            makeClient: { OBSClient(socket: $0, requestTimeout: 0.2) },
+            makeSocket: { sockets.removeFirst() })
+
+        var firstResult: Bool?
+        Task { firstResult = await controller.connect(host: "localhost", port: 4455,
+                                                      password: nil) }
+        await waitUntil({ firstResult != nil }, timeout: 3)
+        XCTAssertEqual(firstResult, false, "the wedged handshake must fail within the bound")
+        XCTAssertEqual(controller.state, .disconnected)
+
+        healthy.enqueueInbound(helloFrame())
+        healthy.replyToLastSent(sessionResponder())
+        var secondResult: Bool?
+        Task { secondResult = await controller.connect(host: "localhost", port: 4455,
+                                                       password: nil) }
+        await waitUntil({ secondResult != nil }, timeout: 3)
+        XCTAssertEqual(secondResult, true,
+                       "the second attempt must start fresh, never coalesce onto the dead task")
+        XCTAssertEqual(controller.state, .connected)
+        controller.disconnect()
+    }
+
     /// connect failure (bad handshake) returns false and leaves .disconnected.
     func testConnectFailureReturnsFalse() async {
         let mock = MockOBSSocket()

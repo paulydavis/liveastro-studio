@@ -157,6 +157,30 @@ privileged runner.
   which 3 are the crash-terminated `faulthelper` cells), and **5 FaultKit self-tests**
   (`FaultKitTests`). 0 blank cells. Every cell TEST, N/A, or PROXY.
 
+### Notes / justification — Outside Review #11 (finding 2: oracle clause 5 refinement)
+
+- **Clause 5 now keys on the manifest's OWN master expectation.** Pre-fix, clause 5 required a
+  durable `master.fit` for ANY manifest with `end_time` set — but only the native engine ever
+  writes one, so every successfully COMPLETED watcher/Siril session (and an empty native session)
+  "ended" without a master and the oracle called it dishonest (the finding's repro:
+  TEST(`testPipelineEnd_watcherSession_endsHonestly_oracleClause5Passes`) failed clause 5 pre-fix).
+  The manifest now carries `master_expected`, SET FROM SESSION SEMANTICS AT SESSION START
+  (`SessionPipeline.start()`: native ⇒ true, watcher ⇒ false) and IMMUTABLE thereafter — a failed
+  native master write must still trip clause 5, never exempt itself
+  (TEST(`testFailedNativeMasterWrite_masterExpectedImmutable_clause5StillTrips`), pinned with
+  `XCTExpectFailure`, plus the `masterExpected == true` assertion added to the review2
+  master-write-fail cell). Clause 5 is now: `end_time` set && `master_expected == true` && frames
+  recorded ⇒ `master.fit` durable. The empty NATIVE session keeps `master_expected == true` but
+  records the zero-frame fact (empty `snapshots`) and `end()` logs "no frames accepted — no master
+  written" (TEST(`testEmptyNativeSession_endsHonestly_logsNoMaster_oraclePasses`)); watcher-mode
+  `end()` logs "watcher session — the stack lives with the external stacker; no master.fit" once.
+- **Backward compatibility (reviewer-pinned).** The field is OPTIONAL: pre-schema manifests on
+  disk decode with it absent (nil — decoding never throws), and the oracle treats absent-field
+  manifests under their era's semantics: clause 5 SKIPPED. Justification: a legacy manifest
+  carries no mode marker, so a missing master cannot be distinguished from an honest watcher
+  session — assuming native would retroactively fail every archived watcher session.
+  TEST(`testLegacyManifestWithoutMasterExpected_decodesAndOracleSkipsClause5`).
+
 ### Notes / justification — Outside Review #2 (review2 fix wave)
 
 - **F1 — SessionPipeline end × master-write-fails (new cell).** The `end()` finalizer's last

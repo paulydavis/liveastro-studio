@@ -67,6 +67,23 @@ public final class OBSController: ObservableObject {
     /// awaits this task's result instead of starting a competing handshake.
     private var connectTask: Task<Bool, Never>?
 
+    /// Per-field event-order stamps (review11 finding 3): bumped by every
+    /// EVENT apply that touches the field. `seedState`/`refreshScenes`
+    /// capture the stamp BEFORE issuing the corresponding status request
+    /// and apply the answer ONLY if no event touched that field since —
+    /// otherwise the (newer) event wins and the stale snapshot is skipped.
+    /// The connection epoch alone could not order a seed answer against an
+    /// event of the SAME epoch: events flow from the moment the handshake
+    /// completes, so an event could apply first and the older seed answer
+    /// then overwrote it, with nothing left to repair the published state.
+    /// Per-FIELD rather than one global version so an unrelated event (a
+    /// scene change landing during the stream read) cannot void a
+    /// still-valid seed field — a skipped-but-untouched field would stay
+    /// unseeded with nothing to repair it either.
+    private var streamStateVersion = 0
+    private var recordStateVersion = 0
+    private var sceneStateVersion = 0
+
     // MARK: - Init
 
     public init(makeClient: @escaping (OBSSocket) -> OBSClient = { OBSClient(socket: $0) },
@@ -101,6 +118,16 @@ public final class OBSController: ObservableObject {
         connectionEpoch += 1                 // connect start
         let epoch = connectionEpoch
         state = .connecting
+        // Cold2 M-3: published output/scene state resets to NEUTRAL at connect
+        // start — under the new epoch, before any seeding. A NON-FATAL seed
+        // failure (requests answered but failing) previously left the PREVIOUS
+        // session's isRecording/sceneNames/currentScene published behind a
+        // fresh .connected. Events of this epoch flow only after the handshake,
+        // so nothing of the new session can be overwritten by this reset; any
+        // in-flight old-epoch answer is already epoch/stamp-guarded.
+        isRecording = false
+        sceneNames = []
+        currentScene = nil
         let socket = makeSocket()
         let client = makeClient(socket)
         self.client = client
@@ -187,17 +214,29 @@ public final class OBSController: ObservableObject {
         await refreshScenes()
         guard epoch == connectionEpoch else { return }
 
+        // Review11 finding 3: stamp captured BEFORE the request goes out;
+        // the answer applies only if no stream event landed in between.
+        let streamStamp = streamStateVersion
         if let stream = await requestData("GetStreamStatus", nil) {
             guard epoch == connectionEpoch else { return }
             if let active = stream["outputActive"] as? Bool, state != .disconnected {
-                state = active ? .streaming : .connected
+                if streamStamp == streamStateVersion {
+                    state = active ? .streaming : .connected
+                } else {
+                    log("seed: a newer stream event superseded the GetStreamStatus answer — keeping the event's state")
+                }
             }
         }
         guard epoch == connectionEpoch else { return }
+        let recordStamp = recordStateVersion
         if let record = await requestData("GetRecordStatus", nil) {
             guard epoch == connectionEpoch else { return }
             if let active = record["outputActive"] as? Bool {
-                isRecording = active
+                if recordStamp == recordStateVersion {
+                    isRecording = active
+                } else {
+                    log("seed: a newer record event superseded the GetRecordStatus answer — keeping the event's state")
+                }
             }
         }
     }
@@ -207,17 +246,24 @@ public final class OBSController: ObservableObject {
     /// Fetch the scene list and current program scene.
     public func refreshScenes() async {
         let epoch = connectionEpoch
+        let sceneStamp = sceneStateVersion   // review11 finding 3
         guard let data = await requestData("GetSceneList", nil) else { return }
         guard epoch == connectionEpoch else { return }   // answered by a dead session
 
         if let scenes = data["scenes"] as? [[String: Any]] {
             // OBS returns scenes top-of-list first; UI convention lists them in
             // the natural order OBS presents, reversed to bottom→top display.
+            // No event carries scene NAMES (SceneListChanged only triggers a
+            // re-fetch), so the list itself has no event to lose against.
             let names = scenes.compactMap { $0["sceneName"] as? String }
             sceneNames = names.reversed()
         }
         if let current = data["currentProgramSceneName"] as? String {
-            currentScene = current
+            if sceneStamp == sceneStateVersion {
+                currentScene = current
+            } else {
+                log("scene refresh: a newer scene-change event superseded the answer — keeping the event's scene")
+            }
         }
     }
 
@@ -471,17 +517,20 @@ public final class OBSController: ObservableObject {
         switch type {
         case "CurrentProgramSceneChanged":
             if let name = data["sceneName"] as? String {
+                sceneStateVersion += 1   // review11 finding 3: the event outranks in-flight answers
                 currentScene = name
             }
 
         case "StreamStateChanged":
             if let active = data["outputActive"] as? Bool {
+                streamStateVersion += 1   // review11 finding 3
                 state = active ? .streaming : .connected
             }
             onOutputEvent?()   // review8 item 3: reconcile broadcast state
 
         case "RecordStateChanged":
             if let active = data["outputActive"] as? Bool {
+                recordStateVersion += 1   // review11 finding 3
                 isRecording = active
             }
             onOutputEvent?()   // review8 item 3: reconcile broadcast state

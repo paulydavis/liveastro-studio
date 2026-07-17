@@ -409,80 +409,149 @@ public final class StackFileWatcher {
     /// drop line fires once per file, not on every poll tick while the file sits there.
     private var outOfOrderDropLogged: Set<String> = []
 
-    // MARK: Invalid-revision write-off (cold1 C1)
+    // MARK: Blocking-deadline write-off (review11 findings 1+4 — replaces the cold1 C1 counter)
     //
-    // The holdback above has two very different causes. A MID-GATE blocker (stat-unstable
-    // this tick, or pending digest-stability) is making progress and holds indefinitely —
-    // that is the point of the order gate. A blocker that is structurally INVALID (open
-    // failure, non-regular node, zero/short size, header parse failure, size below the
-    // header-declared length, digest failure) may be a permanent corpse — a producer that
-    // crashed mid-write of live_stack_00001.fit leaves a truncated file that fails validity
-    // on EVERY scan and, without an escape valve, silently starves every higher revision
-    // forever (both invariant clauses violated: the whole session is lost, and nothing
-    // appears in the log). The valve: each structurally-invalid observation of a numbered
-    // revision accrues a per-name CONSECUTIVE-invalid-scan count; at
-    // `invalidRevisionWriteOffScans` consecutive invalid scans the revision is permanently
-    // written off for ordering purposes — one honest log line, its hold releases, later
-    // revisions proceed (the frame is lost, the session preserved). The high-water mark is
-    // NOT advanced by a write-off (only real emissions advance it), so a written-off file
-    // that later becomes valid lands at or below the mark once healthier revisions emit and
-    // takes the existing out-of-order drop treatment. The count resets whenever the file
-    // passes all validity checks (reaches the gates) or its stat identity changes (a
-    // rewrite is a new attempt); it is cleared with the per-generation state.
+    // The review10 holdback means ONE numbered revision can gate every later revision. Cold1
+    // C1 added an escape valve, but its trigger was a count of CONSECUTIVE structurally-invalid
+    // SCANS (5), with two fatal properties (outside review #11): (1) any stat-identity change
+    // reset the count ("a rewrite is a new attempt"), so a repeatedly-touched _00001 — or
+    // oscillating SMB metadata — NEVER accrued a write-off and silently starved every higher
+    // revision forever: the churn that most needs the valve was exactly what disarmed it;
+    // (2) the count was scan-denominated, so at the supported 10 ms poll (or event-driven
+    // rescans) the threshold elapsed in ~100 ms of wall time, discarding a recoverable paused
+    // write.
+    //
+    // Redesign: a HARD MONOTONIC DEADLINE on blocking-without-emitting. When a numbered
+    // revision first becomes the BLOCKER — it fails to emit while a later, not-yet-emitted
+    // numbered revision is present to be held — its blockStart is recorded from the monotonic
+    // clock. The budget runs REGARDLESS of the blocker's churn: identity changes and digest
+    // changes do NOT reset it. CONVERGING progress — defined narrowly as the digest-stability
+    // gate ADVANCING for a stable identity (the SAME pending digest observed again while the
+    // quiet-period clock runs) — renews a short grace of one quiet period, but renewal is
+    // CAPPED by a hard total ceiling (budget + maxBlockerGraceExtensions × quietPeriod,
+    // enforced as a TOTAL-deadline check, never per-grace logic alone): indefinite renewal
+    // through digest or identity churn is impossible. At the deadline the blocker is written
+    // off exactly like the old valve: one honest log line, it joins the dropped set, the hold
+    // releases, later revisions proceed (the frame is lost, the session preserved). The
+    // high-water mark is NOT advanced (only real emissions advance it). The track clears when
+    // the blocker emits, vanishes from the scan, the folder generation changes, or — cold2 I1 —
+    // the blocking EPISODE ends (no later unemitted revision is present to be held: the budget
+    // charges blocking-without-emitting time only, so lone in-progress time never counts and a
+    // returning blocker starts a fresh clock; the ceiling caps each CONTINUOUS episode).
+    // Structural invalidity is no longer separately counted — the DEADLINE is the mechanism.
 
-    /// Consecutive structurally-invalid OBSERVATIONS after which a numbered revision is
-    /// written off. An invalid observation clears the file's pending evidence (review10
-    /// item 2), so the file re-earns stat stability before it can be observed invalid
-    /// again — observations therefore land every OTHER scan and a write-off takes
-    /// ~2×N poll ticks (~20 s at the production 2 s poll): long enough that no plausible
-    /// slow writer is misjudged (a writer in progress moves the stat identity, which
-    /// resets the count), short enough that a producer-crash corpse cannot starve a
-    /// session.
-    static let invalidRevisionWriteOffScans = 5
+    /// Budget floor: 30 s. Rationale: >> the default 0.5 s quiet period plus several 2 s
+    /// poll/stability cycles (no plausible healthy writer is misjudged), << a night (a corpse
+    /// cannot starve a session).
+    static let blockerBudgetFloorNanos: UInt64 = 30_000_000_000
+    /// Budget scale terms: the budget must dominate one full gate-earning cycle even for
+    /// clamped-extreme configurations (quietPeriod/pollInterval are capped at 3600 s by
+    /// sanitizedInterval) — a fixed 30 s would otherwise write off every blocker before its
+    /// digest gate could possibly confirm under a large quiet period.
+    static let blockerBudgetQuietPeriods: UInt64 = 10
+    static let blockerBudgetPollIntervals: UInt64 = 5
+    /// Cap on converging-grace renewal: total hold for one blocker never exceeds
+    /// budget + maxBlockerGraceExtensions × quietPeriod (the hard ceiling).
+    static let maxBlockerGraceExtensions: UInt64 = 4
 
-    /// Consecutive-invalid tracking: the count and the stat identity it was accrued under
-    /// (nil when the invalidity precedes a successful fstat — open/stat failures).
-    private struct InvalidTrack { var count: Int; var identity: FileIdentity? }
-    private var invalidScanTracks: [String: InvalidTrack] = [:]
+    private var pollIntervalNanos: UInt64 { UInt64((pollInterval * 1_000_000_000).rounded()) }
+    /// The blocking budget (internal so tests pin the wall-clock semantics, not scan counts).
+    internal var blockingBudgetNanos: UInt64 {
+        max(Self.blockerBudgetFloorNanos,
+            Self.blockerBudgetQuietPeriods &* quietPeriodNanos,
+            Self.blockerBudgetPollIntervals &* pollIntervalNanos)
+    }
+    /// One converging-grace renewal: one quiet period (the time the digest gate itself needs).
+    internal var blockingGraceNanos: UInt64 { quietPeriodNanos }
+    /// The hard ceiling on total hold for one blocker — the total-deadline check.
+    internal var blockingCeilingNanos: UInt64 {
+        blockingBudgetNanos &+ Self.maxBlockerGraceExtensions &* blockingGraceNanos
+    }
+
+    /// Per-blocker deadline state: when it first became the blocker, and the current
+    /// write-off deadline (start + budget, possibly grace-extended, never past the ceiling).
+    private struct BlockTrack {
+        let startNanos: UInt64
+        var deadlineNanos: UInt64
+    }
+    private var blockTracks: [String: BlockTrack] = [:]
     /// Numbered revisions permanently written off this folder generation.
-    private var invalidWrittenOff: Set<String> = []
+    private var writtenOffRevisions: Set<String> = []
 
     /// Cold1 I3: the ordering machinery — high-water mark, reject-below, holdback, and the
-    /// C1 write-off that rides the holdback — exists for REPLAY/REVISION semantics, i.e.
+    /// blocking-deadline write-off that rides the holdback — exists for REPLAY/REVISION semantics, i.e.
     /// `.mutableStackerOutput` only. Under `.immutableAfterPublish` numbered files are just
     /// files (order is irrelevant to stacking): no hold, no drop — a bulk copy arriving out
     /// of numeric order loses nothing. Numeric SORTING stays for both policies (harmless
     /// determinism within a scan).
     private var revisionOrderingEnabled: Bool { digestPolicy == .mutableStackerOutput }
 
-    /// Record one structurally-INVALID observation of a candidate (cold1 C1). Returns true
-    /// when higher-numbered revisions must still be held back this scan (the invalidity is
-    /// under the write-off threshold), false when the file exerts no hold: not a numbered
-    /// revision, ordering not in force (I3), already written off, or written off RIGHT NOW —
-    /// in which case the one honest log line fires and the name joins the out-of-order
+    /// Record that a numbered revision FAILED TO EMIT this scan — any cause: open/stat
+    /// failure, stat instability, invalid/incomplete FITS, digest failure or churn, or a
+    /// mid-quiet digest gate. Returns true when the revision (still) holds higher revisions
+    /// back this scan, false when it exerts no hold: not a numbered revision, ordering not
+    /// in force (I3), already written off, or written off RIGHT NOW at its blocking deadline
+    /// — in which case the one honest log line fires and the name joins the out-of-order
     /// dropped set (so a later mark-drop of a recovered file does not log twice).
-    private func noteInvalidObservation(name: String, revision: String?,
-                                        identity: FileIdentity?) -> Bool {
+    ///
+    /// `holdAlreadySet`: an earlier (lower) revision already blocks this scan — this one is a
+    /// queued VICTIM, not the blocker; it holds but its own deadline does not run (it becomes
+    /// the blocker, with a fresh clock, only once everything below it has cleared).
+    /// `blocksLater`: some LATER candidate carries a not-yet-emitted numbered revision — only
+    /// then does the deadline run (a lone in-progress revision starves nobody and may take
+    /// all night; review11: the budget is on BLOCKING-without-emitting, not on slowness).
+    /// `converging`: the digest-stability gate is ADVANCING for a stable identity (the SAME
+    /// pending digest observed again, quiet-period clock running) — the ONLY progress that
+    /// renews grace; identity churn and digest churn are NOT converging.
+    private func revisionFailedToEmit(name: String, revision: String?, converging: Bool,
+                                      holdAlreadySet: Bool, blocksLater: Bool) -> Bool {
         guard revisionOrderingEnabled, let revision else { return false }
-        guard !invalidWrittenOff.contains(name) else { return false }
-        var track = invalidScanTracks[name] ?? InvalidTrack(count: 0, identity: identity)
-        if track.identity != identity {
-            // The stat identity moved since the last invalid sighting — a rewrite is a new
-            // attempt; consecutiveness restarts under the new identity.
-            track = InvalidTrack(count: 0, identity: identity)
-        }
-        track.count += 1
-        guard track.count >= Self.invalidRevisionWriteOffScans else {
-            invalidScanTracks[name] = track
+        guard !writtenOffRevisions.contains(name) else { return false }
+        if holdAlreadySet {
+            // Cold2 I1: a queued VICTIM's own deadline never runs — and any track it
+            // still carries from an earlier episode dies here, so it "becomes the
+            // blocker, with a fresh clock, only once everything below it has cleared"
+            // (the documented rule, now enforced).
+            blockTracks[name] = nil
             return true
         }
-        // Written off: the hold releases, later revisions proceed, the frame is lost —
-        // honestly. The high-water mark is NOT advanced (only real emissions advance it).
-        invalidScanTracks[name] = nil
-        invalidWrittenOff.insert(name)
+        guard blocksLater else {
+            // Cold2 I1 (P1): the deadline is EPISODE-scoped — it charges only
+            // blocking-without-emitting time. With no later unemitted revision present,
+            // nobody is blocked: the episode is over and its clock DIES with it (a lone
+            // in-progress revision starves nobody and may take all night). Pre-fix the
+            // track survived lone periods, so the next blocking episode inherited a
+            // spent deadline (an instant write-off) and the write-off log charged lone
+            // wall time as "blocked" — factually wrong. A returning blocker now starts
+            // a fresh clock; the ceiling still caps any single CONTINUOUS episode.
+            blockTracks[name] = nil
+            return true
+        }
+        let now = monotonicNowNanos()
+        guard var track = blockTracks[name] else {
+            blockTracks[name] = BlockTrack(startNanos: now,
+                                           deadlineNanos: now &+ blockingBudgetNanos)
+            return true
+        }
+        let ceiling = track.startNanos &+ blockingCeilingNanos
+        if converging {
+            // One quiet period of grace per converging observation, clamped at the ceiling —
+            // renewal can never push the total hold past budget + maxGrace×grace.
+            let renewed = min(now &+ blockingGraceNanos, ceiling)
+            if renewed > track.deadlineNanos {
+                track.deadlineNanos = renewed
+                blockTracks[name] = track
+            }
+        }
+        guard now >= min(track.deadlineNanos, ceiling) else { return true }
+        // Deadline passed: written off. The hold releases, later revisions proceed, the frame
+        // is lost — honestly. The high-water mark is NOT advanced (only real emissions do).
+        blockTracks[name] = nil
+        writtenOffRevisions.insert(name)
         outOfOrderDropLogged.insert(name)
-        onLog?("revision \(revision) invalid for \(track.count) scans — abandoning it; "
-               + "later revisions proceed (frame lost: \(name))")
+        let heldSeconds = Int((Double(now &- track.startNanos) / 1_000_000_000).rounded())
+        onLog?("revision \(revision) blocked emissions for \(heldSeconds)s without completing "
+               + "— abandoning it; later revisions proceed (frame lost: \(name))")
         return false
     }
 
@@ -687,6 +756,7 @@ public final class StackFileWatcher {
     /// The timeout log line is the ONE onLog delivery made from the caller's thread rather
     /// than the watcher queue — on this path the queue is, by definition, stalled.
     public func stop(timeout: TimeInterval = 5.0) {
+        stopSeamLock.withLock { _lastStopTimeout = timeout }
         stopRequested.set()
         // Reentrant call (an onLog handler running ON the watcher queue invoking stop()):
         // run the teardown inline — waiting for our own queue would deadlock.
@@ -703,6 +773,13 @@ public final class StackFileWatcher {
             onLog?("watcher stop timed out behind a stalled read — abandoning the scan; descriptors close via cancel handlers")
         }
     }
+
+    /// Test seam (cold2 M3, mirroring FolderFrameSource's): the timeout the most recent
+    /// stop() ran with — pins budget threading without wall-clock assertions.
+    /// Lock-guarded: stop() may be called from any thread.
+    private let stopSeamLock = NSLock()
+    private var _lastStopTimeout: TimeInterval?
+    internal var lastStopTimeout: TimeInterval? { stopSeamLock.withLock { _lastStopTimeout } }
 
     /// Queue-confined terminal teardown (the body of the pre-review10 stop()).
     private func teardown() {
@@ -772,11 +849,11 @@ public final class StackFileWatcher {
                 // revisions still dedup; only the ordering gate restarts.
                 emittedRevisionHighWater = nil
                 outOfOrderDropLogged.removeAll()
-                // Cold1 C1: the write-off state is per-generation too — a persisting corpse
-                // re-accrues its invalid count (and is written off again, honestly) after a
-                // reconnect.
-                invalidScanTracks.removeAll()
-                invalidWrittenOff.removeAll()
+                // Review11 findings 1+4: the write-off state is per-generation too — a
+                // persisting corpse re-earns its blocking deadline (and is written off
+                // again, honestly) after a reconnect.
+                blockTracks.removeAll()
+                writtenOffRevisions.removeAll()
             }
             if nodeExists {
                 // Something non-directory occupies the watched path. Log once per occupation
@@ -854,11 +931,12 @@ public final class StackFileWatcher {
         if !pendingContent.isEmpty {
             pendingContent = pendingContent.filter { present.contains($0.key) }
         }
-        // Cold1 C1: an ABSENT file breaks the consecutiveness of its invalid-scan count —
-        // the count restarts if the name reappears (still invalid). The write-off SET is
-        // retained: a written-off corpse being briefly invisible does not resurrect it.
-        if !invalidScanTracks.isEmpty {
-            invalidScanTracks = invalidScanTracks.filter { present.contains($0.key) }
+        // Review11 findings 1+4: an ABSENT blocker holds nothing — during its absence the
+        // higher revisions it was holding proceed, so its deadline dies with it (a returning
+        // file that blocks again starts a fresh clock). The write-off SET is retained: a
+        // written-off corpse being briefly invisible does not resurrect it.
+        if !blockTracks.isEmpty {
+            blockTracks = blockTracks.filter { present.contains($0.key) }
         }
         // Review9 item 2: process candidates in a deterministic order (numbered revisions
         // numerically, everything else lexicographically — see orderedBefore). The revision
@@ -869,7 +947,21 @@ public final class StackFileWatcher {
         // yet emittable — every higher-numbered revision then advances its gates normally
         // but is not allowed to EMIT this scan (see the pre-emission check below).
         var holdRevisionsAbove = false
-        for (name, revision) in candidates {
+        // Review11 findings 1+4: a failing revision only runs the blocking deadline when it
+        // actually BLOCKS someone — i.e. some LATER candidate carries a not-yet-emitted
+        // numbered revision. Precomputed as a suffix flag over the sorted candidates.
+        var laterUnemittedRevision = [Bool](repeating: false, count: candidates.count)
+        if revisionOrderingEnabled {
+            var seen = false
+            for i in stride(from: candidates.count - 1, through: 0, by: -1) {
+                laterUnemittedRevision[i] = seen
+                let c = candidates[i]
+                if c.revision != nil, lastEmittedDigest[c.name] == nil,
+                   !writtenOffRevisions.contains(c.name) { seen = true }
+            }
+        }
+        for (candidateIndex, candidate) in candidates.enumerated() {
+            let (name, revision) = candidate
             // Review10 item 3: a stop() waiting out its bounded deadline sees this scan
             // yield at the next per-file boundary — never park behind the rest of the folder.
             if stopRequested.isSet { return }
@@ -896,6 +988,13 @@ public final class StackFileWatcher {
                 continue
             }
 
+            // Review11 findings 1+4: a revision written off at its blocking deadline is dead
+            // for this folder generation — it exerts no hold and must never emit (recovering
+            // later does not resurrect it; the honest frame loss was already logged).
+            if revisionOrderingEnabled, revision != nil, writtenOffRevisions.contains(name) {
+                continue
+            }
+
             let url = folder.appendingPathComponent(name)
 
             // ONE pinned descriptor per candidate file (review5 item 1). Everything the WATCHER
@@ -910,8 +1009,10 @@ public final class StackFileWatcher {
             // this tick, exactly like a failed stat before.
             guard let handle = Self.openFile(directoryFD: folderFD, name: name) else {
                 clearPendingEvidence(for: name)                    // review10 item 2
-                // Review10 item 1 + cold1 C1: invalid — holds until the write-off threshold.
-                if noteInvalidObservation(name: name, revision: revision, identity: nil) {
+                // Review10 item 1 + review11: holds until the blocking deadline.
+                if revisionFailedToEmit(name: name, revision: revision, converging: false,
+                                        holdAlreadySet: holdRevisionsAbove,
+                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
                     holdRevisionsAbove = true
                 }
                 continue
@@ -923,8 +1024,11 @@ public final class StackFileWatcher {
             let statResult = Self.statFile(handle)
             guard let observed = statResult, observed.size > 0 else {
                 clearPendingEvidence(for: name)                    // review10 item 2
-                // Review10 item 1 + cold1 C1: invalid (stat failure or zero size).
-                if noteInvalidObservation(name: name, revision: revision, identity: statResult) {
+                // Review10 item 1 + review11: invalid (stat failure or zero size) — holds
+                // until the blocking deadline.
+                if revisionFailedToEmit(name: name, revision: revision, converging: false,
+                                        holdAlreadySet: holdRevisionsAbove,
+                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
                     holdRevisionsAbove = true
                 }
                 continue
@@ -966,9 +1070,14 @@ public final class StackFileWatcher {
                 // gate — a pending content observation is only meaningful under the exact
                 // identity it was observed with.
                 pendingContent[name] = nil
-                // Review10 item 1: unstable — a MID-GATE blocker (making progress), never
-                // subject to the C1 write-off; holds indefinitely (I3: mutable policy only).
-                if revision != nil, revisionOrderingEnabled { holdRevisionsAbove = true }
+                // Review10 item 1 + review11: unstable. Instability is NOT converging (an
+                // oscillating identity must never renew the deadline) — the blocker holds
+                // only until its blocking budget runs out.
+                if revisionFailedToEmit(name: name, revision: revision, converging: false,
+                                        holdAlreadySet: holdRevisionsAbove,
+                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
+                    holdRevisionsAbove = true
+                }
                 continue
             }
 
@@ -982,8 +1091,10 @@ public final class StackFileWatcher {
                       let header = try? FITSReader.readHeader(head),
                       observed.size >= header.minimumFileSize else {
                     clearPendingEvidence(for: name)                    // review10 item 2
-                    // Review10 item 1 + cold1 C1: invalid (malformed/incomplete FITS).
-                    if noteInvalidObservation(name: name, revision: revision, identity: observed) {
+                    // Review10 item 1 + review11: invalid (malformed/incomplete FITS).
+                    if revisionFailedToEmit(name: name, revision: revision, converging: false,
+                                            holdAlreadySet: holdRevisionsAbove,
+                                            blocksLater: laterUnemittedRevision[candidateIndex]) {
                         holdRevisionsAbove = true
                     }
                     continue
@@ -1000,8 +1111,10 @@ public final class StackFileWatcher {
             else {
                 if stopRequested.isSet { return }                  // review10 item 3: aborted by stop()
                 clearPendingEvidence(for: name)                    // review10 item 2
-                // Review10 item 1 + cold1 C1: invalid (digest failure).
-                if noteInvalidObservation(name: name, revision: revision, identity: observed) {
+                // Review10 item 1 + review11: invalid (digest failure).
+                if revisionFailedToEmit(name: name, revision: revision, converging: false,
+                                        holdAlreadySet: holdRevisionsAbove,
+                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
                     holdRevisionsAbove = true
                 }
                 continue
@@ -1015,8 +1128,10 @@ public final class StackFileWatcher {
             // no log spam) and let it re-earn stability on later ticks.
             guard let finalStat = Self.statFile(handle) else {
                 clearPendingEvidence(for: name)                    // review10 item 2
-                // Review10 item 1 + cold1 C1: invalid (revalidation stat failure).
-                if noteInvalidObservation(name: name, revision: revision, identity: observed) {
+                // Review10 item 1 + review11: invalid (revalidation stat failure).
+                if revisionFailedToEmit(name: name, revision: revision, converging: false,
+                                        holdAlreadySet: holdRevisionsAbove,
+                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
                     holdRevisionsAbove = true
                 }
                 continue
@@ -1029,14 +1144,14 @@ public final class StackFileWatcher {
                 // Review8 finding 1: the identity moved mid-scan — restart the
                 // digest-stability gate along with stat stability.
                 pendingContent[name] = nil
-                // Review10 item 1: unstable — mid-gate, never written off (I3: mutable only).
-                if revision != nil, revisionOrderingEnabled { holdRevisionsAbove = true }
+                // Review10 item 1 + review11: unstable mid-scan — not converging.
+                if revisionFailedToEmit(name: name, revision: revision, converging: false,
+                                        holdAlreadySet: holdRevisionsAbove,
+                                        blocksLater: laterUnemittedRevision[candidateIndex]) {
+                    holdRevisionsAbove = true
+                }
                 continue
             }
-            // Cold1 C1: the file passed EVERY structural validity check this scan — the
-            // consecutive-invalid count restarts from zero (a recovery under the threshold
-            // emits normally; only an unbroken run of invalid scans writes a revision off).
-            invalidScanTracks[name] = nil
 
             guard lastEmittedDigest[name] != digest else {
                 // Identical content re-published under a NEW identity (in-place
@@ -1081,7 +1196,15 @@ public final class StackFileWatcher {
                    pending.identity == observed {
                     guard now >= pending.firstObservedNanos,
                           now - pending.firstObservedNanos >= quietPeriodNanos else {
-                        if revision != nil { holdRevisionsAbove = true }   // review10 item 1: mid-gate
+                        // Review10 item 1 + review11: mid-gate, and the ONLY branch that is
+                        // CONVERGING — the same pending digest observed again under a stable
+                        // identity with the quiet-period clock running. Converging progress
+                        // renews one quiet period of grace, capped by the hard ceiling.
+                        if revisionFailedToEmit(name: name, revision: revision, converging: true,
+                                                holdAlreadySet: holdRevisionsAbove,
+                                                blocksLater: laterUnemittedRevision[candidateIndex]) {
+                            holdRevisionsAbove = true
+                        }
                         continue
                     }
                     // Gate satisfied. The pending observation is cleared at EMISSION below,
@@ -1090,7 +1213,13 @@ public final class StackFileWatcher {
                 } else {
                     pendingContent[name] = PendingContent(digest: digest, identity: observed,
                                                           firstObservedNanos: now)
-                    if revision != nil { holdRevisionsAbove = true }   // review10 item 1: mid-gate
+                    // Review10 item 1 + review11: mid-gate; a NEW/CHANGED digest is churn,
+                    // not convergence — it must never renew the blocking deadline.
+                    if revisionFailedToEmit(name: name, revision: revision, converging: false,
+                                            holdAlreadySet: holdRevisionsAbove,
+                                            blocksLater: laterUnemittedRevision[candidateIndex]) {
+                        holdRevisionsAbove = true
+                    }
                     continue
                 }
                 // NOTE (cold1 I3): these two mid-gate holds need no revisionOrderingEnabled
@@ -1125,6 +1254,7 @@ public final class StackFileWatcher {
             pendingContent[name] = nil          // the emission consumes the gate evidence
             lastEmittedDigest[name] = digest
             lastEmittedIdentity[name] = observed
+            blockTracks[name] = nil             // review11: the blocker emitted — clock clears
             if revisionOrderingEnabled, let revision,
                emittedRevisionHighWater.map({ Self.numericCompare(revision, $0) == .orderedDescending })
                     ?? true {
@@ -1171,9 +1301,10 @@ public final class StackFileWatcher {
         // above still dedup any re-sighting of an already-emitted revision).
         emittedRevisionHighWater = nil
         outOfOrderDropLogged.removeAll()
-        // Cold1 C1: write-off state dies with the generation (see the disappear branch).
-        invalidScanTracks.removeAll()
-        invalidWrittenOff.removeAll()
+        // Review11 findings 1+4: write-off state dies with the generation (see the
+        // disappear branch).
+        blockTracks.removeAll()
+        writtenOffRevisions.removeAll()
         folderMissing = true
     }
 

@@ -193,6 +193,371 @@ final class FolderFrameSourceTests: XCTestCase {
         }
     }
 
+    // MARK: - review11 finding 5: no silent frame loss — every drop is logged with a reason
+
+    /// Review11 finding 5 (P2, red-first): import mode swallowed every non-identity load
+    /// error with `try?` — a file DELETED between the snapshot and the pull lost a frame
+    /// with NO log line (pre-fix this test's log assertions failed: the drop was silent).
+    /// Every drop must log the FILENAME and a REASON, and the following valid frame must
+    /// still be delivered — a boundary failure loses one frame, never the session.
+    func testImportMode_deletedFile_loggedWithFilenameAndReason_nextFrameDelivered() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let doomed = try writeFITS(dir, name: "Light_1.fit", value: 0.1)
+        _ = try writeFITS(dir, name: "Light_2.fit", value: 0.2)
+
+        // The cursor snapshots eagerly at init; the file vanishes before the pull.
+        let source = FolderFrameSource(folder: dir, mode: .importOnce, fileNamePrefix: "Light_")
+        let logs = LogBox()
+        source.onLog = { logs.append($0) }
+        try FileManager.default.removeItem(at: doomed)
+        try source.start()
+
+        var names: [String] = []
+        for await frame in source.frames { names.append(frame.sourceName) }
+        XCTAssertEqual(names, ["Light_2.fit"],
+                       "the deleted frame is lost; the following valid frame is still delivered")
+        let dropLines = logs.all.filter { $0.contains("Light_1.fit") }
+        XCTAssertEqual(dropLines.count, 1,
+                       "the drop must appear in the log exactly once, naming the file — got \(logs.all)")
+        XCTAssertTrue(dropLines.first?.contains("Skipped frame (Light_1.fit): ") == true,
+                      "the log must carry the thrown error as the reason — got \(dropLines)")
+    }
+
+    /// Review11 finding 5, import × undecodable: garbage bytes wearing a .fit extension are
+    /// dropped WITH a logged filename + reason, and the next valid frame is delivered.
+    /// Pre-fix: silent (`try?`).
+    func testImportMode_undecodableFile_loggedWithFilenameAndReason_nextFrameDelivered() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try Data("this is not a FITS file at all — corrupt garbage".utf8)
+            .write(to: dir.appendingPathComponent("Light_1.fit"))
+        _ = try writeFITS(dir, name: "Light_2.fit", value: 0.2)
+
+        let source = FolderFrameSource(folder: dir, mode: .importOnce, fileNamePrefix: "Light_")
+        let logs = LogBox()
+        source.onLog = { logs.append($0) }
+        try source.start()
+
+        var names: [String] = []
+        for await frame in source.frames { names.append(frame.sourceName) }
+        XCTAssertEqual(names, ["Light_2.fit"],
+                       "the undecodable frame is lost; the session continues to the next frame")
+        let dropLines = logs.all.filter { $0.contains("Light_1.fit") }
+        XCTAssertEqual(dropLines.count, 1,
+                       "the drop must appear in the log exactly once, naming the file — got \(logs.all)")
+        XCTAssertTrue(dropLines.first?.contains("Skipped frame (Light_1.fit): ") == true,
+                      "the log must carry the decode error as the reason — got \(dropLines)")
+    }
+
+    /// Review11 finding 5, live × unreadable: a buffered update whose file is DELETED
+    /// between the watcher's emit and the consumer's pull. Pre-fix only the identity-
+    /// MISMATCH path logged; the open failure fell into a silent `return nil`. The drop
+    /// must log filename + reason and the next update must still be delivered.
+    func testLiveMode_fileDeletedBeforePull_loggedWithFilenameAndReason_nextDelivered() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let a = try writeFITS(dir, name: "Light_a.fit", value: 0.1)
+        _ = try writeFITS(dir, name: "Light_b.fit", value: 0.2)
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        defer { source.stop() }
+        let logs = LogBox()
+        source.onLog = { logs.append($0) }
+        let buffered = expectation(description: "2 light updates buffered")
+        buffered.expectedFulfillmentCount = 2
+        source.liveSeams.onUpdateBuffered = { _ in buffered.fulfill() }
+        try source.start()
+        await fulfillment(of: [buffered], timeout: 15)
+
+        // The file vanishes AFTER the watcher validated it, BEFORE the consumer pulls.
+        try FileManager.default.removeItem(at: a)
+
+        var it = source.frames.makeAsyncIterator()
+        let got = await it.next()
+        XCTAssertEqual(got?.sourceName, "Light_b.fit",
+                       "the vanished frame is skipped and the NEXT update delivered — " +
+                       "a lost frame must never end a live stream")
+        let dropLines = logs.all.filter { $0.contains("Light_a.fit") }
+        XCTAssertEqual(dropLines.count, 1,
+                       "the drop must appear in the log exactly once, naming the file — got \(logs.all)")
+        XCTAssertTrue(dropLines.first?.contains("Skipped frame (Light_a.fit): ") == true,
+                      "the log must carry the open error as the reason — got \(dropLines)")
+    }
+
+    /// Review11 finding 5, live × undecodable: garbage bytes wearing a .png extension pass
+    /// the watcher's gates (bitmaps have no header/completeness check — only stability and
+    /// digest), so the corruption is discovered at pull-time decode. Pre-fix that drop was
+    /// silent. It must log filename + reason; the following valid FITS is still delivered.
+    func testLiveMode_undecodableFile_loggedWithFilenameAndReason_nextDelivered() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // Sorts before Light_b.fit, so it is emitted (and pulled) first.
+        try Data("garbage that is neither PNG nor FITS".utf8)
+            .write(to: dir.appendingPathComponent("Light_a.png"))
+        _ = try writeFITS(dir, name: "Light_b.fit", value: 0.2)
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        defer { source.stop() }
+        let logs = LogBox()
+        source.onLog = { logs.append($0) }
+        let buffered = expectation(description: "2 light updates buffered")
+        buffered.expectedFulfillmentCount = 2
+        source.liveSeams.onUpdateBuffered = { _ in buffered.fulfill() }
+        try source.start()
+        await fulfillment(of: [buffered], timeout: 15)
+
+        var it = source.frames.makeAsyncIterator()
+        let got = await it.next()
+        XCTAssertEqual(got?.sourceName, "Light_b.fit",
+                       "the undecodable frame is skipped and the valid one delivered")
+        let dropLines = logs.all.filter { $0.contains("Light_a.png") }
+        XCTAssertEqual(dropLines.count, 1,
+                       "the drop must appear in the log exactly once, naming the file — got \(logs.all)")
+        XCTAssertTrue(dropLines.first?.contains("Skipped frame (Light_a.png): ") == true,
+                      "the log must carry the decode error as the reason — got \(dropLines)")
+    }
+
+    // MARK: - review11 finding 3: atomic lifecycle (.starting reserved under the lock)
+
+    /// Lock-guarded capture of concurrent start() outcomes.
+    private final class StartResults: @unchecked Sendable {
+        private let lock = NSLock()
+        private var successes = 0
+        private var errors: [Error] = []
+        func success() { lock.withLock { successes += 1 } }
+        func failure(_ e: Error) { lock.withLock { errors.append(e) } }
+        var snapshot: (successes: Int, errors: [Error]) { lock.withLock { (successes, errors) } }
+    }
+
+    /// Lock-guarded capture of the watcher handed to the beforeStartCommit seam.
+    private final class WatcherBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var watchers: [StackFileWatcher] = []
+        func add(_ w: StackFileWatcher) { lock.withLock { watchers.append(w) } }
+        var all: [StackFileWatcher] { lock.withLock { watchers } }
+    }
+
+    /// Review11 finding 3 (P2, red-first): start() checked `.initial` under the lock but
+    /// constructed/started the watcher OUTSIDE it and committed `.running` afterwards — two
+    /// concurrent start() calls could both pass the check, construct TWO watchers (one
+    /// orphaned: armed fd + live timer, unreachable forever) and both report success. The
+    /// lifecycle must reserve an intermediate `.starting` under the lock: exactly one caller
+    /// wins, the loser throws `.alreadyStarted` before constructing anything, and exactly one
+    /// watcher is ever built (pinned via the construction seam). Repeated to make the pre-fix
+    /// race land reliably.
+    func testLiveMode_concurrentDoubleStart_exactlyOneRunsOtherThrows_noOrphanWatcher() throws {
+        for round in 0..<10 {
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+
+            let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+            let constructed = WatcherBox()
+            source.beforeStartCommit = { constructed.add($0) }
+            let results = StartResults()
+            let ready = DispatchSemaphore(value: 0)
+            let go = DispatchSemaphore(value: 0)
+            let done = DispatchSemaphore(value: 0)
+            for _ in 0..<2 {
+                Thread.detachNewThread {
+                    ready.signal()
+                    go.wait()
+                    do { try source.start(); results.success() }
+                    catch { results.failure(error) }
+                    done.signal()
+                }
+            }
+            ready.wait(); ready.wait()
+            go.signal(); go.signal()
+            XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
+            XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
+
+            let (successes, errors) = results.snapshot
+            XCTAssertEqual(successes, 1, "round \(round): exactly ONE start() may win")
+            XCTAssertEqual(errors.count, 1, "round \(round): the loser must throw, not silently 'succeed'")
+            XCTAssertEqual(errors.first as? FolderFrameSourceError, .alreadyStarted,
+                           "round \(round): the loser fails with .alreadyStarted")
+            XCTAssertEqual(constructed.all.count, 1,
+                           "round \(round): exactly one watcher may ever be constructed — no orphan")
+            source.stop()
+        }
+    }
+
+    /// Review11 finding 3, stop-during-start: stop() lands while start() is between the
+    /// watcher's construction and the `.running` commit (parked deterministically at the
+    /// beforeStartCommit seam). The revalidation under the lock must see `.stopped`, TEAR
+    /// DOWN the freshly constructed watcher (terminal — its one-shot contract proves it),
+    /// and fail start() loudly with `.stopped`: a stopped source must never be resurrected
+    /// with an already-finished stream (pre-fix the late `.running` overwrite did exactly
+    /// that, and the session recorded empty).
+    func testLiveMode_stopDuringStart_staysStopped_watcherTornDown_streamFinished() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        let constructed = WatcherBox()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        source.beforeStartCommit = { w in
+            constructed.add(w)
+            entered.signal()
+            release.wait()          // park start() in the stop-during-start window
+        }
+        let startDone = DispatchSemaphore(value: 0)
+        let errBox = CapturedErrorBox()
+        Thread.detachNewThread {
+            do { try source.start() } catch { errBox.set(error) }
+            startDone.signal()
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 10), .success,
+                       "arrange: start() is parked after watcher construction, before commit")
+        source.stop()               // stop() wins the race
+        release.signal()
+        XCTAssertEqual(startDone.wait(timeout: .now() + 10), .success)
+
+        XCTAssertEqual(errBox.value as? FolderFrameSourceError, .stopped,
+                       "a start() that lost to stop() must fail loudly, never commit .running")
+        // The constructed watcher was torn down, not leaked: its one-shot contract reports
+        // terminal .stopped (a merely-orphaned RUNNING watcher would say .alreadyStarted).
+        let discarded = try XCTUnwrap(constructed.all.first, "arrange: a watcher was constructed")
+        XCTAssertThrowsError(try discarded.start()) {
+            XCTAssertEqual($0 as? StackFileWatcherError, .stopped,
+                           "the discarded watcher must be STOPPED, not left running as an orphan")
+        }
+        // No resurrection: the source stays terminally stopped and its stream stays finished.
+        XCTAssertThrowsError(try source.start()) {
+            XCTAssertEqual($0 as? FolderFrameSourceError, .stopped)
+        }
+        let finished = expectation(description: "frames stream stays finished")
+        Task {
+            var it = source.frames.makeAsyncIterator()
+            let frame = await it.next()
+            XCTAssertNil(frame, "a stopped source's stream must be finished, never revived")
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 5)
+    }
+
+    // MARK: - cold2 I2: dropping a running live source must not leak the armed fd
+
+    /// Count of open descriptors in THIS process that resolve to `url`'s (dev, ino) —
+    /// the reviewer's fd-count probe.
+    private func openDescriptorCount(matching url: URL) -> Int {
+        var target = Darwin.stat()
+        guard stat(url.path, &target) == 0 else { return 0 }
+        var count = 0
+        for fd in 0..<getdtablesize() {
+            var st = Darwin.stat()
+            if fstat(Int32(fd), &st) == 0, st.st_dev == target.st_dev,
+               st.st_ino == target.st_ino {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    /// Cold2 I2 (P1, red-first — proven fd leak): FolderFrameSource had NO deinit, so
+    /// dropping a RUNNING live source without stop() leaked the armed folder fd, the
+    /// poll timer, and the relay task forever (the inner watcher is reachable only
+    /// through the source). deinit now mirrors SessionPipeline's fallback: if running,
+    /// stop the watcher (bounded default) and cancel the relay task — the fd count
+    /// returns to baseline.
+    func testDroppingRunningLiveSourceWithoutStopReleasesFolderDescriptor() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let baseline = openDescriptorCount(matching: dir)
+        var source: FolderFrameSource? =
+            FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        try source!.start()
+        XCTAssertGreaterThan(openDescriptorCount(matching: dir), baseline,
+                             "arrange: the armed watcher holds a descriptor on the folder")
+
+        source = nil          // dropped WITHOUT stop()
+        // deinit stops the watcher; the fd closes via the DispatchSource cancel
+        // handler shortly after the queue teardown runs — poll briefly.
+        let deadline = Date().addingTimeInterval(5)
+        while openDescriptorCount(matching: dir) > baseline && Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(openDescriptorCount(matching: dir), baseline,
+                       "dropping a running live source must release the armed folder fd")
+    }
+
+    // MARK: - cold2 M2: onLog assigned after start() reaches the inner watcher
+
+    /// Cold2 M2 (red-first): live-mode `onLog` assigned AFTER start() never reached the
+    /// inner watcher — the didSet forwarded to the pull/import relays only, and the
+    /// watcher's sink was snapshotted at start. The didSet now feeds a lock-guarded
+    /// relay the watcher logs through, so late assignment (SessionPipeline wires onLog
+    /// in startSources, after constructing the source) always takes effect.
+    func testLiveMode_onLogAssignedAfterStart_reachesInnerWatcher() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        defer { source.stop() }
+        let constructed = WatcherBox()
+        source.beforeStartCommit = { constructed.add($0) }
+        try source.start()
+
+        let logs = LogBox()
+        source.onLog = { logs.append($0) }        // assigned AFTER start()
+
+        // Trigger a watcher-side log deterministically: the folder disappears and a
+        // manual scan (through the captured inner watcher) notices it.
+        let inner = try XCTUnwrap(constructed.all.first)
+        let aside = dir.deletingLastPathComponent()
+            .appendingPathComponent("aside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: dir, to: aside)
+        inner.scanNow()
+        try FileManager.default.moveItem(at: aside, to: dir)   // restore for teardown
+
+        XCTAssertTrue(logs.all.contains { $0.contains("disappeared") },
+                      "a watcher log after start() must reach the late-assigned sink — got \(logs.all)")
+    }
+
+    // MARK: - cold2 M3: the orphan teardown honors the racing stop's budget
+
+    /// Cold2 M3 (red-first): stop-during-start tears the freshly built (orphan) watcher
+    /// down — but with the 5 s default, ignoring the racing stop()'s own budget. The
+    /// caller's timeout is now threaded into the orphan teardown.
+    func testLiveMode_stopDuringStart_orphanTeardownUsesRacingStopsBudget() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        let constructed = WatcherBox()
+        source.beforeStartCommit = { [weak source] w in
+            constructed.add(w)
+            source?.stop(timeout: 0.25)   // the racing stop, with its own budget
+        }
+        XCTAssertThrowsError(try source.start()) {
+            XCTAssertEqual($0 as? FolderFrameSourceError, .stopped)
+        }
+        let orphan = try XCTUnwrap(constructed.all.first)
+        XCTAssertEqual(orphan.lastStopTimeout ?? -1, 0.25, accuracy: 1e-9,
+                       "the orphan teardown must run under the racing stop's budget, not the 5 s default")
+    }
+
     /// Regression: a BOTTOM-UP GRBG file must reach the engine in STORED row order —
     /// FITSReader's display flip would shift the Bayer phase and swap R/B (the
     /// 2026-07-06 "cyan nebula" bug class). Pins loadRawFrame to raw stored bytes.

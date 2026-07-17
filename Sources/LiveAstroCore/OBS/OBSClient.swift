@@ -31,14 +31,50 @@ public actor OBSClient {
 
     private let socket: OBSSocket
     private let requestTimeout: TimeInterval
+    /// Bound on the WHOLE connect handshake (Hello → Identify → Identified) —
+    /// cold2 I-2. A wedge that accepts the TCP/WebSocket connection but never
+    /// sends Hello used to park `connect` forever: the caller sat in
+    /// `.connecting` indefinitely, auto-launch never engaged (its budget starts
+    /// only after the first connect returns), and OBSController's connect
+    /// coalescing was poisoned for every later attempt. Defaults to
+    /// `requestTimeout` — the handshake is a request-shaped exchange, so the
+    /// same patience applies unless the caller injects its own.
+    private let handshakeTimeout: TimeInterval
 
     // MARK: - State
 
     private var connected = false
     private var receiveLoop: Task<Void, Never>?
+    /// Set by the handshake watchdog when it expires a still-parked handshake
+    /// (cold2 I-2) so `connect` reports the failure as `.timeout` rather than
+    /// whatever error the forced socket close surfaced.
+    private var handshakeTimedOut = false
 
     /// Pending request continuations keyed by the requestId (UUID string) we sent.
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
+
+    /// The TRACKED send task of each pending request (review11 finding 1 —
+    /// P1). Pre-fix the send lived in an untracked Task: a request resolved
+    /// by timeout/cancellation left its send alive, and the frame could hit
+    /// OBS arbitrarily late — a StartStream landing AFTER cleanup had
+    /// confirmed OBS idle. Every resolution path (`failPending`, `failAll`,
+    /// disconnect teardown) now cancels the tracked send: a send that has
+    /// not yet reached `socket.send` when the cancel is observed is
+    /// CONFIRMED never sent. A send already inside `socket.send` cannot be
+    /// retracted (URLSession offers no mid-transmission abort guarantee) —
+    /// that residual window stays "possibly issued" for callers, and the
+    /// send CHAIN below guarantees no later frame can overtake it.
+    private var sendTasks: [String: Task<Void, Never>] = [:]
+
+    /// Tail of the outbound send chain (review11 finding 1, ordering half):
+    /// every request send awaits the previous send task's completion before
+    /// touching the socket, so outbound frames keep ISSUE order end to end
+    /// regardless of transport internals. A cleanup StopStream can never
+    /// overtake an earlier, still-unresolved StartStream — "Start delivered
+    /// after Stop" is structurally impossible; if the ambiguous send never
+    /// resolves, the queued stop times out and the caller settles
+    /// `.stopUnconfirmed` (never a confirmed idle over an unprovable order).
+    private var sendChainTail: Task<Void, Never>?
 
     // MARK: - Events
 
@@ -56,9 +92,14 @@ public actor OBSClient {
     ///   - socket: transport seam.
     ///   - requestTimeout: seconds a `request(_:data:)` waits before throwing
     ///     `.timeout`. Defaults to 10 s; tests may inject a small value.
-    public init(socket: OBSSocket, requestTimeout: TimeInterval = 10) {
+    ///   - handshakeTimeout: seconds the connect handshake may take end to end
+    ///     before the attempt fails with `.timeout` and the socket is closed
+    ///     (cold2 I-2). nil (the default) uses `requestTimeout`.
+    public init(socket: OBSSocket, requestTimeout: TimeInterval = 10,
+                handshakeTimeout: TimeInterval? = nil) {
         self.socket = socket
         self.requestTimeout = requestTimeout
+        self.handshakeTimeout = handshakeTimeout ?? requestTimeout
         var cont: AsyncStream<(type: String, data: [String: Any])>.Continuation!
         self.eventStream = AsyncStream { cont = $0 }
         self.eventContinuation = cont
@@ -78,14 +119,42 @@ public actor OBSClient {
     /// auto-launch retry loop accumulated orphaned sockets.
     public func connect(url: URL, password: String?) async throws {
         try await socket.connect(url: url)
+        // Cold2 I-2: the handshake is BOUNDED. A wedge that accepts the
+        // connection but never sends Hello would otherwise park this await
+        // forever. The watchdog closes the socket on expiry — the same
+        // failed-handshake-closes-socket discipline as every other
+        // post-connect failure — which forces the parked receive to throw;
+        // the failure is then reported as `.timeout`. On a completed (or
+        // otherwise failed) handshake the watchdog is cancelled; the
+        // `connected` guard in expireHandshake covers the sleep-already-
+        // elapsed race so a healthy session is never closed late.
+        handshakeTimedOut = false
+        let watchdog = Task { [weak self, handshakeTimeout] in
+            try? await Task.sleep(nanoseconds: UInt64(handshakeTimeout * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await self?.expireHandshake()
+        }
+        defer { watchdog.cancel() }
         do {
             try await performHandshake(password: password)
         } catch {
             socket.close()   // single exit for every post-connect failure
-            throw error
+            throw handshakeTimedOut ? OBSError.timeout : error
         }
         connected = true
         startReceiveLoop()
+    }
+
+    /// Handshake watchdog body (cold2 I-2): if the handshake is still in
+    /// flight when the deadline lands, close the socket so the parked
+    /// receive fails NOW; `connect` maps the resulting error to `.timeout`.
+    /// A handshake that completed first set `connected` in the same actor —
+    /// this hop then touches nothing (each connect uses a fresh client, so
+    /// `connected` is still this attempt's flag).
+    private func expireHandshake() {
+        guard !connected else { return }
+        handshakeTimedOut = true
+        socket.close()
     }
 
     /// The handshake proper — factored out so `connect` can guarantee the
@@ -135,6 +204,13 @@ public actor OBSClient {
     /// guaranteed NOT sent; a caller cancelled after the send is in flight also
     /// resumes with `CancellationError`, but the frame may have reached OBS —
     /// callers must treat that outcome as "possibly issued".
+    ///
+    /// Review11 finding 1 tightens the enqueued-but-late window: a request
+    /// that resolves (timeout/cancel/disconnect) while its send is still
+    /// QUEUED — not yet inside `socket.send` — cancels that send, so the
+    /// frame is confirmed never sent. Only a send already in the socket
+    /// remains "possibly issued", and the outbound chain guarantees no later
+    /// frame (e.g. a cleanup StopStream) is transmitted before it.
     public func request(_ type: String, data: [String: Any]?) async throws -> [String: Any] {
         guard connected else { throw OBSError.notConnected }
 
@@ -179,38 +255,44 @@ public actor OBSClient {
                 return
             }
             pending[id] = continuation
-            // Send inside a child Task so we stay non-suspending here; if the
-            // send fails, resolve the continuation with .notConnected.
-            Task { [weak self] in
-                do {
-                    try await self?.sendFrame(frame)
-                } catch {
-                    await self?.failPending(id: id, error: OBSError.notConnected)
-                }
+            // The send runs in a TRACKED child task (review11 finding 1),
+            // chained behind the previous send so outbound order matches
+            // issue order, and cancellable by every resolution path.
+            let previous = sendChainTail
+            let send = Task { [weak self] in
+                await previous?.value          // FIFO: never overtake an earlier send
+                await self?.performSend(id: id, frame: frame)
             }
+            sendTasks[id] = send
+            sendChainTail = send
         }
     }
 
-    private func sendFrame(_ frame: String) async throws {
-        try await socket.send(frame)
+    /// Body of a tracked send. Runs under actor isolation, so the
+    /// cancellation check is strictly ordered against `failPending`/
+    /// `failAll`: a request resolved before this segment runs observes
+    /// `Task.isCancelled` here and the frame is CONFIRMED never sent. Past
+    /// this check the frame is in the socket and can no longer be retracted
+    /// — the caller-visible "possibly issued" window.
+    private func performSend(id: String, frame: String) async {
+        defer { sendTasks[id] = nil }
+        guard !Task.isCancelled else { return }
+        do {
+            try await socket.send(frame)
+        } catch {
+            failPending(id: id, error: OBSError.notConnected)
+        }
     }
 
     // MARK: - Disconnect
 
-    /// Close the socket, cancel the receive loop, fail all pending requests with
-    /// `.notConnected`, and finish the events stream.
+    /// Close the socket, cancel the receive loop, fail all pending requests
+    /// (cancelling their tracked sends — review11 finding 1), and finish the
+    /// events stream.
     public func disconnect() {
-        connected = false
         receiveLoop?.cancel()
         receiveLoop = nil
-
-        // Fail every in-flight request.
-        let inflight = pending
-        pending.removeAll()
-        for (_, continuation) in inflight {
-            continuation.resume(throwing: OBSError.notConnected)
-        }
-
+        failAll(error: OBSError.notConnected)   // also sets connected = false
         eventContinuation.finish()
         socket.close()
     }
@@ -219,8 +301,12 @@ public actor OBSClient {
 
     private func startReceiveLoop() {
         receiveLoop = Task { [weak self] in
-            guard let self else { return }
             while !Task.isCancelled {
+                // Per-ITERATION weak rebind (review11 finding 4 discipline):
+                // no strong self is pinned for the loop's lifetime — only for
+                // the in-flight receive/handle calls, which retain the actor
+                // regardless. An abandoned client is released between frames.
+                guard let self else { return }
                 let text: String
                 do {
                     text = try await self.receiveFrame()
@@ -278,14 +364,20 @@ public actor OBSClient {
     // MARK: - Pending resolution helpers
 
     /// Resolve a single pending request with an error, if it is still pending.
+    /// Review11 finding 1: resolving a request CANCELS its tracked send —
+    /// if the frame has not reached `socket.send` yet, it never will.
     private func failPending(id: String, error: Error) {
+        if let send = sendTasks.removeValue(forKey: id) { send.cancel() }
         guard let continuation = pending.removeValue(forKey: id) else { return }
         continuation.resume(throwing: error)
     }
 
-    /// Fail every pending request (used when the socket dies).
+    /// Fail every pending request and cancel every tracked send (used when
+    /// the socket dies and by disconnect teardown — review11 finding 1).
     private func failAll(error: Error) {
         connected = false
+        for (_, send) in sendTasks { send.cancel() }
+        sendTasks.removeAll()
         let inflight = pending
         pending.removeAll()
         for (_, continuation) in inflight {

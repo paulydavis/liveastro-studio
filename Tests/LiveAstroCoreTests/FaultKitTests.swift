@@ -191,10 +191,13 @@ final class FaultKitTests: XCTestCase {
                                           snapshotFile: name, estimatedIntegrationSeconds: 60,
                                           width: 10, height: 10, mean: 0.1, median: 0.08, stddev: 0.02))
         }
+        // masterExpected true (review11 finding 2): the fixture models a NATIVE session under
+        // the current schema, so the oracle-teeth test (c) keeps exercising clause 5 — a nil
+        // (legacy) field would skip the clause by documented policy.
         let manifest = SessionManifest(
             sessionId: "valid-session", targetName: "Test", startTime: Date(), endTime: nil,
             subExposureSeconds: 60, bortle: 5, locationLabel: "L", telescope: "T", camera: "C",
-            mount: "M", filter: "F", notes: "", snapshots: records)
+            mount: "M", filter: "F", notes: "", snapshots: records, masterExpected: true)
         try ManifestCoding.encoder().encode(manifest)
             .write(to: root.appendingPathComponent("manifest.json"))
         return root
