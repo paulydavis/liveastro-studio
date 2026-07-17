@@ -106,10 +106,7 @@ public final class SessionManager {
         // Write-then-commit: persist the ended manifest first; only mark ended once it lands,
         // so a failed write can't leave the manager ended with an unpersisted endTime.
         proposed.endTime = date
-        proposed.masterOutcome = finalization?.masterOutcome
-        proposed.stackFrameCount = finalization?.stackFrameCount
-        proposed.sessionAcceptedCount = finalization?.sessionAcceptedCount
-        proposed.sessionRejectedCount = finalization?.sessionRejectedCount
+        proposed.finalizationFacts = finalization
         try persist(proposed, to: dir)
         manifest = proposed
         state = .ended

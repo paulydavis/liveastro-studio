@@ -15,23 +15,23 @@ public enum RejectionReason: Equatable {
 /// Native stacking core (spec §4.2): registration on half-res superpixel luminance,
 /// full-res accumulation. Rejection is registration-failure only (spec §3).
 public final class StackEngine {
-    public enum CurrentStackState: Equatable {
+    enum CurrentStackState: Equatable {
         case initialEmpty
         case active
         case awaitingSeedAfterReseed(manual: Int, auto: Int)
     }
 
-    public enum FinalizationError: Error, Equatable {
+    enum FinalizationError: Error, Equatable {
         case invariantBreach
     }
 
-    public struct FinalizationState {
-        public let image: AstroImage?
-        public let coverage: [Float]?
-        public let frameCount: Int
-        public let stackState: CurrentStackState
-        public let sessionAcceptedCount: Int
-        public let sessionRejectedCount: Int
+    struct FinalizationState {
+        let image: AstroImage?
+        let coverage: [Float]?
+        let frameCount: Int
+        let stackState: CurrentStackState
+        let sessionAcceptedCount: Int
+        let sessionRejectedCount: Int
     }
 
     private let seedMinStars: Int
@@ -140,7 +140,7 @@ public final class StackEngine {
         }
     }
 
-    public func finalizationState() throws -> FinalizationState {
+    func finalizationState() throws -> FinalizationState {
         try lock.withLock {
             let frameCount = accumulator?.frameCount ?? 0
             switch currentStackState {
