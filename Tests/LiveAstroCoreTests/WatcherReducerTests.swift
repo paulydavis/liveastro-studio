@@ -1,45 +1,111 @@
 import XCTest
 @testable import LiveAstroCore
 
-/// Transition-table unit tests for the pure watcher reducer (phase 1 task 1) — synthetic
-/// observations only, zero filesystem. Each of the four required pins (spec §2.6 pins 1–4)
-/// gets dedicated tests, plus the review-12 P1 scenarios and the four cold2/review-11
-/// deadline behaviors in reducer form. The reducer is exercised through a tiny harness that
-/// threads (states, dedup table, episode, manual monotonic clock) across passes exactly the
-/// way the ported scan loop will.
+/// Transition-table unit tests for the pure watcher reducer (phase 1 task 1, aligned to the
+/// revised spec interfaces in task 1b) — synthetic observations only, zero filesystem. Each
+/// of the four required pins (spec §2.6 pins 1–4) gets dedicated tests, plus the review-12
+/// P1 scenarios, the four cold2/review-11 deadline behaviors, and the task-1b command
+/// protocol: generation replacement, settle-on-yield, stale-result rejection, and read-plan
+/// derivation. The reducer is exercised through a tiny harness that mirrors the driver
+/// contract: submit one `.observe` batch, execute effects in order, and (by default) return
+/// each emission intent as a successful `.emissionFinished` before the next pass.
 final class WatcherReducerTests: XCTestCase {
 
     // MARK: Harness
 
-    private static let q: UInt64 = 1_000_000_000            // quiet period: 1 s
-    private static let budget: UInt64 = 30 * q               // blocking budget: 30 s
+    private static let q: UInt64 = 1_000_000_000              // quiet period: 1 s
+    private static let poll: UInt64 = 2_000_000_000           // poll interval: 2 s
+    private static let budget: UInt64 = 30 * q                // = max(30 s, 10×quiet, 5×poll)
     private static let ceiling: UInt64 = 34 * q               // budget + 4×quiet
 
     private func makeConfig(_ policy: StackFileWatcher.DigestPolicy = .mutableStackerOutput)
-        -> WatcherReducerConfig {
-        WatcherReducerConfig(digestPolicy: policy, quietPeriodNanos: Self.q,
-                             blockingBudgetNanos: Self.budget, blockingGraceNanos: Self.q,
-                             blockingCeilingNanos: Self.ceiling)
+        -> WatcherReducerConfiguration {
+        WatcherReducerConfiguration(digestPolicy: policy, filePrefix: "live_stack",
+                                    quietPeriodNanos: Self.q, pollIntervalNanos: Self.poll)
     }
 
-    /// Threads reducer state across passes with a manual monotonic clock.
+    /// Threads reducer state across passes with a manual monotonic clock. `autoYield`
+    /// mirrors the driver contract (every emission intent is yielded and its result
+    /// returned before the next observe); tests of settle-on-yield turn it off and drive
+    /// `.emissionFinished` by hand.
     private struct Harness {
-        var states: [String: FileState] = [:]
-        var dedup: [String: String] = [:]
-        var episode: BlockingEpisode? = nil
+        var reducer: WatcherReducer
         var now: UInt64 = 100_000_000_000
-        let config: WatcherReducerConfig
+        var autoYield = true
+        private var nextGenerationToken: UInt64 = 2
+
+        init(config: WatcherReducerConfiguration) {
+            reducer = WatcherReducer(
+                state: WatcherState(
+                    generation: GenerationState(id: FolderGeneration(rawValue: 1), files: [:],
+                                                ordering: RevisionOrderingState(activeBlocker: nil)),
+                    lastEmittedDigestByName: [:]),
+                configuration: config)
+        }
+
+        // State accessors (setters rebuild the reducer — seeding is a test-arrange
+        // concern; the production driver never writes state directly).
+        var states: [String: FileState] {
+            get { reducer.state.generation.files }
+            set {
+                var s = reducer.state
+                s.generation.files = newValue
+                reducer = WatcherReducer(state: s, configuration: reducer.configuration)
+            }
+        }
+        var dedup: [String: String] {
+            get { reducer.state.lastEmittedDigestByName }
+            set {
+                var s = reducer.state
+                s.lastEmittedDigestByName = newValue
+                reducer = WatcherReducer(state: s, configuration: reducer.configuration)
+            }
+        }
+        var episode: BlockingEpisode? {
+            get { reducer.state.generation.ordering.activeBlocker }
+            set {
+                var s = reducer.state
+                s.generation.ordering.activeBlocker = newValue
+                reducer = WatcherReducer(state: s, configuration: reducer.configuration)
+            }
+        }
+        var generationID: FolderGeneration { reducer.state.generation.id }
+
+        struct PassResult {
+            var intents: [EmissionIntent] = []
+            var logs: [String] = []
+            /// The staged candidates, in effect order (with `autoYield` these have also
+            /// settled by the time the pass returns — the old "emissions" reading).
+            var emissions: [EmissionCandidate] { intents.map(\.candidate) }
+        }
 
         @discardableResult
-        mutating func pass(_ observations: [FileObservation]) -> WatcherReducer.PassResult {
-            let r = WatcherReducer.reduce(states: states, observations: observations,
-                                          nowNanos: now,
-                                          lastEmittedDigestByName: dedup,
-                                          episode: episode, config: config)
-            states = r.states
-            dedup = r.lastEmittedDigestByName
-            episode = r.episode
-            return r
+        mutating func pass(_ observations: [FileObservation]) -> PassResult {
+            let effects = reducer.reduce(.observe(ObservationBatch(
+                generation: generationID, entries: observations, nowNanos: now)))
+            var result = PassResult()
+            for effect in effects {
+                switch effect {
+                case .log(let line): result.logs.append(line)
+                case .emit(let intent):
+                    result.intents.append(intent)
+                    if autoYield { finish(intent, .yielded) }
+                }
+            }
+            return result
+        }
+
+        mutating func finish(_ intent: EmissionIntent, _ outcome: EmissionResult.Outcome) {
+            _ = reducer.reduce(.emissionFinished(EmissionResult(intent: intent, outcome: outcome)))
+        }
+
+        /// Whole-value generation replacement under a fresh monotonic token.
+        @discardableResult
+        mutating func replaceGeneration() -> FolderGeneration {
+            let token = FolderGeneration(rawValue: nextGenerationToken)
+            nextGenerationToken += 1
+            _ = reducer.reduce(.replaceGeneration(token))
+            return token
         }
 
         mutating func advance(seconds: Double) { now += UInt64(seconds * 1_000_000_000) }
@@ -55,25 +121,51 @@ final class WatcherReducerTests: XCTestCase {
     }
 
     private func rev(of name: String) -> String? {
-        // Test-side convenience mirroring the watcher's parser output for live_stack_<d>.fit.
+        // Test-side convenience mirroring the reducer's parser output for live_stack_<d>.fit.
         guard name.hasPrefix("live_stack_"), name.hasSuffix(".fit") else { return nil }
         let digits = name.dropFirst("live_stack_".count).dropLast(".fit".count)
         guard !digits.isEmpty, digits.allSatisfy(\.isNumber) else { return nil }
         return String(digits)
     }
 
+    private func url(_ name: String) -> URL { URL(fileURLWithPath: "/watch/\(name)") }
+
+    /// Expected classification under the mutable policy (all non-numbered test names used
+    /// in kind-sensitive assertions run under `.mutableStackerOutput`).
+    private func kindOf(_ name: String) -> WatcherEntryKind {
+        rev(of: name).map { WatcherEntryKind.numbered(revision: $0) } ?? .classicMutable
+    }
+
+    /// The staged/held candidate the reducer is expected to build for `name`.
+    private func cand(_ name: String, _ id: FileIdentity, _ digest: String) -> EmissionCandidate {
+        EmissionCandidate(name: name, url: url(name), kind: kindOf(name), identity: id,
+                          digest: digest, byteCount: id.size)
+    }
+
+    private func entry(_ name: String, _ id: FileIdentity, isFITS: Bool = true) -> EnumeratedEntry {
+        EnumeratedEntry(name: name, url: url(name), identity: id, isFITS: isFITS)
+    }
+
     private func absent(_ name: String) -> FileObservation {
-        FileObservation(name: name, revision: rev(of: name), kind: .absent)
+        FileObservation(name: name, url: url(name), kind: kindOf(name), outcome: .absent)
     }
-    private func invalid(_ name: String,
-                         _ why: FileObservation.Invalidity = .incompleteHeader) -> FileObservation {
-        FileObservation(name: name, revision: rev(of: name), kind: .invalid(why))
+    private func invalid(_ name: String, _ reason: String = "incomplete header") -> FileObservation {
+        FileObservation(name: name, url: url(name), kind: kindOf(name),
+                        outcome: .invalid(reason: reason))
     }
+    /// A stat-only sighting (first sight, instability, or mid-read revalidation mismatch).
     private func statOnly(_ name: String, _ id: FileIdentity) -> FileObservation {
-        FileObservation(name: name, revision: rev(of: name), kind: .statOnly(id))
+        FileObservation(name: name, url: url(name), kind: kindOf(name),
+                        outcome: .unstable(identity: id))
+    }
+    /// The read-plan fast path's round-tripped observation.
+    private func identityUnchanged(_ name: String, _ id: FileIdentity) -> FileObservation {
+        FileObservation(name: name, url: url(name), kind: kindOf(name),
+                        outcome: .identityUnchanged(identity: id))
     }
     private func content(_ name: String, _ id: FileIdentity, _ digest: String) -> FileObservation {
-        FileObservation(name: name, revision: rev(of: name), kind: .content(stat: id, digest: digest))
+        FileObservation(name: name, url: url(name), kind: kindOf(name),
+                        outcome: .digested(identity: id, digest: digest, byteCount: id.size))
     }
 
     private let classic = "live_stack.fit"
@@ -93,6 +185,22 @@ final class WatcherReducerTests: XCTestCase {
         let r = h.pass([content(name, id, digest)])
         XCTAssertEqual(r.emissions.map(\.name), [name],
                        "arrange: \(name) must emit", file: file, line: line)
+    }
+
+    // MARK: - Configuration derivation (task 1b: budget policy moved reducer-side)
+
+    func testConfigurationDerivesBudgetGraceCeilingFromQuietAndPoll() {
+        let config = makeConfig()
+        XCTAssertEqual(config.blockingBudgetNanos, Self.budget,
+                       "budget = max(30 s, 10×quiet, 5×poll)")
+        XCTAssertEqual(config.blockingGraceNanos, Self.q, "grace = one quiet period")
+        XCTAssertEqual(config.blockingCeilingNanos, Self.ceiling, "ceiling = budget + 4×quiet")
+        // The scale terms dominate when quiet/poll are large (clamped-extreme configs).
+        let slow = WatcherReducerConfiguration(digestPolicy: .mutableStackerOutput,
+                                               filePrefix: "live_stack",
+                                               quietPeriodNanos: 10 * Self.q,
+                                               pollIntervalNanos: Self.poll)
+        XCTAssertEqual(slow.blockingBudgetNanos, 100 * Self.q, "10×quiet dominates the floor")
     }
 
     // MARK: - Pin 1: episode invariant (blocking as a derived property)
@@ -161,8 +269,7 @@ final class WatcherReducerTests: XCTestCase {
         h.advance(seconds: 2)
         var r = h.pass([statOnly(f1, ident(3)), content(f2, ident(100), "d2")])
         XCTAssertTrue(r.emissions.isEmpty, "_00002 held while _00001 blocks")
-        XCTAssertEqual(h.states[f2], .ready(digest: "d2", identity: ident(100),
-                                            firstObservedNanos: episodeStart + 2 * Self.q),
+        XCTAssertEqual(h.states[f2], .ready(cand(f2, ident(100), "d2")),
                        "held revision keeps its earned gate evidence")
 
         var churn: UInt64 = 4
@@ -301,7 +408,8 @@ final class WatcherReducerTests: XCTestCase {
 
         h.advance(seconds: 2)
         let r = h.pass([statOnly(f1, ident(2)), content(f2, ident(100), "d2")])
-        XCTAssertEqual(h.states[f2], .settled(.duplicateOfLastEmission(identity: ident(100))),
+        XCTAssertEqual(h.states[f2],
+                       .settled(.duplicateOfLastEmission(identity: ident(100), digest: "d2")),
                        "the held victim settles as a duplicate despite the hold")
         XCTAssertTrue(r.emissions.isEmpty)
         XCTAssertNil(h.episode, "no nonterminal victim remains — lone teardown applies")
@@ -313,8 +421,9 @@ final class WatcherReducerTests: XCTestCase {
         var h = harness()
         h.states = [
             "a.fit": .observing(stat: ident(1)),
-            "b.fit": .digestPending(digest: "d", identity: ident(2), firstObservedNanos: h.now),
-            "c.fit": .ready(digest: "d", identity: ident(3), firstObservedNanos: h.now),
+            "b.fit": .digestPending(PendingDigest(digest: "d", identity: ident(2),
+                                                  firstObservedNanos: h.now)),
+            "c.fit": .ready(cand("c.fit", ident(3), "d")),
         ]
         h.pass([absent("a.fit"), absent("b.fit"), absent("c.fit")])
         XCTAssertTrue(h.states.isEmpty,
@@ -324,8 +433,8 @@ final class WatcherReducerTests: XCTestCase {
     func testAbsence_terminalStatesImmortalWithinGeneration() {
         var h = harness()
         let terminal: [String: FileState] = [
-            "d.fit": .settled(.emittedNow(identity: ident(4))),
-            "e.fit": .settled(.duplicateOfLastEmission(identity: ident(5))),
+            "d.fit": .settled(.emittedNow(identity: ident(4), digest: "d4")),
+            "e.fit": .settled(.duplicateOfLastEmission(identity: ident(5), digest: "d5")),
             "f.fit": .droppedOutOfOrder,
             "g.fit": .writtenOff,
         ]
@@ -344,7 +453,7 @@ final class WatcherReducerTests: XCTestCase {
         emit(&h, f5, ident(50), "d5")
         h.advance(seconds: 2)
         let r = h.pass([absent(f5), statOnly(f4, ident(40))])   // _00005 deleted, _00004 late
-        XCTAssertEqual(h.states[f5], .settled(.emittedNow(identity: ident(50))),
+        XCTAssertEqual(h.states[f5], .settled(.emittedNow(identity: ident(50), digest: "d5")),
                        "the emitted corpse is immortal within the generation")
         XCTAssertEqual(h.states[f4], .droppedOutOfOrder)
         XCTAssertEqual(r.logs,
@@ -352,42 +461,47 @@ final class WatcherReducerTests: XCTestCase {
                        "the derived mark survives the deletion")
     }
 
-    // MARK: - Pin 3: settlements carry FileIdentity and arm the fast-path
+    // MARK: - Pin 3: settlements carry identity + digest and arm the fast-path
 
-    func testSettlements_bothCarryObservedIdentity() {
+    func testSettlements_bothCarryObservedIdentityAndDigest() {
         var h = harness()
         emit(&h, f1, ident(7), "dA")
-        XCTAssertEqual(h.states[f1], .settled(.emittedNow(identity: ident(7))),
-                       "the emission settlement carries the observed stat identity")
+        XCTAssertEqual(h.states[f1], .settled(.emittedNow(identity: ident(7), digest: "dA")),
+                       "the emission settlement carries the observed identity AND digest")
         XCTAssertEqual(h.dedup[f1], "dA")
 
-        // New generation (caller clears states + episode; dedup survives). The identical
-        // content re-appears under a new identity: it settles duplicateOfLastEmission with
-        // the NEW identity — that identity is what re-arms the caller's fast-path.
-        h.states = [:]
-        h.episode = nil
+        // New generation (whole-value replacement; dedup survives). The identical content
+        // re-appears under a new identity: it settles duplicateOfLastEmission with the NEW
+        // identity — that identity is what re-arms the read-plan fast-path.
+        h.replaceGeneration()
         h.advance(seconds: 2)
         h.pass([statOnly(f1, ident(8))])
         h.advance(seconds: 2)
         let r = h.pass([content(f1, ident(8), "dA")])
         XCTAssertTrue(r.emissions.isEmpty, "dedup holds across generations")
-        XCTAssertEqual(h.states[f1], .settled(.duplicateOfLastEmission(identity: ident(8))))
+        XCTAssertEqual(h.states[f1],
+                       .settled(.duplicateOfLastEmission(identity: ident(8), digest: "dA")))
 
-        // Caller fast-path shape: a statOnly re-sighting of the settlement identity is inert.
+        // Fast-path round trip: an identityUnchanged re-sighting of the settlement
+        // identity is inert.
         h.advance(seconds: 2)
-        h.pass([statOnly(f1, ident(8))])
-        XCTAssertEqual(h.states[f1], .settled(.duplicateOfLastEmission(identity: ident(8))))
+        h.pass([identityUnchanged(f1, ident(8))])
+        XCTAssertEqual(h.states[f1],
+                       .settled(.duplicateOfLastEmission(identity: ident(8), digest: "dA")))
     }
 
-    func testEmission_identityCarriesDigest() {
+    func testEmissionIntent_candidateCarriesIdentityAndDigest() {
         var h = harness()
         h.pass([statOnly(f1, ident(9))])
         h.advance(seconds: 2)
         h.pass([content(f1, ident(9), "dX")])
         h.advance(seconds: 2)
         let r = h.pass([content(f1, ident(9), "dX")])
-        XCTAssertEqual(r.emissions, [WatcherEmission(name: f1, identity: ident(9).withDigest("dX"))],
-                       "the emission carries the validated stat identity WITH the digest")
+        XCTAssertEqual(r.intents,
+                       [EmissionIntent(generation: h.generationID,
+                                       candidate: cand(f1, ident(9), "dX"))],
+                       "the intent carries the generation tag and the validated "
+                       + "identity + digest the driver yields with")
     }
 
     // MARK: - Pin 4: classic-file transitions
@@ -399,7 +513,8 @@ final class WatcherReducerTests: XCTestCase {
         let r = h.pass([content(classic, ident(1), "dB")])
         XCTAssertTrue(r.emissions.isEmpty)
         XCTAssertEqual(h.states[classic],
-                       .digestPending(digest: "dB", identity: ident(1), firstObservedNanos: h.now),
+                       .digestPending(PendingDigest(digest: "dB", identity: ident(1),
+                                                    firstObservedNanos: h.now)),
                        "pin 4: settled → digestPending on digest change")
     }
 
@@ -413,7 +528,8 @@ final class WatcherReducerTests: XCTestCase {
         h.advance(seconds: 2)
         var r = h.pass([content(classic, ident(1), "dA")])      // back to A
         XCTAssertTrue(r.emissions.isEmpty, "A → transient B → A must emit nothing")
-        XCTAssertEqual(h.states[classic], .settled(.duplicateOfLastEmission(identity: ident(1))),
+        XCTAssertEqual(h.states[classic],
+                       .settled(.duplicateOfLastEmission(identity: ident(1), digest: "dA")),
                        "settle-back onto the last emission consumes the pending evidence")
         // B never re-emerges from stale evidence.
         h.advance(seconds: 2)
@@ -437,7 +553,8 @@ final class WatcherReducerTests: XCTestCase {
         r = h.pass([content(classic, ident(1), "dA")])
         XCTAssertTrue(r.emissions.isEmpty, "returning to A must RE-EARN the gate, not free-ride")
         XCTAssertEqual(h.states[classic],
-                       .digestPending(digest: "dA", identity: ident(1), firstObservedNanos: h.now))
+                       .digestPending(PendingDigest(digest: "dA", identity: ident(1),
+                                                    firstObservedNanos: h.now)))
         h.advance(seconds: 2)
         r = h.pass([content(classic, ident(1), "dA")])
         XCTAssertEqual(r.emissions.map(\.name), [classic],
@@ -447,14 +564,15 @@ final class WatcherReducerTests: XCTestCase {
 
     // MARK: - Review-12 P1-1: dedup evidence must never affect ordering or blocker accounting
 
-    /// After a generation reset the dedup table still knows both names. Changed same-name
-    /// content must count in blocker accounting: _00002 (nonterminal, content changed) is a
-    /// real victim, so the failing _00001 gets an episode and a deadline. Pre-fix, the
-    /// retained digest history exempted _00002 and _00001 held it forever with no deadline
-    /// and no log.
-    func testGenerationReset_changedContent_countsInBlockerAccounting() {
+    /// After a generation replacement the dedup table still knows both names. Changed
+    /// same-name content must count in blocker accounting: _00002 (nonterminal, content
+    /// changed) is a real victim, so the failing _00001 gets an episode and a deadline.
+    /// Pre-fix, the retained digest history exempted _00002 and _00001 held it forever
+    /// with no deadline and no log.
+    func testGenerationReplacement_changedContent_countsInBlockerAccounting() {
         var h = harness()
         h.dedup = [f1: "old1", f2: "old2"]      // survives the generation; states do not
+        h.replaceGeneration()
         h.pass([statOnly(f1, ident(1)), statOnly(f2, ident(100))])
         XCTAssertEqual(h.episode?.blocker, f1,
                        "the dedup table must not exclude _00002 from victim accounting")
@@ -466,7 +584,8 @@ final class WatcherReducerTests: XCTestCase {
         let r = h.pass([statOnly(f1, ident(2)), content(f2, ident(100), "new2")])
         XCTAssertTrue(r.logs.isEmpty, "no out-of-order drops — the table carries no ordering evidence")
         XCTAssertEqual(h.states[f2],
-                       .digestPending(digest: "new2", identity: ident(100), firstObservedNanos: h.now))
+                       .digestPending(PendingDigest(digest: "new2", identity: ident(100),
+                                                    firstObservedNanos: h.now)))
         XCTAssertNotNil(h.episode, "the episode keeps running while the victim is nonterminal")
     }
 
@@ -509,8 +628,8 @@ final class WatcherReducerTests: XCTestCase {
         h.advance(seconds: 2)
         var r = h.pass([content(f1, ident(10), "d1"), content(f2, ident(20), "d2")])
         XCTAssertTrue(r.emissions.isEmpty, "_00002 must be held while _00001 earns its gates")
-        XCTAssertEqual(h.states[f2], .ready(digest: "d2", identity: ident(20),
-                                            firstObservedNanos: h.now - 2 * Self.q))
+        XCTAssertEqual(h.states[f2], .ready(cand(f2, ident(20), "d2")),
+                       "held revision keeps its earned gate evidence")
         h.advance(seconds: 2)
         r = h.pass([content(f1, ident(10), "d1"), content(f2, ident(20), "d2")])
         XCTAssertEqual(r.emissions.map(\.name), [f1, f2], "never [2, 1]")
@@ -557,8 +676,8 @@ final class WatcherReducerTests: XCTestCase {
         var r = h.pass([content(classic, ident(1), "dA")])
         XCTAssertTrue(r.emissions.isEmpty, "back-to-back passes prove nothing")
         XCTAssertEqual(h.states[classic],
-                       .digestPending(digest: "dA", identity: ident(1),
-                                      firstObservedNanos: firstObserved),
+                       .digestPending(PendingDigest(digest: "dA", identity: ident(1),
+                                                    firstObservedNanos: firstObserved)),
                        "the pending clock is NOT restarted by a same-digest re-observation")
         h.advance(seconds: 2)
         r = h.pass([content(classic, ident(1), "dA")])
@@ -575,7 +694,8 @@ final class WatcherReducerTests: XCTestCase {
         var r = h.pass([content(classic, ident(1), "dB")])
         XCTAssertTrue(r.emissions.isEmpty, "the replaced pending digest must not emit")
         XCTAssertEqual(h.states[classic],
-                       .digestPending(digest: "dB", identity: ident(1), firstObservedNanos: h.now))
+                       .digestPending(PendingDigest(digest: "dB", identity: ident(1),
+                                                    firstObservedNanos: h.now)))
         // An identity change restarts stability itself.
         h.advance(seconds: 2)
         r = h.pass([content(classic, ident(3), "dB")])
@@ -593,7 +713,8 @@ final class WatcherReducerTests: XCTestCase {
         h.advance(seconds: 2)
         var r = h.pass([content(classic, ident(1), "dA")])
         XCTAssertTrue(r.emissions.isEmpty)
-        XCTAssertEqual(h.states[classic], .settled(.duplicateOfLastEmission(identity: ident(1))),
+        XCTAssertEqual(h.states[classic],
+                       .settled(.duplicateOfLastEmission(identity: ident(1), digest: "dA")),
                        "known content settles without the gate — dedup guard first")
 
         // Fresh name: pending evidence dies on invalidity and re-earns from zero.
@@ -633,7 +754,210 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(r.emissions.map(\.name), [f2],
                        "an invalid neighbor never starves anyone under the immutable policy")
         XCTAssertTrue(r.logs.isEmpty, "no out-of-order drops under the immutable policy")
-        XCTAssertEqual(h.states[f100], .settled(.emittedNow(identity: ident(1000))),
+        XCTAssertEqual(h.states[f100], .settled(.emittedNow(identity: ident(1000), digest: "dH")),
                        "the settled file is untouched (fast-path armed)")
+    }
+
+    // MARK: - Task 1b: generation replacement (whole-value, monotonic token)
+
+    func testGenerationReplacementPreservesOnlyLatestDigestByName() {
+        var h = harness()
+        // Seed every FileState, an active episode, and dedup entries.
+        h.states = [
+            "a.fit": .observing(stat: ident(1)),
+            "b.fit": .digestPending(PendingDigest(digest: "dB", identity: ident(2),
+                                                  firstObservedNanos: h.now)),
+            "c.fit": .ready(cand("c.fit", ident(3), "dC")),
+            f1: .settled(.emittedNow(identity: ident(4), digest: "d1")),
+            f2: .settled(.duplicateOfLastEmission(identity: ident(5), digest: "d2")),
+            f3: .droppedOutOfOrder,
+            f4: .writtenOff,
+        ]
+        h.episode = BlockingEpisode(blocker: f5, startNanos: h.now,
+                                    deadlineNanos: h.now + Self.budget)
+        h.dedup = [f1: "d1", f2: "d2", classic: "dOld"]
+        let oldToken = h.generationID
+
+        let token = h.replaceGeneration()
+        XCTAssertNotEqual(token, oldToken, "a fresh monotonic token, even if (dev, ino) is reused")
+        XCTAssertEqual(h.generationID, token, "the supplied token is adopted")
+        XCTAssertTrue(h.states.isEmpty, "the file table is replaced WHOLESALE — no survivors")
+        XCTAssertNil(h.episode, "the episode dies with the generation")
+        XCTAssertEqual(h.dedup, [f1: "d1", f2: "d2", classic: "dOld"],
+                       "lastEmittedDigestByName is the sole survivor")
+    }
+
+    // MARK: - Task 1b: settlement on yield (the emissionFinished boundary)
+
+    /// The current-generation success path: `.emit` stages but does NOT settle — the file
+    /// stays `ready`, the dedup table and emitted-projection untouched — and
+    /// `.emissionFinished(.yielded)` performs the ONLY transition to settled(.emittedNow)
+    /// plus the ONLY dedup overwrite.
+    func testCurrentGenerationYieldSettlesAndUpdatesDedup() {
+        var h = harness()
+        h.autoYield = false
+        h.pass([statOnly(f1, ident(1))])
+        h.advance(seconds: 2)
+        h.pass([content(f1, ident(1), "d1")])
+        h.advance(seconds: 2)
+        let r = h.pass([content(f1, ident(1), "d1")])
+        XCTAssertEqual(r.intents, [EmissionIntent(generation: h.generationID,
+                                                  candidate: cand(f1, ident(1), "d1"))])
+        // Intent outstanding: NOT emitted evidence.
+        XCTAssertEqual(h.states[f1], .ready(cand(f1, ident(1), "d1")),
+                       "staging leaves the file ready — settlement happens on yield")
+        XCTAssertNil(h.dedup[f1], "no dedup update before the yield result")
+        XCTAssertTrue(h.reducer.state.generation.emittedThisGeneration.isEmpty,
+                      "an outstanding intent is not in the emitted projection")
+
+        h.finish(r.intents[0], .yielded)
+        XCTAssertEqual(h.states[f1], .settled(.emittedNow(identity: ident(1), digest: "d1")),
+                       "a successful yield settles emittedNow with identity + digest")
+        XCTAssertEqual(h.dedup[f1], "d1", "the yield result overwrites the dedup entry")
+        XCTAssertEqual(h.reducer.state.generation.emittedThisGeneration, [f1])
+    }
+
+    /// A rejected yield (driver's pre-yield folder revalidation failed) discards the intent
+    /// without settling: the file keeps its earned evidence and stays re-emittable, and the
+    /// dedup table is untouched — nothing was delivered.
+    func testRejectedYieldLeavesReEmittableStateWithoutDedupUpdate() {
+        var h = harness()
+        h.autoYield = false
+        h.pass([statOnly(f1, ident(1))])
+        h.advance(seconds: 2)
+        h.pass([content(f1, ident(1), "d1")])
+        h.advance(seconds: 2)
+        let r = h.pass([content(f1, ident(1), "d1")])
+        XCTAssertEqual(r.intents.count, 1, "arrange: one staged intent")
+
+        h.finish(r.intents[0], .rejected)
+        XCTAssertEqual(h.states[f1], .ready(cand(f1, ident(1), "d1")),
+                       "rejection leaves the earned candidate in place")
+        XCTAssertNil(h.dedup[f1], "no dedup update on rejection")
+
+        // Re-emittable: the same stable content stages a fresh intent next pass.
+        h.advance(seconds: 2)
+        let r2 = h.pass([content(f1, ident(1), "d1")])
+        XCTAssertEqual(r2.intents.map(\.candidate.name), [f1],
+                       "the file re-stages after a rejected yield")
+    }
+
+    /// An emission result from a superseded folder generation is a complete no-op on the
+    /// current one — the monotonic token, not the directory (dev, ino), is compared, so
+    /// inode reuse cannot resurrect an old intent.
+    func testStaleGenerationEmissionResultCannotSettleOrChangeDigest() {
+        var h = harness()
+        h.autoYield = false
+        h.pass([statOnly(f1, ident(1))])
+        h.advance(seconds: 2)
+        h.pass([content(f1, ident(1), "d1")])
+        h.advance(seconds: 2)
+        let r = h.pass([content(f1, ident(1), "d1")])
+        XCTAssertEqual(r.intents.count, 1, "arrange: one staged intent in generation 1")
+        let staleIntent = r.intents[0]
+
+        // The folder disappears/returns before the yield: the driver replaces the
+        // generation and starts re-tracking the same name (possibly with a REUSED inode).
+        h.replaceGeneration()
+        h.advance(seconds: 2)
+        h.pass([statOnly(f1, ident(1))])
+        let before = h.reducer.state
+
+        h.finish(staleIntent, .yielded)
+        XCTAssertEqual(h.reducer.state, before,
+                       "a stale-generation result must not touch the new generation")
+        XCTAssertNil(h.dedup[f1], "and must not update the dedup table")
+    }
+
+    /// An outstanding intent is NOT emitted evidence anywhere: no high-water mark advance
+    /// (a lower revision is not dropped) and the ready-with-intent file still counts as a
+    /// potential VICTIM in blocker accounting.
+    func testOutstandingIntentIsNotEmittedEvidenceForMarkOrBlockerAccounting() {
+        var h = harness()
+        h.autoYield = false
+        h.pass([statOnly(f2, ident(20))])
+        h.advance(seconds: 2)
+        h.pass([content(f2, ident(20), "d2")])
+        h.advance(seconds: 2)
+        let r = h.pass([content(f2, ident(20), "d2")])
+        XCTAssertEqual(r.intents.map(\.candidate.name), [f2], "arrange: f2 staged, not yielded")
+
+        // A lower revision appears while f2's intent is outstanding.
+        h.advance(seconds: 2)
+        let r2 = h.pass([statOnly(f1, ident(1)), content(f2, ident(20), "d2")])
+        XCTAssertNotEqual(h.states[f1], .droppedOutOfOrder,
+                          "no mark exists yet — an unyielded intent must not advance it")
+        XCTAssertEqual(h.episode?.blocker, f1,
+                       "ready-with-intent f2 still counts as a victim, so failing f1 blocks")
+        XCTAssertTrue(r2.intents.isEmpty, "f2 is held behind the blocker — no re-staging")
+        XCTAssertEqual(h.states[f2], .ready(cand(f2, ident(20), "d2")),
+                       "the earned evidence is intact while held")
+    }
+
+    // MARK: - Task 1b: read-plan derivation (spec §2.1 step 1, §2.5 fast paths)
+
+    func testReadPlan_settledNumberedWithMatchingIdentity_acceptsIdentity() {
+        var h = harness()
+        h.states = [f1: .settled(.emittedNow(identity: ident(1), digest: "d1"))]
+        let plan = h.reducer.readPlan(for: [entry(f1, ident(1))])
+        XCTAssertEqual(plan, [.acceptIdentity(identityUnchanged(f1, ident(1)))],
+                       "settled numbered entry at its settlement identity takes the O(1) fast path")
+    }
+
+    func testReadPlan_duplicateSettlementAlsoArmsFastPath() {
+        var h = harness()
+        h.states = [f2: .settled(.duplicateOfLastEmission(identity: ident(2), digest: "d2"))]
+        let plan = h.reducer.readPlan(for: [entry(f2, ident(2))])
+        XCTAssertEqual(plan, [.acceptIdentity(identityUnchanged(f2, ident(2)))],
+                       "BOTH settlement variants arm the fast path (pin 3)")
+    }
+
+    func testReadPlan_changedIdentity_requiresContentRead() {
+        var h = harness()
+        h.states = [f1: .settled(.emittedNow(identity: ident(1), digest: "d1"))]
+        let plan = h.reducer.readPlan(for: [entry(f1, ident(9))])
+        XCTAssertEqual(plan, [.readContent(name: f1, url: url(f1),
+                                           kind: .numbered(revision: "00001"),
+                                           identity: ident(9), isFITS: true)],
+                       "a moved identity must be re-read — the fast path is identity-exact")
+    }
+
+    func testReadPlan_classicMutable_alwaysReadsContent() {
+        var h = harness()
+        h.states = [classic: .settled(.emittedNow(identity: ident(1), digest: "dA"))]
+        let plan = h.reducer.readPlan(for: [entry(classic, ident(1))])
+        XCTAssertEqual(plan, [.readContent(name: classic, url: url(classic),
+                                           kind: .classicMutable,
+                                           identity: ident(1), isFITS: true)],
+                       "the classic fixed-name file is exempt: permanent full-rehash policy")
+    }
+
+    func testReadPlan_nonSettledAndUntracked_readContent() {
+        var h = harness()
+        h.states = [
+            f1: .observing(stat: ident(1)),
+            f2: .ready(cand(f2, ident(2), "d2")),
+        ]
+        let plan = h.reducer.readPlan(for: [entry(f1, ident(1)), entry(f2, ident(2)),
+                                            entry(f3, ident(3))])
+        XCTAssertEqual(plan, [
+            .readContent(name: f1, url: url(f1), kind: .numbered(revision: "00001"),
+                         identity: ident(1), isFITS: true),
+            .readContent(name: f2, url: url(f2), kind: .numbered(revision: "00002"),
+                         identity: ident(2), isFITS: true),
+            .readContent(name: f3, url: url(f3), kind: .numbered(revision: "00003"),
+                         identity: ident(3), isFITS: true),
+        ], "only settlements arm the fast path — pending and untracked entries read content")
+    }
+
+    func testReadPlan_immutablePolicy_settledNonNumberedMatch_acceptsIdentity() {
+        var h = harness(.immutableAfterPublish)
+        let master = "master.fit"    // non-numbered → .immutable under this policy
+        h.states = [master: .settled(.emittedNow(identity: ident(7), digest: "dM"))]
+        let plan = h.reducer.readPlan(for: [entry(master, ident(7))])
+        XCTAssertEqual(plan, [.acceptIdentity(FileObservation(
+            name: master, url: url(master), kind: .immutable,
+            outcome: .identityUnchanged(identity: ident(7))))],
+                       "the immutable policy fast-paths settled non-numbered entries too")
     }
 }
