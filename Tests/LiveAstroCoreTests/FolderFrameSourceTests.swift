@@ -450,6 +450,114 @@ final class FolderFrameSourceTests: XCTestCase {
         wait(for: [finished], timeout: 5)
     }
 
+    // MARK: - cold2 I2: dropping a running live source must not leak the armed fd
+
+    /// Count of open descriptors in THIS process that resolve to `url`'s (dev, ino) —
+    /// the reviewer's fd-count probe.
+    private func openDescriptorCount(matching url: URL) -> Int {
+        var target = Darwin.stat()
+        guard stat(url.path, &target) == 0 else { return 0 }
+        var count = 0
+        for fd in 0..<getdtablesize() {
+            var st = Darwin.stat()
+            if fstat(Int32(fd), &st) == 0, st.st_dev == target.st_dev,
+               st.st_ino == target.st_ino {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    /// Cold2 I2 (P1, red-first — proven fd leak): FolderFrameSource had NO deinit, so
+    /// dropping a RUNNING live source without stop() leaked the armed folder fd, the
+    /// poll timer, and the relay task forever (the inner watcher is reachable only
+    /// through the source). deinit now mirrors SessionPipeline's fallback: if running,
+    /// stop the watcher (bounded default) and cancel the relay task — the fd count
+    /// returns to baseline.
+    func testDroppingRunningLiveSourceWithoutStopReleasesFolderDescriptor() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let baseline = openDescriptorCount(matching: dir)
+        var source: FolderFrameSource? =
+            FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        try source!.start()
+        XCTAssertGreaterThan(openDescriptorCount(matching: dir), baseline,
+                             "arrange: the armed watcher holds a descriptor on the folder")
+
+        source = nil          // dropped WITHOUT stop()
+        // deinit stops the watcher; the fd closes via the DispatchSource cancel
+        // handler shortly after the queue teardown runs — poll briefly.
+        let deadline = Date().addingTimeInterval(5)
+        while openDescriptorCount(matching: dir) > baseline && Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(openDescriptorCount(matching: dir), baseline,
+                       "dropping a running live source must release the armed folder fd")
+    }
+
+    // MARK: - cold2 M2: onLog assigned after start() reaches the inner watcher
+
+    /// Cold2 M2 (red-first): live-mode `onLog` assigned AFTER start() never reached the
+    /// inner watcher — the didSet forwarded to the pull/import relays only, and the
+    /// watcher's sink was snapshotted at start. The didSet now feeds a lock-guarded
+    /// relay the watcher logs through, so late assignment (SessionPipeline wires onLog
+    /// in startSources, after constructing the source) always takes effect.
+    func testLiveMode_onLogAssignedAfterStart_reachesInnerWatcher() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        defer { source.stop() }
+        let constructed = WatcherBox()
+        source.beforeStartCommit = { constructed.add($0) }
+        try source.start()
+
+        let logs = LogBox()
+        source.onLog = { logs.append($0) }        // assigned AFTER start()
+
+        // Trigger a watcher-side log deterministically: the folder disappears and a
+        // manual scan (through the captured inner watcher) notices it.
+        let inner = try XCTUnwrap(constructed.all.first)
+        let aside = dir.deletingLastPathComponent()
+            .appendingPathComponent("aside-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: dir, to: aside)
+        inner.scanNow()
+        try FileManager.default.moveItem(at: aside, to: dir)   // restore for teardown
+
+        XCTAssertTrue(logs.all.contains { $0.contains("disappeared") },
+                      "a watcher log after start() must reach the late-assigned sink — got \(logs.all)")
+    }
+
+    // MARK: - cold2 M3: the orphan teardown honors the racing stop's budget
+
+    /// Cold2 M3 (red-first): stop-during-start tears the freshly built (orphan) watcher
+    /// down — but with the 5 s default, ignoring the racing stop()'s own budget. The
+    /// caller's timeout is now threaded into the orphan teardown.
+    func testLiveMode_stopDuringStart_orphanTeardownUsesRacingStopsBudget() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
+        let constructed = WatcherBox()
+        source.beforeStartCommit = { [weak source] w in
+            constructed.add(w)
+            source?.stop(timeout: 0.25)   // the racing stop, with its own budget
+        }
+        XCTAssertThrowsError(try source.start()) {
+            XCTAssertEqual($0 as? FolderFrameSourceError, .stopped)
+        }
+        let orphan = try XCTUnwrap(constructed.all.first)
+        XCTAssertEqual(orphan.lastStopTimeout ?? -1, 0.25, accuracy: 1e-9,
+                       "the orphan teardown must run under the racing stop's budget, not the 5 s default")
+    }
+
     /// Regression: a BOTTOM-UP GRBG file must reach the engine in STORED row order —
     /// FITSReader's display flip would shift the Bayer phase and swap R/B (the
     /// 2026-07-06 "cyan nebula" bug class). Pins loadRawFrame to raw stored bytes.

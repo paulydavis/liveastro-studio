@@ -65,12 +65,18 @@ public final class FolderFrameSource: FrameSource {
         didSet {
             livePull?.log = onLog
             importLog?.current = onLog
+            liveWatcherLog?.current = onLog   // cold2 M2: reaches the inner watcher too
         }
     }
     /// Import mode only (review11 finding 5): lock-guarded relay behind the pull closure —
     /// the AsyncStream unfolding closure is created in init, BEFORE `onLog` can be assigned,
     /// so it logs through this box and the didSet above keeps it current.
     private let importLog: LogRelayBox?
+    /// Live mode only (cold2 M2): lock-guarded relay the inner watcher logs through.
+    /// Pre-fix `w.onLog` snapshotted `onLog` at start(), so a sink assigned AFTER
+    /// start() — SessionPipeline wires it in startSources — never reached the watcher.
+    /// The didSet above keeps this relay current instead.
+    private let liveWatcherLog: LogRelayBox?
     /// Live mode only: continuation of the LIGHT update buffer (never RawFrames).
     private let liveUpdateContinuation: AsyncStream<StackUpdate>.Continuation?
     /// Live mode only: the pull-time decoder behind `frames`.
@@ -134,6 +140,7 @@ public final class FolderFrameSource: FrameSource {
             self.totalCount = cursor.fileCount
             self.liveUpdateContinuation = nil
             self.livePull = nil
+            self.liveWatcherLog = nil
             let logBox = LogRelayBox()
             self.importLog = logBox
             // One file is read per pull; a file that cannot be loaded (deleted, unreadable,
@@ -156,6 +163,7 @@ public final class FolderFrameSource: FrameSource {
             self.importCursor = nil
             self.totalCount = nil
             self.importLog = nil
+            self.liveWatcherLog = LogRelayBox()   // cold2 M2
             var cont: AsyncStream<StackUpdate>.Continuation!
             // AsyncStream's init runs this closure synchronously; cont is non-nil here.
             let updates = AsyncStream<StackUpdate> { cont = $0 }
@@ -165,6 +173,20 @@ public final class FolderFrameSource: FrameSource {
             // Cold1 I2: the public frame stream decodes lazily — one pull, one decode.
             self.frames = AsyncStream(unfolding: { await pull.nextFrame() })
         }
+    }
+
+    /// Cold2 I2: a RUNNING live source dropped without stop() must not leak its live
+    /// machinery — the armed folder fd, the poll timer, and the relay task are reachable
+    /// only through this source, so without this fallback they ran forever (proven fd
+    /// leak). Mirrors SessionPipeline's deinit: stop the inner watcher (bounded by its
+    /// 5 s default) and cancel the relay task via the terminal stop(). deinit IS
+    /// reachable while live: the relay task captures the watcher/continuation/seams,
+    /// never self, and every callback seam is owned by the caller. stop() is terminal
+    /// and idempotent, so an already-stopped source skips straight through.
+    deinit {
+        let running: Bool = stateLock.withLock { state == .running || state == .starting }
+        guard running else { return }
+        stop()
     }
 
     public func start() throws {
@@ -193,7 +215,13 @@ public final class FolderFrameSource: FrameSource {
             // whole (ever-growing) folder each scan.
             let w = StackFileWatcher(folder: folder, fileNamePrefix: fileNamePrefix,
                                      digestPolicy: .immutableAfterPublish)
-            w.onLog = onLog   // forward folder-disappearance events to the app log
+            // Cold2 M2: log through the RELAY, never a snapshot of `onLog` — a sink
+            // assigned after start() (SessionPipeline wires it in startSources) must
+            // still reach the watcher. The relay is seeded with the current sink and
+            // the onLog didSet keeps it live.
+            let watcherLog = liveWatcherLog!
+            watcherLog.current = onLog
+            w.onLog = { watcherLog.emit($0) }
             do {
                 try w.start()   // I/O — the lock is NOT held here
             } catch {
@@ -224,7 +252,10 @@ public final class FolderFrameSource: FrameSource {
                 // stop() won while the watcher was being built: tear the orphan down —
                 // stopping it disarms its folder fd/timer and finishes its stream. The
                 // source's own streams were already finished by stop(). No resurrection.
-                w.stop()
+                // Cold2 M3: the RACING stop()'s budget governs this teardown too — a
+                // caller with an overall shutdown budget (SessionPipeline.end()) must
+                // not be pinned behind the watcher's 5 s default on top of it.
+                w.stop(timeout: self.lastStopTimeout ?? 5.0)
             })
         }
     }

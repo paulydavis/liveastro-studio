@@ -756,6 +756,7 @@ public final class StackFileWatcher {
     /// The timeout log line is the ONE onLog delivery made from the caller's thread rather
     /// than the watcher queue — on this path the queue is, by definition, stalled.
     public func stop(timeout: TimeInterval = 5.0) {
+        stopSeamLock.withLock { _lastStopTimeout = timeout }
         stopRequested.set()
         // Reentrant call (an onLog handler running ON the watcher queue invoking stop()):
         // run the teardown inline — waiting for our own queue would deadlock.
@@ -772,6 +773,13 @@ public final class StackFileWatcher {
             onLog?("watcher stop timed out behind a stalled read — abandoning the scan; descriptors close via cancel handlers")
         }
     }
+
+    /// Test seam (cold2 M3, mirroring FolderFrameSource's): the timeout the most recent
+    /// stop() ran with — pins budget threading without wall-clock assertions.
+    /// Lock-guarded: stop() may be called from any thread.
+    private let stopSeamLock = NSLock()
+    private var _lastStopTimeout: TimeInterval?
+    internal var lastStopTimeout: TimeInterval? { stopSeamLock.withLock { _lastStopTimeout } }
 
     /// Queue-confined terminal teardown (the body of the pre-review10 stop()).
     private func teardown() {

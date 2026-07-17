@@ -61,4 +61,49 @@ final class NativePipelineTests: XCTestCase {
         XCTAssertEqual(master.width, 251)
         XCTAssertEqual(master.height, 253)
     }
+
+    /// Cold2 M1 (red-first): a SECOND end() on an already-ended native pipeline
+    /// re-executed the whole master-write block POST-COMMIT — rewriting master.fit
+    /// (new mtime) behind the sealed manifest — before endSession() finally threw
+    /// notRunning. end() must throw BEFORE touching any durable artifact.
+    func testSecondEndThrowsBeforeTouchingDurableArtifacts() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let subsDir = sandbox.appendingPathComponent("subs")
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: subsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        var field: [(Double, Double)] = []
+        for i in 0..<20 {
+            field.append((Double((i * 47) % 240 + 8), Double((i * 83) % 240 + 8)))
+        }
+        try writeSub(subsDir, name: "Light_001.fit", stars: field)
+        try writeSub(subsDir, name: "Light_002.fit", stars: field.map { ($0.0 + 1.5, $0.1 - 0.9) })
+
+        let profile = SessionProfile(targetName: "Double End", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let source = FolderFrameSource(folder: subsDir, mode: .importOnce, fileNamePrefix: "Light_")
+        let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
+                                       profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        let replayURL = try pipeline.end()
+        let masterURL = replayURL.deletingLastPathComponent().appendingPathComponent("master.fit")
+        let bytesBefore = try Data(contentsOf: masterURL)
+        let mtimeBefore = try XCTUnwrap(FileManager.default
+            .attributesOfItem(atPath: masterURL.path)[.modificationDate] as? Date)
+
+        Thread.sleep(forTimeInterval: 0.05)   // any rewrite would move the mtime
+        XCTAssertThrowsError(try pipeline.end(), "a second end() must throw") {
+            XCTAssertEqual($0 as? SessionError, .notRunning)
+        }
+
+        let bytesAfter = try Data(contentsOf: masterURL)
+        let mtimeAfter = try XCTUnwrap(FileManager.default
+            .attributesOfItem(atPath: masterURL.path)[.modificationDate] as? Date)
+        XCTAssertEqual(bytesAfter, bytesBefore, "master.fit bytes must be untouched")
+        XCTAssertEqual(mtimeAfter, mtimeBefore,
+                       "master.fit must not be rewritten by a second end() (mtime moved)")
+    }
 }

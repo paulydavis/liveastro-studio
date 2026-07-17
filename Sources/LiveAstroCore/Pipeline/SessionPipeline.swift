@@ -522,6 +522,13 @@ public final class SessionPipeline {
         // Review10 item 4: fail fast — this thread is currently DELIVERING a callback from
         // the consumer task, and every branch below waits on that task.
         guard !isInsideCallbackDelivery else { throw SessionPipelineError.reentrantEnd }
+        // Cold2 M1: an already-ended (or never-started) session throws BEFORE touching
+        // any durable artifact. Pre-fix a SECOND end() sailed past the drains
+        // (consumeTask already nil), re-executed the whole master-write block
+        // POST-COMMIT — rewriting master.fit behind the sealed manifest — and only then
+        // threw notRunning from endSession(). A FAILED first end() (shutdownTimeout,
+        // master-write failure) leaves the session .running, so retry is unaffected.
+        guard session.state == .running else { throw SessionError.notRunning }
         if source != nil {
             if source?.isFinite ?? false {
                 // Import: the stream ends on its own; drain it completely while frames
