@@ -15,6 +15,25 @@ public enum RejectionReason: Equatable {
 /// Native stacking core (spec §4.2): registration on half-res superpixel luminance,
 /// full-res accumulation. Rejection is registration-failure only (spec §3).
 public final class StackEngine {
+    public enum CurrentStackState: Equatable {
+        case initialEmpty
+        case active
+        case awaitingSeedAfterReseed(manual: Int, auto: Int)
+    }
+
+    public enum FinalizationError: Error, Equatable {
+        case invariantBreach
+    }
+
+    public struct FinalizationState {
+        public let image: AstroImage?
+        public let coverage: [Float]?
+        public let frameCount: Int
+        public let stackState: CurrentStackState
+        public let sessionAcceptedCount: Int
+        public let sessionRejectedCount: Int
+    }
+
     private let seedMinStars: Int
     private let minMatches: Int
     private let inlierTolerance: Double
@@ -66,6 +85,8 @@ public final class StackEngine {
     /// mid-frame applies before the NEXT frame (the intended UX).
     private let lock = NSLock()
     private var accumulator: StackAccumulator?
+    private var currentStackState: CurrentStackState = .initialEmpty
+    private var manualReseedCount = 0
     private var referenceStars: [Star] = []
     private var referenceSize: (w: Int, h: Int)?
     private var referenceChannels: Int?
@@ -111,6 +132,39 @@ public final class StackEngine {
             weightBaseline = nil
             referenceBackgroundSamples = nil
             rejection.reset()
+            manualReseedCount += 1
+            currentStackState = .awaitingSeedAfterReseed(
+                manual: manualReseedCount,
+                auto: autoReseedCount
+            )
+        }
+    }
+
+    public func finalizationState() throws -> FinalizationState {
+        try lock.withLock {
+            let frameCount = accumulator?.frameCount ?? 0
+            switch currentStackState {
+            case .initialEmpty:
+                guard accumulator == nil, acceptedCount == 0 else {
+                    throw FinalizationError.invariantBreach
+                }
+            case .active:
+                guard accumulator != nil, frameCount > 0 else {
+                    throw FinalizationError.invariantBreach
+                }
+            case .awaitingSeedAfterReseed:
+                guard accumulator == nil, frameCount == 0 else {
+                    throw FinalizationError.invariantBreach
+                }
+            }
+            return FinalizationState(
+                image: accumulator?.mean(),
+                coverage: accumulator?.coverage(),
+                frameCount: frameCount,
+                stackState: currentStackState,
+                sessionAcceptedCount: acceptedCount,
+                sessionRejectedCount: rejectedCount
+            )
         }
     }
 
@@ -124,6 +178,14 @@ public final class StackEngine {
     }
 
     func setWeightBaselineForTesting(stars: Int, sigma: Float) { weightBaseline = (stars, sigma) }
+
+    func forceAccumulatorLossForTesting() {
+        lock.withLock { accumulator = nil }
+    }
+
+    func forceInitialEmptyAcceptedHistoryForTesting() {
+        lock.withLock { acceptedCount = 1 }
+    }
 
     public func currentStack() -> AstroImage? {
         lock.withLock { accumulator?.mean() }
@@ -177,6 +239,7 @@ public final class StackEngine {
                 ? BackgroundExtraction.tileSamples(rgb) : nil
             acceptedCount += 1
             consecutiveNoTransform = 0
+            currentStackState = .active
             return .becameReference
         }
 
@@ -204,6 +267,10 @@ public final class StackEngine {
                 rejection.reset()   // else the new field's seed is sigma-clipped against the old field's stats
                 consecutiveNoTransform = 0
                 autoReseedCount += 1
+                currentStackState = .awaitingSeedAfterReseed(
+                    manual: manualReseedCount,
+                    auto: autoReseedCount
+                )
             }
             return .rejected(.noTransform)
         }
@@ -350,6 +417,7 @@ public final class StackEngine {
                 ? BackgroundExtraction.tileSamples(rgb) : nil
             acceptedCount += 1
             consecutiveNoTransform = 0
+            currentStackState = .active
             return true
         }
     }
