@@ -225,11 +225,20 @@ struct WatcherReducer {
             guard batch.generation == state.generation.id else { return [] }
             return reduce(batch)
         case .emissionFinished(let result):
-            guard result.outcome == .yielded,
-                  result.intent.generation == state.generation.id,
+            guard result.intent.generation == state.generation.id,
                   state.generation.files[result.intent.candidate.name]
                     == .ready(result.intent.candidate) else { return [] }
             let candidate = result.intent.candidate
+            if result.outcome == .rejected {
+                guard revisionOrderingEnabled,
+                      case .numbered(let revision) = candidate.kind,
+                      let mark = emittedRevisionHighWater,
+                      revisionOrder.compare(revision, mark) != .orderedDescending
+                else { return [] }
+                state.generation.files[candidate.name] = .droppedOutOfOrder
+                return [.log(
+                    "revision \(revision) arrived out of order — skipped (high-water \(mark))")]
+            }
             state.generation.files[candidate.name] = .settled(.emittedNow(
                 identity: candidate.identity,
                 digest: candidate.digest))
@@ -237,6 +246,18 @@ struct WatcherReducer {
             reconcileActiveBlocker(afterEmitting: candidate)
             return []
         }
+    }
+
+    /// An intent may be invalidated by feedback from an earlier effect in the same batch.
+    /// The driver asks immediately before performing the filesystem-facing yield.
+    func shouldExecuteEmission(_ intent: EmissionIntent) -> Bool {
+        guard intent.generation == state.generation.id,
+              state.generation.files[intent.candidate.name] == .ready(intent.candidate)
+        else { return false }
+        guard revisionOrderingEnabled,
+              case .numbered(let revision) = intent.candidate.kind,
+              let mark = emittedRevisionHighWater else { return true }
+        return revisionOrder.compare(revision, mark) == .orderedDescending
     }
 
     private mutating func reconcileActiveBlocker(afterEmitting candidate: EmissionCandidate) {
@@ -443,11 +464,6 @@ struct WatcherReducer {
         }
     }
 
-    private func isReady(_ fileState: FileState?) -> Bool {
-        if case .ready = fileState { return true }
-        return false
-    }
-
     private mutating func classify(
         _ observation: FileObservation,
         nowNanos: UInt64
@@ -597,7 +613,17 @@ struct WatcherReducer {
         }
     }
 
-    private func entryKind(for name: String) -> WatcherEntryKind {
+    /// Deterministic descriptor-work order for the effect driver, using the same anchored
+    /// parser/comparator as classification, high-water derivation, and reducer effects.
+    func orderedNamesForScan(_ names: [String]) -> [String] {
+        names.map { (name: $0, revision: revisionOrder.revision(in: $0)) }
+            .sorted(by: revisionOrder.orderedBefore)
+            .map(\.name)
+    }
+
+    /// Pure classification shared with the driver for failures that occur before a read plan
+    /// can be built (open/stat/type). The anchored parser remains reducer-owned.
+    func entryKind(for name: String) -> WatcherEntryKind {
         if let revision = revisionOrder.revision(in: name) {
             return .numbered(revision: revision)
         }

@@ -988,6 +988,89 @@ final class StackFileWatcherTests: XCTestCase {
                        "fast-path re-established by the dedup branch")
     }
 
+    /// Reducer integration pin: a directory swap after the complete observation batch has
+    /// produced an emission intent, but before that intent executes, must reject the stale
+    /// intent and replace all generation-local state. The latest per-name digest is the sole
+    /// survivor: an identical file in the replacement folder is re-hashed once, deduplicated,
+    /// and then arms the new generation's identity fast-path.
+    func testFolderReplacementAfterObservationBeforeEmissionRejectsStaleIntentAndRetainsOnlyDigestDedup()
+        async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
+                                   digestPolicy: .immutableAfterPublish)
+        let collector = collect(watcher)
+        try watcher.start()
+
+        let name = "sub_001.fit"
+        let url = tmp.appendingPathComponent(name)
+        let original = makeFITS(0.25, size: 16)
+        try original.write(to: url)
+        watcher.scanNow()   // first stat observation
+        watcher.scanNow()   // stable observation -> baseline emission
+        let baselineEmitted = await collector.waitForCount(1, timeout: 2)
+        XCTAssertTrue(baselineEmitted, "arrange: baseline emits")
+
+        let baselineDigest = FileIdentity.contentDigest(data: original)
+        let baselineState = watcher.reducerStateSnapshot
+        let baselineGeneration = baselineState.generation.id.rawValue
+        XCTAssertEqual(baselineState.lastEmittedDigestByName, [name: baselineDigest])
+
+        // B earns an old-generation intent. The hook swaps in a fresh directory containing A
+        // at the exact observe/effect boundary, so B's path must never be yielded.
+        try makeFITS(0.75, size: 16).write(to: url)
+        watcher.scanNow()   // B changed identity -> re-earns stat stability
+
+        let staged = tmp.deletingLastPathComponent()
+            .appendingPathComponent("watch-staged-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: staged, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: staged) }
+        try original.write(to: staged.appendingPathComponent(name))
+
+        var swapError: Error?
+        var hashesAtSwap = -1
+        watcher.afterObservationBatchForTesting = { [weak watcher] in
+            guard let watcher else { return }
+            watcher.afterObservationBatchForTesting = nil
+            hashesAtSwap = watcher.digestComputations
+            do {
+                try Disruptor.atomicallySwapDirectory(at: self.tmp, with: staged)
+            } catch {
+                swapError = error
+            }
+        }
+        watcher.scanNow()   // B observed/hashed, then folder replaced before its effect
+        XCTAssertNil(swapError)
+        XCTAssertGreaterThanOrEqual(hashesAtSwap, 0, "the boundary hook must execute")
+
+        let replacedState = watcher.reducerStateSnapshot
+        XCTAssertEqual(replacedState.generation.id.rawValue, baselineGeneration + 1,
+                       "replacement allocates a fresh monotonic generation")
+        XCTAssertTrue(replacedState.generation.files.isEmpty,
+                      "no old-generation file or ordering evidence may survive")
+        XCTAssertNil(replacedState.generation.ordering.activeBlocker)
+        XCTAssertEqual(replacedState.lastEmittedDigestByName, [name: baselineDigest],
+                       "latest per-name digest is the sole cross-generation survivor")
+        let itemsAfterReplacement = await collector.items
+        XCTAssertEqual(itemsAfterReplacement.count, 1,
+                       "the old-generation intent must be rejected before yield")
+
+        watcher.scanNow()   // re-arm + first stat observation in the replacement generation
+        watcher.scanNow()   // stable -> one rehash -> duplicate settlement
+        XCTAssertEqual(watcher.digestComputations, hashesAtSwap + 1,
+                       "the replacement file is re-hashed exactly once")
+        let itemsAfterDedup = await collector.items
+        XCTAssertEqual(itemsAfterDedup.count, 1,
+                       "retained latest-digest evidence suppresses the identical replacement")
+
+        guard case .settled(.duplicateOfLastEmission(_, let digest)) =
+                watcher.reducerStateSnapshot.generation.files[name] else {
+            return XCTFail("the replacement generation must settle through latest-digest dedup")
+        }
+        XCTAssertEqual(digest, baselineDigest)
+        watcher.scanNow()
+        XCTAssertEqual(watcher.digestComputations, hashesAtSwap + 1,
+                       "duplicate settlement arms the replacement generation's fast-path")
+    }
+
     // MARK: - review10 item 3: bounded stop behind a stalled scan
 
     /// Review10 item 3 (pre-fix this test HANGS: stop() queue.sync'd behind the stalled

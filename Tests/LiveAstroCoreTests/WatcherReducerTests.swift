@@ -67,6 +67,56 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(reducer.state.generation.files[one], .writtenOff)
     }
 
+    func testEqualNumericRevisionIntentInvalidatesAfterEarlierSettlementAndRejectedDropLogs() {
+        let paddedName = "live_stack_007.fit"
+        let plainName = "live_stack_7.fit"
+        let padded = makeCandidate(
+            name: paddedName,
+            identity: makeIdentity(7),
+            digest: "padded",
+            kind: .numbered(revision: "007"))
+        let plain = makeCandidate(
+            name: plainName,
+            identity: makeIdentity(8),
+            digest: "plain",
+            kind: .numbered(revision: "7"))
+        var reducer = makeReducer(files: [
+            paddedName: .ready(padded),
+            plainName: .ready(plain),
+        ])
+
+        let effects = observeBatch([
+            observation(
+                name: paddedName,
+                revision: "007",
+                outcome: .identityUnchanged(identity: padded.identity)),
+            observation(
+                name: plainName,
+                revision: "7",
+                outcome: .identityUnchanged(identity: plain.identity)),
+        ], nowNanos: 10, reducer: &reducer)
+
+        XCTAssertEqual(emittedNames(in: effects), [paddedName, plainName])
+        let intents = effects.compactMap { effect -> EmissionIntent? in
+            guard case .emit(let intent) = effect else { return nil }
+            return intent
+        }
+        XCTAssertTrue(intents.allSatisfy { reducer.shouldExecuteEmission($0) })
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: intents[0],
+            outcome: .yielded))).isEmpty)
+
+        XCTAssertFalse(reducer.shouldExecuteEmission(intents[1]),
+                       "the first settlement's derived mark invalidates its equal sibling")
+        let rejectedEffects = reducer.reduce(.emissionFinished(EmissionResult(
+            intent: intents[1],
+            outcome: .rejected)))
+        XCTAssertEqual(rejectedEffects, [
+            .log("revision 7 arrived out of order — skipped (high-water 007)"),
+        ])
+        XCTAssertEqual(reducer.state.generation.files[plainName], .droppedOutOfOrder)
+    }
+
     func testRoleRoundTripStartsFreshEpisodeClock() {
         var reducer = makeReducer()
 
@@ -837,6 +887,35 @@ final class WatcherReducerTests: XCTestCase {
                         isFITS: testCase.isFITS),
                 ], testCase.label)
         }
+    }
+
+    func testOrderedNamesForScanUsesAnchoredNumericComparator() {
+        let reducer = makeReducer(filePrefix: "live.stack+(v1)")
+
+        XCTAssertEqual(reducer.orderedNamesForScan([
+            "live.stack+(v1)_10.fit",
+            "z.fit",
+            "live.stack+(v1)_002.fit",
+            "live.stack+(v1)_1.fit",
+            "a.fit",
+        ]), [
+            "a.fit",
+            "z.fit",
+            "live.stack+(v1)_1.fit",
+            "live.stack+(v1)_002.fit",
+            "live.stack+(v1)_10.fit",
+        ])
+    }
+
+    func testEntryKindForPreReadFailureUsesAnchoredReducerClassification() {
+        let mutable = makeReducer(filePrefix: "live.stack+(v1)")
+        XCTAssertEqual(mutable.entryKind(for: "live.stack+(v1)_0007.fit"),
+                       .numbered(revision: "0007"))
+        XCTAssertEqual(mutable.entryKind(for: "live.stack+(v1)_extra_0007.fit"),
+                       .classicMutable)
+
+        let immutable = makeReducer(digestPolicy: .immutableAfterPublish)
+        XCTAssertEqual(immutable.entryKind(for: "frame.fit"), .immutable)
     }
 
     func testThirtyDigitRevisionClassifiesAndDerivesHighWaterWithoutIntConversion() {
