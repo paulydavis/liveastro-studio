@@ -1,197 +1,110 @@
 # LiveAstro Studio
 
-Turn a live astrophotography session into a polished livestream and an automatic
-recap video — without manual video editing.
+LiveAstro Studio turns an astrophotography session into a polished live broadcast and an automatic replay.
 
-LiveAstro Studio watches your live-stacker's output (Siril `live_stack.fit`,
-or PNG/JPG/TIFF), shows the latest stack in a clean 1920×1080 broadcast window
-for OBS, records a snapshot on every stack update, and renders a 45-second
-"stack evolution" MP4 when you end the session.
+It watches the files your capture or live-stacking software creates, stacks or displays them live, shows a clean OBS-friendly broadcast window, records session snapshots, and renders a stack-evolution replay when the session ends.
+
+LiveAstro is not camera-control software. Seestar, ASIAIR, NINA, Siril, or another acquisition tool still gets images off the camera. LiveAstro starts at the folder boundary: when new FITS files or stack images appear on disk, it turns them into a live stack, broadcast view, session record, and replay.
 
 ## Requirements
 
-- macOS 14+
-- [Siril](https://siril.org) (or any tool that periodically writes a stack image to a folder)
-- [OBS](https://obsproject.com) for streaming
+- macOS 14 or later
+- A source folder that receives incoming `.fit` / `.fits` files, or an external stacker output folder
+- [OBS Studio](https://obsproject.com) for streaming
+- Optional: [Siril](https://siril.org), if you want Siril to do the live stacking and LiveAstro to watch Siril's output
 
-## Run
+## Supported Workflows
+
+- **Seestar live** — mount the Seestar SMB share, click **Start Seestar**, and LiveAstro stacks new raw subs as they arrive.
+- **ASIAIR live** — mount the ASIAIR network share, click **Start ASIAIR**, and LiveAstro watches the active light-frame folder.
+- **Generic folder live** — choose any folder where a capture app writes incoming raw subs.
+- **Siril / external stacker output** — watch `live_stack.fit` or numbered stack revisions from Siril or another stacker.
+- **Import existing subs** — stack a folder of already-captured raw subs and produce a replay plus native master.
+
+See the full [User Guide](docs/user-guide.md) for setup, OBS streaming, session outputs, reseeding, and troubleshooting.
+
+## Open LiveAstro
+
+If you have a packaged build, open `LiveAstroStudio.app`.
+
+To run from source:
 
 ```bash
 swift run LiveAstroStudio
 ```
 
-1. Choose the folder Siril's livestack writes into.
-2. Fill in the session profile (target, scope, camera, sub length…). For OSC cameras, enable **Neutralize background (OSC white balance)** to scale R and B channel medians to G before stretching — useful when your live-stack output looks green-dominant. The toggle is off by default and locks once a session starts.
-3. The **File name starts with** field defaults to `live_stack` — this matches both
-   Siril's classic in-place `live_stack.fit` and the numbered `live_stack_00001.fit`
-   revisions Siril 1.4+ writes, while ignoring raw sub-exposures and `r_live_stack_*`
-   registered frames that land in the same folder.
-   Clear the field (or leave it blank) when pointing at a folder of arbitrary display-ready images.
+## Quick Start
 
-> **Siril tip:** after launching Siril, run `cd /path/to/your/watch/folder` in its
-> command line before starting livestacking. A freshly launched Siril otherwise
-> rejects every file with "File not supported for live stacking" (stat against the
-> wrong process CWD — see `docs/upstream/siril-livestack-cwd-bug.md`).
-4. Open the Broadcast Window; in OBS add a **Window Capture** for "LiveAstro Broadcast".
-5. Start Session. Stream from OBS as usual.
-6. End Session → `~/Documents/LiveAstro/<session>/replay.mp4`. The replay cloud gate automatically drops frames whose background brightness deviates more than 50% from the recent accepted-frame baseline before keyframe selection — first and last frames are always kept, so passing clouds do not corrupt the evolution video.
+1. Start or prepare your capture system.
+   - Seestar, ASIAIR, NINA, Siril, or another tool should be writing files into a folder LiveAstro can read.
+2. In LiveAstro, choose a source:
+   - **Start Seestar**
+   - **Start ASIAIR**
+   - **Choose Folder…**
+   - **Stacker output folder**
+   - **Import Subs…**
+3. Fill in the session profile fields you care about: target, telescope, camera, filter, location, and sub-exposure length.
+4. Click **Start Session** for live workflows, or choose a folder for **Import Subs…**.
+5. Click **Detach** to open the broadcast window.
+6. In OBS, add a Window Capture for the LiveAstro broadcast window.
+7. Click **Go Live** if OBS automation is configured, or start streaming manually in OBS.
+8. Click **End Session** when finished. LiveAstro writes the session folder under `~/Documents/LiveAstro/`.
 
-## OBS automation
+## OBS Automation
 
-LiveAstro can drive OBS over the obs-websocket 5.x protocol so you never have to
-touch OBS during a session — **Go Live** launches OBS, connects, and starts the
-stream, and scene automation switches scenes based on whether stacking is making
-progress. Broadcasting is deliberate: starting a session never starts a stream.
+LiveAstro can control OBS through the OBS WebSocket server.
 
-**One-time OBS setup**
+One-time setup:
 
 1. In OBS, open **Tools → WebSocket Server Settings**.
-2. Check **Enable WebSocket server** (default port **4455**).
-3. Either turn off **Enable Authentication**, or set a password and copy it into
-   the Control window's OBS **Password** field.
+2. Enable the WebSocket server.
+3. Use the default port `4455`, or enter your chosen port in LiveAstro.
+4. If authentication is enabled, copy the OBS WebSocket password into LiveAstro.
 
-**Control window — OBS section**
+LiveAstro treats broadcasting as deliberate:
 
-- **Status line** — a colored dot + text (`disconnected` / `connecting…` /
-  `connected` / `streaming`), plus a red **REC** indicator while OBS is recording.
-- **Connect / Disconnect** — connect manually with the current host/port/password.
-- **Host / Port / Password** — connection settings; locked while connected.
-- **Auto-launch OBS on Go Live** — when on (default), clicking Go Live with OBS
-  unreachable launches OBS (in the background, without stealing focus) and
-  retries the connection for up to 20 s. The manual Connect button never
-  launches OBS.
-- **Scene picker + ↻** — pick the live program scene; ↻ refreshes the scene list
-  from OBS.
-- **Record while streaming** — also start OBS recording when the stream comes up.
-- **Scene automation (scope on stall)** with **Stack scene** / **Scope scene**
-  pickers — see below.
+- **Start Session** starts the astronomy session, not the stream.
+- **Go Live** starts the OBS stream.
+- **End Broadcast** stops OBS without ending the astronomy session.
+- **End Session** finishes the astronomy session, renders the replay, then stops OBS if LiveAstro owns the broadcast.
+- Quitting the app does not intentionally stop an active OBS stream.
 
-**What happens on Go Live / Start / End Session**
+## Session Outputs
 
-- **Start Session** starts stacking and scene automation only — it never starts
-  a stream. Broadcasting begins when you click **Go Live** (footer): it connects
-  to OBS (auto-launching if needed), switches to the Stack scene, starts the
-  stream, optionally starts recording, and confirms via status polls; **End
-  Broadcast** stops it without ending the session. Every OBS step is
-  best-effort: if any of it fails, the failure is logged and the astronomy
-  session continues regardless — **OBS never blocks the session.**
-- **Scene automation:** while a session runs with automation on, a stall detector
-  (seeded from your sub-exposure length) watches for stacking to stall. On a stall
-  it switches OBS to the **Scope scene** once; when frames resume it switches back
-  to the **Stack scene** once. If you change the program scene by hand, automation
-  detects the override and pauses until the next stall/resume boundary.
-- **End Session** runs the replay generation first, then — and only then — stops
-  the OBS stream and recording. While the replay renders, the footer shows
-  "Ending broadcast…" with live stream health, and **End Broadcast** stays
-  available as an operator override if you need the stream down immediately.
-  The stream is stopped only by these deliberate actions (End Session's deferred
-  stop, or End Broadcast): quitting or force-quitting the app deliberately
-  leaves the OBS stream alive so a crash or accidental quit never kills your
-  broadcast. Every stop is confirmed against OBS — if OBS can't confirm the
-  stream and recording actually stopped, the app says "OBS may still be live"
-  and offers Retry instead of pretending it's idle.
+Session folders are written under `~/Documents/LiveAstro/`.
 
-**Manual validation checklist**
+Depending on the workflow, a session may contain:
 
-Run through these against a live OBS before relying on the automation:
+- `replay.mp4` — automatic stack-evolution video
+- `master.fit` — linear 32-bit FITS master for native stacking sessions
+- snapshots — still frames captured throughout the session
+- manifest metadata — profile, timing, and output facts
 
-- [ ] **Auth** — with a WebSocket password set, Connect succeeds; with a wrong
-      password it fails and logs an auth error (session still starts).
-- [ ] **Cold auto-launch** — with OBS quit and Auto-launch on, Go Live
-      launches OBS (in the background) and connects within ~20 s.
-- [ ] **Stream toggle** — Go Live turns OBS's stream indicator on; End
-      Session (or End Broadcast) turns it off.
-- [ ] **Scene automation via stall** — with automation on and Stack/Scope scenes
-      chosen, stop feeding frames (or pause `fakesiril`); after the stall threshold
-      OBS switches to the Scope scene, and resuming frames switches back to Stack.
-- [ ] **Accidental quit leaves stream alive** — while streaming, force-quit
-      LiveAstro; OBS keeps streaming (only End Session stops it).
+External-stacker sessions do not promise a native `master.fit`; the external stacker owns that artifact.
 
-**Real-connection smoke test**
+## Demo Without a Telescope
 
-`Scripts/obs_smoke.swift` is a headless program that connects to a live OBS on
-`localhost:4455`, prints the state, scene list, and OBS version, then starts and
-stops the stream. It is run **manually** (it connects to real OBS and starts a
-real stream, so never run it during a live broadcast). The password is passed as
-the first argument; the build+run command is documented in a comment at the top
-of the script.
-
-## Native stacking
-
-LiveAstro v2 can stack raw sub-exposures itself — no external live-stacker required.
-There are two entry points:
-
-**Import Subs… (batch import from acquired files)**
-
-1. In the Control window, set the source mode to **Raw subs folder (native stacking)**.
-2. Click **Import Subs…** and choose the folder containing your `.fit` files.
-   Choosing the folder starts the import immediately — no Start Session needed
-   (and it refuses to start while a live session is running). Target and
-   exposure are auto-detected from the newest sub's FITS header and overwrite
-   the profile fields when readable; fill in the rest of the profile before
-   importing if you want it in the session record.
-   The engine imports each file in chronological order: calibration (if
-   configured) → RCD debayer → star registration → gradient leveling →
-   σ-clip → quality-weighted stack. A progress bar shows N / total with
-   accepted/rejected counts and a Cancel button; a cancelled import finalizes
-   the frames stacked so far.
-   The session lands in `~/Documents/LiveAstro/<date-target>/` like any
-   other session — including `replay.mp4` and `master.fit`.
-
-**Live raw-subs (watch folder as subs arrive)**
-
-1. Set source mode to **Raw subs folder (native stacking)**.
-2. Point the watch folder at the folder your capture software writes subs into
-   (Seestar SMB share, ASIAIR, or a local capture path).
-3. Start Session — each new sub is stacked as it arrives.
-4. Use **Reseed Reference** to discard the current reference frame and restart
-   alignment from the next accepted sub (useful after a long gap, fog clearing,
-   or a meridian flip that changes field rotation significantly).
-
-**Stacker output folder (Siril / external stacker)**
-
-This is the original v1 mode.  Set source mode to **Stacker output folder (Siril)**
-and point at the folder Siril writes its `live_stack.fit` into.  All v1 behavior
-is unchanged.
-
-**master.fit output**
-
-At the end of every native-stack session, `master.fit` is written into the session
-directory alongside `replay.mp4`.  It is a 32-bit float RGB FITS file in TOP-DOWN
-row order, suitable for further processing in PixInsight or Siril.
-
-**Validation results (NGC 6888, 2026-07-07)**
-
-120 × 20 s subs (40 min) imported headless against Paul's Siril 1000-sub master:
-
-| Channel | LiveAstro r | Siril master baseline (16-sub prototype) | Delta |
-|---------|-------------|------------------------------------------|-------|
-| R       | **0.9490**  | 0.87                                     | +0.079 |
-| G       | **0.9522**  | 0.94                                     | +0.012 |
-| B       | **0.9466**  | 0.83                                     | +0.117 |
-
-All 120 subs accepted, 0 rejected.  Import time: ~350 s on Apple Silicon (M-class).
-Correlation measured by `Scripts/compare_to_master.py` (astroalign luminance
-registration, full registered frame Pearson r).
-
-## Demo without a telescope
+You can simulate an updating stack folder:
 
 ```bash
 mkdir -p /tmp/fakestack
 swift run fakesiril /tmp/fakestack --interval 3 --count 20
 ```
 
-Point the watch folder at `/tmp/fakestack`.
+Then point LiveAstro's stacker-output workflow at `/tmp/fakestack`.
 
 ## Development
 
 ```bash
-swift test                                          # full suite, no hardware needed
-swift test -c release --filter PerformanceTests     # 26 MP perf gate (< 10 s per frame)
+swift test
+swift build -c release
+swift test -c release --filter PerformanceTests
 ```
 
-Design specs:
-- v1: `docs/history/specs/2026-07-05-liveastro-studio-v1-design.md`
-- v2 native stacking: `docs/history/specs/2026-07-07-liveastro-v2-native-stacking-design.md`
+Siril parity testing is optional and requires a local dataset:
 
-Validation comparison script: `Scripts/compare_to_master.py`
+```bash
+LIVEASTRO_PARITY_DATASET=~/LiveAstroCorpus/siril-m8-asi2600 swift test --filter SirilParityTests
+```
+
+Design and history documents live under `docs/`.
