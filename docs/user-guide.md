@@ -23,6 +23,8 @@ To run from source:
 swift run LiveAstroStudio
 ```
 
+If you want to try the app without a telescope or clear skies, use the [Beta Quickstart](beta-quickstart.md). For structured tester notes, use the [Beta Tester Checklist](beta-checklist.md).
+
 ## The Big Picture
 
 A normal session has four moving parts:
@@ -57,10 +59,10 @@ Use this when an ASIAIR is writing autorun light frames to its network share.
 
 ### Generic folder live
 
-Use this for NINA, local capture software, a mounted network share, or any folder that receives incoming raw subs.
+Use this for NINA, local capture software, a mounted network share, or any folder that receives incoming raw subs. There is no separate NINA button because NINA already writes FITS files to a normal folder; in LiveAstro, NINA uses **Choose Folder…**.
 
 1. Click **Choose Folder…**.
-2. Select the folder where new light frames will appear.
+2. Select the folder where new light frames will appear, such as NINA's image output folder.
 3. Start the session.
 
 Only frames that arrive after the live source is armed are treated as live session frames. If you point LiveAstro at a folder full of old files that is no longer changing, nothing new will stack.
@@ -164,9 +166,23 @@ Calibration applies to native raw-sub stacking and import workflows.
 
 - **Dark** frames subtract thermal signal.
 - **Flat** frames correct dust and vignetting.
-- **Bias** frames are used to clean flats.
+- **Bias / dark-flat** frames remove the camera readout offset, mainly so flats can be applied cleanly.
 
 You can point LiveAstro at existing master calibration files or build masters from folders of raw calibration frames. Calibration is optional; leave a row empty to skip that type.
+
+Darks are useful for many rigs, especially uncooled cameras, long exposures,
+amp glow, warm sensors, or data that was not dithered. They are not mandatory
+for every modern cooled-camera workflow. If your capture software dithers
+between subs and LiveAstro's Winsorized sigma clipping is enabled, test your
+own data both with and without darks before assuming one answer is always
+better. LiveAstro records what calibration was used, but dithering is controlled
+by the upstream capture system, not by LiveAstro.
+
+Bias or dark-flat frames are mostly a companion to flats. If you are using
+flats, provide whichever master your calibration workflow calls for; with many
+CMOS astro cameras, matched dark-flats are often preferred over very short bias
+frames. If you are stacking lights only and skipping flats, bias/dark-flat
+frames usually do little by themselves.
 
 ## Reseed Reference
 

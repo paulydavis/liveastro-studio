@@ -4,12 +4,14 @@ LiveAstro Studio turns an astrophotography session into a polished live broadcas
 
 It watches the files your capture or live-stacking software creates, stacks or displays them live, shows a clean OBS-friendly broadcast window, records session snapshots, and renders a stack-evolution replay when the session ends.
 
-LiveAstro is not camera-control software. Seestar, ASIAIR, NINA, Siril, or another acquisition tool still gets images off the camera. LiveAstro starts at the folder boundary: when new FITS files or stack images appear on disk, it turns them into a live stack, broadcast view, session record, and replay.
+LiveAstro is not camera-control software. Seestar, ASIAIR, NINA, Siril, or another acquisition tool still gets images off the camera and writes files to disk. LiveAstro starts at that folder boundary: it watches a folder that another program or device is already writing into, then turns those files into a live stack, broadcast view, session record, and replay.
 
 ## Requirements
 
 - macOS 14 or later
-- A source folder that receives incoming `.fit` / `.fits` files, or an external stacker output folder
+- A folder that is already receiving files from your capture system, or a folder of existing files from a previous shoot
+  - raw `.fit` / `.fits` light frames for native stacking
+  - external stack images such as Siril's `live_stack.fit` for stacker-output mode
 - [OBS Studio](https://obsproject.com) for streaming
 - Optional: [Siril](https://siril.org), if you want Siril to do the live stacking and LiveAstro to watch Siril's output
 
@@ -17,11 +19,13 @@ LiveAstro is not camera-control software. Seestar, ASIAIR, NINA, Siril, or anoth
 
 - **Seestar live** — mount the Seestar SMB share, click **Start Seestar**, and LiveAstro stacks new raw subs as they arrive.
 - **ASIAIR live** — mount the ASIAIR network share, click **Start ASIAIR**, and LiveAstro watches the active light-frame folder.
-- **Generic folder live** — choose any folder where a capture app writes incoming raw subs.
-- **Siril / external stacker output** — watch `live_stack.fit` or numbered stack revisions from Siril or another stacker.
-- **Import existing subs** — stack a folder of already-captured raw subs and produce a replay plus native master.
+- **Generic folder live** — choose a folder where another capture app is actively writing new raw subs. This is the NINA path: point **Choose Folder…** at NINA's image output folder.
+- **Siril / external stacker output** — choose the folder where Siril or another stacker writes `live_stack.fit` or numbered stack revisions.
+- **Import existing subs** — choose a folder of already-captured raw subs from a previous shoot, then stack them offline and produce a replay plus native master.
 
 See the full [User Guide](docs/user-guide.md) for setup, OBS streaming, session outputs, reseeding, and troubleshooting.
+
+Trying LiveAstro before you have clear skies? Start with the [Beta Quickstart](docs/beta-quickstart.md), then use the [Beta Tester Checklist](docs/beta-checklist.md) to record what worked.
 
 ## Open LiveAstro
 
@@ -36,15 +40,16 @@ swift run LiveAstroStudio
 ## Quick Start
 
 1. Start or prepare your capture system.
-   - Seestar, ASIAIR, NINA, Siril, or another tool should be writing files into a folder LiveAstro can read.
+   - For live use, Seestar, ASIAIR, NINA, Siril, or another tool should be writing new files into a folder LiveAstro can read.
+   - For offline use, choose a folder of existing FITS light frames from a previous shoot.
 2. In LiveAstro, choose a source:
    - **Start Seestar**
    - **Start ASIAIR**
-   - **Choose Folder…**
+   - **Choose Folder…** for NINA or any other capture app that writes FITS subs to a folder
    - **Stacker output folder**
    - **Import Subs…**
 3. Fill in the session profile fields you care about: target, telescope, camera, filter, location, and sub-exposure length.
-4. Click **Start Session** for live workflows, or choose a folder for **Import Subs…**.
+4. Click **Start Session** for live workflows, or use **Import Subs…** to stack an existing folder.
 5. Click **Detach** to open the broadcast window.
 6. In OBS, add a Window Capture for the LiveAstro broadcast window.
 7. Click **Go Live** if OBS automation is configured, or start streaming manually in OBS.
@@ -82,16 +87,36 @@ Depending on the workflow, a session may contain:
 
 External-stacker sessions do not promise a native `master.fit`; the external stacker owns that artifact.
 
-## Demo Without a Telescope
+## Calibration Philosophy
 
-You can simulate an updating stack folder:
+Calibration frames are optional. LiveAstro can use dark, flat, and
+bias/dark-flat masters when you provide them, but missing calibration frames
+are not an error.
+
+Darks are often helpful, especially with uncooled cameras, long exposures, amp
+glow, warm sensors, or non-dithered data. With a modern cooled camera, dithered
+subs, and Winsorized sigma clipping, darks may be less important; try both on
+your own data if you are unsure. LiveAstro does not control dithering itself —
+that happens in Seestar, ASIAIR, NINA/PHD2, or your capture software.
+
+Bias or dark-flat frames are mainly useful when you are using flats: they remove
+the camera readout offset from the flat before the flat is applied. With many
+CMOS astro cameras, matched dark-flats are often preferred over very short bias
+frames. If you are stacking lights only and skipping flats, bias/dark-flat
+frames usually do little on their own.
+
+## Try It Without a Telescope
+
+The sample stack generator writes changing stack files into a folder so you can test LiveAstro before connecting a telescope:
 
 ```bash
-mkdir -p /tmp/fakestack
-swift run fakesiril /tmp/fakestack --interval 3 --count 20
+mkdir -p /tmp/liveastro-demo-stack
+swift run fakesiril /tmp/liveastro-demo-stack --interval 3 --count 20
 ```
 
-Then point LiveAstro's stacker-output workflow at `/tmp/fakestack`.
+Then point LiveAstro's stacker-output workflow at `/tmp/liveastro-demo-stack`.
+
+For the fuller no-sky walkthrough, see [docs/beta-quickstart.md](docs/beta-quickstart.md).
 
 ## Development
 
@@ -107,6 +132,8 @@ Siril parity testing is optional and requires a local dataset:
 LIVEASTRO_PARITY_DATASET=~/LiveAstroCorpus/siril-m8-asi2600 swift test --filter SirilParityTests
 ```
 
-Design and history documents live under `docs/`.
+Design, history, and roadmap documents live under `docs/`.
 
 Release packaging and notarization notes live in [docs/distribution.md](docs/distribution.md).
+
+Near-term product direction is tracked in [docs/roadmap.md](docs/roadmap.md).

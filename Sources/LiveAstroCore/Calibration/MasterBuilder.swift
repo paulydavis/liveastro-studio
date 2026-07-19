@@ -16,7 +16,8 @@ public enum MasterBuilder {
 
     /// Mean-combine `fitsURLs` into a top-down master.
     /// - .flat: subtracts `bias` per-frame when provided, then clamps ≥ flatFloor
-    ///   and normalizes to median 1.
+    ///   and normalizes to median 1. The `bias` input may be a bias master or a
+    ///   matched dark-flat master; both occupy the same flat-offset role.
     /// - The first successfully-read frame sets the reference dimensions; later
     ///   frames of a different size are skipped. Throws if no frames are readable.
     public static func combine(fitsURLs: [URL], kind: MasterKind,
@@ -36,7 +37,8 @@ public enum MasterBuilder {
             } else if img.width != refW || img.height != refH || img.channels != refC {
                 continue    // dimension mismatch → skip
             }
-            // For flats, subtract bias per-frame when its dimensions match.
+            // For flats, subtract the selected bias/dark-flat per-frame when its
+            // dimensions match.
             if kind == .flat, let bias,
                bias.width == refW && bias.height == refH && bias.channels == refC {
                 for i in 0..<sum.count { sum[i] += Double(img.pixels[i]) - Double(bias.pixels[i]) }
@@ -92,7 +94,8 @@ public enum MasterBuilder {
     public static func load(_ url: URL) throws -> AstroImage {
         let data = try Data(contentsOf: url)
         let img = try FITSReader.read(data, normalizeRowOrder: true)
-        // Master frames are always linear calibration data (dark/flat/bias), never raw Bayer.
+        // Master frames are always linear calibration data (dark/flat/bias-or-dark-flat),
+        // never raw Bayer.
         return AstroImage(width: img.width, height: img.height, channels: img.channels,
                           pixels: img.pixels, sourceIsLinear: true)
     }

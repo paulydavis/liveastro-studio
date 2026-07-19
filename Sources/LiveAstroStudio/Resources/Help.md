@@ -12,7 +12,7 @@ It does not control your camera or mount. Use Seestar, ASIAIR, NINA, Siril, or a
 2. Choose a source in LiveAstro:
    - **Start Seestar** for a mounted Seestar share
    - **Start ASIAIR** for a mounted ASIAIR share
-   - **Choose Folder…** for any incoming raw-sub folder
+   - **Choose Folder…** for NINA or any incoming raw-sub folder
    - **Stacker output folder** for Siril or another external stacker
    - **Import Subs…** for an existing folder of captured subs
 3. Fill in the session profile fields you want saved with the session.
@@ -28,7 +28,7 @@ It does not control your camera or mount. Use Seestar, ASIAIR, NINA, Siril, or a
 |------|-------------|
 | **Start Seestar** | A Seestar SMB share is mounted and writing raw FITS subs. |
 | **Start ASIAIR** | An ASIAIR network share is mounted and writing light frames. |
-| **Choose Folder…** | A capture app writes incoming raw subs to a folder you choose. |
+| **Choose Folder…** | NINA or another capture app writes incoming raw subs to a folder you choose. |
 | **Stacker output folder** | Siril or another stacker writes `live_stack.fit` or image revisions. |
 | **Import Subs…** | You already have a folder of subs and want a stack/replay afterward. |
 
@@ -87,9 +87,13 @@ Calibration applies to native raw-sub stacking and import workflows.
 
 - **Dark** subtracts thermal signal.
 - **Flat** corrects dust and vignetting.
-- **Bias** cleans flats before they are applied.
+- **Bias / dark-flat** removes camera readout offset, mainly so flats can be applied cleanly.
 
 You can use existing master calibration files or build masters from folders of calibration frames. Leave a calibration row empty to skip it.
+
+Darks are helpful for many cameras and conditions, but they are not required for every stack. For modern cooled cameras with dithered subs and Winsorized sigma clipping, compare your own data with and without darks if the result looks cleaner one way. LiveAstro does not perform dithering; Seestar, ASIAIR, NINA/PHD2, or another capture tool must do that upstream.
+
+Bias or dark-flat frames mostly matter when you use flats. With many CMOS astro cameras, matched dark-flats are often preferred over very short bias frames. If you are stacking lights only and skipping flats, bias/dark-flat usually does little by itself.
 
 ---
 
