@@ -108,3 +108,5 @@ LIVEASTRO_PARITY_DATASET=~/LiveAstroCorpus/siril-m8-asi2600 swift test --filter 
 ```
 
 Design and history documents live under `docs/`.
+
+Release packaging and notarization notes live in [docs/distribution.md](docs/distribution.md).
