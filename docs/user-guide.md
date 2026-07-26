@@ -200,16 +200,32 @@ Reseed does not erase the session history or snapshots already recorded. It does
 
 ## Session Outputs
 
-Sessions are written under `~/Documents/LiveAstro/`.
+Sessions are written under `~/Documents/LiveAstro/`. These are LiveAstro-generated outputs; your original capture files stay in the folder, share, or device location where Seestar, ASIAIR, NINA, Siril, or your capture software wrote them.
 
 A session folder may contain:
 
 - `replay.mp4` — the automatic stack-evolution video
 - `master.fit` — the final native-stack master, when LiveAstro performed native stacking and a current stack exists
+- `latest.png` — a stable monitor image for the newest saved snapshot
 - snapshots — still frames captured throughout the session
 - a manifest — session metadata, profile fields, timing, and output facts
 
 For external-stacker sessions, the external program owns the stack master. LiveAstro records what it observed and produces the replay from those observations.
+
+The **Session Outputs** area gives you shortcuts after a session finishes or a previous shoot is stacked:
+
+- **Open Replay** opens `replay.mp4` in the default macOS video app.
+- **Reveal Replay** shows `replay.mp4` in Finder.
+- **Open Session Folder** opens the specific output folder for the latest session.
+- **Open Sessions Folder** opens the root output folder under `~/Documents/LiveAstro/`.
+- **Reveal master.fit** shows the native master in Finder when one exists.
+- **Open Latest Image** opens `latest.png`, useful for a quick support check or monitor/overlay workflow.
+- **Reveal latest.png** shows that monitor image in Finder.
+- **Copy Summary** copies target, frame counts, and output paths.
+- **Copy Support Bundle** copies a fuller support report with app version, session health, output paths, output footprint, and recent log lines.
+- **Copy Log Tail** copies only the recent log lines.
+
+Use **Refresh Sizes** when you want to know how much disk space the output root and latest session currently use. It is informational only; it does not delete, prune, or move files.
 
 ## Troubleshooting
 
