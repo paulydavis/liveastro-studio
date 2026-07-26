@@ -7,6 +7,7 @@ struct ControlView: View {
 
     private let logDisplayCap = 200
     private let logMinHeight: CGFloat = 120
+    @State private var outputFootprintText = "not checked"
 
     private var liveWorkflowDisabled: Bool {
         model.isRunning || model.importer.isImporting || model.liveSource.isDetecting
@@ -601,6 +602,11 @@ struct ControlView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Spacer()
+                            Text("Output footprint: \(outputFootprintText)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Button("Refresh Sizes") { refreshOutputFootprint() }
+                                .help("Calculate the size of the LiveAstro output root and latest session folder.")
                             Button("Open Sessions Folder") { openSessionsRoot() }
                                 .help("Open the root folder where LiveAstro writes session outputs.")
                             Button("Regenerate Replay…") { pickSessionDirectory() }
@@ -773,6 +779,24 @@ struct ControlView: View {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    private func refreshOutputFootprint() {
+        do {
+            let rootBytes = try DirectoryFootprint.byteCount(at: model.liveAstroRoot)
+            let rootSize = ByteCountFormatter.string(fromByteCount: rootBytes, countStyle: .file)
+            if let session = model.lastSessionDirectory {
+                let sessionBytes = try DirectoryFootprint.byteCount(at: session)
+                let sessionSize = ByteCountFormatter.string(fromByteCount: sessionBytes, countStyle: .file)
+                outputFootprintText = "root \(rootSize) · last session \(sessionSize)"
+            } else {
+                outputFootprintText = "root \(rootSize)"
+            }
+            model.log.append("Refreshed output footprint")
+        } catch {
+            outputFootprintText = "unavailable"
+            model.log.append("Could not calculate output footprint: \(error.localizedDescription)")
+        }
+    }
+
     private func openSessionFolder() {
         guard let url = model.lastSessionDirectory else { return }
         NSWorkspace.shared.open(url)
@@ -853,6 +877,7 @@ struct ControlView: View {
         Replay: \(replayPath)
         Latest image: \(latestImagePath)
         Master: \(masterPath)
+        Output footprint: \(outputFootprintText)
 
         Recent Log
         \(logTail.isEmpty ? "(empty)" : logTail)
