@@ -25,6 +25,7 @@ public final class SnapshotRecorder {
         }
         CGImageDestinationAddImage(dest, cgImage, nil)
         guard CGImageDestinationFinalize(dest) else { throw SnapshotError.encodeFailed }
+        updateLatestImage(from: url)
 
         // AstroImage.init computes stats for every channel; stats.count == channels >= 1.
         let stats = linear.stats[0]
@@ -33,5 +34,20 @@ public final class SnapshotRecorder {
                               estimatedIntegrationSeconds: estimatedIntegrationSeconds,
                               width: linear.width, height: linear.height,
                               mean: stats.mean, median: stats.median, stddev: stats.stddev)
+    }
+
+    private func updateLatestImage(from snapshotURL: URL) {
+        let latestURL = sessionDirectory.appendingPathComponent("latest.png")
+        let tempURL = sessionDirectory.appendingPathComponent(".latest-\(UUID().uuidString).png")
+        do {
+            try FileManager.default.copyItem(at: snapshotURL, to: tempURL)
+            if FileManager.default.fileExists(atPath: latestURL.path) {
+                _ = try FileManager.default.replaceItemAt(latestURL, withItemAt: tempURL)
+            } else {
+                try FileManager.default.moveItem(at: tempURL, to: latestURL)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+        }
     }
 }
