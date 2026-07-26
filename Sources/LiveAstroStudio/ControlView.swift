@@ -454,6 +454,27 @@ struct ControlView: View {
                         .disabled(model.isRunning || model.importer.isImporting)
                         .help("Select a folder of previously captured FITS light frames to stack offline, with progress tracking and Cancel support.")
                 }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Session Health")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    LazyVGrid(columns: [
+                        GridItem(.flexible(minimum: 120), alignment: .leading),
+                        GridItem(.flexible(minimum: 120), alignment: .leading),
+                        GridItem(.flexible(minimum: 120), alignment: .leading),
+                        GridItem(.flexible(minimum: 120), alignment: .leading)
+                    ], alignment: .leading, spacing: 8) {
+                        HealthItem(label: "State", value: sessionStateText)
+                        HealthItem(label: "Source", value: sourceSummaryText)
+                        HealthItem(label: "Folder", value: watchFolderSummaryText)
+                        HealthItem(label: "Last update", value: lastUpdateSummaryText)
+                        HealthItem(label: "Frames", value: framesSummaryText)
+                        HealthItem(label: "Last rejection", value: lastRejectionSummaryText)
+                        HealthItem(label: "OBS", value: obsSummaryText)
+                        HealthItem(label: "Outputs", value: outputsSummaryText)
+                    }
+                }
                 // Go Live / End Broadcast — decoupled from session start.
                 HStack {
                     switch model.broadcast.broadcastState {
