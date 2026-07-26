@@ -602,35 +602,41 @@ struct ControlView: View {
                         }
 
                         if hasSessionOutputs {
-                            HStack(spacing: 8) {
-                                Button("Open Replay") { openReplay() }
-                                    .disabled(model.replayURL == nil)
-                                    .help("Open the latest replay video with the default macOS app.")
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(spacing: 8) {
+                                    Button("Open Replay") { openReplay() }
+                                        .disabled(model.replayURL == nil)
+                                        .help("Open the latest replay video with the default macOS app.")
 
-                                Button("Reveal Replay") { revealReplay() }
-                                    .disabled(model.replayURL == nil)
-                                    .help("Show the latest replay video in Finder.")
+                                    Button("Reveal Replay") { revealReplay() }
+                                        .disabled(model.replayURL == nil)
+                                        .help("Show the latest replay video in Finder.")
 
-                                Button("Open Session Folder") { openSessionFolder() }
-                                    .disabled(model.lastSessionDirectory == nil)
-                                    .help("Open the folder containing this session's manifest, snapshots, replay, and native master when present.")
+                                    Button("Open Session Folder") { openSessionFolder() }
+                                        .disabled(model.lastSessionDirectory == nil)
+                                        .help("Open the folder containing this session's manifest, snapshots, replay, and native master when present.")
 
-                                if latestMasterURL != nil {
-                                    Button("Reveal master.fit") { revealMaster() }
-                                        .help("Show the native stacking master in Finder.")
-                                } else if model.lastSessionDirectory != nil {
-                                    Button("No master.fit") {}
-                                        .disabled(true)
-                                        .help("Native sessions write master.fit when a current stack exists. Siril/external stacker sessions may not create one.")
+                                    if latestMasterURL != nil {
+                                        Button("Reveal master.fit") { revealMaster() }
+                                            .help("Show the native stacking master in Finder.")
+                                    } else if model.lastSessionDirectory != nil {
+                                        Button("No master.fit") {}
+                                            .disabled(true)
+                                            .help("Native sessions write master.fit when a current stack exists. Siril/external stacker sessions may not create one.")
+                                    }
+
+                                    Spacer()
                                 }
 
-                                Spacer()
+                                HStack(spacing: 8) {
+                                    Spacer()
 
-                                Button("Copy Support Bundle") { copySupportBundle() }
-                                    .help("Copy health, output paths, and recent log lines for sharing or debugging.")
+                                    Button("Copy Support Bundle") { copySupportBundle() }
+                                        .help("Copy health, output paths, and recent log lines for sharing or debugging.")
 
-                                Button("Copy Summary") { copySessionSummary() }
-                                    .help("Copy target, output paths, and accepted/rejected frame counts.")
+                                    Button("Copy Summary") { copySessionSummary() }
+                                        .help("Copy target, output paths, and accepted/rejected frame counts.")
+                                }
                             }
                             .font(.caption)
                         } else {
