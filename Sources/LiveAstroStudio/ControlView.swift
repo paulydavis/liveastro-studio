@@ -26,6 +26,12 @@ struct ControlView: View {
         return FileManager.default.fileExists(atPath: master.path) ? master : nil
     }
 
+    private var latestImageURL: URL? {
+        guard let dir = model.lastSessionDirectory else { return nil }
+        let latest = dir.appendingPathComponent("latest.png")
+        return FileManager.default.fileExists(atPath: latest.path) ? latest : nil
+    }
+
     private var appVersionText: String {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = (info["CFBundleShortVersionString"] as? String)?
@@ -744,8 +750,18 @@ struct ControlView: View {
         NSWorkspace.shared.open(url)
     }
 
+    private func openLatestImage() {
+        guard let url = latestImageURL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     private func revealReplay() {
         guard let url = model.replayURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func revealLatestImage() {
+        guard let url = latestImageURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
