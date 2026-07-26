@@ -54,14 +54,14 @@ Use this checklist for pre-field beta validation. It is intentionally split into
 - [ ] Run an ad-hoc local package:
 
   ```bash
-  Scripts/package_release.sh --version 3.0.1 --sign ad-hoc
+  Scripts/package_release.sh --version 3.0.2 --sign ad-hoc
   ```
 
 - [ ] Run a Developer ID signed package:
 
   ```bash
   Scripts/package_release.sh \
-    --version 3.0.1 \
+    --version 3.0.2 \
     --sign developer-id \
     --identity 48A67337B61BCAF1F4970C1389A4EC36D0096E26
   ```
@@ -70,7 +70,7 @@ Use this checklist for pre-field beta validation. It is intentionally split into
 
   ```bash
   Scripts/package_release.sh \
-    --version 3.0.1 \
+    --version 3.0.2 \
     --sign developer-id \
     --identity 48A67337B61BCAF1F4970C1389A4EC36D0096E26 \
     --notarize \
@@ -79,7 +79,7 @@ Use this checklist for pre-field beta validation. It is intentionally split into
 
 - [ ] Confirm `codesign --verify --strict --verbose=2 dist/LiveAstroStudio.app` passes.
 - [ ] Confirm notarized builds pass `spctl -a -vv --type execute dist/LiveAstroStudio.app`.
-- [ ] Confirm `xcrun stapler validate dist/LiveAstroStudio-3.0.1.dmg` passes for notarized DMGs.
+- [ ] Confirm `xcrun stapler validate dist/LiveAstroStudio-3.0.2.dmg` passes for notarized DMGs.
 
 ## Field Checks
 

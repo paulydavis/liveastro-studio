@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-VERSION="3.0.1"
+VERSION="3.0.2"
 SIGN_MODE="ad-hoc"
 IDENTITY="${DEVID:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
@@ -26,7 +26,7 @@ Usage:
   Scripts/package_release.sh [options]
 
 Options:
-  --version VERSION             App/DMG version. Default: 3.0.1
+  --version VERSION             App/DMG version. Default: 3.0.2
   --sign ad-hoc|developer-id    Signing mode. Default: ad-hoc
   --identity IDENTITY           Developer ID Application identity. May also use DEVID.
   --notarize                    Submit the DMG to Apple notarization and staple the ticket.
@@ -35,10 +35,10 @@ Options:
   -h, --help                    Show this help.
 
 Examples:
-  Scripts/package_release.sh --version 3.0.1 --sign ad-hoc
-  Scripts/package_release.sh --version 3.0.1 --sign developer-id \
+  Scripts/package_release.sh --version 3.0.2 --sign ad-hoc
+  Scripts/package_release.sh --version 3.0.2 --sign developer-id \
       --identity "Developer ID Application: Name (TEAMID)"
-  Scripts/package_release.sh --version 3.0.1 --sign developer-id \
+  Scripts/package_release.sh --version 3.0.2 --sign developer-id \
       --identity "Developer ID Application: Name (TEAMID)" \
       --notarize --notary-profile liveastro-notary
 USAGE
