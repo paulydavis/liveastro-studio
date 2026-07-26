@@ -483,13 +483,13 @@ struct ControlView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Button("Copy Health") { copyHealthSnapshot() }
-                            .font(.caption)
-                            .help("Copy the current session health snapshot for sharing or debugging.")
                         Button("Open Watch Folder") { openWatchFolder() }
                             .font(.caption)
                             .disabled(model.watchFolder == nil)
                             .help("Open the folder LiveAstro is currently watching for FITS files.")
+                        Button("Copy Health") { copyHealthSnapshot() }
+                            .font(.caption)
+                            .help("Copy the current session health snapshot for sharing or debugging.")
                     }
 
                     LazyVGrid(columns: [
