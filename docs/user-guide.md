@@ -231,6 +231,19 @@ The **Session Outputs** area gives you shortcuts after a session finishes or a p
 
 Use **Refresh Sizes** when you want to know how much disk space the output root and latest session currently use. It is informational only; it does not delete, prune, or move files.
 
+### Reading the frame summary CSV
+
+Open `frame-summary.csv` in Numbers, Excel, LibreOffice, or a text editor when you want a quick after-action view of the session.
+
+Useful columns:
+
+- `source_file` tells you which upstream FITS file produced the snapshot.
+- `estimated_integration_seconds` is LiveAstro's running integration estimate at that snapshot.
+- `sub_exposure_seconds` is the profile's per-sub exposure value.
+- `mean`, `median`, and `stddev` are simple image statistics for the saved snapshot. They are not a full sub-quality score yet, but they are useful for spotting brightness jumps, clouds, bad stretches, or other obvious changes.
+
+For now, the CSV reports the snapshots LiveAstro saved during the session, not every raw sub in the source folder. A future quality-report pass can add richer per-sub registration, star, FWHM, and weighting columns.
+
 ## Troubleshooting
 
 ### The app does not see my Seestar or ASIAIR
