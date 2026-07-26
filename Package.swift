@@ -11,6 +11,7 @@ let package = Package(
         .target(name: "LiveAstroCore"),
         .executableTarget(name: "LiveAstroStudio", dependencies: ["LiveAstroCore"],
                           resources: [.process("Resources")]),
+        .executableTarget(name: "demo-stack", dependencies: ["LiveAstroCore"]),
         .executableTarget(name: "fakesiril", dependencies: ["LiveAstroCore"]),
         .executableTarget(name: "faulthelper", dependencies: ["LiveAstroCore"]),
         .testTarget(name: "LiveAstroCoreTests", dependencies: ["LiveAstroCore"],

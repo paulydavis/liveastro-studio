@@ -1,0 +1,80 @@
+import Foundation
+
+/// Writes a deterministic, improving Siril-style `live_stack.fit` stream for
+/// no-sky demos and local manual testing.
+public enum DemoStackGenerator {
+    public static func run(arguments: [String], programName: String) throws {
+        guard arguments.count >= 2 else {
+            print("usage: \(programName) <folder> [--interval 5] [--count 40]")
+            exit(1)
+        }
+
+        let folder = URL(fileURLWithPath: arguments[1], isDirectory: true)
+
+        func option(_ name: String, default value: Double) -> Double {
+            guard let i = arguments.firstIndex(of: name),
+                  i + 1 < arguments.count,
+                  let v = Double(arguments[i + 1]) else {
+                return value
+            }
+            return v
+        }
+
+        let interval = option("--interval", default: 5)
+        let count = Int(option("--count", default: 40))
+
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let url = folder.appendingPathComponent("live_stack.fit")
+        let width = 800
+        let height = 500
+        let starCount = 120
+
+        // Fixed synthetic starfield (seeded LCG so every run looks the same).
+        var seed: UInt64 = 0x5EED
+        func rand() -> Double {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            return Double(seed >> 33) / Double(UInt32.max)
+        }
+
+        let stars: [(x: Int, y: Int, brightness: Double)] = (0..<starCount).map { _ in
+            (Int(rand() * Double(width)), Int(rand() * Double(height)), 0.3 + rand() * 0.7)
+        }
+
+        // SNR model for the k-th stack update:
+        // - background floor 0.02 with white noise of stddev 0.08/√k — averaging k
+        //   uncorrelated frames reduces noise like 1/√k
+        // - star signal ramps 30% → 100% linearly across the run, simulating the
+        //   apparent SNR gain as integration accumulates
+        // - each star is a 5×5 PSF with falloff 1/(1 + dx² + dy²), approximating seeing
+        for k in 1...count {
+            let noiseScale = 0.08 / Double(k).squareRoot()
+            var px = [Float](repeating: 0, count: width * height)
+            for i in 0..<px.count {
+                px[i] = Float(max(0, 0.02 + (rand() - 0.5) * 2 * noiseScale))
+            }
+            for s in stars {
+                let signal = Float(min(1, s.brightness * (0.3 + 0.7 * Double(k) / Double(count))))
+                for dy in -2...2 {
+                    for dx in -2...2 {
+                        let x = s.x + dx
+                        let y = s.y + dy
+                        guard x >= 0, x < width, y >= 0, y < height else { continue }
+                        let falloff = Float(1) / Float(1 + dx * dx + dy * dy)
+                        let idx = y * width + x
+                        px[idx] = min(1, px[idx] + signal * falloff)
+                    }
+                }
+            }
+            let data = FITSWriter.float32(width: width, height: height, channels: 1, pixels: px)
+            // Simulates capture software caught mid-write: half the file lands, then a
+            // 0.3 s pause before the complete write — exercises the watcher's
+            // completeness check.
+            try data.prefix(data.count / 2).write(to: url)
+            Thread.sleep(forTimeInterval: 0.3)
+            try data.write(to: url)
+            print("\(programName): stack update \(k)/\(count)")
+            if k < count { Thread.sleep(forTimeInterval: interval) }
+        }
+        print("\(programName): done")
+    }
+}
