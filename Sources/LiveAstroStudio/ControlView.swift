@@ -26,6 +26,20 @@ struct ControlView: View {
         return FileManager.default.fileExists(atPath: master.path) ? master : nil
     }
 
+    private var appVersionText: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = (info["CFBundleShortVersionString"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let build = (info["CFBundleVersion"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let version, !version.isEmpty else { return "LiveAstro dev" }
+        if let build, !build.isEmpty, build != version {
+            return "LiveAstro v\(version) (build \(build))"
+        }
+        return "LiveAstro v\(version)"
+    }
+
     private var sessionStateText: String {
         if model.liveSource.isDetecting { return "Detecting source" }
         if model.importer.isImporting { return "Importing" }
