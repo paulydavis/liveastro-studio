@@ -526,7 +526,22 @@ struct WatcherReducer {
 
             let blocker = potential[blockerIndex]
             let blockerName = blocker.observation.name
-            if state.generation.ordering.activeBlocker?.blocker != blockerName {
+            if let active = state.generation.ordering.activeBlocker,
+               active.blocker != blockerName {
+                guard isSameNumericRevision(active.blocker, blockerName) else {
+                    state.generation.ordering.activeBlocker = BlockingEpisode(
+                        blocker: blockerName,
+                        startNanos: nowNanos,
+                        deadlineNanos: nowNanos &+ blockingBudgetNanos,
+                        victims: victimNames)
+                    return effects
+                }
+                state.generation.ordering.activeBlocker = BlockingEpisode(
+                    blocker: blockerName,
+                    startNanos: active.startNanos,
+                    deadlineNanos: active.deadlineNanos,
+                    victims: victimNames)
+            } else if state.generation.ordering.activeBlocker == nil {
                 state.generation.ordering.activeBlocker = BlockingEpisode(
                     blocker: blockerName,
                     startNanos: nowNanos,
@@ -561,6 +576,12 @@ struct WatcherReducer {
                 + "without completing — abandoning it; later revisions proceed "
                 + "(frame lost: \(blockerName))"))
         }
+    }
+
+    private func isSameNumericRevision(_ lhsName: String, _ rhsName: String) -> Bool {
+        guard let lhs = revisionOrder.revision(in: lhsName),
+              let rhs = revisionOrder.revision(in: rhsName) else { return false }
+        return revisionOrder.compare(lhs, rhs) == .orderedSame
     }
 
     private func isTerminal(_ fileState: FileState?) -> Bool {

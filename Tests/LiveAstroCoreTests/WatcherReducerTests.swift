@@ -117,6 +117,40 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(reducer.state.generation.files[plainName], .droppedOutOfOrder)
     }
 
+    func testEqualNumericPaddingChurnDoesNotResetBlockingEpisodeClock() {
+        let rawBlocker = "live_stack_7.fit"
+        let paddedBlocker = "live_stack_007.fit"
+        let victim = "live_stack_8.fit"
+        let victimIdentity = makeIdentity(8)
+        var reducer = makeReducer(files: [
+            victim: .ready(makeCandidate(
+                name: victim,
+                identity: victimIdentity,
+                digest: "victim",
+                kind: .numbered(revision: "8"))),
+        ])
+
+        XCTAssertTrue(observeBatch([
+            observation(name: rawBlocker, revision: "7", outcome: .invalid),
+            observation(name: victim, revision: "8", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: 10, reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, rawBlocker)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos, 10)
+
+        let released = observeBatch([
+            observation(name: rawBlocker, revision: "7", outcome: .absent),
+            observation(name: paddedBlocker, revision: "007", outcome: .invalid),
+            observation(name: victim, revision: "8", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: 30_000_000_010, reducer: &reducer)
+
+        XCTAssertEqual(emittedNames(in: released), [victim],
+                       "same numeric blocker with different zero padding must spend the original episode budget")
+        XCTAssertEqual(reducer.state.generation.files[paddedBlocker], .writtenOff)
+        XCTAssertNil(reducer.state.generation.ordering.activeBlocker)
+    }
+
     func testRoleRoundTripStartsFreshEpisodeClock() {
         var reducer = makeReducer()
 
