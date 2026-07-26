@@ -29,7 +29,7 @@ Trying LiveAstro before you have clear skies? Start with the [Beta Quickstart](d
 
 ## Open LiveAstro
 
-For the current tester build, download `LiveAstroStudio-3.0.3.dmg` from the [LiveAstro Studio 3.0.3 release](https://github.com/paulydavis/liveastro-studio/releases/tag/v3.0.3), open the DMG, drag LiveAstro Studio to Applications, then launch it.
+For the current tester build, download `LiveAstroStudio-3.0.4.dmg` from the [LiveAstro Studio 3.0.4 release](https://github.com/paulydavis/liveastro-studio/releases/tag/v3.0.4), open the DMG, drag LiveAstro Studio to Applications, then launch it.
 
 To run from source:
 
@@ -149,6 +149,8 @@ LIVEASTRO_PARITY_DATASET=~/LiveAstroCorpus/siril-m8-asi2600 swift test --filter 
 ```
 
 Design, history, and roadmap documents live under `docs/`.
+
+Release history is summarized in [CHANGELOG.md](CHANGELOG.md).
 
 Release packaging and notarization notes live in [docs/distribution.md](docs/distribution.md).
 

@@ -50,7 +50,7 @@ echo "   arch: $(lipo -archs "$BIN")"
 echo "== assemble $APP =="
 rm -rf dist && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 ditto --norsrc --noextattr "$BIN" "$APP/Contents/MacOS/LiveAstroStudio"
-ditto --norsrc --noextattr "$BUNDLE_SRC" "$APP/Contents/MacOS/$BUNDLE_NAME"
+ditto --norsrc --noextattr "$BUNDLE_SRC" "$APP/Contents/Resources/$BUNDLE_NAME"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -75,7 +75,7 @@ PLIST
 # which codesign rejects as "bundle format unrecognized". Inject a minimal
 # Info.plist so it is a signable bundle. It stays a flat bundle (no Contents/),
 # so Bundle.module still resolves Help.md at the bundle root.
-cat > "$APP/Contents/MacOS/$BUNDLE_NAME/Info.plist" <<PLIST
+cat > "$APP/Contents/Resources/$BUNDLE_NAME/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID.resources</string>
@@ -87,10 +87,13 @@ PLIST
 # Strip any resource forks / xattrs that trip codesign.
 xattr -cr "$APP"
 
+[ -d "$APP/Contents/Resources/$BUNDLE_NAME" ] || { echo "ERROR: resource bundle was not packaged under Contents/Resources"; exit 1; }
+[ ! -d "$APP/Contents/MacOS/$BUNDLE_NAME" ] || { echo "ERROR: resource bundle was incorrectly packaged under Contents/MacOS"; exit 1; }
+
 echo "== sign inside-out (NOT --deep; --deep chokes on the resource bundle) =="
 SIGN=(codesign --force --timestamp --options runtime --sign "$DEVID")
 # 1. nested resource bundle first
-"${SIGN[@]}" "$APP/Contents/MacOS/$BUNDLE_NAME"
+"${SIGN[@]}" "$APP/Contents/Resources/$BUNDLE_NAME"
 # 2. main executable (with entitlements)
 "${SIGN[@]}" --entitlements "$ENTITLEMENTS" "$APP/Contents/MacOS/LiveAstroStudio"
 # 3. outer app last (seals everything)

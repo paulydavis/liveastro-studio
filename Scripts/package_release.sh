@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-VERSION="3.0.3"
+VERSION="3.0.4"
 SIGN_MODE="ad-hoc"
 IDENTITY="${DEVID:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
@@ -26,7 +26,7 @@ Usage:
   Scripts/package_release.sh [options]
 
 Options:
-  --version VERSION             App/DMG version. Default: 3.0.3
+  --version VERSION             App/DMG version. Default: 3.0.4
   --sign ad-hoc|developer-id    Signing mode. Default: ad-hoc
   --identity IDENTITY           Developer ID Application identity. May also use DEVID.
   --notarize                    Submit the DMG to Apple notarization and staple the ticket.
@@ -35,10 +35,10 @@ Options:
   -h, --help                    Show this help.
 
 Examples:
-  Scripts/package_release.sh --version 3.0.3 --sign ad-hoc
-  Scripts/package_release.sh --version 3.0.3 --sign developer-id \
+  Scripts/package_release.sh --version 3.0.4 --sign ad-hoc
+  Scripts/package_release.sh --version 3.0.4 --sign developer-id \
       --identity "Developer ID Application: Name (TEAMID)"
-  Scripts/package_release.sh --version 3.0.3 --sign developer-id \
+  Scripts/package_release.sh --version 3.0.4 --sign developer-id \
       --identity "Developer ID Application: Name (TEAMID)" \
       --notarize --notary-profile liveastro-notary
 USAGE
@@ -157,7 +157,7 @@ echo "== assemble $APP =="
 rm -rf dist
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 ditto --norsrc --noextattr "$BIN" "$APP/Contents/MacOS/LiveAstroStudio"
-ditto --norsrc --noextattr "$BUNDLE_SRC" "$APP/Contents/MacOS/$BUNDLE_NAME"
+ditto --norsrc --noextattr "$BUNDLE_SRC" "$APP/Contents/Resources/$BUNDLE_NAME"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -182,8 +182,8 @@ PLIST
 # a conventional bundle with Contents/Info.plist. Only apply the old flat-bundle
 # workaround when the built bundle lacks a structured Info.plist; adding a root
 # Info.plist to a structured bundle makes codesign reject "unsealed contents".
-if [ ! -f "$APP/Contents/MacOS/$BUNDLE_NAME/Contents/Info.plist" ]; then
-    cat > "$APP/Contents/MacOS/$BUNDLE_NAME/Info.plist" <<PLIST
+if [ ! -f "$APP/Contents/Resources/$BUNDLE_NAME/Contents/Info.plist" ]; then
+    cat > "$APP/Contents/Resources/$BUNDLE_NAME/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID.resources</string>
@@ -192,6 +192,9 @@ if [ ! -f "$APP/Contents/MacOS/$BUNDLE_NAME/Contents/Info.plist" ]; then
 </dict></plist>
 PLIST
 fi
+
+[ -d "$APP/Contents/Resources/$BUNDLE_NAME" ] || fail "resource bundle was not packaged under Contents/Resources"
+[ ! -d "$APP/Contents/MacOS/$BUNDLE_NAME" ] || fail "resource bundle was incorrectly packaged under Contents/MacOS"
 
 xattr -cr "$APP"
 
@@ -202,7 +205,7 @@ else
     SIGN=(codesign --force --timestamp --options runtime --sign "$IDENTITY")
 fi
 
-"${SIGN[@]}" "$APP/Contents/MacOS/$BUNDLE_NAME"
+"${SIGN[@]}" "$APP/Contents/Resources/$BUNDLE_NAME"
 "${SIGN[@]}" --entitlements "$ENTITLEMENTS" "$APP/Contents/MacOS/LiveAstroStudio"
 "${SIGN[@]}" --entitlements "$ENTITLEMENTS" "$APP"
 

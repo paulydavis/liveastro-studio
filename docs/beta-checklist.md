@@ -60,14 +60,14 @@ Optional source-run fallback:
 - [ ] Run an ad-hoc local package:
 
   ```bash
-  Scripts/package_release.sh --version 3.0.3 --sign ad-hoc
+  Scripts/package_release.sh --version 3.0.4 --sign ad-hoc
   ```
 
 - [ ] Run a Developer ID signed package:
 
   ```bash
   Scripts/package_release.sh \
-    --version 3.0.3 \
+    --version 3.0.4 \
     --sign developer-id \
     --identity 48A67337B61BCAF1F4970C1389A4EC36D0096E26
   ```
@@ -76,7 +76,7 @@ Optional source-run fallback:
 
   ```bash
   Scripts/package_release.sh \
-    --version 3.0.3 \
+    --version 3.0.4 \
     --sign developer-id \
     --identity 48A67337B61BCAF1F4970C1389A4EC36D0096E26 \
     --notarize \
@@ -85,7 +85,7 @@ Optional source-run fallback:
 
 - [ ] Confirm `codesign --verify --strict --verbose=2 dist/LiveAstroStudio.app` passes.
 - [ ] Confirm notarized builds pass `spctl -a -vv --type execute dist/LiveAstroStudio.app`.
-- [ ] Confirm `xcrun stapler validate dist/LiveAstroStudio-3.0.3.dmg` passes for notarized DMGs.
+- [ ] Confirm `xcrun stapler validate dist/LiveAstroStudio-3.0.4.dmg` passes for notarized DMGs.
 
 ## Field Checks
 

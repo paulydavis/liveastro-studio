@@ -9,6 +9,7 @@ cd "$(dirname "$0")/.."
 VERSION="${1:-1.1.0}"
 APP=dist/LiveAstroStudio.app
 DMG="dist/LiveAstroStudio-$VERSION.dmg"
+BUNDLE_NAME="LiveAstroStudio_LiveAstroStudio.bundle"
 
 echo "== release build =="
 swift build -c release
@@ -16,6 +17,7 @@ swift build -c release
 echo "== assemble $APP =="
 rm -rf dist && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/LiveAstroStudio "$APP/Contents/MacOS/LiveAstroStudio"
+cp -R ".build/release/$BUNDLE_NAME" "$APP/Contents/Resources/$BUNDLE_NAME"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -34,6 +36,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+[ -d "$APP/Contents/Resources/$BUNDLE_NAME" ] || { echo "ERROR: resource bundle was not packaged under Contents/Resources"; exit 1; }
+[ ! -d "$APP/Contents/MacOS/$BUNDLE_NAME" ] || { echo "ERROR: resource bundle was incorrectly packaged under Contents/MacOS"; exit 1; }
 
 echo "== create DMG =="
 STAGING=$(mktemp -d)
