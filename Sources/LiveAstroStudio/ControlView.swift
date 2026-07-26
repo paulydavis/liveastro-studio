@@ -610,6 +610,9 @@ struct ControlView: View {
 
                                 Spacer()
 
+                                Button("Copy Support Bundle") { copySupportBundle() }
+                                    .help("Copy health, output paths, and recent log lines for sharing or debugging.")
+
                                 Button("Copy Summary") { copySessionSummary() }
                                     .help("Copy target, output paths, and accepted/rejected frame counts.")
                             }
@@ -760,6 +763,40 @@ struct ControlView: View {
         pasteboard.clearContents()
         pasteboard.setString(summary, forType: .string)
         model.log.append("Copied session health")
+    }
+
+    private func copySupportBundle() {
+        let target = model.targetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionPath = model.lastSessionDirectory?.path ?? "(none)"
+        let replayPath = model.replayURL?.path ?? "(none)"
+        let masterPath = latestMasterURL?.path ?? "(none)"
+        let logTail = model.log.suffix(logDisplayCap).joined(separator: "\n")
+        let summary = """
+        LiveAstro Support Bundle
+
+        Session Health
+        State: \(sessionStateText)
+        Source: \(sourceSummaryText)
+        Folder: \(watchFolderSummaryText)
+        Last update: \(lastUpdateSummaryText)
+        Frames: \(framesSummaryText)
+        Last rejection: \(lastRejectionSummaryText)
+        OBS: \(obsSummaryText)
+        Outputs: \(outputsSummaryText)
+
+        Session Outputs
+        Target: \(target.isEmpty ? "(untitled)" : target)
+        Session folder: \(sessionPath)
+        Replay: \(replayPath)
+        Master: \(masterPath)
+
+        Recent Log
+        \(logTail.isEmpty ? "(empty)" : logTail)
+        """
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(summary, forType: .string)
+        model.log.append("Copied support bundle")
     }
 
     private func copySessionSummary() {
