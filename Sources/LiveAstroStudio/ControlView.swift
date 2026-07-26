@@ -410,7 +410,7 @@ struct ControlView: View {
                         }
                         .help("Back to the neutral auto-stretch look.")
                     }
-                    Section("Log") {
+                    Section {
                         ScrollView {
                             VStack(alignment: .leading, spacing: 2) {
                                 ForEach(Array(model.log.suffix(logDisplayCap).enumerated()), id: \.offset) {
@@ -418,6 +418,15 @@ struct ControlView: View {
                                 }
                             }.frame(maxWidth: .infinity, alignment: .leading)
                         }.frame(minHeight: logMinHeight)
+                    } header: {
+                        HStack {
+                            Text("Log")
+                            Spacer()
+                            Button("Copy Log") { copyLogTail() }
+                                .font(.caption)
+                                .disabled(model.log.isEmpty)
+                                .help("Copy the visible recent log lines for sharing or debugging.")
+                        }
                     }
                 }
                 .formStyle(.grouped)
@@ -725,6 +734,14 @@ struct ControlView: View {
     private func revealMaster() {
         guard let url = latestMasterURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func copyLogTail() {
+        let tail = model.log.suffix(logDisplayCap).joined(separator: "\n")
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(tail, forType: .string)
+        model.log.append("Copied log tail")
     }
 
     private func copyHealthSnapshot() {
