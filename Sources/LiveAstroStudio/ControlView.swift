@@ -449,14 +449,49 @@ struct ControlView: View {
                     }.padding(.horizontal)
                 }
                 if !model.isRunning {
-                    HStack {
-                        Button("Regenerate Replay…") { pickSessionDirectory() }
-                            .disabled(model.importer.isGeneratingReplay)
-                        if let url = model.replayURL {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Session Outputs")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                             Spacer()
-                            Button("Reveal Replay in Finder") {
-                                NSWorkspace.shared.activateFileViewerSelecting([url])
+                            Button("Regenerate Replay…") { pickSessionDirectory() }
+                                .disabled(model.importer.isGeneratingReplay)
+                        }
+
+                        if hasSessionOutputs {
+                            HStack(spacing: 8) {
+                                Button("Open Replay") { openReplay() }
+                                    .disabled(model.replayURL == nil)
+                                    .help("Open the latest replay video with the default macOS app.")
+
+                                Button("Reveal Replay") { revealReplay() }
+                                    .disabled(model.replayURL == nil)
+                                    .help("Show the latest replay video in Finder.")
+
+                                Button("Open Session Folder") { openSessionFolder() }
+                                    .disabled(model.lastSessionDirectory == nil)
+                                    .help("Open the folder containing this session's manifest, snapshots, replay, and native master when present.")
+
+                                if latestMasterURL != nil {
+                                    Button("Reveal master.fit") { revealMaster() }
+                                        .help("Show the native stacking master in Finder.")
+                                } else if model.lastSessionDirectory != nil {
+                                    Button("No master.fit") {}
+                                        .disabled(true)
+                                        .help("Native sessions write master.fit when a current stack exists. Siril/external stacker sessions may not create one.")
+                                }
+
+                                Spacer()
+
+                                Button("Copy Summary") { copySessionSummary() }
+                                    .help("Copy target, output paths, and accepted/rejected frame counts.")
                             }
+                            .font(.caption)
+                        } else {
+                            Text("Finish a session or stack a previous shoot to see output shortcuts here.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
