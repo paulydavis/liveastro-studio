@@ -7,7 +7,7 @@ The easiest demo is the built-in **Try Demo** workflow. It writes a changing sam
 ## What You Need
 
 - macOS 14 or later
-- LiveAstro Studio from source or a packaged build
+- LiveAstro Studio from source or the current tester DMG: [LiveAstro Studio 3.0.2](https://github.com/paulydavis/liveastro-studio/releases/tag/v3.0.2)
 - OBS Studio, optional but recommended for the broadcast-window check
 
 ## 1. Start the Demo
@@ -25,7 +25,7 @@ Leave that Terminal window running. It writes a new stack update every few secon
 
 ## 2. Open LiveAstro
 
-If you have a packaged build, open `LiveAstroStudio.app`.
+If you installed from the DMG, open **LiveAstro Studio** from Applications.
 
 To run from source:
 
