@@ -13,7 +13,18 @@ Use this checklist for pre-field beta validation. It is intentionally split into
 
 ### Demo Source
 
-- [ ] Run the sample stack generator:
+- [ ] Click **Try Demo** in LiveAstro.
+- [ ] Confirm the display updates as new demo frames arrive.
+- [ ] Click **Detach** and confirm the broadcast window opens.
+- [ ] End the session.
+- [ ] Confirm a new session folder appears under `~/Documents/LiveAstro/`.
+- [ ] Confirm `replay.mp4` exists and plays.
+- [ ] Confirm `session-summary.md` exists and opens from **Open Summary**.
+- [ ] Confirm `frame-summary.csv` exists and opens from **Open Frame CSV**.
+
+Optional source-run fallback:
+
+- [ ] Run the sample stack generator manually:
 
   ```bash
   mkdir -p /tmp/liveastro-demo-stack
@@ -23,11 +34,6 @@ Use this checklist for pre-field beta validation. It is intentionally split into
 - [ ] Choose **Stacker output folder** in LiveAstro.
 - [ ] Select `/tmp/liveastro-demo-stack`.
 - [ ] Start the session.
-- [ ] Confirm the display updates as new demo frames arrive.
-- [ ] Click **Detach** and confirm the broadcast window opens.
-- [ ] End the session.
-- [ ] Confirm a new session folder appears under `~/Documents/LiveAstro/`.
-- [ ] Confirm `replay.mp4` exists and plays.
 
 ### OBS Local Check
 
