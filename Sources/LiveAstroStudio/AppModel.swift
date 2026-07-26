@@ -402,7 +402,10 @@ final class AppModel {
         demoTask = Task.detached { [weak self] in
             guard let model = self else { return }
             do {
-                try DemoStackGenerator.run(arguments: args, programName: "demo-stack")
+                try DemoStackGenerator.run(
+                    arguments: args,
+                    programName: "demo-stack",
+                    shouldContinue: { !Task.isCancelled })
                 await MainActor.run {
                     model.log.append("Try Demo generator finished — click End Session when ready.")
                     model.demoTask = nil
@@ -469,6 +472,7 @@ final class AppModel {
 
         // Stop the relay (if any) immediately — before the pipeline drains.
         liveSource.stopRelay()
+        demoTask?.cancel()
 
         // Immediate part only: scene automation stops and live broadcast state
         // resets at the click. The OBS stream/record stop is deferred to
