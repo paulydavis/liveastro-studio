@@ -16,6 +16,16 @@ struct ControlView: View {
         model.isRunning || model.importer.isImporting
     }
 
+    private var hasSessionOutputs: Bool {
+        !model.isRunning && (model.replayURL != nil || model.lastSessionDirectory != nil)
+    }
+
+    private var latestMasterURL: URL? {
+        guard let dir = model.lastSessionDirectory else { return nil }
+        let master = dir.appendingPathComponent("master.fit")
+        return FileManager.default.fileExists(atPath: master.path) ? master : nil
+    }
+
     /// A Form toggle row with a visible ⓘ info button next to the label. macOS `Form`
     /// only attaches `.help()` tooltips to the switch control, not the label text, so
     /// hovering the label showed nothing. A tap-to-reveal info button is an explicit,
@@ -537,6 +547,46 @@ struct ControlView: View {
         if panel.runModal() == .OK, let url = panel.url {
             model.importer.regenerateReplay(sessionDirectory: url)
         }
+    }
+
+    private func openReplay() {
+        guard let url = model.replayURL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func revealReplay() {
+        guard let url = model.replayURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func openSessionFolder() {
+        guard let url = model.lastSessionDirectory else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func revealMaster() {
+        guard let url = latestMasterURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func copySessionSummary() {
+        let target = model.targetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionPath = model.lastSessionDirectory?.path ?? "(none)"
+        let replayPath = model.replayURL?.path ?? "(none)"
+        let masterPath = latestMasterURL?.path ?? "(none)"
+        let summary = """
+        LiveAstro Session
+        Target: \(target.isEmpty ? "(untitled)" : target)
+        Session folder: \(sessionPath)
+        Replay: \(replayPath)
+        Master: \(masterPath)
+        Accepted frames: \(model.acceptedCount)
+        Rejected frames: \(model.rejectedCount)
+        """
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(summary, forType: .string)
+        model.log.append("Copied session summary")
     }
 }
 
