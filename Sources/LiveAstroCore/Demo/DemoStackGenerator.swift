@@ -3,7 +3,9 @@ import Foundation
 /// Writes a deterministic, improving Siril-style `live_stack.fit` stream for
 /// no-sky demos and local manual testing.
 public enum DemoStackGenerator {
-    public static func run(arguments: [String], programName: String) throws {
+    public static func run(arguments: [String],
+                           programName: String,
+                           shouldContinue: () -> Bool = { true }) throws {
         guard arguments.count >= 2 else {
             print("usage: \(programName) <folder> [--interval 5] [--count 40]")
             exit(1)
@@ -47,6 +49,7 @@ public enum DemoStackGenerator {
         //   apparent SNR gain as integration accumulates
         // - each star is a 5×5 PSF with falloff 1/(1 + dx² + dy²), approximating seeing
         for k in 1...count {
+            guard shouldContinue() else { break }
             let noiseScale = 0.08 / Double(k).squareRoot()
             var px = [Float](repeating: 0, count: width * height)
             for i in 0..<px.count {
@@ -73,7 +76,7 @@ public enum DemoStackGenerator {
             Thread.sleep(forTimeInterval: 0.3)
             try data.write(to: url)
             print("\(programName): stack update \(k)/\(count)")
-            if k < count { Thread.sleep(forTimeInterval: interval) }
+            if k < count, shouldContinue() { Thread.sleep(forTimeInterval: interval) }
         }
         print("\(programName): done")
     }
