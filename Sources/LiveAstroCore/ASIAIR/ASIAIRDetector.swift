@@ -28,6 +28,7 @@ public enum ASIAIRDetector {
         var candidates: [(url: URL, mod: Date)] = []
         let vols = (try? fm.contentsOfDirectory(at: volumesRoot, includingPropertiesForKeys: nil)) ?? []
         for vol in vols {
+            guard isPlausibleASIAIRVolume(vol) else { continue }
             let lightRoot = vol.appendingPathComponent("Autorun").appendingPathComponent("Light")
             let targets = (try? fm.contentsOfDirectory(
                 at: lightRoot,
@@ -46,6 +47,10 @@ public enum ASIAIRDetector {
                      target: best.url.lastPathComponent,
                      subExposure: meta?.exposureSeconds,
                      subFileExtension: meta?.fileExtension ?? "fit")
+    }
+
+    private static func isPlausibleASIAIRVolume(_ volume: URL) -> Bool {
+        volume.lastPathComponent.lowercased().contains("asiair")
     }
 
     private static func folderContainsFITS(_ folder: URL, fm: FileManager) -> Bool {

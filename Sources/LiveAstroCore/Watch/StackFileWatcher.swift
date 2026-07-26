@@ -591,7 +591,8 @@ public final class StackFileWatcher {
 
         for name in trackedNames {
             if stopRequested.isSet { return }
-            guard let observation = observeFile(named: name) else { return }
+            guard var observation = observeFile(named: name) else { return }
+            observation.observedAtNanos = monotonicNowNanos()
             observations.append(observation)
         }
 

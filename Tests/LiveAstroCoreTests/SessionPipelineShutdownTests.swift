@@ -34,6 +34,35 @@ final class SessionPipelineShutdownTests: XCTestCase {
         func stop() {}
     }
 
+    final class SlowFirstFrameFiniteSource: FrameSource, FrameSourceActivityReporting {
+        let frames: AsyncStream<RawFrame>
+        private let cont: AsyncStream<RawFrame>.Continuation
+        let frame: RawFrame
+        var onActivity: ((FrameSourceActivity) -> Void)?
+        var isFinite: Bool { true }
+        var totalCount: Int? { 1 }
+
+        init(frame: RawFrame) {
+            self.frame = frame
+            var c: AsyncStream<RawFrame>.Continuation!
+            frames = AsyncStream { c = $0 }
+            cont = c
+        }
+
+        func start() throws {
+            Task.detached { [weak self] in
+                guard let self else { return }
+                self.onActivity?(.beginFrameRead(self.frame.sourceName))
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                self.cont.yield(self.frame)
+                self.onActivity?(.endFrameRead(self.frame.sourceName))
+                self.cont.finish()
+            }
+        }
+
+        func stop() { cont.finish() }
+    }
+
     /// A ≥15-star seed frame so the engine accepts it and fires onUpdate (our block point).
     private func seedFrame() -> RawFrame {
         let w = 256, h = 256
@@ -81,6 +110,27 @@ final class SessionPipelineShutdownTests: XCTestCase {
                            "end() must throw shutdownTimeout rather than finalizing a racing stack")
         }
         wedged.signal()   // release the wedged task so the process can exit cleanly
+    }
+
+    func testFiniteImportDrainDoesNotCancelHealthySlowFirstRead() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "Slow Import", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let pipeline = SessionPipeline(nativeSource: SlowFirstFrameFiniteSource(frame: seedFrame()),
+                                       engine: StackEngine(), profile: profile, rootDirectory: sessions)
+        pipeline.drainPrimaryTimeout = .milliseconds(100)
+        pipeline.drainGraceTimeout = .milliseconds(100)
+        pipeline.importActiveReadTimeout = .seconds(2)
+
+        try pipeline.start()
+        XCTAssertNoThrow(try pipeline.end(),
+                         "a finite import actively reading its first sub must not be cancelled merely because no frame has finalized yet")
     }
 
     // MARK: - review10 items 4+5 fixtures

@@ -334,9 +334,9 @@ public final class StackEngine {
             lum.withUnsafeMutableBufferPointer { lumBuf in
                 Parallel.rows(hh, minRows: minRows) { rows in
                     for j in rows {
-                        let srcRow = bottomUp ? (hh - 1 - j) : j
+                        let srcRow = bottomUp ? (raw.height - 2 - 2 * j) : (2 * j)
                         for i in 0..<hw {
-                            let r0 = 2 * srcRow * rw + 2 * i
+                            let r0 = srcRow * rw + 2 * i
                             let r1 = r0 + rw
                             lumBuf[j * hw + i] = (p[r0] + p[r0 + 1] + p[r1] + p[r1 + 1]) / 4
                         }

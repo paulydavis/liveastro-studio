@@ -40,7 +40,7 @@ public final class OBSController: ObservableObject {
     public var onOutputEvent: (() -> Void)?
 
     /// Fired on the main actor when the connection is lost UNEXPECTEDLY —
-    /// receive-loop death (surfaced by the client finishing its events stream)
+    /// receive-loop death (surfaced by the client's connection-lost event)
     /// or a request-error convergence — after this controller has already
     /// converged to `.disconnected`. NEVER fired for a deliberate
     /// `disconnect()` (review8 item 3).
@@ -499,11 +499,9 @@ public final class OBSController: ObservableObject {
     /// Epoch-guarded (review8 item 2): once the session is superseded, this
     /// consumer stops applying the dead client's events entirely.
     ///
-    /// The stream FINISHING is a signal (review8 item 3): the client finishes
-    /// it when its receive loop dies unexpectedly, so falling out of the loop
-    /// at the CURRENT epoch (not cancelled, not superseded) means the socket
-    /// is gone — converge to `.disconnected` and surface `onConnectionLost`.
-    /// Deliberate disconnects cancel this task and bump the epoch first, so
+    /// The client emits an explicit connection-lost event when its receive loop
+    /// dies unexpectedly. The stream itself remains reusable across reconnects;
+    /// deliberate disconnects cancel this task and bump the epoch first, so
     /// they can never reach the convergence.
     private func subscribeToEvents(of client: OBSClient, epoch: Int) {
         let events = client.events
@@ -511,16 +509,17 @@ public final class OBSController: ObservableObject {
             for await event in events {
                 guard let self, !Task.isCancelled else { return }
                 guard self.connectionEpoch == epoch else { return }
+                if event.type == OBSClient.connectionLostEventType {
+                    self.log("connection lost — converging to .disconnected")
+                    self.teardown()
+                    self.state = .disconnected
+                    self.onConnectionLost?()
+                    return
+                }
                 // Task {} inherits this controller's main-actor isolation, so
                 // apply(event:data:) is a same-actor synchronous call.
                 self.apply(event: event.type, data: event.data)
             }
-            guard let self, !Task.isCancelled else { return }
-            guard self.connectionEpoch == epoch else { return }
-            self.log("connection lost — converging to .disconnected")
-            self.teardown()
-            self.state = .disconnected
-            self.onConnectionLost?()
         }
     }
 

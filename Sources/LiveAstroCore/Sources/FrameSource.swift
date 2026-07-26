@@ -28,3 +28,12 @@ public protocol FrameSource: AnyObject {
     func start() throws
     func stop()
 }
+
+public enum FrameSourceActivity: Equatable {
+    case beginFrameRead(String)
+    case endFrameRead(String)
+}
+
+public protocol FrameSourceActivityReporting: AnyObject {
+    var onActivity: ((FrameSourceActivity) -> Void)? { get set }
+}

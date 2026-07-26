@@ -206,6 +206,11 @@ public final class BroadcastController {
     /// Set when the operator changes the program scene by hand (an event we
     /// didn't cause). Suspends automation until the next stall/resume boundary.
     private var manualOverride = false
+    /// True when a tick observed a stalled period while manual override was
+    /// latched; the next accepted frame is then the resume boundary that clears
+    /// the latch. This covers OBS-latency false positives that happen after
+    /// `showingScopeDueToStall` has already been cleared.
+    private var manualOverrideAwaitingResume = false
     /// The scene name automation last requested, so an incoming
     /// CurrentProgramSceneChanged can tell "us" from "the operator".
     private var lastAutomationScene: String?
@@ -1290,6 +1295,7 @@ public final class BroadcastController {
         stall = detector
         showingScopeDueToStall = false
         manualOverride = false
+        manualOverrideAwaitingResume = false
         lastAutomationScene = nil
 
         let timer = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
@@ -1309,6 +1315,7 @@ public final class BroadcastController {
         stall = nil
         showingScopeDueToStall = false
         manualOverride = false
+        manualOverrideAwaitingResume = false
         lastAutomationScene = nil
     }
 
@@ -1324,6 +1331,9 @@ public final class BroadcastController {
         detectManualOverride()
 
         let stalledNow = detector.isStalled(at: now)
+        if stalledNow && manualOverride {
+            manualOverrideAwaitingResume = true
+        }
         if stalledNow && !showingScopeDueToStall && !manualOverride && !scopeSceneName.isEmpty {
             showingScopeDueToStall = true
             let scene = scopeSceneName
@@ -1340,9 +1350,14 @@ public final class BroadcastController {
         detector.recordUpdate(at: Date())
         stall = detector
 
+        if manualOverrideAwaitingResume {
+            manualOverride = false   // resume boundary clears false/real override latch
+            manualOverrideAwaitingResume = false
+        }
+
         if showingScopeDueToStall {
             showingScopeDueToStall = false
-            manualOverride = false   // resume boundary clears the override
+            manualOverride = false
             if !stackSceneName.isEmpty {
                 let scene = stackSceneName
                 let gen = automationGeneration

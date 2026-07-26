@@ -494,6 +494,47 @@ final class BroadcastControllerTests: XCTestCase {
                        "queued scene automation must not fire after stopSceneAutomation()")
     }
 
+    /// Review 2026-07-26 I3: a delayed OBS scene update can look like a manual
+    /// override after automation has already decided imaging resumed. That
+    /// latch must clear at the next stall/resume boundary; otherwise one slow
+    /// OBS round-trip disables scene automation for the rest of the session.
+    func testSceneAutomationClearsLatencyFalseManualOverrideAtResumeBoundary() async {
+        let h = await makeHarness()
+        h.controller.sceneAutomationOn = true
+        h.controller.stackSceneName = "Stack"
+        h.controller.scopeSceneName = "Scope"
+        h.controller.sessionDidStart(subExposureSeconds: 1)
+
+        // First real stall: automation asks OBS for Scope.
+        h.controller.sceneTick(now: Date().addingTimeInterval(1000))
+        await waitUntil { self.sent("SetCurrentProgramScene", h.mock) == 1 }
+
+        // OBS eventually reports Scope, then imaging resumes and automation
+        // asks for Stack. We deliberately do NOT deliver the Stack scene event,
+        // modeling OBS latency/modal delay.
+        h.mock.enqueueInbound(eventFrame(type: "CurrentProgramSceneChanged",
+                                         data: ["sceneName": "Scope"]))
+        await waitUntil { h.obs.currentScene == "Scope" }
+        h.controller.frameAccepted()
+        await waitUntil { self.sent("SetCurrentProgramScene", h.mock) == 2 }
+
+        // Before OBS reports Stack, another tick sees current=Scope while
+        // lastAutomationScene=Stack and latches manualOverride falsely.
+        h.controller.sceneTick(now: Date().addingTimeInterval(1000))
+        XCTAssertEqual(sent("SetCurrentProgramScene", h.mock), 2)
+
+        // The next accepted frame is the resume half of that stall/resume
+        // boundary. It must clear the false latch so a later stall can switch
+        // to Scope again.
+        h.controller.frameAccepted()
+        h.mock.enqueueInbound(eventFrame(type: "CurrentProgramSceneChanged",
+                                         data: ["sceneName": "Stack"]))
+        await waitUntil { h.obs.currentScene == "Stack" }
+        h.controller.sceneTick(now: Date().addingTimeInterval(2000))
+        await waitUntil { self.sent("SetCurrentProgramScene", h.mock) == 3 }
+        XCTAssertTrue(h.mock.sentFrames.last { $0.contains("\"op\":6") }?.contains("Scope") == true)
+    }
+
     // MARK: - (7) Emergency override: End Broadcast during .endingSession
 
     /// The operator can force the stream down while the replay renders: the

@@ -28,6 +28,14 @@ final class CalibratorTests: XCTestCase {
         assertPixelsEqual(out.image.pixels, [0.2, 0.3, 0.4, 0.5])
     }
 
+    func testDarkSubtractionPreservesNegativeNoise() {
+        let dark = AstroImage(width: 2, height: 1, channels: 1,
+                              pixels: [0.4, 0.4], sourceIsLinear: true)
+        let f = mono(2, 1, [0.39, 0.41])
+        let out = Calibrator(dark: dark, flat: nil).apply(f)
+        assertPixelsEqual(out.image.pixels, [-0.01, 0.01])
+    }
+
     func testFlatDividesAndNormalizes() {
         // flat = 0.5 multiplier everywhere → light / 0.5 = light × 2, clamped [0,1]
         let flat = AstroImage(width: 2, height: 2, channels: 1,

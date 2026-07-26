@@ -57,4 +57,23 @@ final class SeestarDetectorTests: XCTestCase {
         XCTAssertEqual(found?.target, "NGC 6960")
         XCTAssertEqual(found?.subExposure, 20.0)   // newest by capture-timestamp token
     }
+
+    func testIgnoresBackupVolumeWithSeestarFolderShape() throws {
+        let vols = try tmp()
+        let realWorks = vols.appendingPathComponent("EMMC Images/MyWorks")
+        let backupWorks = vols.appendingPathComponent("BackupDrive/MyWorks")
+        try FileManager.default.createDirectory(at: realWorks, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: backupWorks, withIntermediateDirectories: true)
+        let real = realWorks.appendingPathComponent("M 8_sub")
+        let backup = backupWorks.appendingPathComponent("Wrong Target_sub")
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: backup, withIntermediateDirectories: true)
+        try Data(count: 8).write(to: real.appendingPathComponent("Light_M 8_10.0s_LP_1.fit"))
+        try Data(count: 8).write(to: backup.appendingPathComponent("Light_Wrong Target_10.0s_LP_1.fit"))
+        try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: backup.path)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)], ofItemAtPath: real.path)
+
+        let found = SeestarDetector.detect(volumesRoot: vols)
+        XCTAssertEqual(found?.target, "M 8")
+    }
 }

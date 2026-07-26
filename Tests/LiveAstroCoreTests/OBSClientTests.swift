@@ -278,23 +278,32 @@ final class OBSClientTests: XCTestCase {
 
     // MARK: - Connection-loss signalling (review8 item 3)
 
-    /// The receive loop's death must FINISH the events stream — that finish is
-    /// the connection-loss signal consumers rely on. Pre-fix the stream was
-    /// never finished when the loop died, so nothing downstream could tell.
-    func testReceiveLoopFailureFinishesEventStream() async throws {
+    /// The receive loop's death must emit a connection-loss event while keeping
+    /// the reusable event stream alive for a later reconnect.
+    func testReceiveLoopFailureEmitsConnectionLostWithoutFinishingEventStream() async throws {
         let mock = MockOBSSocket()
         let client = OBSClient(socket: mock, requestTimeout: 10)
         try await connect(client, mock)
 
-        let exp = expectation(description: "events stream finished")
-        let consumer = Task {
-            for await _ in client.events { }
-            exp.fulfill()
-        }
+        var iterator = client.events.makeAsyncIterator()
 
         mock.finishWithError(OBSSocketError.notConnected)   // the socket dies
-        await fulfillment(of: [exp], timeout: 2)
-        consumer.cancel()
+        let event = await iterator.next()
+        XCTAssertEqual(event?.type, OBSClient.connectionLostEventType)
+
+        mock.clearsTerminalOnConnect = true
+        await mock.waitForCloseEffects()
+        mock.enqueueInbound(helloFrame())
+        mock.replyToLastSent { [identifiedFrame] sent in
+            sent.contains("\"op\":1") ? identifiedFrame : nil
+        }
+        try await client.connect(url: url, password: nil)
+
+        mock.enqueueInbound(eventFrame(type: "StreamStateChanged",
+                                       data: ["outputActive": true]))
+        let reconnectedEvent = await iterator.next()
+        XCTAssertEqual(reconnectedEvent?.type, "StreamStateChanged",
+                       "the same OBSClient.events stream must still deliver events after reconnect")
         await client.disconnect()
     }
 

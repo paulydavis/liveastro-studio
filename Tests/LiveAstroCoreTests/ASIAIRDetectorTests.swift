@@ -108,4 +108,19 @@ final class ASIAIRDetectorTests: XCTestCase {
                                                 withIntermediateDirectories: true)
         XCTAssertNil(ASIAIRDetector.detect(volumesRoot: volumes))
     }
+
+    func testIgnoresBackupVolumeWithASIAIRFolderShape() throws {
+        let volumes = try tmp()
+        let realVol = volumes.appendingPathComponent("ASIAIR", isDirectory: true)
+        let backupVol = volumes.appendingPathComponent("BackupDrive", isDirectory: true)
+        let real = try makeTarget(realVol, "M 31")
+        let backup = try makeTarget(backupVol, "Wrong Target")
+        try writeFITS(real, "a.fit", object: "M 31", exposure: 120)
+        try writeFITS(backup, "b.fit", object: "Wrong Target", exposure: 120)
+        try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: backup.path)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)], ofItemAtPath: real.path)
+
+        let found = ASIAIRDetector.detect(volumesRoot: volumes)
+        XCTAssertEqual(found?.target, "M 31")
+    }
 }

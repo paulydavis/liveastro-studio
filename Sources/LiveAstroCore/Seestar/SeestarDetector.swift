@@ -17,6 +17,7 @@ public enum SeestarDetector {
         var candidates: [(url: URL, mod: Date)] = []
         let vols = (try? fm.contentsOfDirectory(at: volumesRoot, includingPropertiesForKeys: nil)) ?? []
         for vol in vols {
+            guard isPlausibleSeestarVolume(vol) else { continue }
             let works = vol.appendingPathComponent("MyWorks")
             let subs = (try? fm.contentsOfDirectory(at: works, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
             for sub in subs where sub.lastPathComponent.hasSuffix("_sub") {
@@ -35,6 +36,11 @@ public enum SeestarDetector {
         }
         return Found(subDir: best.url, target: target,
                      subExposure: newestName.flatMap(parseExposure(fromFilename:)))
+    }
+
+    private static func isPlausibleSeestarVolume(_ volume: URL) -> Bool {
+        let name = volume.lastPathComponent.lowercased()
+        return name == "emmc images" || name.contains("seestar")
     }
 
     /// Parse "..._10.0s_..." → 10.0

@@ -48,19 +48,41 @@ final class ImportController {
         surface.saveSettings?()
         guard !surface.isSessionRunning() else { surface.presentError("End the session before importing."); return }
         guard !isImporting else { return }
+        let prefix = surface.currentFileNamePrefix?() ?? ""
+        importProcessed = 0
+        importTotal = 0
+        isImporting = true
+        surface.log("Preparing import from \(folder.path)…")
+
+        Task.detached { [weak self, folder, prefix] in
+            guard let self else { return }
+            let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder)
+            await MainActor.run {
+                self.beginImport(from: folder, meta: meta, prefix: prefix)
+            }
+        }
+    }
+
+    private func beginImport(from folder: URL,
+                             meta: (object: String?, exposureSeconds: Double?, fileExtension: String)?,
+                             prefix: String) {
+        guard !surface.isSessionRunning() else {
+            surface.presentError("End the session before importing.")
+            isImporting = false
+            return
+        }
         // Reflect the imported subs' actual target/exposure in the profile + Live
         // overlay instead of showing stale form values from a prior session (matches
         // the live/auto-detect paths, which fill these from the newest sub's header).
-        if let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder) {
+        if let meta {
             var detected = DetectedProfile()
             if let object = meta.object, !object.isEmpty { detected.targetName = object }
             if let exp = meta.exposureSeconds, exp > 0 { detected.subExposureText = String(format: "%g", exp) }
             surface.applyDetectedProfile?(detected)
             surface.saveSettings?()
         }
-        let prefixField = surface.currentFileNamePrefix?() ?? ""
         let source = FolderFrameSource(folder: folder, mode: .importOnce,
-                                        fileNamePrefix: prefixField.isEmpty ? nil : prefixField)
+                                        fileNamePrefix: prefix.isEmpty ? nil : prefix)
         let engine = surface.makeStackEngine!()
         let calibration = surface.currentCalibration!()
         let (importCalibrator, importCalWarnings) = CalibrationLoader.makeCalibrator(
@@ -86,11 +108,7 @@ final class ImportController {
         // fire synchronously on the consume task, which end() drains before returning.
         let matchedFrames = AtomicCounter()
         surface.wireImportCallbacks?(importPipeline, { matchedFrames.increment() })
-        importProcessed = 0
-        importTotal = 0
-        isImporting = true
         surface.log("Importing subs from \(folder.path)…")
-        let prefix = prefixField
         Task.detached { [weak self] in
             guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             do {
@@ -105,6 +123,7 @@ final class ImportController {
                         self.surface.log("Import complete. Replay: \(url.path)")
                     }
                     self.isImporting = false
+                    self.importPipeline = nil
                 }
             } catch {
                 await MainActor.run {
@@ -114,12 +133,16 @@ final class ImportController {
                         ? ImportController.noMatchMessage(prefix: prefix)
                         : "Import failed: \(error)")
                     self.isImporting = false
+                    self.importPipeline = nil
                 }
             }
         }
     }
 
-    func cancelImport() { importPipeline?.cancelImport() }
+    func cancelImport() {
+        importPipeline?.cancelImport()
+        importPipeline = nil
+    }
 
     /// User-facing message for an import that matched zero files.
     private nonisolated static func noMatchMessage(prefix: String) -> String {

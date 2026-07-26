@@ -29,4 +29,23 @@ final class HalfResLuminanceParallelTests: XCTestCase {
         let parallel = StackEngine.halfResLuminance(frame: frame, minRows: 0)
         XCTAssertEqual(serial.lum, parallel.lum)
     }
+
+    func testOddHeightBottomUpBinningUsesDisplayRowPairs() {
+        let w = 2, h = 5
+        var px = [Float]()
+        for y in 0..<h {
+            px.append(Float(y * 10))
+            px.append(Float(y * 10))
+        }
+        let img = AstroImage(width: w, height: h, channels: 1, pixels: px, sourceIsLinear: true)
+        let frame = RawFrame(image: img, bayerPattern: .rggb, bottomUp: true,
+                             timestamp: Date(timeIntervalSince1970: 0), sourceName: "odd.fit")
+
+        let result = StackEngine.halfResLuminance(frame: frame, minRows: .max)
+
+        XCTAssertEqual(result.width, 1)
+        XCTAssertEqual(result.height, 2)
+        XCTAssertEqual(result.lum, [35, 15],
+                       "bottom-up odd heights must bin raw rows (3,4), then (1,2); flipping half-row indices bins the wrong pairs")
+    }
 }

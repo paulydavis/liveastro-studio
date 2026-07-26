@@ -50,4 +50,59 @@ final class AppSourceRegressionTests: XCTestCase {
             "The 80 ms throttle must not return before updating SessionPipeline.displayAdjustments."
         )
     }
+
+    func testURLSessionOBSSocketOpenDelegateAndStateAreReusableAcrossReconnects() throws {
+        let socketURL = root.appendingPathComponent("Sources/LiveAstroCore/OBS/OBSSocket.swift")
+        let source = try String(contentsOf: socketURL, encoding: .utf8)
+
+        XCTAssertTrue(
+            source.contains("private let stateLock = NSLock()"),
+            "URLSessionOBSSocket must guard task/session access; URLSession delegate callbacks and close/send/receive can arrive on different threads."
+        )
+        XCTAssertTrue(
+            source.contains("settled = false"),
+            "OpenDelegate.awaitOpen must reset settled for each connect; otherwise the second connect can park forever."
+        )
+        XCTAssertTrue(
+            source.contains("takeStateForClose()"),
+            "close() must atomically detach task/session before cancelling them, so reconnect cannot race stale teardown."
+        )
+    }
+
+    func testImportControllerReleasesPipelineAndScansMetadataOffMainActor() throws {
+        let controllerURL = root.appendingPathComponent("Sources/LiveAstroStudio/ImportController.swift")
+        let source = try String(contentsOf: controllerURL, encoding: .utf8)
+
+        XCTAssertTrue(
+            source.contains("Task.detached { [weak self, folder, prefix] in"),
+            "importSubs must move the initial newest-FITS metadata scan off MainActor; SMB enumeration/header reads can be slow."
+        )
+        XCTAssertTrue(
+            source.contains("let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder)"),
+            "The off-main import preparation task must perform the metadata read before returning to MainActor."
+        )
+        XCTAssertTrue(
+            source.contains("self.importPipeline = nil"),
+            "ImportController must release its full-resolution SessionPipeline after success/failure/cancel so the accumulator is not retained forever."
+        )
+    }
+
+    func testLiveSourceDetectCompletionsRecheckSessionStateBeforeConfiguring() throws {
+        let controllerURL = root.appendingPathComponent("Sources/LiveAstroStudio/LiveSourceController.swift")
+        let source = try String(contentsOf: controllerURL, encoding: .utf8)
+
+        XCTAssertTrue(
+            source.contains("private func canApplyDetectedLiveSource() -> Bool"),
+            "Live auto-detect completions need one shared post-await guard before mutating profile, starting relay, or starting a session."
+        )
+        XCTAssertEqual(
+            source.components(separatedBy: "guard self.canApplyDetectedLiveSource() else").count - 1,
+            3,
+            "Watch-folder, Seestar, and ASIAIR detect completions must all re-check that no session/import started while detection was in flight."
+        )
+        XCTAssertTrue(
+            source.contains("if !canApplyDetectedLiveSource() { return }"),
+            "Configure helpers must also guard direct/internal calls before creating a relay."
+        )
+    }
 }

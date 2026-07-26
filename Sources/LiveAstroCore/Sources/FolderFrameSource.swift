@@ -43,6 +43,16 @@ internal final class LogRelayBox: @unchecked Sendable {
     func emit(_ line: String) { current?(line) }
 }
 
+internal final class ActivityRelayBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sink: ((FrameSourceActivity) -> Void)?
+    var current: ((FrameSourceActivity) -> Void)? {
+        get { lock.withLock { sink } }
+        set { lock.withLock { sink = newValue } }
+    }
+    func emit(_ activity: FrameSourceActivity) { current?(activity) }
+}
+
 /// Reads raw frames from a folder, either as a one-shot import or by watching for new files.
 ///
 /// BOTH modes are PULL-based (`AsyncStream(unfolding:)`): one file is decoded per consumer
@@ -52,7 +62,7 @@ internal final class LogRelayBox: @unchecked Sendable {
 /// decoded every emitted update eagerly into an unbounded RawFrame buffer, so a restart
 /// onto a folder holding 1000+ subs decoded multi-GB of Float planes faster than the serial
 /// consumer could stack them.
-public final class FolderFrameSource: FrameSource {
+public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting {
 
     public enum Mode { case importOnce, live }
 
@@ -70,10 +80,14 @@ public final class FolderFrameSource: FrameSource {
             liveWatcherLog?.current = onLog   // cold2 M2: reaches the inner watcher too
         }
     }
+    public var onActivity: ((FrameSourceActivity) -> Void)? {
+        didSet { importActivity?.current = onActivity }
+    }
     /// Import mode only (review11 finding 5): lock-guarded relay behind the pull closure —
     /// the AsyncStream unfolding closure is created in init, BEFORE `onLog` can be assigned,
     /// so it logs through this box and the didSet above keeps it current.
     private let importLog: LogRelayBox?
+    private let importActivity: ActivityRelayBox?
     /// Live mode only (cold2 M2): lock-guarded relay the inner watcher logs through.
     /// Pre-fix `w.onLog` snapshotted `onLog` at start(), so a sink assigned AFTER
     /// start() — SessionPipeline wires it in startSources — never reached the watcher.
@@ -148,6 +162,8 @@ public final class FolderFrameSource: FrameSource {
             self.liveWatcherLog = nil
             let logBox = LogRelayBox()
             self.importLog = logBox
+            let activityBox = ActivityRelayBox()
+            self.importActivity = activityBox
             // One file is read per pull; a file that cannot be loaded (deleted, unreadable,
             // corrupt, undecodable) is skipped WITH an honest log line naming the file and
             // the reason (review11 finding 5 — pre-fix `try?` dropped frames silently), and
@@ -157,6 +173,8 @@ public final class FolderFrameSource: FrameSource {
                     do {
                         guard let url = try cursor.next() else { return nil }
                         do {
+                            activityBox.emit(.beginFrameRead(url.lastPathComponent))
+                            defer { activityBox.emit(.endFrameRead(url.lastPathComponent)) }
                             return try FolderFrameSource.loadRawFrame(url: url)
                         } catch {
                             logBox.emit("Skipped frame (\(url.lastPathComponent)): \(error)")
@@ -176,6 +194,7 @@ public final class FolderFrameSource: FrameSource {
             self.importCursor = nil
             self.totalCount = nil
             self.importLog = nil
+            self.importActivity = nil
             self.liveWatcherLog = LogRelayBox()   // cold2 M2
             var cont: AsyncStream<StackUpdate>.Continuation!
             // AsyncStream's init runs this closure synchronously; cont is non-nil here.

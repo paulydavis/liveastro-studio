@@ -43,6 +43,7 @@ public protocol OBSSocket: AnyObject {
 /// validates it. Use `MockOBSSocket` (in the test target) for unit testing.
 public final class URLSessionOBSSocket: OBSSocket {
 
+    private let stateLock = NSLock()
     private var task: URLSessionWebSocketTask?
     private var session: URLSession?
     private let openDelegate = OpenDelegate()
@@ -56,9 +57,8 @@ public final class URLSessionOBSSocket: OBSSocket {
         // Await the delegate's didOpenWithProtocol (success) / didCompleteWithError
         // (failure) so connect() only returns once the connection is truly live.
         let session = URLSession(configuration: .default, delegate: openDelegate, delegateQueue: nil)
-        self.session = session
         let t = session.webSocketTask(with: url)
-        task = t
+        setState(session: session, task: t)
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             openDelegate.awaitOpen(cont)
             t.resume()
@@ -66,14 +66,14 @@ public final class URLSessionOBSSocket: OBSSocket {
     }
 
     public func send(_ text: String) async throws {
-        guard let task else {
+        guard let task = currentTask() else {
             throw OBSSocketError.notConnected
         }
         try await task.send(.string(text))
     }
 
     public func receive() async throws -> String {
-        guard let task else {
+        guard let task = currentTask() else {
             throw OBSSocketError.notConnected
         }
         let message = try await task.receive()
@@ -88,10 +88,32 @@ public final class URLSessionOBSSocket: OBSSocket {
     }
 
     public func close() {
-        task?.cancel(with: .normalClosure, reason: nil)
-        task = nil
-        session?.invalidateAndCancel()   // release the delegate-retaining session
+        let state = takeStateForClose()
+        state.task?.cancel(with: .normalClosure, reason: nil)
+        state.session?.invalidateAndCancel()   // release the delegate-retaining session
+    }
+
+    private func setState(session: URLSession?, task: URLSessionWebSocketTask?) {
+        stateLock.lock()
+        self.session = session
+        self.task = task
+        stateLock.unlock()
+    }
+
+    private func currentTask() -> URLSessionWebSocketTask? {
+        stateLock.lock()
+        let t = task
+        stateLock.unlock()
+        return t
+    }
+
+    private func takeStateForClose() -> (session: URLSession?, task: URLSessionWebSocketTask?) {
+        stateLock.lock()
+        let state = (session, task)
         session = nil
+        task = nil
+        stateLock.unlock()
+        return state
     }
 }
 
@@ -107,6 +129,7 @@ private final class OpenDelegate: NSObject, URLSessionWebSocketDelegate {
 
     func awaitOpen(_ cont: CheckedContinuation<Void, Error>) {
         lock.lock(); defer { lock.unlock() }
+        settled = false
         continuation = cont
     }
 

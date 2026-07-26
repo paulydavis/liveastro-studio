@@ -84,8 +84,24 @@ public final class SessionPipeline {
     // it from the caller's thread while the consumer task writes it.
     private let progressLock = NSLock()
     private var progressTicks = 0
+    private var activityTicks = 0
+    private var activeFrameReads = 0
     private func noteFrameProgress() { progressLock.withLock { progressTicks += 1 } }
     private var progressSnapshot: Int { progressLock.withLock { progressTicks } }
+    private var importActivitySnapshot: (progress: Int, activity: Int, activeReads: Int) {
+        progressLock.withLock { (progressTicks, activityTicks, activeFrameReads) }
+    }
+    private func noteFrameSourceActivity(_ activity: FrameSourceActivity) {
+        progressLock.withLock {
+            activityTicks += 1
+            switch activity {
+            case .beginFrameRead:
+                activeFrameReads += 1
+            case .endFrameRead:
+                activeFrameReads = max(0, activeFrameReads - 1)
+            }
+        }
+    }
 
     private let adjLock = NSLock()
     private var _displayAdjustments = DisplayAdjustments.neutral
@@ -113,6 +129,7 @@ public final class SessionPipeline {
     /// Drain deadlines for end() (P1-3). Internal so tests can shrink them; production uses 10s/5s.
     var drainPrimaryTimeout: DispatchTimeInterval = .seconds(10)
     var drainGraceTimeout: DispatchTimeInterval = .seconds(5)
+    var importActiveReadTimeout: DispatchTimeInterval = .seconds(60)
 
     /// Watcher mode: monitors a folder for new Siril stacks and processes each update.
     public init(watchFolder: URL, profile: SessionProfile, rootDirectory: URL,
@@ -274,6 +291,11 @@ public final class SessionPipeline {
             // Forward folder-disappearance log events from the watcher inside a live FolderFrameSource.
             if let folderSrc = src as? FolderFrameSource {
                 folderSrc.onLog = { [weak self] msg in self?.onLog?(msg) }
+            }
+            if let activitySource = src as? FrameSourceActivityReporting {
+                activitySource.onActivity = { [weak self] activity in
+                    self?.noteFrameSourceActivity(activity)
+                }
             }
             try src.start()
             let done = consumeDone
@@ -501,14 +523,28 @@ public final class SessionPipeline {
     /// contract).
     private func drainFiniteImportOrThrow() throws {
         guard let task = consumeTask else { return }
-        var lastProgress = progressSnapshot
+        var last = importActivitySnapshot
         while true {
             if consumeDone.wait(timeout: .now() + drainPrimaryTimeout) == .success {
                 consumeTask = nil
                 return
             }
-            let now = progressSnapshot
-            if now != lastProgress { lastProgress = now; continue }   // progressing — keep draining
+            let now = importActivitySnapshot
+            if now.progress != last.progress || now.activity != last.activity {
+                last = now
+                continue   // progressing/starting or finishing reads — keep draining
+            }
+            if now.activeReads > 0 {
+                if consumeDone.wait(timeout: .now() + importActiveReadTimeout) == .success {
+                    consumeTask = nil
+                    return
+                }
+                let afterActiveRead = importActivitySnapshot
+                if afterActiveRead.progress != now.progress || afterActiveRead.activity != now.activity {
+                    last = afterActiveRead
+                    continue
+                }
+            }
             break                                                     // a full window, no progress
         }
         cancelImport()

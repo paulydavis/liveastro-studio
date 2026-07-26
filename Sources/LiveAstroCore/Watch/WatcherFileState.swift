@@ -135,6 +135,7 @@ struct FileObservation: Equatable {
     let url: URL
     let kind: WatcherEntryKind
     let outcome: ObservationOutcome
+    var observedAtNanos: UInt64? = nil
 }
 
 enum ObservationOutcome: Equatable {
@@ -391,7 +392,9 @@ struct WatcherReducer {
         for observation in batch.entries {
             // Finish classification (including duplicate settlement) for the complete batch
             // before either ordering evidence or victim roles are derived.
-            let isConverging = classify(observation, nowNanos: batch.nowNanos)
+            let isConverging = classify(
+                observation,
+                nowNanos: observation.observedAtNanos ?? batch.nowNanos)
             classifiedByName[observation.name] = ClassifiedObservation(
                 observation: observation,
                 revision: revisionOrder.revision(in: observation.name),

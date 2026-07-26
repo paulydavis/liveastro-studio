@@ -55,7 +55,7 @@ public final class Calibrator {
                     let denom = max(f.pixels[i], MasterBuilder.flatFloor)
                     v /= denom
                 }
-                out[i] = v.isFinite ? min(max(v, 0), 1) : 0
+                out[i] = v.isFinite ? min(v, 1) : 0
             }
         }
         let image = AstroImage(width: light.width, height: light.height,

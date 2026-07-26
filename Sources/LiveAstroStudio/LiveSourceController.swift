@@ -53,6 +53,10 @@ final class LiveSourceController {
         }
     }
 
+    private func canApplyDetectedLiveSource() -> Bool {
+        !surface.isSessionRunning() && !surface.isImporting()
+    }
+
     func startWatchFolderLive(source: URL, sourceMode: AppModel.SourceMode = .nativeStack) {
         guard !surface.isSessionRunning(), !surface.isImporting(), !isDetecting else { return }
         surface.resetZoomPan?()
@@ -63,6 +67,10 @@ final class LiveSourceController {
             let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: source)   // SMB header read, off main
             await MainActor.run {
                 self.isDetecting = false
+                guard self.canApplyDetectedLiveSource() else {
+                    self.surface.log("Live source detection ignored — a session or import started while detection was running.")
+                    return
+                }
                 self.configureAndStartWatchFolder(source: source, sourceMode: sourceMode, meta: meta)
             }
         }
@@ -71,6 +79,7 @@ final class LiveSourceController {
     private func configureAndStartWatchFolder(source: URL,
                                               sourceMode: AppModel.SourceMode,
                                               meta: (object: String?, exposureSeconds: Double?, fileExtension: String)?) {
+        if !canApplyDetectedLiveSource() { return }
         var profile = DetectedProfile(sourceMode: sourceMode, neutralizeBackground: true)
         if let object = meta?.object, !object.isEmpty { profile.targetName = object }        // else keep form value
         if let exp = meta?.exposureSeconds, exp > 0 { profile.subExposureText = String(format: "%g", exp) }
@@ -103,6 +112,10 @@ final class LiveSourceController {
             let found = SeestarDetector.detect()      // SMB directory work, off the main thread
             await MainActor.run {
                 self.isDetecting = false
+                guard self.canApplyDetectedLiveSource() else {
+                    self.surface.log("Seestar detection ignored — a session or import started while detection was running.")
+                    return
+                }
                 guard let found else {
                     self.surface.presentError("No Seestar share found. Mount it first: Finder → Go → Connect to Server → the Seestar's smb:// address, then try again.")
                     return
@@ -115,6 +128,7 @@ final class LiveSourceController {
     /// The on-main configure + start body (unchanged from the old synchronous
     /// startSeestarLive, from `found` onward). Runs on the main actor.
     private func configureAndStartSeestar(_ found: SeestarDetector.Found) {
+        if !canApplyDetectedLiveSource() { return }
         let exp = found.subExposure
         surface.applyDetectedProfile?(DetectedProfile(sourceMode: .nativeStack,
                                                       neutralizeBackground: true,
@@ -154,6 +168,10 @@ final class LiveSourceController {
             let found = ASIAIRDetector.detect()       // SMB directory work, off the main thread
             await MainActor.run {
                 self.isDetecting = false
+                guard self.canApplyDetectedLiveSource() else {
+                    self.surface.log("ASIAIR detection ignored — a session or import started while detection was running.")
+                    return
+                }
                 guard let found else {
                     self.surface.presentError("No ASIAIR share found. In the ASIAIR app: Settings → Network Share → Enable. Then on the Mac: Finder → Go → Connect to Server → smb://asiair.local, and try again.")
                     return
@@ -170,6 +188,7 @@ final class LiveSourceController {
     /// accept every FITS in it — ASIAIR light files are not guaranteed to start
     /// with "Light_" (the .nativeStack default prefix would otherwise drop them).
     private func configureAndStartASIAIR(_ found: ASIAIRDetector.Found) {
+        if !canApplyDetectedLiveSource() { return }
         surface.applyDetectedProfile?(DetectedProfile(sourceMode: .nativeStack,
                                                       neutralizeBackground: true,
                                                       targetName: found.target,

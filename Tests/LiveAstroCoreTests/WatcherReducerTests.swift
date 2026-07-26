@@ -151,6 +151,39 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertNil(reducer.state.generation.ordering.activeBlocker)
     }
 
+    func testDigestQuietPeriodUsesPerFileReadTimestampNotBatchEnd() {
+        let name = "live_stack.fit"
+        let identity = makeIdentity(42)
+        var reducer = makeReducer(
+            files: [name: .digestPending(PendingDigest(
+                digest: "A",
+                identity: identity,
+                firstObservedNanos: 0))],
+            quietPeriodNanos: 100)
+
+        let tooEarly = observeBatch([
+            FileObservation(
+                name: name,
+                url: URL(fileURLWithPath: "/watch/\(name)"),
+                kind: .classicMutable,
+                outcome: .digested(identity: identity, digest: "A", byteCount: identity.size),
+                observedAtNanos: 50),
+        ], nowNanos: 100, reducer: &reducer)
+
+        XCTAssertTrue(tooEarly.isEmpty,
+                      "a slow scan ending after the quiet period must not emit a file read before the quiet period elapsed")
+
+        let emitted = observeBatch([
+            FileObservation(
+                name: name,
+                url: URL(fileURLWithPath: "/watch/\(name)"),
+                kind: .classicMutable,
+                outcome: .digested(identity: identity, digest: "A", byteCount: identity.size),
+                observedAtNanos: 100),
+        ], nowNanos: 150, reducer: &reducer)
+        XCTAssertEqual(emittedNames(in: emitted), [name])
+    }
+
     func testRoleRoundTripStartsFreshEpisodeClock() {
         var reducer = makeReducer()
 

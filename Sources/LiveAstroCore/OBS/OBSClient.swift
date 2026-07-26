@@ -11,6 +11,7 @@ import Foundation
 /// the socket and feeds each one back into the actor via `handle(frame:)`, so
 /// routing runs under actor isolation too.
 public actor OBSClient {
+    public static let connectionLostEventType = "__LiveAstroConnectionLost"
 
     // MARK: - Errors
 
@@ -287,14 +288,14 @@ public actor OBSClient {
 
     // MARK: - Disconnect
 
-    /// Close the socket, cancel the receive loop, fail all pending requests
-    /// (cancelling their tracked sends — review11 finding 1), and finish the
-    /// events stream.
+    /// Close the socket, cancel the receive loop, and fail all pending requests
+    /// (cancelling their tracked sends — review11 finding 1). Deliberate
+    /// disconnects do NOT finish the reusable events stream; the same
+    /// OBSClient instance may reconnect and deliver events again.
     public func disconnect() {
         receiveLoop?.cancel()
         receiveLoop = nil
         failAll(error: OBSError.notConnected)   // also sets connected = false
-        eventContinuation.finish()
         socket.close()
     }
 
@@ -325,13 +326,12 @@ public actor OBSClient {
     }
 
     /// The receive loop died unexpectedly (socket closed or errored): fail all
-    /// pending requests and FINISH the events stream. The stream's finish IS
-    /// the connection-loss signal consumers rely on (review8 item 3 — pre-fix
-    /// the stream was never finished on receive-loop death, so downstream
-    /// state machines could not see the socket loss).
+    /// pending requests and emit an explicit connection-loss event. The events
+    /// stream itself is intentionally kept alive so a reused client can
+    /// reconnect and continue delivering OBS events in the next session.
     private func receiveLoopDied() {
         failAll(error: OBSError.notConnected)   // also sets connected = false
-        eventContinuation.finish()
+        eventContinuation.yield((type: Self.connectionLostEventType, data: [:]))
     }
 
     private func receiveFrame() async throws -> String {
