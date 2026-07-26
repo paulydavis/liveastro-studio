@@ -242,7 +242,7 @@ struct ControlView: View {
                     } label: { Label("Start ASIAIR", systemImage: "camera.aperture") }
                     .help("Auto-detect the ASIAIR's Autorun/Light folder, relay its subs, and begin native stacking — one tap.")
                     .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
-                    Button("Choose Folder…") { pickWatchFolderLive() }
+                    Button("Choose Folder…") { pickNativeWatchFolderLive() }
                         .help("Live-stack subs from any folder your rig writes to (NINA / ASI camera / any incoming-subs folder) — session-scoped from the moment you start.")
                         .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
                     Button("Import Subs…") { pickImportFolder() }
@@ -383,13 +383,29 @@ struct ControlView: View {
         if panel.runModal() == .OK { model.watchFolder = panel.url }
     }
 
-    private func pickWatchFolderLive() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
+    private func pickNativeWatchFolderLive() {
+        pickWatchFolderLive(
+            sourceMode: .nativeStack,
+            title: "Choose Live FITS Folder",
+            message: "Select the folder where NINA, ASIAIR, or another capture app writes new FITS light frames."
+        )
+    }
+
+    private func pickStackerOutputWatchFolder() {
+        pickWatchFolderLive(
+            sourceMode: .stackerOutput,
+            title: "Choose Stacker Output Folder",
+            message: "Select the folder where Siril or another stacker writes live_stack FITS output."
+        )
+    }
+
+    private func pickWatchFolderLive(sourceMode: AppModel.SourceMode,
+                                     title: String,
+                                     message: String) {
+        let panel = makeDirectoryPanel(title: title, message: message)
         panel.prompt = "Watch"
         if panel.runModal() == .OK, let url = panel.url {
+            model.sourceMode = sourceMode
             model.liveSource.startWatchFolderLive(source: url)
         }
     }
