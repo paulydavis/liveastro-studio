@@ -33,6 +33,14 @@ struct ControlView: View {
         return FileManager.default.fileExists(atPath: latest.path) ? latest : nil
     }
 
+    private var sessionSummaryURL: URL? {
+        model.lastSessionDirectory?.appendingPathComponent("session-summary.md")
+    }
+
+    private var frameSummaryURL: URL? {
+        model.lastSessionDirectory?.appendingPathComponent("frame-summary.csv")
+    }
+
     private var appVersionText: String {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = (info["CFBundleShortVersionString"] as? String)?
@@ -857,6 +865,8 @@ struct ControlView: View {
         let replayPath = model.replayURL?.path ?? "(none)"
         let masterPath = latestMasterURL?.path ?? "(none)"
         let latestImagePath = latestImageURL?.path ?? "(none)"
+        let sessionSummaryPath = sessionSummaryURL?.path ?? "(none)"
+        let frameSummaryPath = frameSummaryURL?.path ?? "(none)"
         let logTail = model.log.suffix(logDisplayCap).joined(separator: "\n")
         let summary = """
         LiveAstro Support Bundle
@@ -878,6 +888,8 @@ struct ControlView: View {
         Replay: \(replayPath)
         Latest image: \(latestImagePath)
         Master: \(masterPath)
+        Session summary: \(sessionSummaryPath)
+        Frame summary CSV: \(frameSummaryPath)
         Output footprint: \(outputFootprintText)
 
         Recent Log
@@ -895,6 +907,8 @@ struct ControlView: View {
         let replayPath = model.replayURL?.path ?? "(none)"
         let masterPath = latestMasterURL?.path ?? "(none)"
         let latestImagePath = latestImageURL?.path ?? "(none)"
+        let sessionSummaryPath = sessionSummaryURL?.path ?? "(none)"
+        let frameSummaryPath = frameSummaryURL?.path ?? "(none)"
         let summary = """
         LiveAstro Session
         Target: \(target.isEmpty ? "(untitled)" : target)
@@ -902,6 +916,8 @@ struct ControlView: View {
         Replay: \(replayPath)
         Latest image: \(latestImagePath)
         Master: \(masterPath)
+        Session summary: \(sessionSummaryPath)
+        Frame summary CSV: \(frameSummaryPath)
         Accepted frames: \(model.acceptedCount)
         Rejected frames: \(model.rejectedCount)
         """
