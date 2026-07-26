@@ -207,6 +207,7 @@ A session folder may contain:
 - `replay.mp4` — the automatic stack-evolution video
 - `master.fit` — the final native-stack master, when LiveAstro performed native stacking and a current stack exists
 - `latest.png` — a stable monitor image for the newest saved snapshot
+- `session-summary.md` — a readable target, timing, frame-count, and output summary
 - snapshots — still frames captured throughout the session
 - a manifest — session metadata, profile fields, timing, and output facts
 

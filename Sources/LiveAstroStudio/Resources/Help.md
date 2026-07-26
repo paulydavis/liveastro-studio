@@ -139,6 +139,7 @@ Common outputs:
 - `replay.mp4` — stack-evolution video
 - `master.fit` — native-stacking master, when LiveAstro owns the stack and a current stack exists
 - `latest.png` — stable monitor image for the newest saved snapshot
+- `session-summary.md` — readable target, timing, frame-count, and output summary
 - snapshots — frames captured throughout the session
 - manifest metadata — profile, timing, and output facts
 

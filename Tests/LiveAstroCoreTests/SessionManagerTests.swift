@@ -84,6 +84,33 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(loaded.sessionRejectedCount, 2)
     }
 
+    func testEndSessionWritesHumanReadableSummary() throws {
+        let mgr = SessionManager(rootDirectory: tmp)
+        let dir = try mgr.startSession(profile: profile)
+        try mgr.recordSnapshot(SnapshotRecord(index: 1, timestamp: Date(),
+                                              sourceFile: "live_stack.fit",
+                                              snapshotFile: "snapshots/0001.png",
+                                              estimatedIntegrationSeconds: 120,
+                                              width: 100, height: 80,
+                                              mean: 0.1, median: 0.08, stddev: 0.02))
+        let facts = SessionFinalizationFacts(masterOutcome: .written, stackFrameCount: 3,
+                                             sessionAcceptedCount: 7, sessionRejectedCount: 2)
+
+        try mgr.endSession(finalization: facts)
+
+        let summaryURL = dir.appendingPathComponent("session-summary.md")
+        let summary = try String(contentsOf: summaryURL, encoding: .utf8)
+        XCTAssertTrue(summary.contains("# Session Summary"))
+        XCTAssertTrue(summary.contains("NGC 6888 Crescent Nebula"))
+        XCTAssertTrue(summary.contains("Master outcome | written"))
+        XCTAssertTrue(summary.contains("Current-stack frames | 3"))
+        XCTAssertTrue(summary.contains("Current-stack integration | 6m · 3 × 120s"))
+        XCTAssertTrue(summary.contains("Session accepted | 7"))
+        XCTAssertTrue(summary.contains("Session rejected | 2"))
+        XCTAssertTrue(summary.contains("session-summary.md"))
+        XCTAssertTrue(summary.contains("manifest.json"))
+    }
+
     func testLegacyManifestWithoutFinalizationFactsDecodesWithNilFields() throws {
         let legacy = """
         {

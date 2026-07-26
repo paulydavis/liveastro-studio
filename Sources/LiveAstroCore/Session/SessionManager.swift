@@ -110,6 +110,7 @@ public final class SessionManager {
         try persist(proposed, to: dir)
         manifest = proposed
         state = .ended
+        try? SessionSummaryMarkdown.write(manifest: proposed, to: dir)
     }
 
     /// Fill blank manifest metadata from the source header. User-entered values always win.
