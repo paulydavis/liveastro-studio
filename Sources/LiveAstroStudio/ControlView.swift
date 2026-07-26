@@ -34,11 +34,15 @@ struct ControlView: View {
     }
 
     private var sessionSummaryURL: URL? {
-        model.lastSessionDirectory?.appendingPathComponent("session-summary.md")
+        guard let dir = model.lastSessionDirectory else { return nil }
+        let summary = dir.appendingPathComponent("session-summary.md")
+        return FileManager.default.fileExists(atPath: summary.path) ? summary : nil
     }
 
     private var frameSummaryURL: URL? {
-        model.lastSessionDirectory?.appendingPathComponent("frame-summary.csv")
+        guard let dir = model.lastSessionDirectory else { return nil }
+        let csv = dir.appendingPathComponent("frame-summary.csv")
+        return FileManager.default.fileExists(atPath: csv.path) ? csv : nil
     }
 
     private var appVersionText: String {
@@ -658,6 +662,16 @@ struct ControlView: View {
                                 }
 
                                 HStack(spacing: 8) {
+                                    if sessionSummaryURL != nil {
+                                        Button("Open Summary") { openSessionSummary() }
+                                            .help("Open the session-summary.md human-readable session report.")
+                                    }
+
+                                    if frameSummaryURL != nil {
+                                        Button("Open Frame CSV") { openFrameSummary() }
+                                            .help("Open the frame-summary.csv per-snapshot table.")
+                                    }
+
                                     Spacer()
 
                                     Button("Copy Support Bundle") { copySupportBundle() }
@@ -775,6 +789,16 @@ struct ControlView: View {
 
     private func openLatestImage() {
         guard let url = latestImageURL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func openSessionSummary() {
+        guard let url = sessionSummaryURL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func openFrameSummary() {
+        guard let url = frameSummaryURL else { return }
         NSWorkspace.shared.open(url)
     }
 

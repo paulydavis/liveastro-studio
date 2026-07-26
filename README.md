@@ -93,6 +93,8 @@ External-stacker sessions do not promise a native `master.fit`; the external sta
 The app's **Session Outputs** area provides quick actions for the files you are most likely to need:
 
 - **Open Sessions Folder** opens the output root.
+- **Open Summary** opens `session-summary.md` for the latest session.
+- **Open Frame CSV** opens `frame-summary.csv` for spreadsheet review.
 - **Open Latest Image** opens `latest.png` for the most recent session.
 - **Reveal latest.png** shows that monitor image in Finder.
 - **Refresh Sizes** calculates the current output footprint for the root folder and latest session. It is informational only; it does not delete, prune, or move files.

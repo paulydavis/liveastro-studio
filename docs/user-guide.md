@@ -221,6 +221,8 @@ The **Session Outputs** area gives you shortcuts after a session finishes or a p
 - **Open Session Folder** opens the specific output folder for the latest session.
 - **Open Sessions Folder** opens the root output folder under `~/Documents/LiveAstro/`.
 - **Reveal master.fit** shows the native master in Finder when one exists.
+- **Open Summary** opens `session-summary.md` for the latest session.
+- **Open Frame CSV** opens `frame-summary.csv` for spreadsheet review.
 - **Open Latest Image** opens `latest.png`, useful for a quick support check or monitor/overlay workflow.
 - **Reveal latest.png** shows that monitor image in Finder.
 - **Copy Summary** copies target, frame counts, and output paths.

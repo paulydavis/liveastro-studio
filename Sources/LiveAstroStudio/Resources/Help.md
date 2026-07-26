@@ -149,6 +149,8 @@ External-stacker sessions may not write `master.fit`; the external stacker owns 
 Useful buttons:
 
 - **Open Sessions Folder** opens the output root in Finder.
+- **Open Summary** opens `session-summary.md` for the latest session.
+- **Open Frame CSV** opens `frame-summary.csv` for spreadsheet review.
 - **Open Latest Image** opens `latest.png` for the latest session.
 - **Reveal latest.png** selects the monitor image in Finder.
 - **Refresh Sizes** checks how much disk space the output root and latest session currently use.
