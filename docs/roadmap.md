@@ -106,6 +106,8 @@ If “Stack Previous Shoot” becomes first-class, polish the offline path:
 - clearer calibration setup
 - progress ETA
 - final quality report
+- per-sub exposure and quality data, ideally as both an in-app table and an
+  exportable CSV/summary for later inspection
 - Siril parity report output when a benchmark corpus is available
 - processing summary saved with the session
 
