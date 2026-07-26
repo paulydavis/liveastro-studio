@@ -121,7 +121,7 @@ The sample stack generator writes changing stack files into a folder so you can 
 
 ```bash
 mkdir -p /tmp/liveastro-demo-stack
-swift run fakesiril /tmp/liveastro-demo-stack --interval 3 --count 20
+swift run demo-stack /tmp/liveastro-demo-stack --interval 3 --count 20
 ```
 
 Then point LiveAstro's stacker-output workflow at `/tmp/liveastro-demo-stack`.

@@ -2,7 +2,7 @@
 
 This quickstart lets a new tester see what LiveAstro Studio does without clear skies, a mounted camera, or a live rig.
 
-The demo uses a sample stack generator included with the repository. Its command name is `fakesiril`, because it behaves like a tiny Siril-style stack writer for testing. It writes a changing stack image into a folder, similar to an external live stacker. LiveAstro watches that folder, updates the display, records snapshots, and creates a replay when the session ends.
+The demo uses a sample stack generator included with the repository. It writes a changing stack image into a folder, similar to an external live stacker. LiveAstro watches that folder, updates the display, records snapshots, and creates a replay when the session ends.
 
 ## What You Need
 
@@ -16,7 +16,7 @@ From the repository root:
 
 ```bash
 mkdir -p /tmp/liveastro-demo-stack
-swift run fakesiril /tmp/liveastro-demo-stack --interval 3 --count 30
+swift run demo-stack /tmp/liveastro-demo-stack --interval 3 --count 30
 ```
 
 Leave that Terminal window running. It writes a new stack update every few seconds.

@@ -17,7 +17,7 @@ Use this checklist for pre-field beta validation. It is intentionally split into
 
   ```bash
   mkdir -p /tmp/liveastro-demo-stack
-  swift run fakesiril /tmp/liveastro-demo-stack --interval 3 --count 30
+  swift run demo-stack /tmp/liveastro-demo-stack --interval 3 --count 30
   ```
 
 - [ ] Choose **Stacker output folder** in LiveAstro.
