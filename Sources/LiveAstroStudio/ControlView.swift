@@ -463,6 +463,10 @@ struct ControlView: View {
                         Button("Copy Health") { copyHealthSnapshot() }
                             .font(.caption)
                             .help("Copy the current session health snapshot for sharing or debugging.")
+                        Button("Open Watch Folder") { openWatchFolder() }
+                            .font(.caption)
+                            .disabled(model.watchFolder == nil)
+                            .help("Open the folder LiveAstro is currently watching for FITS files.")
                     }
 
                     LazyVGrid(columns: [
@@ -710,6 +714,12 @@ struct ControlView: View {
     private func openSessionFolder() {
         guard let url = model.lastSessionDirectory else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    private func openWatchFolder() {
+        guard let url = model.watchFolder else { return }
+        NSWorkspace.shared.open(url)
+        model.log.append("Opened watch folder")
     }
 
     private func revealMaster() {
