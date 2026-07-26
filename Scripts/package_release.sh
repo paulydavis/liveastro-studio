@@ -223,6 +223,12 @@ hdiutil create -volname "LiveAstro Studio" -srcfolder "$STAGING" -ov -format UDZ
 rm -rf "$STAGING"
 echo "   wrote $DMG"
 
+if [ "$SIGN_MODE" = "developer-id" ]; then
+    echo "== sign DMG =="
+    codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+    codesign --verify --verbose=2 "$DMG"
+fi
+
 if [ "$NOTARIZE" -eq 0 ]; then
     if [ "$SIGN_MODE" = "developer-id" ]; then
         echo "== Developer ID signed but not notarized =="
@@ -235,8 +241,8 @@ if [ "$NOTARIZE" -eq 0 ]; then
     exit 0
 fi
 
-echo "== notarize DMG with notarytool =="
-xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+echo "== notarize app with notarytool =="
+xcrun notarytool submit "$APP" --keychain-profile "$NOTARY_PROFILE" --wait
 
 echo "== staple app ticket =="
 xcrun stapler staple "$APP"
@@ -248,9 +254,18 @@ ln -s /Applications "$STAGING/Applications"
 hdiutil create -volname "LiveAstro Studio" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGING"
 
+echo "== sign DMG with stapled app =="
+codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+codesign --verify --verbose=2 "$DMG"
+
+echo "== notarize DMG with notarytool =="
+xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+
 echo "== staple DMG ticket =="
 xcrun stapler staple "$DMG"
+xcrun stapler validate "$DMG"
 
 echo "== final Gatekeeper check =="
 spctl -a -vv --type execute "$APP"
+spctl -a -vv -t open --context context:primary-signature "$DMG"
 echo "done: notarized + stapled → $DMG"
