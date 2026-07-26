@@ -622,6 +622,14 @@ struct ControlView: View {
                                         .disabled(model.lastSessionDirectory == nil)
                                         .help("Open the folder containing this session's manifest, snapshots, replay, and native master when present.")
 
+                                    if latestImageURL != nil {
+                                        Button("Open Latest Image") { openLatestImage() }
+                                            .help("Open the session's latest.png monitor image.")
+
+                                        Button("Reveal latest.png") { revealLatestImage() }
+                                            .help("Show the session's latest.png monitor image in Finder.")
+                                    }
+
                                     if latestMasterURL != nil {
                                         Button("Reveal master.fit") { revealMaster() }
                                             .help("Show the native stacking master in Finder.")
@@ -823,6 +831,7 @@ struct ControlView: View {
         let sessionPath = model.lastSessionDirectory?.path ?? "(none)"
         let replayPath = model.replayURL?.path ?? "(none)"
         let masterPath = latestMasterURL?.path ?? "(none)"
+        let latestImagePath = latestImageURL?.path ?? "(none)"
         let logTail = model.log.suffix(logDisplayCap).joined(separator: "\n")
         let summary = """
         LiveAstro Support Bundle
@@ -842,6 +851,7 @@ struct ControlView: View {
         Target: \(target.isEmpty ? "(untitled)" : target)
         Session folder: \(sessionPath)
         Replay: \(replayPath)
+        Latest image: \(latestImagePath)
         Master: \(masterPath)
 
         Recent Log
@@ -858,11 +868,13 @@ struct ControlView: View {
         let sessionPath = model.lastSessionDirectory?.path ?? "(none)"
         let replayPath = model.replayURL?.path ?? "(none)"
         let masterPath = latestMasterURL?.path ?? "(none)"
+        let latestImagePath = latestImageURL?.path ?? "(none)"
         let summary = """
         LiveAstro Session
         Target: \(target.isEmpty ? "(untitled)" : target)
         Session folder: \(sessionPath)
         Replay: \(replayPath)
+        Latest image: \(latestImagePath)
         Master: \(masterPath)
         Accepted frames: \(model.acceptedCount)
         Rejected frames: \(model.rejectedCount)
