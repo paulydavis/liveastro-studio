@@ -648,6 +648,10 @@ struct ControlView: View {
                           : "Run GraXpert on the last stacked master → master_processed.fit")
                 }
                 if model.importer.isGeneratingReplay { ProgressView("Rendering replay…") }
+                Text(appVersionText)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
@@ -787,6 +791,7 @@ struct ControlView: View {
         let logTail = model.log.suffix(logDisplayCap).joined(separator: "\n")
         let summary = """
         LiveAstro Support Bundle
+        App: \(appVersionText)
 
         Session Health
         State: \(sessionStateText)
