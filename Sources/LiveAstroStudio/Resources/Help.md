@@ -36,6 +36,21 @@ Live sessions are session-scoped. Files already sitting in a folder before the s
 
 ---
 
+## Try Without a Telescope
+
+If you are running from the repository, the demo stack generator can feed LiveAstro before you have clear skies:
+
+```bash
+mkdir -p /tmp/liveastro-demo-stack
+swift run demo-stack /tmp/liveastro-demo-stack --interval 3 --count 30
+```
+
+Then choose **Stacker output folder** in LiveAstro and select `/tmp/liveastro-demo-stack`.
+
+This checks folder watching, display updates, the broadcast window, snapshots, and replay generation. It does not test camera acquisition, real calibration quality, real star registration from your optics, or network-share behavior.
+
+---
+
 ## OBS and Go Live
 
 LiveAstro broadcasts through OBS Studio.
