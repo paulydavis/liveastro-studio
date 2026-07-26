@@ -14,7 +14,7 @@ It does not control your camera or mount. Use Seestar, ASIAIR, NINA, Siril, or a
    - **Start ASIAIR** for a mounted ASIAIR share
    - **Choose Folder…** for NINA or any incoming raw-sub folder
    - **Stacker output folder** for Siril or another external stacker
-   - **Import Subs…** for an existing folder of captured subs
+   - **Stack Previous Shoot…** for an existing folder of captured subs
 3. Fill in the session profile fields you want saved with the session.
 4. Start the session.
 5. Click **Detach** to open the broadcast window for OBS.
@@ -30,7 +30,7 @@ It does not control your camera or mount. Use Seestar, ASIAIR, NINA, Siril, or a
 | **Start ASIAIR** | An ASIAIR network share is mounted and writing light frames. |
 | **Choose Folder…** | NINA or another capture app writes incoming raw subs to a folder you choose. |
 | **Stacker output folder** | Siril or another stacker writes `live_stack.fit` or image revisions. |
-| **Import Subs…** | You already have a folder of subs and want a stack/replay afterward. |
+| **Stack Previous Shoot…** | You already have a folder of subs and want a stack/replay afterward. |
 
 Live sessions are session-scoped. Files already sitting in a folder before the source is armed are not replayed as new live frames.
 
