@@ -40,9 +40,9 @@ Use this checklist for pre-field beta validation. It is intentionally split into
 - [ ] Confirm scene automation switches between Stack and Scope scenes when frames stall/resume.
 - [ ] Confirm LiveAstro reports an honest degraded state if OBS cannot confirm stop status.
 
-### Import Existing Data
+### Stack Previous Shoot
 
-- [ ] Choose **Import Subs…**.
+- [ ] Choose **Stack Previous Shoot…**.
 - [ ] Select a folder of existing FITS light frames.
 - [ ] Confirm import progress advances.
 - [ ] Confirm Cancel preserves a valid partial result.

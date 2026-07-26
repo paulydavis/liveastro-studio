@@ -78,12 +78,12 @@ Use this when another program is already producing a live stack image, such as S
 
 In this mode, LiveAstro does not create a native `master.fit`; the external stacker owns the master stack. LiveAstro records snapshots and replay output from the stack images it observes.
 
-### Import existing subs
+### Stack previous shoot
 
 Use this after a night of imaging when you already have a folder of subs and want LiveAstro to build a stack and replay.
 
 1. Set the source mode to **Raw subs folder**.
-2. Click **Import Subs…**.
+2. Click **Stack Previous Shoot…**.
 3. Select the folder containing existing light frames.
 4. LiveAstro imports them in chronological order and writes a session folder when finished.
 

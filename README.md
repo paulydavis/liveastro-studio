@@ -21,7 +21,7 @@ LiveAstro is not camera-control software. Seestar, ASIAIR, NINA, Siril, or anoth
 - **ASIAIR live** — mount the ASIAIR network share, click **Start ASIAIR**, and LiveAstro watches the active light-frame folder.
 - **Generic folder live** — choose a folder where another capture app is actively writing new raw subs. This is the NINA path: point **Choose Folder…** at NINA's image output folder.
 - **Siril / external stacker output** — choose the folder where Siril or another stacker writes `live_stack.fit` or numbered stack revisions.
-- **Import existing subs** — choose a folder of already-captured raw subs from a previous shoot, then stack them offline and produce a replay plus native master.
+- **Stack previous shoot** — choose a folder of already-captured raw subs from a previous shoot, then stack them offline and produce a replay plus native master.
 
 See the full [User Guide](docs/user-guide.md) for setup, OBS streaming, session outputs, reseeding, and troubleshooting.
 
@@ -47,9 +47,9 @@ swift run LiveAstroStudio
    - **Start ASIAIR**
    - **Choose Folder…** for NINA or any other capture app that writes FITS subs to a folder
    - **Stacker output folder**
-   - **Import Subs…**
+   - **Stack Previous Shoot…**
 3. Fill in the session profile fields you care about: target, telescope, camera, filter, location, and sub-exposure length.
-4. Click **Start Session** for live workflows, or use **Import Subs…** to stack an existing folder.
+4. Click **Start Session** for live workflows, or use **Stack Previous Shoot…** to stack an existing folder.
 5. Click **Detach** to open the broadcast window.
 6. In OBS, add a Window Capture for the LiveAstro broadcast window.
 7. Click **Go Live** if OBS automation is configured, or start streaming manually in OBS.
