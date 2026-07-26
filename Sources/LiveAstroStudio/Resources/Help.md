@@ -140,6 +140,7 @@ Common outputs:
 - `master.fit` — native-stacking master, when LiveAstro owns the stack and a current stack exists
 - `latest.png` — stable monitor image for the newest saved snapshot
 - `session-summary.md` — readable target, timing, frame-count, and output summary
+- `frame-summary.csv` — per-snapshot source, exposure, and image-stat table for spreadsheets
 - snapshots — frames captured throughout the session
 - manifest metadata — profile, timing, and output facts
 

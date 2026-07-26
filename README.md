@@ -84,6 +84,7 @@ Depending on the workflow, a session may contain:
 - `master.fit` — linear 32-bit FITS master for native stacking sessions
 - `latest.png` — a stable monitor image that always points at the newest saved snapshot
 - `session-summary.md` — human-readable target, timing, frame-count, and output summary
+- `frame-summary.csv` — spreadsheet-friendly per-snapshot source, exposure, and image-stat table
 - snapshots — still frames captured throughout the session
 - manifest metadata — profile, timing, and output facts
 

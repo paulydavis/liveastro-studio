@@ -111,6 +111,38 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertTrue(summary.contains("manifest.json"))
     }
 
+    func testEndSessionWritesFrameSummaryCSV() throws {
+        let mgr = SessionManager(rootDirectory: tmp)
+        let dir = try mgr.startSession(profile: profile)
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let timestamp = iso.date(from: "2026-07-05T21:30:45.123Z")!
+        try mgr.recordSnapshot(SnapshotRecord(index: 1, timestamp: timestamp,
+                                              sourceFile: "light, one.fit",
+                                              snapshotFile: "snapshots/0001.png",
+                                              estimatedIntegrationSeconds: 120,
+                                              width: 100, height: 80,
+                                              mean: 0.1, median: 0.08, stddev: 0.02))
+
+        try mgr.endSession()
+
+        let csv = try String(contentsOf: dir.appendingPathComponent("frame-summary.csv"),
+                             encoding: .utf8)
+        XCTAssertTrue(csv.hasPrefix("index,timestamp,source_file,snapshot_file,estimated_integration_seconds,sub_exposure_seconds,width,height,mean,median,stddev\n"))
+        XCTAssertTrue(csv.contains("1,2026-07-05T21:30:45.123Z,\"light, one.fit\",snapshots/0001.png,120.0,120.0,100,80,0.1,0.08,0.02"))
+    }
+
+    func testEndSessionWritesHeaderOnlyFrameSummaryCSVForEmptySession() throws {
+        let mgr = SessionManager(rootDirectory: tmp)
+        let dir = try mgr.startSession(profile: profile)
+
+        try mgr.endSession()
+
+        let csv = try String(contentsOf: dir.appendingPathComponent("frame-summary.csv"),
+                             encoding: .utf8)
+        XCTAssertEqual(csv, "index,timestamp,source_file,snapshot_file,estimated_integration_seconds,sub_exposure_seconds,width,height,mean,median,stddev\n")
+    }
+
     func testLegacyManifestWithoutFinalizationFactsDecodesWithNilFields() throws {
         let legacy = """
         {
