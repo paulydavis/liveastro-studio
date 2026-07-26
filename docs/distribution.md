@@ -39,7 +39,7 @@ If `security find-identity` shows multiple Developer ID Application identities w
 
 ```bash
 Scripts/package_release.sh \
-  --version 3.0.2 \
+  --version 3.0.3 \
   --sign developer-id \
   --identity 48A67337B61BCAF1F4970C1389A4EC36D0096E26
 ```
@@ -64,13 +64,13 @@ Use an app-specific password from Apple ID account management. Do not commit App
 Use this for local testing before Developer ID is installed:
 
 ```bash
-Scripts/package_release.sh --version 3.0.2 --sign ad-hoc
+Scripts/package_release.sh --version 3.0.3 --sign ad-hoc
 ```
 
 Expected output:
 
 - `dist/LiveAstroStudio.app`
-- `dist/LiveAstroStudio-3.0.2.dmg`
+- `dist/LiveAstroStudio-3.0.3.dmg`
 
 This build is signed for local packaging sanity only. It is not notarized and is not suitable for public distribution.
 
@@ -80,7 +80,7 @@ After the Developer ID identity appears in the keychain:
 
 ```bash
 Scripts/package_release.sh \
-  --version 3.0.2 \
+  --version 3.0.3 \
   --sign developer-id \
   --identity "Developer ID Application: Your Name (TEAMID)"
 ```
@@ -93,7 +93,7 @@ After the notary profile is stored:
 
 ```bash
 Scripts/package_release.sh \
-  --version 3.0.2 \
+  --version 3.0.3 \
   --sign developer-id \
   --identity "Developer ID Application: Your Name (TEAMID)" \
   --notarize \
@@ -107,9 +107,9 @@ The script submits the DMG with `xcrun notarytool submit --wait`, staples the no
 Dry runs validate command choices without building, signing, or contacting Apple:
 
 ```bash
-Scripts/package_release.sh --dry-run --version 3.0.2 --sign ad-hoc
-Scripts/package_release.sh --dry-run --version 3.0.2 --sign developer-id --identity "Developer ID Application: Example (TEAMID)"
-Scripts/package_release.sh --dry-run --version 3.0.2 --sign developer-id --identity "Developer ID Application: Example (TEAMID)" --notarize --notary-profile liveastro-notary
+Scripts/package_release.sh --dry-run --version 3.0.3 --sign ad-hoc
+Scripts/package_release.sh --dry-run --version 3.0.3 --sign developer-id --identity "Developer ID Application: Example (TEAMID)"
+Scripts/package_release.sh --dry-run --version 3.0.3 --sign developer-id --identity "Developer ID Application: Example (TEAMID)" --notarize --notary-profile liveastro-notary
 ```
 
 Invalid combinations fail deliberately:
@@ -125,7 +125,7 @@ After packaging:
 ```bash
 codesign --verify --strict --verbose=2 dist/LiveAstroStudio.app
 spctl -a -vv --type execute dist/LiveAstroStudio.app
-xcrun stapler validate dist/LiveAstroStudio-3.0.2.dmg
+xcrun stapler validate dist/LiveAstroStudio-3.0.3.dmg
 ```
 
 Ad-hoc builds are expected to fail Gatekeeper assessment. Developer ID notarized builds should pass.
