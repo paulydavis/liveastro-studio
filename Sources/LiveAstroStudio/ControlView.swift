@@ -455,9 +455,15 @@ struct ControlView: View {
                         .help("Select a folder of previously captured FITS light frames to stack offline, with progress tracking and Cancel support.")
                 }
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Session Health")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack {
+                        Text("Session Health")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Copy Health") { copyHealthSnapshot() }
+                            .font(.caption)
+                            .help("Copy the current session health snapshot for sharing or debugging.")
+                    }
 
                     LazyVGrid(columns: [
                         GridItem(.flexible(minimum: 120), alignment: .leading),
@@ -709,6 +715,24 @@ struct ControlView: View {
     private func revealMaster() {
         guard let url = latestMasterURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func copyHealthSnapshot() {
+        let summary = """
+        LiveAstro Session Health
+        State: \(sessionStateText)
+        Source: \(sourceSummaryText)
+        Folder: \(watchFolderSummaryText)
+        Last update: \(lastUpdateSummaryText)
+        Frames: \(framesSummaryText)
+        Last rejection: \(lastRejectionSummaryText)
+        OBS: \(obsSummaryText)
+        Outputs: \(outputsSummaryText)
+        """
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(summary, forType: .string)
+        model.log.append("Copied session health")
     }
 
     private func copySessionSummary() {
