@@ -267,11 +267,12 @@ struct ControlView: View {
 
                         WorkflowActionRow(
                             title: "Try Demo",
-                            subtitle: "A built-in sample session is planned; for now use real or previously captured FITS files.",
+                            subtitle: "Start a local sample stack stream so you can test the display, outputs, and replay without clear skies.",
                             systemImage: "sparkles",
-                            badge: "coming soon",
-                            disabled: true
-                        ) {}
+                            disabled: liveWorkflowDisabled
+                        ) {
+                            model.startDemoSession()
+                        }
                     }
                     Section("Watch Folder") {
                         Picker("Source", selection: $model.sourceMode) {
