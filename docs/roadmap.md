@@ -6,7 +6,25 @@ This is a lightweight product roadmap for work that does not depend on immediate
 
 Once the public guide, beta quickstart, visual docs, and distribution notes are in good shape, shift from explaining the app to improving the product path itself.
 
-### 1. First-Run Workflow Chooser
+## Current Status
+
+Shipped public-polish items:
+
+- **Start workflow chooser** — the app now names user intents directly.
+- **Stack Previous Shoot…** — public wording now matches how users think about offline stacking.
+- **Output discoverability** — replay, session folder, latest image, master, summaries, support bundle, log tail, and output-footprint actions are visible after a session.
+- **Operational support surface** — session health, build version, output footprint, support bundle, and `latest.png` are available for beta/support conversations.
+- **No-sky demo command** — public docs now use `swift run demo-stack ...`; the old `fakesiril` command remains for development/history.
+
+Remaining near-term product candidates:
+
+1. in-app **Try Demo** mode, so first impressions do not depend on Terminal;
+2. previous-shoot quality workflow: ETA, per-sub data, final report, CSV/summary;
+3. optional problem notifications / unattended confidence;
+4. visual identity and release screenshots;
+5. test-harness hygiene for OBS mock continuation warnings.
+
+### 1. First-Run Workflow Chooser — shipped
 
 Add a first-run or prominent start workflow that names the user intent directly:
 
@@ -19,7 +37,9 @@ Add a first-run or prominent start workflow that names the user intent directly:
 
 This should reduce confusion around why some systems have named buttons and others use a folder picker. NINA should be explicitly presented as the **Live from Folder / NINA** path because NINA already writes FITS files to a normal output folder.
 
-### 2. Rename “Import Subs” for Public Users
+Status: shipped in the Start Workflow section. **Try Demo** is visible but still disabled.
+
+### 2. Rename “Import Subs” for Public Users — shipped
 
 The current label is technically accurate but engineering-flavored. Public users are more likely to think:
 
@@ -36,18 +56,29 @@ Supporting copy:
 
 The app can keep using the existing import pipeline behind that clearer public wording.
 
-### 3. Make Outputs Obvious
+Status: shipped as **Stack Previous Shoot…** in the app, README, user guide, beta checklist, and bundled Help.
+
+### 3. Make Outputs Obvious — shipped
 
 After ending a session or finishing an offline stack, make artifacts discoverable without Finder archaeology:
 
 - **Open Replay**
+- **Reveal Replay**
 - **Open Session Folder**
+- **Open Sessions Folder**
 - **Reveal master.fit**
+- **Open Latest Image**
+- **Reveal latest.png**
 - **Copy Session Summary**
+- **Copy Support Bundle**
+- **Copy Log Tail**
+- **Refresh Sizes**
 
 This is a trust feature. Users should immediately see what LiveAstro produced.
 
-### 4. In-App Demo Mode
+Status: shipped for output actions. `latest.png`, support bundle, and output footprint were added as follow-on polish.
+
+### 4. In-App Demo Mode — future
 
 Replace the terminal-oriented sample stack generator path with an app-level demo:
 
@@ -57,6 +88,8 @@ Replace the terminal-oriented sample stack generator path with an app-level demo
 - end with a sample replay/session output
 
 Keep the command-line sample stack generator for development, but do not make public users depend on Terminal for the first impression.
+
+Partial progress: public docs now use `swift run demo-stack ...` instead of the older `fakesiril` command name. The app-level **Try Demo** button remains a disabled future affordance.
 
 ### 5. Better Status and Diagnostics
 
@@ -72,25 +105,29 @@ Add a status/diagnostic surface that answers:
 
 This helps beta users self-debug and gives better feedback when they report issues.
 
+Partial progress: the fixed footer now shows a session health summary and exposes **Copy Health**, **Open Watch Folder**, **Copy Support Bundle**, and recent log copying. Deeper per-frame diagnostics remain future work.
+
 ### 6. Operational Polish
 
 Borrow the useful unattended-operation ideas from all-sky monitoring tools
 without turning LiveAstro into an all-sky camera app. These are product polish
 items for deep-sky sessions:
 
-- **Latest image output** — optionally write a `latest.png` or `latest.jpg`
+- **Latest image output** — write a `latest.png`
   beside the session so a local web page, Discord bot, or simple monitor can
-  show the current stack.
+  show the current stack. **Shipped.**
 - **Session health summary** — show accepted frames, rejected frames, last
   rejection reason, current output folder, replay status, and OBS status in one
-  place.
-- **Folder size guardrails** — warn before relay/snapshot/replay outputs grow
-  unexpectedly large; eventually offer per-session cleanup controls.
+  place. **Shipped.**
+- **Folder size guardrails** — show the output footprint on request and include
+  it in support bundles. **Initial informational guardrail shipped; warnings
+  and cleanup controls remain future.**
 - **Problem notifications** — future optional notifications for session-ending
   errors, stalled input folders, OBS disconnects, or disk-space problems.
 - **Unattended run confidence** — make it obvious whether LiveAstro is actively
   receiving frames, holding the last good frame, waiting for input, generating a
-  replay, or finished.
+  replay, or finished. **Partially shipped through the health summary; stronger
+  notifications remain future.**
 - **Simple local status page** — possible future read-only page for LAN viewing
   of current stack, session status, and output links.
 
@@ -139,11 +176,12 @@ eventually run without runtime continuation warnings.
 
 ## Recommended Next Product Slice
 
-After the docs/distribution branch lands, the highest-leverage implementation slice is:
+After the shipped docs/output/health polish, the highest-leverage implementation slices are:
 
-1. **First-run workflow chooser**
-2. **Stack Previous Shoot wording**
-3. **Open Replay / Open Session Folder actions**
-4. **Session health summary**
+1. **In-app Try Demo mode**
+2. **Previous-shoot quality report**
+3. **Per-sub exposure and quality data**
+4. **Problem notifications / unattended confidence**
+5. **Visual identity and release screenshots**
 
-That is the shortest path from “powerful app” to “people understand how to use it without an explanation.”
+That is the shortest path from “people can understand it” to “people can evaluate it without clear skies.”
