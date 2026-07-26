@@ -115,16 +115,28 @@ Reseed keeps the session history and snapshots, but resets the current stack. Th
 
 ## Session Outputs
 
-Sessions are written under `~/Documents/LiveAstro/`.
+Sessions are written under `~/Documents/LiveAstro/`. This folder contains LiveAstro's own session record, generated images, replay, and native master when available. It does not replace your original capture folder; Seestar, ASIAIR, NINA, Siril, or your capture app still owns the source files.
 
 Common outputs:
 
 - `replay.mp4` — stack-evolution video
 - `master.fit` — native-stacking master, when LiveAstro owns the stack and a current stack exists
+- `latest.png` — stable monitor image for the newest saved snapshot
 - snapshots — frames captured throughout the session
 - manifest metadata — profile, timing, and output facts
 
 External-stacker sessions may not write `master.fit`; the external stacker owns that file.
+
+Useful buttons:
+
+- **Open Sessions Folder** opens the output root in Finder.
+- **Open Latest Image** opens `latest.png` for the latest session.
+- **Reveal latest.png** selects the monitor image in Finder.
+- **Refresh Sizes** checks how much disk space the output root and latest session currently use.
+- **Copy Support Bundle** copies app version, session health, output paths, output footprint, and recent log lines.
+- **Copy Log Tail** copies only the recent log.
+
+`latest.png` is for quick viewing, OBS/web overlays, and support checks. Use `master.fit` for serious post-processing when a native master is available.
 
 ---
 
@@ -135,6 +147,9 @@ Mount the device's SMB share in Finder first, then try again.
 
 **Folder selected, but nothing stacks**
 Confirm new `.fit` or `.fits` files are appearing after the session starts.
+
+**Refresh Sizes shows a large output footprint**
+That number is informational. LiveAstro will not delete anything when you click **Refresh Sizes**.
 
 **Seestar stacks do not start**
 Confirm the Seestar is writing raw FITS subs, not JPEG-only live-view images.
