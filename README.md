@@ -76,16 +76,26 @@ LiveAstro treats broadcasting as deliberate:
 
 ## Session Outputs
 
-Session folders are written under `~/Documents/LiveAstro/`.
+Session folders are written under `~/Documents/LiveAstro/`. These are LiveAstro's own output copies and generated files; your original capture files stay where Seestar, ASIAIR, NINA, Siril, or your other upstream tool wrote them.
 
 Depending on the workflow, a session may contain:
 
 - `replay.mp4` — automatic stack-evolution video
 - `master.fit` — linear 32-bit FITS master for native stacking sessions
+- `latest.png` — a stable monitor image that always points at the newest saved snapshot
 - snapshots — still frames captured throughout the session
 - manifest metadata — profile, timing, and output facts
 
 External-stacker sessions do not promise a native `master.fit`; the external stacker owns that artifact.
+
+The app's **Session Outputs** area provides quick actions for the files you are most likely to need:
+
+- **Open Sessions Folder** opens the output root.
+- **Open Latest Image** opens `latest.png` for the most recent session.
+- **Reveal latest.png** shows that monitor image in Finder.
+- **Refresh Sizes** calculates the current output footprint for the root folder and latest session. It is informational only; it does not delete, prune, or move files.
+- **Copy Support Bundle** copies a compact text report with app version, session health, output paths, output footprint, and recent log lines.
+- **Copy Log Tail** copies only the visible recent log lines.
 
 ## Calibration Philosophy
 
