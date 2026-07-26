@@ -15,10 +15,11 @@ Shipped public-polish items:
 - **Output discoverability** — replay, session folder, latest image, master, summaries, support bundle, log tail, and output-footprint actions are visible after a session.
 - **Operational support surface** — session health, build version, output footprint, support bundle, and `latest.png` are available for beta/support conversations.
 - **No-sky demo path** — **Try Demo** now starts a local sample stack stream in the app; `swift run demo-stack ...` remains available from source.
+- **Completed-session reports v1** — finished sessions write `session-summary.md` and `frame-summary.csv`, with app shortcuts to open them.
 
 Remaining near-term product candidates:
 
-1. previous-shoot quality workflow: ETA, per-sub data, final report, CSV/summary;
+1. previous-shoot quality workflow: ETA, richer per-sub quality metrics, final report;
 2. optional problem notifications / unattended confidence;
 3. visual identity and release screenshots;
 4. test-harness hygiene for OBS mock continuation warnings.
@@ -101,7 +102,7 @@ Add a status/diagnostic surface that answers:
 
 This helps beta users self-debug and gives better feedback when they report issues.
 
-Partial progress: the fixed footer now shows a session health summary and exposes **Copy Health**, **Open Watch Folder**, **Copy Support Bundle**, and recent log copying. Deeper per-frame diagnostics remain future work.
+Partial progress: the fixed footer now shows a session health summary and exposes **Copy Health**, **Open Watch Folder**, **Copy Support Bundle**, recent log copying, and completed-session report artifacts. Deeper live per-frame diagnostics remain future work.
 
 ### 6. Operational Polish
 
@@ -126,6 +127,8 @@ items for deep-sky sessions:
   notifications remain future.**
 - **Simple local status page** — possible future read-only page for LAN viewing
   of current stack, session status, and output links.
+- **Completed-session summary files** — write readable `session-summary.md` and
+  spreadsheet-friendly `frame-summary.csv` beside the manifest. **Shipped.**
 
 These should stay downstream of LiveAstro's real job: DSO stacking, broadcast,
 session records, and replay. Camera acquisition, all-sky scheduling, meteor
@@ -139,10 +142,11 @@ If “Stack Previous Shoot” becomes first-class, polish the offline path:
 - clearer calibration setup
 - progress ETA
 - final quality report
-- per-sub exposure and quality data, ideally as both an in-app table and an
-  exportable CSV/summary for later inspection
+- richer per-sub exposure and quality metrics, ideally as both an in-app table
+  and an expanded CSV for later inspection
 - Siril parity report output when a benchmark corpus is available
-- processing summary saved with the session
+- processing summary saved with the session. **Initial `session-summary.md` and
+  `frame-summary.csv` shipped; richer quality scoring remains future.**
 
 Future mixed-setup handling belongs here, not in the live stacker. A later
 offline-only pass could preflight a folder for different cameras, dimensions,
@@ -174,10 +178,10 @@ eventually run without runtime continuation warnings.
 
 After the shipped docs/output/health polish, the highest-leverage implementation slices are:
 
-1. **In-app Try Demo mode**
-2. **Previous-shoot quality report**
-3. **Per-sub exposure and quality data**
-4. **Problem notifications / unattended confidence**
-5. **Visual identity and release screenshots**
+1. **Previous-shoot quality report**
+2. **Per-sub exposure and quality metrics**
+3. **Problem notifications / unattended confidence**
+4. **Visual identity and release screenshots**
+5. **Test-harness hygiene for OBS mock continuation warnings**
 
 That is the shortest path from “people can understand it” to “people can evaluate it without clear skies.”
