@@ -13,6 +13,7 @@ struct HelpView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding()
         }
+        .scrollIndicators(.visible)
     }
 
     private var blocks: [MarkdownBlock] {
