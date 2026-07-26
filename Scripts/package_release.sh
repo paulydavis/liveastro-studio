@@ -241,8 +241,8 @@ if [ "$NOTARIZE" -eq 0 ]; then
     exit 0
 fi
 
-echo "== notarize app with notarytool =="
-xcrun notarytool submit "$APP" --keychain-profile "$NOTARY_PROFILE" --wait
+echo "== notarize DMG with notarytool =="
+xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
 
 echo "== staple app ticket =="
 xcrun stapler staple "$APP"
