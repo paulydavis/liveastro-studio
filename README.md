@@ -29,7 +29,7 @@ Trying LiveAstro before you have clear skies? Start with the [Beta Quickstart](d
 
 ## Open LiveAstro
 
-If you have a packaged build, open `LiveAstroStudio.app`.
+For the current tester build, download `LiveAstroStudio-3.0.2.dmg` from the [LiveAstro Studio 3.0.2 release](https://github.com/paulydavis/liveastro-studio/releases/tag/v3.0.2), open the DMG, drag LiveAstro Studio to Applications, then launch it.
 
 To run from source:
 
