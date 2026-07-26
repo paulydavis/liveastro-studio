@@ -2,7 +2,7 @@
 
 This quickstart lets a new tester see what LiveAstro Studio does without clear skies, a mounted camera, or a live rig.
 
-The demo uses a sample stack generator included with the repository. It writes a changing stack image into a folder, similar to an external live stacker. LiveAstro watches that folder, updates the display, records snapshots, and creates a replay when the session ends.
+The easiest demo is the built-in **Try Demo** workflow. It writes a changing sample stack into a local folder, starts LiveAstro watching it, updates the display, records snapshots, and creates a replay when the session ends.
 
 ## What You Need
 
@@ -10,9 +10,11 @@ The demo uses a sample stack generator included with the repository. It writes a
 - LiveAstro Studio from source or a packaged build
 - OBS Studio, optional but recommended for the broadcast-window check
 
-## 1. Start the Sample Stacker
+## 1. Start the Demo
 
-From the repository root:
+In LiveAstro, click **Try Demo** in the Start Workflow section.
+
+If you are running from source and want to drive the demo from Terminal instead:
 
 ```bash
 mkdir -p /tmp/liveastro-demo-stack
@@ -35,15 +37,16 @@ swift run LiveAstroStudio
 
 In LiveAstro:
 
-1. Choose **Stacker output folder**.
-2. Choose `/tmp/liveastro-demo-stack`.
-3. Leave **File name starts with** set to `live_stack` if the generated files use that prefix.
-4. Fill in a simple profile:
+1. If you clicked **Try Demo**, LiveAstro already chose the demo folder and started the session.
+2. If you are using the Terminal fallback, choose **Stacker output folder**.
+3. Choose `/tmp/liveastro-demo-stack`.
+4. Leave **File name starts with** set to `live_stack` if the generated files use that prefix.
+5. Fill in a simple profile:
    - Target: `Demo Nebula`
    - Telescope: `Demo`
    - Camera: `Demo`
    - Sub-exposure: `30s`
-5. Start the session.
+6. Start the session.
 
 The live view should update as new demo stack files arrive.
 

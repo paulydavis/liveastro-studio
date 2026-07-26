@@ -117,7 +117,9 @@ frames usually do little on their own.
 
 ## Try It Without a Telescope
 
-The sample stack generator writes changing stack files into a folder so you can test LiveAstro before connecting a telescope:
+Click **Try Demo** in the Start Workflow section. LiveAstro creates a local demo input folder, writes a changing sample stack, starts watching it, and lets you test the live view, broadcast window, snapshots, and replay without clear skies.
+
+If you are running from source and want the Terminal-driven fallback, the demo stack generator is still available:
 
 ```bash
 mkdir -p /tmp/liveastro-demo-stack

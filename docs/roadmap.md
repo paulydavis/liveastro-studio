@@ -14,15 +14,14 @@ Shipped public-polish items:
 - **Stack Previous Shoot…** — public wording now matches how users think about offline stacking.
 - **Output discoverability** — replay, session folder, latest image, master, summaries, support bundle, log tail, and output-footprint actions are visible after a session.
 - **Operational support surface** — session health, build version, output footprint, support bundle, and `latest.png` are available for beta/support conversations.
-- **No-sky demo command** — public docs now use `swift run demo-stack ...`; the old `fakesiril` command remains for development/history.
+- **No-sky demo path** — **Try Demo** now starts a local sample stack stream in the app; `swift run demo-stack ...` remains available from source.
 
 Remaining near-term product candidates:
 
-1. in-app **Try Demo** mode, so first impressions do not depend on Terminal;
-2. previous-shoot quality workflow: ETA, per-sub data, final report, CSV/summary;
-3. optional problem notifications / unattended confidence;
-4. visual identity and release screenshots;
-5. test-harness hygiene for OBS mock continuation warnings.
+1. previous-shoot quality workflow: ETA, per-sub data, final report, CSV/summary;
+2. optional problem notifications / unattended confidence;
+3. visual identity and release screenshots;
+4. test-harness hygiene for OBS mock continuation warnings.
 
 ### 1. First-Run Workflow Chooser — shipped
 
@@ -37,7 +36,7 @@ Add a first-run or prominent start workflow that names the user intent directly:
 
 This should reduce confusion around why some systems have named buttons and others use a folder picker. NINA should be explicitly presented as the **Live from Folder / NINA** path because NINA already writes FITS files to a normal output folder.
 
-Status: shipped in the Start Workflow section. **Try Demo** is visible but still disabled.
+Status: shipped in the Start Workflow section. **Try Demo** now starts a local sample stack stream.
 
 ### 2. Rename “Import Subs” for Public Users — shipped
 
@@ -78,18 +77,15 @@ This is a trust feature. Users should immediately see what LiveAstro produced.
 
 Status: shipped for output actions. `latest.png`, support bundle, and output footprint were added as follow-on polish.
 
-### 4. In-App Demo Mode — future
+### 4. In-App Demo Mode — v1 shipped, refinements future
 
 Replace the terminal-oriented sample stack generator path with an app-level demo:
 
-- **Try Demo**
-- generate or play a sample stack stream
-- open the broadcast window
-- end with a sample replay/session output
+- **Try Demo** starts a local sample stack stream and normal LiveAstro session.
+- Future refinement: auto-open or highlight the broadcast window.
+- Future refinement: optional auto-end / replay walkthrough.
 
-Keep the command-line sample stack generator for development, but do not make public users depend on Terminal for the first impression.
-
-Partial progress: public docs now use `swift run demo-stack ...` instead of the older `fakesiril` command name. The app-level **Try Demo** button remains a disabled future affordance.
+The command-line `demo-stack` generator remains available for development and source-run fallback, but public first impressions no longer depend on Terminal.
 
 ### 5. Better Status and Diagnostics
 

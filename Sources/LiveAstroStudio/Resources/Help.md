@@ -38,7 +38,9 @@ Live sessions are session-scoped. Files already sitting in a folder before the s
 
 ## Try Without a Telescope
 
-If you are running from the repository, the demo stack generator can feed LiveAstro before you have clear skies:
+Click **Try Demo** in the Start Workflow section. LiveAstro creates a local demo input folder, starts a sample stack stream, and watches it like an external stacker output.
+
+If you are running from the repository and want the Terminal fallback:
 
 ```bash
 mkdir -p /tmp/liveastro-demo-stack
