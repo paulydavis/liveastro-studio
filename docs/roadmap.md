@@ -174,6 +174,44 @@ receives cannot leak a checked continuation. This is test-only cleanup — the
 production OBS client has a single receive loop — but the default suite should
 eventually run without runtime continuation warnings.
 
+## Long-Term Differentiator: Mosaic Night Mode
+
+Mosaics should become a major future product direction, not a one-off export
+feature. The roadmap is deliberately all five layers, staged so LiveAstro can
+earn value before attempting the hardest final-blending work.
+
+The guiding product promise:
+
+> Run a mosaic night live, understand each panel as it happens, show progress
+> cleanly on stream, and end with organized data plus a trustworthy preview of
+> whether the shot was captured.
+
+### Mosaic stages
+
+1. **Mosaic session model** — a session can contain multiple panels. Each panel
+   has its own stack, exposure total, accepted/rejected counts, quality stats,
+   thumbnails, and artifacts.
+2. **Live Mosaic Board** — an OBS-friendly dashboard with the panel grid,
+   active panel highlight, per-panel thumbnails, exposure/quality balance, and
+   obvious weak or missing panels. This is the first likely “why this app
+   exists” moment for mosaic users.
+3. **Downstream export package** — one-click organization for Siril,
+   PixInsight, ASTAP-style solving, or other post tools: per-panel masters,
+   relevant calibrated/intermediate data when available, panel map, session
+   summary, and recommended next steps.
+4. **Offline mosaic preview** — a rough but useful post-session assembly that
+   proves coverage, overlap, rotation, framing, and panel balance. This is not
+   initially a final aesthetic integration.
+5. **Native mosaic engine** — eventual full registration, coordinate solving,
+   normalization, seam handling, gradient matching, blending, and final mosaic
+   master output.
+
+The intended sequence is control plane before math plane. Panel tracking,
+progress, broadcast presentation, logs, and export structure fit LiveAstro's
+existing session-intelligence lane. Full native stitching is powerful but much
+larger; it should arrive after the panel workflow proves valuable and provides
+real datasets to validate against.
+
 ## Recommended Next Product Slice
 
 After the shipped docs/output/health polish, the highest-leverage implementation slices are:
