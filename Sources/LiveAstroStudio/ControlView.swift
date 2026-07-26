@@ -26,6 +26,75 @@ struct ControlView: View {
         return FileManager.default.fileExists(atPath: master.path) ? master : nil
     }
 
+    private var sessionStateText: String {
+        if model.liveSource.isDetecting { return "Detecting source" }
+        if model.importer.isImporting { return "Importing" }
+        if model.importer.isGeneratingReplay { return "Rendering replay" }
+        if model.isRunning { return "Running" }
+        return "Idle"
+    }
+
+    private var sourceSummaryText: String {
+        switch model.sourceMode {
+        case .nativeStack:
+            return "Native stacking"
+        case .stackerOutput:
+            return "Siril / external stacker"
+        }
+    }
+
+    private var watchFolderSummaryText: String {
+        model.watchFolder?.path ?? "(none selected)"
+    }
+
+    private var lastUpdateSummaryText: String {
+        guard let record = model.latestRecord else { return model.integrationCaption }
+        return "#\(record.index) · \(record.snapshotFile)"
+    }
+
+    private var framesSummaryText: String {
+        "accepted \(model.acceptedCount) · rejected \(model.rejectedCount)"
+    }
+
+    private var lastRejectionSummaryText: String {
+        guard let line = model.log.last(where: { $0.hasPrefix("✗ rejected ") }) else {
+            return "(none)"
+        }
+        let prefix = "✗ rejected "
+        if line.hasPrefix(prefix) {
+            return String(line.dropFirst(prefix.count))
+        }
+        return line
+    }
+
+    private var obsSummaryText: String {
+        switch model.broadcast.broadcastState {
+        case .idle:
+            return "idle"
+        case .unknown:
+            return "not checked"
+        case .connecting:
+            return "connecting"
+        case .live:
+            if let h = model.broadcast.streamHealth {
+                return "live · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% congestion"
+            }
+            return "live"
+        case .endingSession:
+            return "ending session"
+        case .stopping:
+            return "stopping"
+        case .stopUnconfirmed:
+            return "may still be live"
+        }
+    }
+
+    private var outputsSummaryText: String {
+        if model.replayURL != nil { return "replay ready" }
+        if model.lastSessionDirectory != nil { return "session folder ready" }
+        return "no finished session yet"
+    }
+
     /// A Form toggle row with a visible ⓘ info button next to the label. macOS `Form`
     /// only attaches `.help()` tooltips to the switch control, not the label text, so
     /// hovering the label showed nothing. A tap-to-reveal info button is an explicit,
@@ -56,6 +125,23 @@ struct ControlView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(12)
                     .frame(width: 300)
+            }
+        }
+    }
+
+    private struct HealthItem: View {
+        let label: String
+        let value: String
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(value)
+                    .font(.system(.caption, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
         }
     }
