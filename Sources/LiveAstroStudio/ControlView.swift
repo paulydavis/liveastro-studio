@@ -8,6 +8,14 @@ struct ControlView: View {
     private let logDisplayCap = 200
     private let logMinHeight: CGFloat = 120
 
+    private var liveWorkflowDisabled: Bool {
+        model.isRunning || model.importer.isImporting || model.liveSource.isDetecting
+    }
+
+    private var offlineWorkflowDisabled: Bool {
+        model.isRunning || model.importer.isImporting
+    }
+
     /// A Form toggle row with a visible ⓘ info button next to the label. macOS `Form`
     /// only attaches `.help()` tooltips to the switch control, not the label text, so
     /// hovering the label showed nothing. A tap-to-reveal info button is an explicit,
@@ -42,11 +50,112 @@ struct ControlView: View {
         }
     }
 
+    private struct WorkflowActionRow: View {
+        let title: String
+        let subtitle: String
+        let systemImage: String
+        var badge: String?
+        var disabled = false
+        let action: () -> Void
+
+        var body: some View {
+            Button(action: action) {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: systemImage)
+                        .font(.title3)
+                        .frame(width: 26)
+                        .foregroundStyle(disabled ? Color.secondary : Color.accentColor)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 8) {
+                            Text(title)
+                                .font(.headline)
+                            if let badge {
+                                Text(badge)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(.quaternary, in: Capsule())
+                            }
+                        }
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 3)
+                }
+                .contentShape(Rectangle())
+                .padding(.vertical, 4)
+            }
+            .buttonStyle(.plain)
+            .disabled(disabled)
+        }
+    }
+
     var body: some View {
         @Bindable var model = model
         VStack(spacing: 0) {
             ScrollView {
                 Form {
+                    Section("Start Workflow") {
+                        WorkflowActionRow(
+                            title: "Live from Seestar",
+                            subtitle: "Auto-detect the mounted Seestar folder, relay new subs, and start native live stacking.",
+                            systemImage: "dot.radiowaves.left.and.right",
+                            disabled: liveWorkflowDisabled
+                        ) {
+                            model.liveSource.startSeestarLive()
+                        }
+
+                        WorkflowActionRow(
+                            title: "Live from ASIAIR",
+                            subtitle: "Auto-detect the ASIAIR Autorun/Light folder and start native live stacking.",
+                            systemImage: "camera.aperture",
+                            disabled: liveWorkflowDisabled
+                        ) {
+                            model.liveSource.startASIAIRLive()
+                        }
+
+                        WorkflowActionRow(
+                            title: "Live from Folder / NINA",
+                            subtitle: "Watch any folder where NINA or another capture app writes new FITS light frames.",
+                            systemImage: "folder.badge.plus",
+                            disabled: liveWorkflowDisabled
+                        ) {
+                            pickNativeWatchFolderLive()
+                        }
+
+                        WorkflowActionRow(
+                            title: "Watch Siril / External Stacker",
+                            subtitle: "Watch a live_stack FITS output from Siril or another stacker instead of stacking raw subs.",
+                            systemImage: "rectangle.stack.badge.play",
+                            disabled: liveWorkflowDisabled
+                        ) {
+                            pickStackerOutputWatchFolder()
+                        }
+
+                        WorkflowActionRow(
+                            title: "Stack Previous Shoot",
+                            subtitle: "Choose a folder of existing FITS light frames and stack them offline.",
+                            systemImage: "tray.and.arrow.down",
+                            disabled: offlineWorkflowDisabled
+                        ) {
+                            pickImportFolder()
+                        }
+
+                        WorkflowActionRow(
+                            title: "Try Demo",
+                            subtitle: "A built-in sample session is planned; for now use real or previously captured FITS files.",
+                            systemImage: "sparkles",
+                            badge: "coming soon",
+                            disabled: true
+                        ) {}
+                    }
                     Section("Watch Folder") {
                         Picker("Source", selection: $model.sourceMode) {
                             ForEach(AppModel.SourceMode.allCases, id: \.self) { mode in
