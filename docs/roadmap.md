@@ -128,6 +128,13 @@ After the workflow is clearer:
 - optional DMG polish
 - simple public landing page or GitHub visual section
 
+### 9. Test Harness Hygiene
+
+The OBS mock socket should be hardened so overlapping or abandoned test
+receives cannot leak a checked continuation. This is test-only cleanup — the
+production OBS client has a single receive loop — but the default suite should
+eventually run without runtime continuation warnings.
+
 ## Recommended Next Product Slice
 
 After the docs/distribution branch lands, the highest-leverage implementation slice is:
