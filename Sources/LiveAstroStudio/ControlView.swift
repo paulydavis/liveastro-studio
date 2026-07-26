@@ -351,12 +351,12 @@ struct ControlView: View {
                     } label: { Label("Start ASIAIR", systemImage: "camera.aperture") }
                     .help("Auto-detect the ASIAIR's Autorun/Light folder, relay its subs, and begin native stacking — one tap.")
                     .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
-                    Button("Choose Folder…") { pickNativeWatchFolderLive() }
-                        .help("Live-stack subs from any folder your rig writes to (NINA / ASI camera / any incoming-subs folder) — session-scoped from the moment you start.")
+                    Button("Live from Folder / NINA…") { pickNativeWatchFolderLive() }
+                        .help("Live-stack subs from any folder your rig writes to, including NINA or another FITS capture app.")
                         .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
-                    Button("Import Subs…") { pickImportFolder() }
+                    Button("Stack Previous Shoot…") { pickImportFolder() }
                         .disabled(model.isRunning || model.importer.isImporting)
-                        .help("Select a folder of previously captured FITS subs to stack offline, with progress tracking and Cancel support.")
+                        .help("Select a folder of previously captured FITS light frames to stack offline, with progress tracking and Cancel support.")
                 }
                 // Go Live / End Broadcast — decoupled from session start.
                 HStack {
