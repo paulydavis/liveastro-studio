@@ -595,6 +595,8 @@ struct ControlView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Spacer()
+                            Button("Open Sessions Folder") { openSessionsRoot() }
+                                .help("Open the root folder where LiveAstro writes session outputs.")
                             Button("Regenerate Replay…") { pickSessionDirectory() }
                                 .disabled(model.importer.isGeneratingReplay)
                         }
@@ -744,6 +746,17 @@ struct ControlView: View {
     private func openSessionFolder() {
         guard let url = model.lastSessionDirectory else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    private func openSessionsRoot() {
+        let url = model.liveAstroRoot
+        do {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(url)
+            model.log.append("Opened sessions folder")
+        } catch {
+            model.errorMessage = "Could not open sessions folder: \(error.localizedDescription)"
+        }
     }
 
     private func openWatchFolder() {
