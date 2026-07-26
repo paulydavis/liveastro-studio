@@ -73,6 +73,23 @@ final class MasterBuilderTests: XCTestCase {
         for (a, b) in zip(loaded.pixels, master.pixels) { XCTAssertEqual(a, b, accuracy: 1e-5) }
     }
 
+    func testSavedNormalizedFlatRoundTripPreservesValuesAboveOne() throws {
+        let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
+        let flat = AstroImage(width: 2, height: 2, channels: 1,
+                              pixels: [0.4, 0.8, 1.2, 1.6], sourceIsLinear: true)
+        let url = dir.appendingPathComponent("master_flat.fit")
+        try MasterBuilder.save(flat, to: url)
+
+        let loaded = try MasterBuilder.load(url)
+
+        XCTAssertEqual(loaded.width, 2)
+        XCTAssertEqual(loaded.height, 2)
+        XCTAssertEqual(loaded.channels, 1)
+        for (got, expected) in zip(loaded.pixels, flat.pixels) {
+            XCTAssertEqual(got, expected, accuracy: 1e-5)
+        }
+    }
+
     func testNormalizedFlatMakesMedianOne() throws {
         // pixels [1, 2, 3, 4] → median = (2+3)/2 = 2.5 → normalized [0.4, 0.8, 1.2, 1.6]
         let input = AstroImage(width: 2, height: 2, channels: 1,

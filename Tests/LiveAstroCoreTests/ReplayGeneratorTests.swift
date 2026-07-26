@@ -74,6 +74,20 @@ final class ReplayGeneratorTests: XCTestCase {
         }
     }
 
+    func testExistingReplaySurvivesFailedRender() throws {
+        let existing = tmp.appendingPathComponent("replay.mp4")
+        let oldBytes = Data("old durable replay".utf8)
+        try oldBytes.write(to: existing)
+
+        let missing = tmp.appendingPathComponent("missing.png")
+        XCTAssertThrowsError(try ReplayGenerator().render(
+            keyframes: [ReplayKeyframe(imageURL: missing, caption: "x")],
+            to: existing))
+
+        XCTAssertEqual(try Data(contentsOf: existing), oldBytes,
+                       "Replay generation must publish only after a successful render; failed renders must not delete or truncate the sealed replay.")
+    }
+
     func testColorChannelsNotSwapped() throws {
         let url = tmp.appendingPathComponent("red.png")
         try writePNG(to: url, r: 1.0, g: 0.0, b: 0.0, width: 320, height: 180)

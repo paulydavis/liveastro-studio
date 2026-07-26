@@ -481,11 +481,7 @@ public final class FolderFrameSource: FrameSource {
 
         let timestamp: Date
         if let dateStr = dateObs {
-            let fmtFractional = ISO8601DateFormatter()
-            fmtFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let fmtPlain = ISO8601DateFormatter()
-            fmtPlain.formatOptions = [.withInternetDateTime]
-            if let d = fmtFractional.date(from: dateStr) ?? fmtPlain.date(from: dateStr) {
+            if let d = parseDateObs(dateStr) {
                 timestamp = d
             } else {
                 timestamp = modDate(url: url)
@@ -504,5 +500,30 @@ public final class FolderFrameSource: FrameSource {
     private static func modDate(url: URL) -> Date {
         (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
             ?? Date()
+    }
+
+    private static func parseDateObs(_ raw: String) -> Date? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fmtFractional = ISO8601DateFormatter()
+        fmtFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let fmtPlain = ISO8601DateFormatter()
+        fmtPlain.formatOptions = [.withInternetDateTime]
+        if let d = fmtFractional.date(from: trimmed) ?? fmtPlain.date(from: trimmed) {
+            return d
+        }
+
+        // FITS DATE-OBS commonly omits a timezone designator. Capture tools use UTC
+        // for that form; falling back to file mtime makes snapshot/CSV history lie.
+        let utc = TimeZone(secondsFromGMT: 0)
+        for format in ["yyyy-MM-dd'T'HH:mm:ss.SSSSSS",
+                       "yyyy-MM-dd'T'HH:mm:ss.SSS",
+                       "yyyy-MM-dd'T'HH:mm:ss"] {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = utc
+            formatter.dateFormat = format
+            if let d = formatter.date(from: trimmed) { return d }
+        }
+        return nil
     }
 }

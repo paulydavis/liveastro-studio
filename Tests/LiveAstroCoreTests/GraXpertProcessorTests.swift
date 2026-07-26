@@ -7,14 +7,21 @@ final class GraXpertProcessorTests: XCTestCase {
     final class FakeRunner: ProcessRunner {
         var calls: [[String]] = []
         var exitCodes: [Int32]
-        var writeOutputOnCallIndex: Int?   // create the file named after this call's -output
-        init(exitCodes: [Int32], writeOutputOnCallIndex: Int? = nil) {
-            self.exitCodes = exitCodes; self.writeOutputOnCallIndex = writeOutputOnCallIndex
+        var writeOutputOnCallIndices: Set<Int>   // create the file named after these calls' -output
+        init(exitCodes: [Int32], writeOutputOnCallIndex: Int? = nil, writeOutputOnCallIndices: Set<Int>? = nil) {
+            self.exitCodes = exitCodes
+            if let writeOutputOnCallIndices {
+                self.writeOutputOnCallIndices = writeOutputOnCallIndices
+            } else if let writeOutputOnCallIndex {
+                self.writeOutputOnCallIndices = [writeOutputOnCallIndex]
+            } else {
+                self.writeOutputOnCallIndices = []
+            }
         }
         func run(executable: URL, arguments: [String], log: ((String)->Void)?) throws -> Int32 {
             let idx = calls.count
             calls.append(arguments)
-            if writeOutputOnCallIndex == idx, let oi = arguments.firstIndex(of: "-output"), oi+1 < arguments.count {
+            if writeOutputOnCallIndices.contains(idx), let oi = arguments.firstIndex(of: "-output"), oi+1 < arguments.count {
                 FileManager.default.createFile(atPath: arguments[oi+1], contents: Data("fake".utf8))
             }
             return idx < exitCodes.count ? exitCodes[idx] : 0
@@ -29,13 +36,29 @@ final class GraXpertProcessorTests: XCTestCase {
         func run(executable: URL, arguments: [String], log: ((String)->Void)?) throws -> Int32 {
             let idx = calls.count
             calls.append(arguments)
-            // On the second call (denoising), write <output-stem>.fits instead of .fit
-            if idx == 1, let oi = arguments.firstIndex(of: "-output"), oi+1 < arguments.count {
+            // Write <output-stem>.fits instead of .fit on every successful step.
+            if let oi = arguments.firstIndex(of: "-output"), oi+1 < arguments.count {
                 let requestedURL = URL(fileURLWithPath: arguments[oi+1])
                 let fitsURL = requestedURL.deletingPathExtension().appendingPathExtension("fits")
                 FileManager.default.createFile(atPath: fitsURL.path, contents: Data("fake".utf8))
             }
             return idx < exitCodes.count ? exitCodes[idx] : 0
+        }
+    }
+
+    // Fake runner for the installed GraXpert behavior observed in the cold review:
+    // every requested -output path receives an appended ".fits" suffix.
+    final class AppendingFitsFakeRunner: ProcessRunner {
+        var calls: [[String]] = []
+        func run(executable: URL, arguments: [String], log: ((String) -> Void)?) throws -> Int32 {
+            calls.append(arguments)
+            if let oi = arguments.firstIndex(of: "-output"), oi + 1 < arguments.count {
+                let requestedURL = URL(fileURLWithPath: arguments[oi + 1])
+                FileManager.default.createFile(
+                    atPath: requestedURL.path + ".fits",
+                    contents: Data("fake".utf8))
+            }
+            return 0
         }
     }
 
@@ -51,7 +74,7 @@ final class GraXpertProcessorTests: XCTestCase {
     override func tearDownWithError() throws { try? FileManager.default.removeItem(at: tmp) }
 
     func testRunsBgThenDenoiseWithExpectedArgs() throws {
-        let runner = FakeRunner(exitCodes: [0, 0], writeOutputOnCallIndex: 1)
+        let runner = FakeRunner(exitCodes: [0, 0], writeOutputOnCallIndices: [0, 1])
         let exe = URL(fileURLWithPath: "/Applications/GraXpert.app/Contents/MacOS/GraXpert")
         let proc = GraXpertProcessor(executable: exe, runner: runner, denoiseStrength: 0.5)
         let master = tmp.appendingPathComponent("master.fit")
@@ -105,6 +128,27 @@ final class GraXpertProcessorTests: XCTestCase {
         // The .fit itself should not exist; the .fits sibling should.
         XCTAssertFalse(FileManager.default.fileExists(atPath: out.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: out.deletingPathExtension().appendingPathExtension("fits").path))
+    }
+
+    func testAcceptsGraXpertAppendedFitsOutputsAndCleansBackgroundTemp() throws {
+        let runner = AppendingFitsFakeRunner()
+        let proc = GraXpertProcessor(executable: exeFile, runner: runner)
+        let master = tmp.appendingPathComponent("master.fit")
+        let out = tmp.appendingPathComponent("master_processed.fit")
+
+        XCTAssertNoThrow(try proc.process(masterURL: master, outputURL: out, log: nil))
+
+        XCTAssertEqual(runner.calls.count, 2)
+        let bgOutIdx = runner.calls[0].firstIndex(of: "-output")!
+        let bgRequested = URL(fileURLWithPath: runner.calls[0][bgOutIdx + 1])
+        XCTAssertFalse(bgRequested.lastPathComponent.hasPrefix("._"),
+                       "GraXpert temps must be visible, normal files so cleanup and debugging can see them.")
+        XCTAssertEqual(runner.calls[1].last, bgRequested.path + ".fits",
+                       "Denoising must consume the actual background output GraXpert wrote, not the requested stem.")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bgRequested.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bgRequested.path + ".fits"),
+                       "The real appended background temp must be cleaned up.")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: out.path + ".fits"))
     }
 
     func testIsAvailableReflectsExecutableExistence() {

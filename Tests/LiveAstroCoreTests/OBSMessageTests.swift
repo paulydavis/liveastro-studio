@@ -156,4 +156,11 @@ final class OBSMessageTests: XCTestCase {
     func testParseInvalidJSON() {
         XCTAssertNil(OBSMessage.parse("not json at all"))
     }
+
+    func testMalformedHelloPayloadReturnsUnknownInsteadOfRaisingException() {
+        let frame = OBSMessage.parse(#"{"op":0,"d":null}"#)
+        guard case .unknown = frame else {
+            return XCTFail("Expected .unknown, got \(String(describing: frame))")
+        }
+    }
 }

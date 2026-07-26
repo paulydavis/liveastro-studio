@@ -8,8 +8,17 @@ public protocol ProcessRunner {
     func run(executable: URL, arguments: [String], log: ((String) -> Void)?) throws -> Int32
 }
 
+public enum ProcessRunnerError: Error, Equatable {
+    case timedOut(seconds: TimeInterval)
+}
+
 public struct FoundationProcessRunner: ProcessRunner {
-    public init() {}
+    private let timeoutSeconds: TimeInterval
+
+    public init(timeoutSeconds: TimeInterval = 60) {
+        self.timeoutSeconds = timeoutSeconds
+    }
+
     public func run(executable: URL, arguments: [String], log: ((String) -> Void)?) throws -> Int32 {
         let process = Process()
         process.executableURL = executable
@@ -17,21 +26,41 @@ public struct FoundationProcessRunner: ProcessRunner {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        if let log {
-            pipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                if !data.isEmpty {
-                    let s = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? "«non-UTF-8 output»"
-                    s.split(separator: "\n").forEach { log(String($0)) }
-                }
+        let handle = pipe.fileHandleForReading
+        handle.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            guard let log else { return }   // still drain when logs are disabled
+            let s = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? "«non-UTF-8 output»"
+            s.split(separator: "\n").forEach { log(String($0)) }
+        }
+        defer {
+            handle.readabilityHandler = nil
+            try? handle.close()
+        }
+        let finished = DispatchSemaphore(value: 0)
+        let waiter = DispatchQueue(label: "LiveAstro.ProcessRunner.wait")
+        var waitStarted = false
+        func waitForExit() {
+            guard !waitStarted else { return }
+            waitStarted = true
+            waiter.async {
+                process.waitUntilExit()
+                finished.signal()
             }
         }
         try process.run()
-        process.waitUntilExit()
-        pipe.fileHandleForReading.readabilityHandler = nil
+        waitForExit()
+        if finished.wait(timeout: .now() + timeoutSeconds) == .timedOut {
+            if process.isRunning {
+                process.terminate()
+            }
+            _ = finished.wait(timeout: .now() + 2)
+            throw ProcessRunnerError.timedOut(seconds: timeoutSeconds)
+        }
         // Drain any bytes the async handler didn't deliver (process has exited; no block risk).
         if let log {
-            let tail = pipe.fileHandleForReading.readDataToEndOfFile()
+            let tail = handle.readDataToEndOfFile()
             if !tail.isEmpty {
                 let s = String(data: tail, encoding: .utf8) ?? String(data: tail, encoding: .isoLatin1) ?? "«non-UTF-8 output»"
                 s.split(separator: "\n").forEach { log(String($0)) }

@@ -758,7 +758,7 @@ struct ControlView: View {
         panel.prompt = "Watch"
         if panel.runModal() == .OK, let url = panel.url {
             model.sourceMode = sourceMode
-            model.liveSource.startWatchFolderLive(source: url)
+            model.liveSource.startWatchFolderLive(source: url, sourceMode: sourceMode)
         }
     }
 

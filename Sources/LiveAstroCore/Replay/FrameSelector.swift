@@ -82,13 +82,27 @@ public enum FrameSelector {
         // relative deviation would explode, so keep everything instead.
         let minimumMeaningfulMedian = 1e-12
         var kept: [Int] = [0]
+        var pendingHighStep: [Int] = []
         for i in 1..<(medians.count - 1) {
             let window = kept.suffix(baselineWindow).map { medians[$0] }
             let sorted = window.sorted()
             let baseline = sorted[sorted.count / 2]
             guard baseline > minimumMeaningfulMedian else { kept.append(i); continue }
-            let deviation = abs(medians[i] - baseline) / baseline
-            if deviation <= deviationThreshold { kept.append(i) }
+            let highDeviation = (medians[i] - baseline) / baseline
+            if highDeviation <= deviationThreshold {
+                pendingHighStep.removeAll()
+                kept.append(i)
+            } else {
+                pendingHighStep.append(i)
+                if pendingHighStep.count >= baselineWindow {
+                    // A short high-median excursion is a likely cloud/haze regression and stays
+                    // out of the replay. A sustained regime change (moonrise, target transition,
+                    // reseed, or long transparency shift) must be adopted or the frozen baseline
+                    // rejects the rest of the night.
+                    kept.append(contentsOf: pendingHighStep)
+                    pendingHighStep.removeAll()
+                }
+            }
         }
         kept.append(medians.count - 1)
         return kept

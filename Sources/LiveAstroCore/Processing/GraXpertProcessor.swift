@@ -23,23 +23,40 @@ public struct GraXpertProcessor: Processor {
     public func process(masterURL: URL, outputURL: URL, log: ((String) -> Void)?) throws {
         guard isAvailable else { throw ProcessorError.notAvailable }
         let bgTmp = outputURL.deletingLastPathComponent()
-            .appendingPathComponent("._graxpert_bg_\(UUID().uuidString).fits")
-        defer { try? fileManager.removeItem(at: bgTmp) }
+            .appendingPathComponent("graxpert-bg-\(UUID().uuidString).fits")
+        defer {
+            for url in outputVariants(for: bgTmp) {
+                try? fileManager.removeItem(at: url)
+            }
+        }
 
         let bgArgs = ["-cli", "-cmd", "background-extraction", "-gpu", "false",
                       "-output", bgTmp.path, masterURL.path]
         let c1 = try runner.run(executable: executable, arguments: bgArgs, log: log)
         guard c1 == 0 else { throw ProcessorError.stepFailed(cmd: "background-extraction", code: c1) }
+        guard let bgOutput = firstExistingOutput(for: bgTmp) else { throw ProcessorError.noOutput }
 
         let strength = String(format: "%g", denoiseStrength)   // 0.5 -> "0.5"
         let dnArgs = ["-cli", "-cmd", "denoising", "-strength", strength, "-gpu", "false",
-                      "-output", outputURL.path, bgTmp.path]
+                      "-output", outputURL.path, bgOutput.path]
         let c2 = try runner.run(executable: executable, arguments: dnArgs, log: log)
         guard c2 == 0 else { throw ProcessorError.stepFailed(cmd: "denoising", code: c2) }
 
-        let altOutput = outputURL.deletingPathExtension().appendingPathExtension("fits")
-        guard fileManager.fileExists(atPath: outputURL.path) || fileManager.fileExists(atPath: altOutput.path) else {
+        guard firstExistingOutput(for: outputURL) != nil else {
             throw ProcessorError.noOutput
         }
+    }
+
+    private func firstExistingOutput(for requested: URL) -> URL? {
+        outputVariants(for: requested).first { fileManager.fileExists(atPath: $0.path) }
+    }
+
+    private func outputVariants(for requested: URL) -> [URL] {
+        var variants = [requested]
+        let replaced = requested.deletingPathExtension().appendingPathExtension("fits")
+        if replaced.path != requested.path { variants.append(replaced) }
+        let appended = URL(fileURLWithPath: requested.path + ".fits")
+        if !variants.contains(appended) { variants.append(appended) }
+        return variants
     }
 }

@@ -251,10 +251,13 @@ final class AppModel {
     func applyDisplayAdjustments() {
         saveSettings()
         guard let pipeline else { return }
-        let now = Date()
-        guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else { return }
-        lastAdjustmentRender = now
         let adj = displayAdjustments
+        pipeline.displayAdjustments = adj
+        let now = Date()
+        guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else {
+            return   // throttle re-render only; the pipeline state was already updated above
+        }
+        lastAdjustmentRender = now
         Task.detached { [weak self] in
             // Swift 6: rebind weak self to an immutable strong let up front — nested
             // @Sendable closures may not reference a captured *var* (a weak binding).
@@ -325,9 +328,10 @@ final class AppModel {
             calWarnings.forEach { log.append("⚠ \($0)") }
             CalibrationStore.save(calibration, to: .standard)
             p = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
-                               rootDirectory: root, neutralizeBackground: neutralizeBackground,
+                rootDirectory: root, neutralizeBackground: neutralizeBackground,
                                calibrator: calibrator)
         }
+        p.displayAdjustments = displayAdjustments
 
         acceptedCount = 0
         rejectedCount = 0

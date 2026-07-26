@@ -114,4 +114,20 @@ final class FrameSelectorTests: XCTestCase {
         let kept = FrameSelector.qualityGate(medians: medians)
         XCTAssertEqual(kept, [0, 1, 2, 3, 7, 8, 9])
     }
+
+    func testQualityGateKeepsPersistentImprovementStep() {
+        let medians = [0.030, 0.030, 0.029, 0.029] + [Double](repeating: 0.012, count: 20)
+        XCTAssertEqual(FrameSelector.qualityGate(medians: medians), Array(medians.indices),
+                       "A persistent background improvement is not a cloud regression and must not gut the replay.")
+    }
+
+    func testQualityGateAdoptsPersistentHigherBackgroundAfterShortHoldoff() {
+        let medians = [0.020, 0.020, 0.020, 0.020] + [Double](repeating: 0.055, count: 30)
+        let kept = FrameSelector.qualityGate(medians: medians)
+
+        XCTAssertEqual(kept.first, 0)
+        XCTAssertEqual(kept.last, medians.count - 1)
+        XCTAssertGreaterThan(kept.count, 20,
+                             "A persistent median step may lose the transition, but it must not reject the rest of the session.")
+    }
 }

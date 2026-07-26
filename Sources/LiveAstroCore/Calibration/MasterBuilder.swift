@@ -93,7 +93,7 @@ public enum MasterBuilder {
     /// Load a pre-built master as a canonical top-down AstroImage.
     public static func load(_ url: URL) throws -> AstroImage {
         let data = try Data(contentsOf: url)
-        let img = try FITSReader.read(data, normalizeRowOrder: true)
+        let img = try FITSReader.readLinear(data, normalizeRowOrder: true)
         // Master frames are always linear calibration data (dark/flat/bias-or-dark-flat),
         // never raw Bayer.
         return AstroImage(width: img.width, height: img.height, channels: img.channels,

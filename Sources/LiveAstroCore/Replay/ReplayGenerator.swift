@@ -43,6 +43,19 @@ public final class ReplayGenerator {
     }
 
     public func render(keyframes: [ReplayKeyframe], to outputURL: URL) throws {
+        let directory = outputURL.deletingLastPathComponent()
+        let tempURL = directory.appendingPathComponent(".replay-\(UUID().uuidString).mp4")
+        do {
+            try renderDirect(keyframes: keyframes, to: tempURL)
+            try? FileManager.default.removeItem(at: outputURL)
+            try FileManager.default.moveItem(at: tempURL, to: outputURL)
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            throw error
+        }
+    }
+
+    private func renderDirect(keyframes: [ReplayKeyframe], to outputURL: URL) throws {
         guard !keyframes.isEmpty else { throw ReplayError.noKeyframes }
         try? FileManager.default.removeItem(at: outputURL)
 

@@ -53,7 +53,7 @@ final class LiveSourceController {
         }
     }
 
-    func startWatchFolderLive(source: URL) {
+    func startWatchFolderLive(source: URL, sourceMode: AppModel.SourceMode = .nativeStack) {
         guard !surface.isSessionRunning(), !surface.isImporting(), !isDetecting else { return }
         surface.resetZoomPan?()
         isDetecting = true
@@ -63,14 +63,15 @@ final class LiveSourceController {
             let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: source)   // SMB header read, off main
             await MainActor.run {
                 self.isDetecting = false
-                self.configureAndStartWatchFolder(source: source, meta: meta)
+                self.configureAndStartWatchFolder(source: source, sourceMode: sourceMode, meta: meta)
             }
         }
     }
 
     private func configureAndStartWatchFolder(source: URL,
+                                              sourceMode: AppModel.SourceMode,
                                               meta: (object: String?, exposureSeconds: Double?, fileExtension: String)?) {
-        var profile = DetectedProfile(sourceMode: .nativeStack, neutralizeBackground: true)
+        var profile = DetectedProfile(sourceMode: sourceMode, neutralizeBackground: true)
         if let object = meta?.object, !object.isEmpty { profile.targetName = object }        // else keep form value
         if let exp = meta?.exposureSeconds, exp > 0 { profile.subExposureText = String(format: "%g", exp) }
         surface.applyDetectedProfile?(profile)

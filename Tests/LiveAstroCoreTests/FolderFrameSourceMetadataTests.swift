@@ -20,4 +20,26 @@ final class FolderFrameSourceMetadataTests: XCTestCase {
         XCTAssertEqual(frame.metadata?.ra ?? 0, 314.36667, accuracy: 1e-5)
         XCTAssertEqual(frame.metadata?.filter, "LP")
     }
+
+    func testDateObsWithoutTimezoneParsesAsUTCInsteadOfFallingBackToFileMTime() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        var metadata = SourceMetadata()
+        metadata.dateObs = "2026-07-10T03:51:36.210844"
+        let url = dir.appendingPathComponent("Light_dateobs.fit")
+        let fits = FITSWriter.float32(width: 2, height: 2, channels: 1,
+                                      pixels: [0.1, 0.2, 0.3, 0.4],
+                                      metadata: metadata)
+        try fits.write(to: url)
+        let fallbackMTime = Date(timeIntervalSince1970: 100)
+        try FileManager.default.setAttributes([.modificationDate: fallbackMTime],
+                                              ofItemAtPath: url.path)
+
+        let frame = try FolderFrameSource.loadRawFrame(url: url)
+
+        XCTAssertEqual(frame.timestamp.timeIntervalSince1970, 1_783_655_496.210844, accuracy: 0.001)
+        XCTAssertNotEqual(frame.timestamp, fallbackMTime)
+    }
 }

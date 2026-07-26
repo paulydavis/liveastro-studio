@@ -25,6 +25,21 @@ final class FITSReaderTests: XCTestCase {
         for (a, b) in zip(img.pixels, px) { XCTAssertEqual(a, b, accuracy: 1e-6) }
     }
 
+    func testReadAcceptsDataSliceWithNonZeroStartIndex() throws {
+        let px: [Float] = [0.1, 0.2, 0.3, 0.4]
+        let data = FITSWriter.float32(width: 2, height: 2, channels: 1, pixels: px)
+        let prefixed = Data([0x00, 0x01, 0x02]) + data
+        let slice = prefixed[3..<prefixed.count]
+
+        let img = try FITSReader.read(slice)
+
+        XCTAssertEqual(img.width, 2)
+        XCTAssertEqual(img.height, 2)
+        for (got, expected) in zip(img.pixels, px) {
+            XCTAssertEqual(got, expected, accuracy: 1e-6)
+        }
+    }
+
     func testFloat32RoundTripRGB() throws {
         let px = (0..<12).map { Float($0) / 11.0 }
         let data = FITSWriter.float32(width: 2, height: 2, channels: 3, pixels: Array(px))
@@ -58,6 +73,31 @@ final class FITSReaderTests: XCTestCase {
         let img = try FITSReader.read(data)
         XCTAssertEqual(img.pixels[0], 0.0, accuracy: 1e-4)
         XCTAssertEqual(img.pixels[1], 1.0, accuracy: 1e-4)
+    }
+
+    func testBZeroAndBScaleAcceptFitsDExponent() throws {
+        let data = FITSTestBuilder.header(cards: [
+            ("SIMPLE", "T"), ("BITPIX", "16"), ("NAXIS", "2"),
+            ("NAXIS1", "1"), ("NAXIS2", "1"),
+            ("BZERO", "3.2768D+04"), ("BSCALE", "1.0D+00"),
+        ]) + Data(repeating: 0, count: 2880)
+
+        let header = try FITSReader.readHeader(data)
+
+        XCTAssertEqual(header.bzero, 32768, accuracy: 1e-9)
+        XCTAssertEqual(header.bscale, 1, accuracy: 1e-9)
+    }
+
+    func testMalformedBZeroThrowsInsteadOfDefaultingToZero() {
+        let data = FITSTestBuilder.header(cards: [
+            ("SIMPLE", "T"), ("BITPIX", "16"), ("NAXIS", "2"),
+            ("NAXIS1", "1"), ("NAXIS2", "1"),
+            ("BZERO", "not-a-number"),
+        ]) + Data(repeating: 0, count: 2880)
+
+        XCTAssertThrowsError(try FITSReader.readHeader(data)) {
+            XCTAssertEqual($0 as? FITSError, .malformedHeader("bad BZERO"))
+        }
     }
 
     func testUnsupportedBitpixThrows() {

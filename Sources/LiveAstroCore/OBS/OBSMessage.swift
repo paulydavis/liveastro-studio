@@ -90,7 +90,7 @@ public enum OBSMessage {
 
         switch OBSOpCode(rawValue: op) {
         case .hello:
-            guard let dVal = obj["d"] else { return .unknown }
+            guard let dVal = obj["d"] as? [String: Any] else { return .unknown }
             do {
                 let dData = try JSONSerialization.data(withJSONObject: dVal)
                 let hello = try JSONDecoder().decode(OBSHello.self, from: dData)

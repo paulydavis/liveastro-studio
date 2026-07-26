@@ -35,6 +35,29 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertTrue(lines.contains("gamma"), "lines: \(lines)")
     }
 
+    func testDrainsLargeOutputWhenLogIsNil() throws {
+        let runner = FoundationProcessRunner(timeoutSeconds: 5)
+        let code = try runner.run(
+            executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "yes x | head -c 200000"],
+            log: nil
+        )
+        XCTAssertEqual(code, 0)
+    }
+
+    func testTimeoutTerminatesHungChild() throws {
+        let runner = FoundationProcessRunner(timeoutSeconds: 0.2)
+        let start = Date()
+        XCTAssertThrowsError(try runner.run(
+            executable: URL(fileURLWithPath: "/bin/sleep"),
+            arguments: ["5"],
+            log: nil
+        )) {
+            XCTAssertEqual($0 as? ProcessRunnerError, .timedOut(seconds: 0.2))
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 2.0)
+    }
+
     // A fake conforming type proves the protocol is injectable (used heavily in Task 3).
     private class FakeRunner: ProcessRunner {
         var recorded: [(URL, [String])] = []

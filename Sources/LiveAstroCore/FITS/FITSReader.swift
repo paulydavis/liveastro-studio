@@ -10,6 +10,7 @@ public enum FITSReader {
     static let cardsPerBlock = blockSize / cardSize   // 36
 
     public static func readHeader(_ data: Data) throws -> FITSHeader {
+        let data = data.startIndex == 0 ? data : Data(data)
         if data.count < 6 {
             throw FITSError.truncatedHeader
         }
@@ -66,8 +67,8 @@ public enum FITSReader {
             guard !overflow else { throw FITSError.malformedHeader("implausible dimensions") }
             totalBytes = product
         }
-        let bscale = cards["BSCALE"].flatMap(Double.init) ?? 1
-        let bzero = cards["BZERO"].flatMap(Double.init) ?? 0
+        let bscale = try doubleValue("BSCALE", default: 1, cards: cards)
+        let bzero = try doubleValue("BZERO", default: 0, cards: cards)
         let bottomUp = (cards["ROWORDER"] ?? "BOTTOM-UP").uppercased() != "TOP-DOWN"
         return FITSHeader(bitpix: bitpix, dims: dims, bscale: bscale, bzero: bzero,
                           bottomUp: bottomUp, headerBytes: headerBytes!, keywords: cards)
@@ -108,6 +109,22 @@ public enum FITSReader {
     }
 
     public static func read(_ data: Data, normalizeRowOrder: Bool = true) throws -> FITSImage {
+        try read(data, normalizeRowOrder: normalizeRowOrder, clampToDisplayRange: true)
+    }
+
+    /// Read FITS pixels as linear data without clamping finite values to the display 0…1 range.
+    ///
+    /// Calibration masters can legitimately contain flat-normalization values above 1.0
+    /// (and finite signed values in other calibration data). The default `read` entry point
+    /// keeps its normalized-display contract; this entry point is for calibration/math paths.
+    public static func readLinear(_ data: Data, normalizeRowOrder: Bool = true) throws -> FITSImage {
+        try read(data, normalizeRowOrder: normalizeRowOrder, clampToDisplayRange: false)
+    }
+
+    private static func read(_ data: Data,
+                             normalizeRowOrder: Bool,
+                             clampToDisplayRange: Bool) throws -> FITSImage {
+        let data = data.startIndex == 0 ? data : Data(data)
         let h = try readHeader(data)
         guard data.count >= h.minimumFileSize else {
             throw FITSError.truncatedData(expected: h.minimumFileSize, actual: data.count)
@@ -146,10 +163,19 @@ public enum FITSReader {
                 preconditionFailure("validated in readHeader")
             }
         }
-        // Clamp all pixel values to normalized 0…1 range (FITSImage contract).
         // Swift's min/max do NOT clamp NaN (comparisons with NaN are false), so
         // non-finite samples (NaN/±Inf from BITPIX -32/-64 data) map to 0 explicitly.
-        for i in 0..<n { px[i] = px[i].isFinite ? min(max(px[i], 0), 1) : 0 }
+        // The default reader also clamps to the normalized display 0…1 range; linear
+        // calibration reads preserve finite values outside that range.
+        for i in 0..<n {
+            guard px[i].isFinite else {
+                px[i] = 0
+                continue
+            }
+            if clampToDisplayRange {
+                px[i] = min(max(px[i], 0), 1)
+            }
+        }
 
         if h.bottomUp && normalizeRowOrder {
             let plane = h.width * h.height
@@ -162,5 +188,18 @@ public enum FITSReader {
             }
         }
         return FITSImage(width: h.width, height: h.height, channels: h.channels, pixels: px)
+    }
+
+    private static func doubleValue(_ key: String,
+                                    default defaultValue: Double,
+                                    cards: [String: String]) throws -> Double {
+        guard let raw = cards[key] else { return defaultValue }
+        let fitsNumber = raw
+            .replacingOccurrences(of: "D", with: "E")
+            .replacingOccurrences(of: "d", with: "E")
+        guard let value = Double(fitsNumber), value.isFinite else {
+            throw FITSError.malformedHeader("bad \(key)")
+        }
+        return value
     }
 }
