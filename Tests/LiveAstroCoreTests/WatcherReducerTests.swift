@@ -2143,7 +2143,9 @@ final class WatcherReducerTests: XCTestCase {
             generation: FolderGeneration(rawValue: 1),
             candidate: candidate)
         var pausedClock = VictimBlockingClock(startNanos: 10, deadlineNanos: 30_000_000_010)
-        pausedClock.pause(at: 20)
+        pausedClock.pause(
+            at: 20,
+            chargedUnder: ChargingBlocker(name: blocker, revision: "00001"))
         var reducer = makeReducer(
             files: [blocker: .ready(candidate)],
             victimClocks: [victim: pausedClock])
@@ -2154,6 +2156,55 @@ final class WatcherReducerTests: XCTestCase {
 
         XCTAssertNil(reducer.state.generation.ordering.victimClocks[victim],
                      "when the blocker emits after its victim disappeared, the paused victim clock is stale")
+    }
+
+    func testLowerEmissionDoesNotClearPausedClockChargedUnderLaterBlocker() {
+        let lower = revisionName("00003")
+        let blocker = revisionName("00005")
+        let victim = revisionName("00006")
+        let lowerIdentity = makeIdentity(3)
+        let victimIdentity = makeIdentity(6)
+        let lowerCandidate = makeCandidate(
+            name: lower,
+            identity: lowerIdentity,
+            digest: "lower",
+            kind: .numbered(revision: "00003"))
+        var reducer = makeReducer(files: [
+            lower: .ready(lowerCandidate),
+            victim: .ready(makeCandidate(
+                name: victim,
+                identity: victimIdentity,
+                digest: "victim",
+                kind: .numbered(revision: "00006"))),
+        ])
+
+        XCTAssertTrue(observeBatch([
+            invalidRevision("00005"),
+            observation(name: victim, revision: "00006", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: 10, reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, blocker)
+
+        let effects = observeBatch([
+            observation(name: lower, revision: "00003", outcome: .identityUnchanged(
+                identity: lowerIdentity)),
+            invalidRevision("00005"),
+            observation(name: victim, revision: "00006", outcome: .absent),
+        ], nowNanos: 20, reducer: &reducer)
+
+        guard case .emit(let lowerIntent) = effects.first else {
+            return XCTFail("ready lower revision should emit before the later blocker")
+        }
+        XCTAssertNil(reducer.state.generation.ordering.activeBlocker)
+        XCTAssertNotNil(reducer.state.generation.ordering.victimClocks[victim],
+                        "the absent victim clock is paused under \(blocker)")
+
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: lowerIntent,
+            outcome: .yielded))).isEmpty)
+
+        XCTAssertNotNil(reducer.state.generation.ordering.victimClocks[victim],
+                        "emitting \(lower) did not resolve \(blocker), so it must not wipe \(victim)'s charged clock")
     }
 
     func testCurrentGenerationRejectedEmissionPreservesReadyStateAndDigest() {

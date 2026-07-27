@@ -27,15 +27,22 @@ struct RevisionOrderingState {
     var victimClocks: [String: VictimBlockingClock] = [:]
 }
 
+struct ChargingBlocker: Equatable {
+    let name: String
+    let revision: String
+}
+
 struct VictimBlockingClock: Equatable {
     var startNanos: UInt64
     var deadlineNanos: UInt64
     var pausedAtNanos: UInt64?
+    var chargingBlocker: ChargingBlocker?
 
-    mutating func pause(at nowNanos: UInt64) {
+    mutating func pause(at nowNanos: UInt64, chargedUnder blocker: ChargingBlocker) {
         if pausedAtNanos == nil {
             pausedAtNanos = nowNanos
         }
+        chargingBlocker = blocker
     }
 
     mutating func resume(at nowNanos: UInt64) {
@@ -46,6 +53,7 @@ struct VictimBlockingClock: Equatable {
         startNanos = startNanos &+ pausedDuration
         deadlineNanos = deadlineNanos &+ pausedDuration
         self.pausedAtNanos = nil
+        chargingBlocker = nil
     }
 }
 
@@ -414,8 +422,14 @@ struct WatcherReducer {
         of candidate: EmissionCandidate
     ) {
         guard case .numbered(let emittedRevision) = candidate.kind else { return }
+        let emitted = (name: candidate.name, revision: emittedRevision)
         for name in Array(state.generation.ordering.victimClocks.keys) {
             guard let victimRevision = revisionOrder.revision(in: name),
+                  let chargingBlocker = state.generation.ordering
+                    .victimClocks[name]?.chargingBlocker,
+                  !revisionOrder.orderedBefore(
+                    emitted,
+                    (name: chargingBlocker.name, revision: chargingBlocker.revision)),
                   revisionOrder.orderedBefore(
                     (name: candidate.name, revision: emittedRevision),
                     (name: name, revision: victimRevision))
@@ -680,12 +694,17 @@ struct WatcherReducer {
             guard shouldPauseVictimClock(
                 named: name,
                 behind: blocker,
-                classifiedByName: classifiedByName)
+                classifiedByName: classifiedByName),
+                let blockerRevision = blocker.revision
             else {
                 state.generation.ordering.victimClocks[name] = nil
                 continue
             }
-            state.generation.ordering.victimClocks[name]?.pause(at: nowNanos)
+            state.generation.ordering.victimClocks[name]?.pause(
+                at: nowNanos,
+                chargedUnder: ChargingBlocker(
+                    name: blocker.observation.name,
+                    revision: blockerRevision))
         }
     }
 
