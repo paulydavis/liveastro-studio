@@ -400,9 +400,9 @@ public enum Debayer {
                     guard y >= 4 && y < h - 4 else { continue }
                     for x in 4..<w-4 {
                         let i = y * w + x
-                        outBuf[          i] = max(0.0, min(1.0, rgbRBuf2[i]))
-                        outBuf[plane   + i] = max(0.0, min(1.0, rgbGBuf2[i]))
-                        outBuf[2*plane + i] = max(0.0, min(1.0, rgbBBuf2[i]))
+                        outBuf[          i] = min(1.0, rgbRBuf2[i])
+                        outBuf[plane   + i] = min(1.0, rgbGBuf2[i])
+                        outBuf[2*plane + i] = min(1.0, rgbBBuf2[i])
                     }
                 }
             }

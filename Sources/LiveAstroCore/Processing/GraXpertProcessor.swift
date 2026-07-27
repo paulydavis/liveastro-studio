@@ -24,13 +24,15 @@ public struct GraXpertProcessor: Processor {
 
     public func process(masterURL: URL, outputURL: URL, log: ((String) -> Void)?) throws -> URL {
         guard isAvailable else { throw ProcessorError.notAvailable }
-        for url in outputVariants(for: outputURL) {
-            try? fileManager.removeItem(at: url)
-        }
+        let workOutputURL = outputURL.deletingLastPathComponent()
+            .appendingPathComponent(".graxpert-output-\(UUID().uuidString).fit")
         let bgTmp = outputURL.deletingLastPathComponent()
             .appendingPathComponent("graxpert-bg-\(UUID().uuidString).fits")
         defer {
             for url in outputVariants(for: bgTmp) {
+                try? fileManager.removeItem(at: url)
+            }
+            for url in outputVariants(for: workOutputURL) {
                 try? fileManager.removeItem(at: url)
             }
         }
@@ -43,14 +45,27 @@ public struct GraXpertProcessor: Processor {
 
         let strength = String(format: "%g", denoiseStrength)   // 0.5 -> "0.5"
         let dnArgs = ["-cli", "-cmd", "denoising", "-strength", strength, "-gpu", "false",
-                      "-output", outputURL.path, bgOutput.path]
+                      "-output", workOutputURL.path, bgOutput.path]
         let c2 = try runner.run(executable: executable, arguments: dnArgs, log: log)
         guard c2 == 0 else { throw ProcessorError.stepFailed(cmd: "denoising", code: c2) }
 
-        guard let produced = firstExistingOutput(for: outputURL) else {
+        guard let produced = firstExistingOutput(for: workOutputURL) else {
             throw ProcessorError.noOutput
         }
-        return produced
+        let finalProduced: URL
+        if produced.path == workOutputURL.path + ".fits" {
+            finalProduced = URL(fileURLWithPath: outputURL.path + ".fits")
+        } else if produced.path == workOutputURL.deletingPathExtension()
+            .appendingPathExtension("fits").path {
+            finalProduced = outputURL.deletingPathExtension().appendingPathExtension("fits")
+        } else {
+            finalProduced = outputURL
+        }
+        for url in outputVariants(for: outputURL) {
+            try? fileManager.removeItem(at: url)
+        }
+        try fileManager.moveItem(at: produced, to: finalProduced)
+        return finalProduced
     }
 
     private func firstExistingOutput(for requested: URL) -> URL? {

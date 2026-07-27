@@ -148,6 +148,16 @@ final class FrameSelectorTests: XCTestCase {
                        "A persistent background improvement is not a cloud regression and must not gut the replay.")
     }
 
+    func testQualityGateAdoptsSustainedLowRegimeAfterReseed() {
+        let medians = [Double](repeating: 0.5, count: 10) + [Double](repeating: 0.05, count: 90)
+        let kept = FrameSelector.qualityGate(medians: medians)
+
+        XCTAssertEqual(kept.first, 0)
+        XCTAssertEqual(kept.last, medians.count - 1)
+        XCTAssertGreaterThan(kept.count, 80,
+                             "A sustained low regime after reseed/target switch must be adopted, not culled forever.")
+    }
+
     func testQualityGateAdoptsPersistentHigherBackgroundAfterShortHoldoff() {
         let medians = [0.020, 0.020, 0.020, 0.020] + [Double](repeating: 0.055, count: 30)
         let kept = FrameSelector.qualityGate(medians: medians)

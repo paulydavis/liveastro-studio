@@ -139,9 +139,9 @@ final class DebayerRCDTests: XCTestCase {
         XCTAssertEqual(rcd.pixels, bil.pixels, "tiny frame: rcd must equal bilinear byte-for-byte")
     }
 
-    // MARK: Output finite and clamped
+    // MARK: Output finite and range handling
 
-    func testOutputFiniteAndClamped() {
+    func testOutputFiniteAndHighCapped() {
         let w = 128, h = 128
         var px = [Float](repeating: 0, count: w * h)
         for i in 0..<px.count {
@@ -155,9 +155,27 @@ final class DebayerRCDTests: XCTestCase {
         let out = Debayer.rcd(cfa: img, pattern: BayerPattern.grbg)
         for (i, v) in out.pixels.enumerated() {
             XCTAssertTrue(v.isFinite, "pixel \(i) is not finite: \(v)")
-            XCTAssertGreaterThanOrEqual(v, 0.0, "pixel \(i) below 0: \(v)")
             XCTAssertLessThanOrEqual(v, 1.0, "pixel \(i) above 1: \(v)")
         }
+    }
+
+    func testRCDPreservesNegativeNoiseFloor() {
+        let w = 32, h = 32
+        let px = [Float](repeating: -0.01, count: w * h)
+        let img = AstroImage(width: w, height: h, channels: 1, pixels: px, sourceIsLinear: true)
+
+        let out = Debayer.rcd(cfa: img, pattern: .grbg)
+        let plane = w * h
+        let interior = (h / 2) * w + (w / 2)
+
+        XCTAssertLessThan(out.pixels[interior], -0.001,
+                          "RCD interior red channel must preserve calibrated negative noise.")
+        XCTAssertLessThan(out.pixels[plane + interior], -0.001,
+                          "RCD interior green channel must preserve calibrated negative noise.")
+        XCTAssertLessThan(out.pixels[2 * plane + interior], -0.001,
+                          "RCD interior blue channel must preserve calibrated negative noise.")
+        XCTAssertTrue(out.pixels.allSatisfy(\.isFinite))
+        XCTAssertLessThanOrEqual(out.pixels.max() ?? 0, 1.0)
     }
 
     // MARK: Star sharper than bilinear

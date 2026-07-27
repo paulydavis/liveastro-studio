@@ -205,8 +205,8 @@ final class WatcherReducerTests: XCTestCase {
         ], nowNanos: 200, reducer: &reducer).isEmpty)
         XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker,
                        revisionName("00001"))
-        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos, 200,
-                       "00002 is now a victim, so its first blocker clock is gone")
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos, 100,
+                       "00003 has been continuously blocked since the first episode; victim clocks survive blocker role changes.")
 
         XCTAssertTrue(observeBatch([
             observation(name: revisionName("00001"), revision: "00001", outcome: .absent),
@@ -216,10 +216,10 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(reducer.state.generation.ordering.activeBlocker,
                        BlockingEpisode(
                         blocker: revisionName("00002"),
-                        startNanos: 300,
-                        deadlineNanos: 300 &+ reducer.blockingBudgetNanos,
+                        startNanos: 100,
+                        deadlineNanos: 100 &+ reducer.blockingBudgetNanos,
                         victims: [revisionName("00003")]),
-                       "the second blocker role starts a new episode at the transition")
+                       "the victim's starvation clock, not the blocker role, defines the episode age")
     }
 
     func testAggregateBlockerChurnDoesNotStarveContinuouslyHeldVictim() {
@@ -265,6 +265,66 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(emittedNames(in: released), [victim])
         XCTAssertEqual(reducer.state.generation.files[firstBlocker], .writtenOff)
         XCTAssertNil(reducer.state.generation.ordering.activeBlocker)
+    }
+
+    func testDisjointBlockerHandoffDoesNotStarveContinuouslyHeldVictim() {
+        let victim = revisionName("00004")
+        let victimIdentity = makeIdentity(4)
+        var reducer = makeReducer(files: [
+            victim: .ready(makeCandidate(
+                name: victim,
+                identity: victimIdentity,
+                digest: "victim",
+                kind: .numbered(revision: "00004"))),
+        ])
+
+        for step in 0..<8 {
+            let blockerRevision = String(format: "%05d", step.isMultiple(of: 2) ? 1 : 2)
+            let otherRevision = String(format: "%05d", step.isMultiple(of: 2) ? 2 : 1)
+            let now = UInt64(step + 1) * 5_000_000_000
+            let effects = observeBatch([
+                invalidRevision(blockerRevision),
+                observation(name: revisionName(otherRevision), revision: otherRevision, outcome: .absent),
+                observation(name: victim, revision: "00004", outcome: .identityUnchanged(
+                    identity: victimIdentity)),
+            ], nowNanos: now, reducer: &reducer)
+
+            if now < 30_000_000_000 {
+                XCTAssertTrue(effects.isEmpty)
+            }
+        }
+
+        XCTAssertTrue(
+            reducer.state.generation.files[revisionName("00001")] == .writtenOff
+                || reducer.state.generation.files[revisionName("00002")] == .writtenOff,
+            "At least one blocker must be written off; alternating names cannot hold \(victim) forever.")
+    }
+
+    func testRoleSwapDoesNotStarveContinuouslyBlockedVictims() {
+        var reducer = makeReducer()
+
+        for step in 0..<10 {
+            let first: [FileObservation]
+            if step.isMultiple(of: 2) {
+                first = [
+                    invalidRevision("00001"),
+                    invalidRevision("00002"),
+                    observation(name: revisionName("00003"), revision: "00003", outcome: .absent),
+                ]
+            } else {
+                first = [
+                    observation(name: revisionName("00001"), revision: "00001", outcome: .absent),
+                    invalidRevision("00002"),
+                    invalidRevision("00003"),
+                ]
+            }
+            _ = observeBatch(first, nowNanos: UInt64(step + 1) * 5_000_000_000, reducer: &reducer)
+        }
+
+        XCTAssertTrue(
+            reducer.state.generation.files[revisionName("00001")] == .writtenOff
+                || reducer.state.generation.files[revisionName("00002")] == .writtenOff,
+            "Alternating blocker/victim roles must not reset every starvation clock forever.")
     }
 
     func testVictimDisappearanceDestroysEpisodeAndReappearanceStartsFresh() {

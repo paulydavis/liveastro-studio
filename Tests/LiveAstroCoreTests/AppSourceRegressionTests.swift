@@ -134,6 +134,10 @@ final class AppSourceRegressionTests: XCTestCase {
             "Import prepare needs a generation token so cancel invalidates detached metadata scans before beginImport."
         )
         XCTAssertTrue(
+            source.contains("private var importPrepareInFlight = false"),
+            "ImportController must distinguish prepare-with-no-pipeline from cancel-drain-with-no-pipeline; double cancel must not unlock UI mid-finalization."
+        )
+        XCTAssertTrue(
             source.contains("beginImport(from: folder, meta: meta, prefix: prefix, generation: generation)"),
             "The detached prepare completion must carry the generation it started under."
         )

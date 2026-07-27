@@ -84,34 +84,38 @@ public enum FrameSelector {
         let minimumRelativeScale = 0.01
         let darkDropoutDeviation = -0.8
         var kept: [Int] = [0]
-        var pendingHighStep: [Int] = []
+        var pendingStep: [Int] = []
+        var pendingSign: Int = 0
         for i in 1..<(medians.count - 1) {
             let window = kept.suffix(baselineWindow).map { medians[$0] }
             let sorted = window.sorted()
             let baseline = sorted[sorted.count / 2]
             let relativeScale = max(abs(baseline), minimumRelativeScale)
-            let highDeviation = (medians[i] - baseline) / relativeScale
-            if highDeviation < darkDropoutDeviation {
-                pendingHighStep.removeAll()
+            let deviation = (medians[i] - baseline) / relativeScale
+            if deviation < darkDropoutDeviation || deviation > deviationThreshold {
+                let sign = deviation > 0 ? 1 : -1
+                if pendingSign != sign {
+                    pendingStep.removeAll()
+                    pendingSign = sign
+                }
+                pendingStep.append(i)
+                if pendingStep.count > baselineWindow {
+                    // A short excursion is a likely cloud/haze/dropout regression and stays
+                    // out of the replay. A sustained regime change (moonrise, target
+                    // transition, reseed, clouded-start clearing, or long transparency shift)
+                    // must be adopted or the frozen baseline rejects the rest of the night.
+                    kept.append(contentsOf: pendingStep)
+                    pendingStep.removeAll()
+                    pendingSign = 0
+                }
                 continue
             }
-            if highDeviation <= deviationThreshold {
-                pendingHighStep.removeAll()
-                kept.append(i)
-            } else {
-                pendingHighStep.append(i)
-                if pendingHighStep.count >= baselineWindow {
-                    // A short high-median excursion is a likely cloud/haze regression and stays
-                    // out of the replay. A sustained regime change (moonrise, target transition,
-                    // reseed, or long transparency shift) must be adopted or the frozen baseline
-                    // rejects the rest of the night.
-                    kept.append(contentsOf: pendingHighStep)
-                    pendingHighStep.removeAll()
-                }
-            }
+            pendingStep.removeAll()
+            pendingSign = 0
+            kept.append(i)
         }
-        if !pendingHighStep.isEmpty {
-            kept.append(contentsOf: pendingHighStep)
+        if !pendingStep.isEmpty {
+            kept.append(contentsOf: pendingStep)
         }
         kept.append(medians.count - 1)
         return kept

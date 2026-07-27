@@ -343,7 +343,7 @@ final class WatcherReducerPropertyTests: XCTestCase {
         }
     }
 
-    func testRoleRoundTripsNeverInheritEpisodeClocks() {
+    func testRoleRoundTripsPreserveOnlyContinuousVictimClocks() {
         var generator = SplitMix64(seed: Self.seed)
         var transition = 0
 
@@ -394,8 +394,8 @@ final class WatcherReducerPropertyTests: XCTestCase {
                 "seed=\(Self.seed) transition=\(transition)")
             XCTAssertEqual(
                 reducer.state.generation.ordering.activeBlocker?.startNanos,
-                thirdTime,
-                "seed=\(Self.seed) transition=\(transition) inherited=\(firstTime)")
+                firstTime,
+                "seed=\(Self.seed) transition=\(transition) victim clock reset unexpectedly")
         }
 
         XCTAssertGreaterThanOrEqual(transition, Self.transitionCount)

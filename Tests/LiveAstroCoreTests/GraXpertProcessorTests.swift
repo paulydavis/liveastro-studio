@@ -93,7 +93,10 @@ final class GraXpertProcessorTests: XCTestCase {
         let bgOutIdx = runner.calls[0].firstIndex(of: "-output")!
         XCTAssertEqual(runner.calls[1].last, runner.calls[0][bgOutIdx+1])  // denoise input == bg output
         let dOutIdx = runner.calls[1].firstIndex(of: "-output")!
-        XCTAssertEqual(runner.calls[1][dOutIdx+1], out.path)
+        XCTAssertTrue(URL(fileURLWithPath: runner.calls[1][dOutIdx+1]).lastPathComponent
+            .hasPrefix(".graxpert-output-"))
+        XCTAssertNotEqual(runner.calls[1][dOutIdx+1], out.path,
+                          "Denoising writes to a temp output so a failed rerun preserves the prior good master.")
         XCTAssertTrue(FileManager.default.fileExists(atPath: out.path))
     }
 
@@ -154,7 +157,7 @@ final class GraXpertProcessorTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: out.path + ".fits"))
     }
 
-    func testRemovesStaleOutputVariantsBeforeProcessing() throws {
+    func testFailedRerunDoesNotDestroyPriorGoodProcessedMaster() throws {
         let stale = tmp.appendingPathComponent("master_processed.fit.fits")
         FileManager.default.createFile(atPath: stale.path, contents: Data("stale".utf8))
         let runner = FakeRunner(exitCodes: [0, 0], writeOutputOnCallIndex: 0)
@@ -165,8 +168,8 @@ final class GraXpertProcessorTests: XCTestCase {
                                               log: nil)) { err in
             XCTAssertEqual(err as? ProcessorError, .noOutput)
         }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path),
-                       "Stale denoise output variants must be removed before running so a failed rerun cannot look successful.")
+        XCTAssertEqual(try Data(contentsOf: stale), Data("stale".utf8),
+                       "A failed rerun must not delete the last good processed master.")
     }
 
     func testIsAvailableReflectsExecutableExistence() {

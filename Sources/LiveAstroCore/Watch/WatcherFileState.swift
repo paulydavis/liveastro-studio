@@ -24,6 +24,12 @@ struct GenerationState {
 
 struct RevisionOrderingState {
     var activeBlocker: BlockingEpisode?
+    var victimClocks: [String: VictimBlockingClock] = [:]
+}
+
+struct VictimBlockingClock: Equatable {
+    let startNanos: UInt64
+    var deadlineNanos: UInt64
 }
 
 enum FileState: Equatable {
@@ -407,6 +413,9 @@ struct WatcherReducer {
                 (name: $0.observation.name, revision: $0.revision),
                 (name: $1.observation.name, revision: $1.revision))
         }
+        for item in classified where !item.isPresent {
+            state.generation.ordering.victimClocks[item.observation.name] = nil
+        }
         var effects = applyMarkDrops(in: classified)
         effects.append(contentsOf: orderedEffects(
             for: classified,
@@ -481,6 +490,7 @@ struct WatcherReducer {
                 && participatesInNumberedOrdering(
                     state.generation.files[item.observation.name])
         }
+        let presentNames = Set(classified.filter(\.isPresent).map(\.observation.name))
         guard revisionOrderingEnabled else {
             state.generation.ordering.activeBlocker = nil
             for item in numbered {
@@ -529,38 +539,33 @@ struct WatcherReducer {
 
             let blocker = potential[blockerIndex]
             let blockerName = blocker.observation.name
-            if let active = state.generation.ordering.activeBlocker,
-               active.blocker != blockerName {
-                if isSameNumericRevision(active.blocker, blockerName) {
-                    state.generation.ordering.activeBlocker = BlockingEpisode(
-                        blocker: blockerName,
+            for victim in victimNames where state.generation.ordering.victimClocks[victim] == nil {
+                if let active = state.generation.ordering.activeBlocker,
+                   active.victims.contains(victim) {
+                    state.generation.ordering.victimClocks[victim] = VictimBlockingClock(
                         startNanos: active.startNanos,
-                        deadlineNanos: active.deadlineNanos,
-                        victims: victimNames)
+                        deadlineNanos: active.deadlineNanos)
                 } else {
-                    let continuouslyHeldVictims = active.victims.intersection(victimNames)
-                    let blockerWasVictim = active.victims.contains(blockerName)
-                    let previousBlockerBecameVictim = victimNames.contains(active.blocker)
-                    let preservesAggregateClock = !continuouslyHeldVictims.isEmpty
-                        && !blockerWasVictim
-                        && !previousBlockerBecameVictim
-                    state.generation.ordering.activeBlocker = BlockingEpisode(
-                        blocker: blockerName,
-                        startNanos: preservesAggregateClock ? active.startNanos : nowNanos,
-                        deadlineNanos: preservesAggregateClock
-                            ? active.deadlineNanos
-                            : nowNanos &+ blockingBudgetNanos,
-                        victims: victimNames)
-                    if !preservesAggregateClock { return effects }
+                    state.generation.ordering.victimClocks[victim] = VictimBlockingClock(
+                        startNanos: nowNanos,
+                        deadlineNanos: nowNanos &+ blockingBudgetNanos)
                 }
-            } else if state.generation.ordering.activeBlocker == nil {
-                state.generation.ordering.activeBlocker = BlockingEpisode(
-                    blocker: blockerName,
-                    startNanos: nowNanos,
-                    deadlineNanos: nowNanos &+ blockingBudgetNanos,
-                    victims: victimNames)
-                return effects
             }
+            state.generation.ordering.victimClocks = state.generation.ordering
+                .victimClocks
+                .filter { name, _ in
+                    victimNames.contains(name) || presentNames.contains(name)
+                }
+
+            let victimClocks = victimNames.compactMap {
+                state.generation.ordering.victimClocks[$0]
+            }
+            state.generation.ordering.activeBlocker = BlockingEpisode(
+                blocker: blockerName,
+                startNanos: victimClocks.map(\.startNanos).min() ?? nowNanos,
+                deadlineNanos: victimClocks.map(\.deadlineNanos).min()
+                    ?? (nowNanos &+ blockingBudgetNanos),
+                victims: victimNames)
 
             guard var episode = state.generation.ordering.activeBlocker else {
                 return effects
@@ -569,17 +574,42 @@ struct WatcherReducer {
                 state.generation.ordering.activeBlocker = nil
                 return effects
             }
-            let ceiling = episode.startNanos &+ blockingCeilingNanos
             if blocker.isConverging {
-                let renewed = min(nowNanos &+ blockingGraceNanos, ceiling)
-                if renewed > episode.deadlineNanos {
-                    episode.deadlineNanos = renewed
+                for victim in victimNames {
+                    guard var clock = state.generation.ordering.victimClocks[victim] else {
+                        continue
+                    }
+                    let victimCeiling = clock.startNanos &+ blockingCeilingNanos
+                    let renewed = min(nowNanos &+ blockingGraceNanos, victimCeiling)
+                    if renewed > clock.deadlineNanos {
+                        clock.deadlineNanos = renewed
+                        state.generation.ordering.victimClocks[victim] = clock
+                    }
                 }
             }
+            let refreshedClocks = victimNames.compactMap {
+                state.generation.ordering.victimClocks[$0]
+            }
+            episode = BlockingEpisode(
+                blocker: blockerName,
+                startNanos: refreshedClocks.map(\.startNanos).min() ?? episode.startNanos,
+                deadlineNanos: refreshedClocks.map(\.deadlineNanos).min()
+                    ?? episode.deadlineNanos,
+                victims: victimNames) ?? episode
             state.generation.ordering.activeBlocker = episode
-            guard nowNanos >= min(episode.deadlineNanos, ceiling) else { return effects }
+            guard victimNames.contains(where: { victim in
+                guard let clock = state.generation.ordering.victimClocks[victim] else {
+                    return false
+                }
+                return nowNanos >= min(
+                    clock.deadlineNanos,
+                    clock.startNanos &+ blockingCeilingNanos)
+            }) else { return effects }
 
             state.generation.files[blockerName] = .writtenOff
+            for victim in victimNames {
+                state.generation.ordering.victimClocks[victim] = nil
+            }
             state.generation.ordering.activeBlocker = nil
             let heldSeconds = Int(
                 (Double(nowNanos &- episode.startNanos) / 1_000_000_000).rounded())

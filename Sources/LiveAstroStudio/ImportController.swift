@@ -36,6 +36,7 @@ final class ImportController {
     /// The active one-shot import pipeline (nil unless an import is draining).
     private var importPipeline: SessionPipeline?
     private var importPrepareGeneration = 0
+    private var importPrepareInFlight = false
 
     init(surface: AppSurface) {
         self.surface = surface
@@ -54,6 +55,7 @@ final class ImportController {
         importTotal = 0
         isImporting = true
         importPrepareGeneration += 1
+        importPrepareInFlight = true
         let generation = importPrepareGeneration
         surface.log("Preparing import from \(folder.path)…")
 
@@ -71,6 +73,7 @@ final class ImportController {
                              prefix: String,
                              generation: Int) {
         guard generation == importPrepareGeneration, isImporting else { return }
+        importPrepareInFlight = false
         guard !surface.isSessionRunning() else {
             surface.presentError("End the session before importing.")
             isImporting = false
@@ -151,8 +154,11 @@ final class ImportController {
 
     func cancelImport() {
         if importPipeline == nil {
-            importPrepareGeneration += 1
-            isImporting = false
+            if importPrepareInFlight {
+                importPrepareGeneration += 1
+                importPrepareInFlight = false
+                isImporting = false
+            }
             return
         }
         importPipeline?.cancelImport()
