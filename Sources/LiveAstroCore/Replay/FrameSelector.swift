@@ -104,6 +104,10 @@ public enum FrameSelector {
                     // out of the replay. A sustained regime change (moonrise, target
                     // transition, reseed, clouded-start clearing, or long transparency shift)
                     // must be adopted or the frozen baseline rejects the rest of the night.
+                    // The strict ">" is intentional: exactly-window-length excursions are
+                    // still treated as transient. A true dome-closure-length dark tail will
+                    // cross this threshold and be documented honestly; short terminal black
+                    // dropouts should not be smuggled in by loop-end cleanup.
                     kept.append(contentsOf: pendingStep)
                     pendingStep.removeAll()
                     pendingSign = 0
@@ -114,7 +118,11 @@ public enum FrameSelector {
             pendingSign = 0
             kept.append(i)
         }
-        if !pendingStep.isEmpty {
+        if !pendingStep.isEmpty && pendingSign > 0 {
+            // Preserve the existing moonrise / bright-tail behavior: if the session ends
+            // during a short high-side shift, include the transition before the mandatory
+            // final frame. Low-side tails need to earn sustained adoption inside the loop;
+            // otherwise a terminal dark dropout becomes a black replay frame.
             kept.append(contentsOf: pendingStep)
         }
         kept.append(medians.count - 1)

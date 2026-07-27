@@ -96,6 +96,17 @@ public enum Debayer {
         let EPS: Float    = 1e-5
         let EPSSQ: Float  = 1e-10
 
+        // RCD's ratio-correction denominators assume a non-negative raw mosaic
+        // (the upstream rcd.cc regime). Calibrated, dark-subtracted frames can
+        // be zero-centered, which lets lpf_i + lpf_neighbor cross zero and
+        // creates huge sign spikes. Shift only those inputs into the original
+        // non-negative regime, run the same algorithm, then remove the pedestal.
+        let minPixel = cfa.pixels.min() ?? 0
+        let pedestal: Float = minPixel < 0 ? max(0.5, -minPixel + 0.5) : 0
+        let workingPixels: [Float] = pedestal > 0
+            ? cfa.pixels.map { $0 + pedestal }
+            : cfa.pixels
+
         // Wrap entire algorithm body in withUnsafeBufferPointer so that all
         // concurrent closures see an UnsafeBufferPointer<Float> (a value type)
         // rather than the Swift Array itself. Swift's exclusivity runtime can
@@ -113,7 +124,7 @@ public enum Debayer {
         var VH_Dir = [Float](repeating: 0, count: plane)
         var PQ_Dir = [Float](repeating: 0, count: plane)
 
-        cfa.pixels.withUnsafeBufferPointer { srcBuf in
+        workingPixels.withUnsafeBufferPointer { srcBuf in
 
         // srcBuf: UnsafeBufferPointer<Float> — value type, safe to copy into parallel
         // closures for concurrent read-only access. Each Parallel.rows body defines
@@ -187,9 +198,9 @@ public enum Debayer {
         }}}}}}
 
         // ── Seed: rgbR = rgbG = rgbB = CFA (matches prototype's array seed) ─────
-        rgbR = cfa.pixels
-        rgbG = cfa.pixels
-        rgbB = cfa.pixels
+        rgbR = workingPixels
+        rgbG = workingPixels
+        rgbB = workingPixels
 
         // ── Step 3: Green at R/B sites — whole image (parallel) ──────────────────
         // Reads only from srcBuf (UBP, immutable), lpf, and VH_Dir — all immutable
@@ -390,7 +401,14 @@ public enum Debayer {
 
         // ── Build output: bilinear border + parallel RCD interior ────────────────
         // Start from bilinear (covers the border); overwrite interior with RCD.
-        out = bilinear(cfa: cfa, pattern: pattern, minRows: minRows).pixels
+        let bilinearSource = AstroImage(
+            width: w,
+            height: h,
+            channels: 1,
+            pixels: workingPixels,
+            sourceIsLinear: cfa.sourceIsLinear)
+        let highCap = 1.0 + pedestal
+        out = bilinear(cfa: bilinearSource, pattern: pattern, minRows: minRows).pixels
         rgbR.withUnsafeBufferPointer { rgbRBuf2 in
         rgbG.withUnsafeBufferPointer { rgbGBuf2 in
         rgbB.withUnsafeBufferPointer { rgbBBuf2 in
@@ -400,15 +418,19 @@ public enum Debayer {
                     guard y >= 4 && y < h - 4 else { continue }
                     for x in 4..<w-4 {
                         let i = y * w + x
-                        outBuf[          i] = min(1.0, rgbRBuf2[i])
-                        outBuf[plane   + i] = min(1.0, rgbGBuf2[i])
-                        outBuf[2*plane + i] = min(1.0, rgbBBuf2[i])
+                        outBuf[          i] = min(highCap, rgbRBuf2[i])
+                        outBuf[plane   + i] = min(highCap, rgbGBuf2[i])
+                        outBuf[2*plane + i] = min(highCap, rgbBBuf2[i])
                     }
                 }
             }
         }}}}
 
-        } // end cfa.pixels.withUnsafeBufferPointer
+        } // end workingPixels.withUnsafeBufferPointer
+
+        if pedestal > 0 {
+            for i in out.indices { out[i] -= pedestal }
+        }
 
         return AstroImage(width: w, height: h, channels: 3, pixels: out,
                           sourceIsLinear: cfa.sourceIsLinear)

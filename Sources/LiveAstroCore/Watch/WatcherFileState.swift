@@ -28,8 +28,25 @@ struct RevisionOrderingState {
 }
 
 struct VictimBlockingClock: Equatable {
-    let startNanos: UInt64
+    var startNanos: UInt64
     var deadlineNanos: UInt64
+    var pausedAtNanos: UInt64?
+
+    mutating func pause(at nowNanos: UInt64) {
+        if pausedAtNanos == nil {
+            pausedAtNanos = nowNanos
+        }
+    }
+
+    mutating func resume(at nowNanos: UInt64) {
+        guard let pausedAtNanos else { return }
+        let pausedDuration = nowNanos >= pausedAtNanos
+            ? nowNanos - pausedAtNanos
+            : 0
+        startNanos = startNanos &+ pausedDuration
+        deadlineNanos = deadlineNanos &+ pausedDuration
+        self.pausedAtNanos = nil
+    }
 }
 
 enum FileState: Equatable {
@@ -362,10 +379,12 @@ struct WatcherReducer {
     }
 
     private mutating func reconcileActiveBlocker(afterEmitting candidate: EmissionCandidate) {
+        state.generation.ordering.victimClocks[candidate.name] = nil
         guard var episode = state.generation.ordering.activeBlocker else { return }
 
         if candidate.name == episode.blocker {
             state.generation.ordering.activeBlocker = nil
+            state.generation.ordering.victimClocks.removeAll()
             return
         }
 
@@ -374,6 +393,7 @@ struct WatcherReducer {
                 state.generation.ordering.activeBlocker = episode
             } else {
                 state.generation.ordering.activeBlocker = nil
+                state.generation.ordering.victimClocks.removeAll()
             }
         }
 
@@ -384,6 +404,7 @@ struct WatcherReducer {
               revisionOrder.compare(blockerRevision, mark) != .orderedDescending
         else { return }
         state.generation.ordering.activeBlocker = nil
+        state.generation.ordering.victimClocks.removeAll()
     }
 
     private struct ClassifiedObservation {
@@ -412,9 +433,6 @@ struct WatcherReducer {
             revisionOrder.orderedBefore(
                 (name: $0.observation.name, revision: $0.revision),
                 (name: $1.observation.name, revision: $1.revision))
-        }
-        for item in classified where !item.isPresent {
-            state.generation.ordering.victimClocks[item.observation.name] = nil
         }
         var effects = applyMarkDrops(in: classified)
         effects.append(contentsOf: orderedEffects(
@@ -451,6 +469,7 @@ struct WatcherReducer {
                 else { continue }
                 state.generation.files[name] = .droppedOutOfOrder
             }
+            state.generation.ordering.victimClocks[name] = nil
             effects.append(.log(
                 "revision \(revision) arrived out of order — skipped (high-water \(mark))"))
         }
@@ -490,9 +509,11 @@ struct WatcherReducer {
                 && participatesInNumberedOrdering(
                     state.generation.files[item.observation.name])
         }
-        let presentNames = Set(classified.filter(\.isPresent).map(\.observation.name))
+        let classifiedByName = Dictionary(
+            uniqueKeysWithValues: classified.map { ($0.observation.name, $0) })
         guard revisionOrderingEnabled else {
             state.generation.ordering.activeBlocker = nil
+            state.generation.ordering.victimClocks.removeAll()
             for item in numbered {
                 appendIntent(
                     named: item.observation.name,
@@ -512,6 +533,7 @@ struct WatcherReducer {
                 readyCandidate(in: state.generation.files[$0.observation.name]) == nil
             }) else {
                 state.generation.ordering.activeBlocker = nil
+                state.generation.ordering.victimClocks.removeAll()
                 for item in potential {
                     appendIntent(
                         named: item.observation.name,
@@ -531,31 +553,41 @@ struct WatcherReducer {
             }
 
             let victimStart = potential.index(after: blockerIndex)
+            let blocker = potential[blockerIndex]
             guard victimStart < potential.endIndex else {
+                retainVictimClocks(
+                    currentVictims: [],
+                    blocker: blocker,
+                    classifiedByName: classifiedByName,
+                    nowNanos: nowNanos)
                 state.generation.ordering.activeBlocker = nil
                 return effects
             }
             let victimNames = Set(potential[victimStart...].map(\.observation.name))
 
-            let blocker = potential[blockerIndex]
             let blockerName = blocker.observation.name
-            for victim in victimNames where state.generation.ordering.victimClocks[victim] == nil {
+            retainVictimClocks(
+                currentVictims: victimNames,
+                blocker: blocker,
+                classifiedByName: classifiedByName,
+                nowNanos: nowNanos)
+            for victim in victimNames {
+                if var clock = state.generation.ordering.victimClocks[victim] {
+                    clock.resume(at: nowNanos)
+                    state.generation.ordering.victimClocks[victim] = clock
+                    continue
+                }
                 if let active = state.generation.ordering.activeBlocker,
                    active.victims.contains(victim) {
                     state.generation.ordering.victimClocks[victim] = VictimBlockingClock(
                         startNanos: active.startNanos,
                         deadlineNanos: active.deadlineNanos)
-                } else {
-                    state.generation.ordering.victimClocks[victim] = VictimBlockingClock(
-                        startNanos: nowNanos,
-                        deadlineNanos: nowNanos &+ blockingBudgetNanos)
+                    continue
                 }
+                state.generation.ordering.victimClocks[victim] = VictimBlockingClock(
+                    startNanos: nowNanos,
+                    deadlineNanos: nowNanos &+ blockingBudgetNanos)
             }
-            state.generation.ordering.victimClocks = state.generation.ordering
-                .victimClocks
-                .filter { name, _ in
-                    victimNames.contains(name) || presentNames.contains(name)
-                }
 
             let victimClocks = victimNames.compactMap {
                 state.generation.ordering.victimClocks[$0]
@@ -620,10 +652,39 @@ struct WatcherReducer {
         }
     }
 
-    private func isSameNumericRevision(_ lhsName: String, _ rhsName: String) -> Bool {
-        guard let lhs = revisionOrder.revision(in: lhsName),
-              let rhs = revisionOrder.revision(in: rhsName) else { return false }
-        return revisionOrder.compare(lhs, rhs) == .orderedSame
+    private mutating func retainVictimClocks(
+        currentVictims: Set<String>,
+        blocker: ClassifiedObservation,
+        classifiedByName: [String: ClassifiedObservation],
+        nowNanos: UInt64
+    ) {
+        for name in Array(state.generation.ordering.victimClocks.keys) {
+            if currentVictims.contains(name) { continue }
+            guard shouldPauseVictimClock(
+                named: name,
+                behind: blocker,
+                classifiedByName: classifiedByName)
+            else {
+                state.generation.ordering.victimClocks[name] = nil
+                continue
+            }
+            state.generation.ordering.victimClocks[name]?.pause(at: nowNanos)
+        }
+    }
+
+    private func shouldPauseVictimClock(
+        named name: String,
+        behind blocker: ClassifiedObservation,
+        classifiedByName: [String: ClassifiedObservation]
+    ) -> Bool {
+        guard let blockerRevision = blocker.revision,
+              let victimRevision = revisionOrder.revision(in: name),
+              let victim = classifiedByName[name],
+              !victim.isPresent
+        else { return false }
+        return revisionOrder.orderedBefore(
+            (name: blocker.observation.name, revision: blockerRevision),
+            (name: name, revision: victimRevision))
     }
 
     private func isTerminal(_ fileState: FileState?) -> Bool {

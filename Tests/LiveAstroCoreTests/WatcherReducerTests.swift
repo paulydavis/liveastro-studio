@@ -303,7 +303,7 @@ final class WatcherReducerTests: XCTestCase {
     func testRoleSwapDoesNotStarveContinuouslyBlockedVictims() {
         var reducer = makeReducer()
 
-        for step in 0..<10 {
+        for step in 0..<14 {
             let first: [FileObservation]
             if step.isMultiple(of: 2) {
                 first = [
@@ -327,7 +327,7 @@ final class WatcherReducerTests: XCTestCase {
             "Alternating blocker/victim roles must not reset every starvation clock forever.")
     }
 
-    func testVictimDisappearanceDestroysEpisodeAndReappearanceStartsFresh() {
+    func testVictimDisappearancePausesClockAndReappearanceResumes() {
         var reducer = makeReducer()
 
         XCTAssertTrue(observeBatch([
@@ -339,14 +339,65 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertTrue(observeBatch([
             invalidRevision("00001"),
             observation(name: revisionName("00002"), revision: "00002", outcome: .absent),
-        ], nowNanos: 20, reducer: &reducer).isEmpty)
+        ], nowNanos: 10_000_000_000, reducer: &reducer).isEmpty)
         XCTAssertNil(reducer.state.generation.ordering.activeBlocker)
 
         XCTAssertTrue(observeBatch([
             invalidRevision("00001"),
             invalidRevision("00002"),
-        ], nowNanos: 30, reducer: &reducer).isEmpty)
-        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos, 30)
+        ], nowNanos: 100_000_000_000, reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos,
+                       90_000_000_010,
+                       "the victim's clock should pause while absent, not restart or age through the gap")
+
+        let released = observeBatch([
+            invalidRevision("00001"),
+            invalidRevision("00002"),
+        ], nowNanos: 120_000_000_011, reducer: &reducer)
+
+        XCTAssertEqual(reducer.state.generation.files[revisionName("00001")], .writtenOff)
+        XCTAssertFalse(released.isEmpty,
+                       "the resumed victim clock must eventually write off the blocker instead of starving forever")
+    }
+
+    func testVictimClockClearedWhenNoLongerBehindLiveBlocker() {
+        let blocker = revisionName("00001")
+        let victim = revisionName("00002")
+        let victimIdentity = makeIdentity(2)
+        var reducer = makeReducer(files: [
+            victim: .ready(makeCandidate(
+                name: victim,
+                identity: victimIdentity,
+                digest: "victim",
+                kind: .numbered(revision: "00002"))),
+        ])
+
+        XCTAssertTrue(observeBatch([
+            invalidRevision("00001"),
+            observation(name: victim, revision: "00002", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: 10, reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.victims, [victim])
+
+        XCTAssertEqual(emittedNames(in: observeBatch([
+            observation(name: blocker, revision: "00001", outcome: .absent),
+            observation(name: victim, revision: "00002", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: 40_000_000_000, reducer: &reducer)), [victim])
+        XCTAssertNil(reducer.state.generation.ordering.activeBlocker)
+        XCTAssertNil(reducer.state.generation.ordering.victimClocks[victim],
+                     "once the blocker is gone, the old victim clock cannot shorten a future episode")
+
+        let freshEffects = observeBatch([
+            invalidRevision("00001"),
+            observation(name: victim, revision: "00002", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: 42_000_000_000, reducer: &reducer)
+
+        XCTAssertTrue(freshEffects.isEmpty,
+                      "a genuinely fresh blocker must receive a fresh budget, not inherit the stale victim clock")
+        XCTAssertEqual(reducer.state.generation.files[blocker], nil)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos, 42_000_000_000)
     }
 
     func testDuplicateSettlementWhileHeldRemovesVictimAndEpisode() {

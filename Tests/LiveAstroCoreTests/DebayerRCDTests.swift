@@ -178,6 +178,29 @@ final class DebayerRCDTests: XCTestCase {
         XCTAssertLessThanOrEqual(out.pixels.max() ?? 0, 1.0)
     }
 
+    func testRCDBoundsZeroMeanDarkSubtractedInput() {
+        let w = 40, h = 40
+        var state: UInt64 = 0xC0FFEE
+        var px: [Float] = []
+        px.reserveCapacity(w * h)
+        for _ in 0..<(w * h) {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            let unit = Float((state >> 40) & 0xFFFFFF) / Float(0xFFFFFF)
+            px.append((unit - 0.5) * 0.10)
+        }
+        let mean = px.reduce(Float(0), +) / Float(px.count)
+        for i in px.indices { px[i] -= mean }
+        let img = AstroImage(width: w, height: h, channels: 1, pixels: px, sourceIsLinear: true)
+
+        let out = Debayer.rcd(cfa: img, pattern: .grbg)
+
+        XCTAssertTrue(out.pixels.allSatisfy(\.isFinite))
+        XCTAssertGreaterThanOrEqual(out.pixels.min() ?? 0, -0.25,
+                                    "RCD must not create denominator-crossing negative spikes from zero-mean calibrated data.")
+        XCTAssertLessThanOrEqual(out.pixels.max() ?? 0, 0.25,
+                                 "The pedestal fix should stabilize RCD without creating matching positive spikes.")
+    }
+
     // MARK: Star sharper than bilinear
 
     func testStarSharperThanBilinear() {

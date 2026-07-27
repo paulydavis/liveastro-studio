@@ -95,6 +95,35 @@ final class FrameSelectorTests: XCTestCase {
         XCTAssertEqual(kept.last, 5)
     }
 
+    func testQualityGateRejectsTerminalDarkDropoutBeforeFinalFrame() {
+        let medians = [Double](repeating: 0.35, count: 8) + [0.001, 0.35]
+        let kept = FrameSelector.qualityGate(medians: medians)
+
+        XCTAssertFalse(kept.contains(medians.count - 2),
+                       "A short terminal dark dropout is a transient, not a sustained low-side regime.")
+        XCTAssertEqual(kept.last, medians.count - 1,
+                       "The actual final frame still anchors the replay.")
+    }
+
+    func testQualityGateCullsExactWindowLengthExcursions() {
+        let highExcursion = [Double](repeating: 0.02, count: 6)
+            + [Double](repeating: 0.07, count: 5)
+            + [Double](repeating: 0.02, count: 4)
+        let lowExcursion = [Double](repeating: 0.35, count: 6)
+            + [Double](repeating: 0.01, count: 5)
+            + [Double](repeating: 0.35, count: 4)
+
+        let highKept = FrameSelector.qualityGate(medians: highExcursion)
+        let lowKept = FrameSelector.qualityGate(medians: lowExcursion)
+
+        for i in 6..<11 {
+            XCTAssertFalse(highKept.contains(i),
+                           "Exactly-window-length high excursions should not cross the sustained-regime threshold.")
+            XCTAssertFalse(lowKept.contains(i),
+                           "Exactly-window-length low excursions should not cross the sustained-regime threshold.")
+        }
+    }
+
     func testQualityGateShortSequences() {
         XCTAssertEqual(FrameSelector.qualityGate(medians: []), [])
         XCTAssertEqual(FrameSelector.qualityGate(medians: [0.5]), [0])
