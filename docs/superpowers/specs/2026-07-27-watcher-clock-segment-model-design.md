@@ -84,7 +84,7 @@ narrow: replace the ambiguous clock representation, not the whole watcher.
 All clock ownership is keyed by normalized numeric revision, not raw filename:
 
 ```swift
-struct RevisionKey: Hashable, Comparable {
+struct RevisionKey: Hashable {
     let normalizedDigits: String
 }
 ```
@@ -94,6 +94,11 @@ names may still be kept for logs and emission intents, but segment ownership,
 redemption, and padding-tie comparisons use `RevisionKey`. This closes the
 padding-rename-during-absence family: `r_1.fit`, `r_01.fit`, and equivalent
 padding variants redeem the same owner.
+
+`RevisionKey` must not sort lexicographically. Any ordering delegates to the
+existing digit-string numeric comparator (`NumberedRevisionOrder.compare` /
+`orderedBefore` semantics). A future `Comparable` conformance is allowed only
+if it calls that comparator; `"10" < "9"` is a correctness bug.
 
 Victims are still keyed by filename in the generation state, because a concrete
 file path is what the watcher observes and emits. Segment owners are keyed by
@@ -142,26 +147,42 @@ revision and its active victims, but it no longer owns the only clock:
 struct BlockingEpisode {
     let blockerName: String
     let owner: RevisionKey
-    let firstObservedNanos: UInt64
     var victims: Set<String>
 }
 ```
 
 Deadlines are derived from ledgers when deciding write-off, not stored as the
 episode's inherited minimum. This removes the "oldest-clock-governs successor"
-bug class.
+bug class. The grace and ceiling anchor lives on each owner's `AccrualSegment`
+(`firstChargeNanos`), not on `BlockingEpisode`; the episode is only the current
+head-of-line role.
 
 ---
 
 ## 4. Reducer ordering
 
-Each observation batch is applied in this order:
+The reducer remains command-driven:
+
+- `.observe(batch)` classifies observations and returns emission intents;
+- the driver executes an intent only if `shouldExecuteEmission` still accepts
+  it;
+- `.emissionFinished(result)` settles the executed intent afterward.
+
+Redemption fires only while reducing `.emissionFinished` for the current
+generation, and only when `result.outcome == .yielded` and the candidate really
+settles as `.emittedNow`. A rejected, skipped, stale-generation, or invalidated
+intent does not redeem anything. This preserves the v3 settle-on-yield rule:
+stream progress is observed only after the driver actually yields the frame.
+
+Each observation batch is otherwise applied in this order:
 
 1. **Classify the complete batch.** Build the fd-pinned, generation-scoped
    observation snapshot exactly as today.
-2. **Redeem resolved owners.** For every numbered emission finishing in this
-   reduce pass, redeem all segments whose `owner == emitted RevisionKey`,
-   regardless of whether the victim is currently present or absent.
+2. **Apply already-settled redemptions.** All preceding yielded
+   `.emissionFinished` commands have already redeemed their owners before this
+   observe pass opens, extends, or consumes ledger segments. An `.observe`
+   command must not redeem a candidate merely because it returns an emission
+   intent.
 3. **Apply terminal owner outcomes.** Written-off owners consume the segments
    used to justify their write-off. Vanished owners are not redeemed; their
    unredeemed segments remain owed.
@@ -179,10 +200,25 @@ Each observation batch is applied in this order:
 7. **Emit eligible candidates.** Emission intents remain generation-tagged and
    still pass through the existing consumer identity/digest verification.
 
-The load-bearing ordering is redemption before successor charging. The h4
-same-batch present-handoff case then falls out without a special case: segments
-charged to the old owner are redeemed before the successor episode begins
-charging, so the successor starts from a clean attribution base.
+The load-bearing ordering is redemption before successor charging in the
+command stream. If an observe pass returns an old owner's emission intent and
+also sees a possible successor blocker, the old owner is not redeemed on
+intent; instead, any write-off decision that would depend on the old owner's
+segments is deferred until after the corresponding yielded
+`.emissionFinished`. The next observe pass then charges the successor against a
+ledger where the yielded old owner has already been redeemed. This keeps h4's
+same-batch present handoff from inheriting redeemed time without ever
+pretending an unexecuted intent is stream progress.
+
+Operationally, this is a **pending-emission barrier**: when an observe batch
+returns one or more emission intents before the first unready candidate, the
+reducer may record the emitted intents but must not open, extend, consume, or
+write off successor-owner segments that depend on those pending owners in the
+same `.observe` command. Successor charging resumes in the next observe pass
+after the pending intents have either yielded (redeemed), rejected/skipped
+(unredeemed), or gone stale. This is a narrow ordering rule for segment
+attribution; it does not change the existing generation-tagged emission
+protocol.
 
 ---
 
@@ -210,6 +246,15 @@ This is the explicit d9-vs-d4 distinction:
 - emitted owner: resolved progress, debt cleared;
 - vanished owner: unresolved stall, debt still owed.
 
+Unredeemed debt is not immortal across a broken blocking chain. It carries only
+while the victim remains continuously blocked or absent. The reducer discharges
+the victim's remaining unredeemed ledger after one full observe pass where that
+victim is present and unblocked, because the victim had a real chance to emit
+and the old stall no longer explains the current wait. The victim's own
+successful emission also clears its ledger. This preserves the round-6 b1 /
+W4-2a behavior: a victim unblocked for a long interval starts a later fresh
+blocker with a fresh budget, not hours-stale debt.
+
 ### 5.3 Starvation is bounded over unredeemed wait
 
 Under uniform redemption, a victim can wait longer than one budget across a
@@ -221,7 +266,30 @@ time across resolving owners.
 The contrast case is a vanished blocker. Since it did not emit, its segment is
 not redeemed and continues to count as unresolved wait.
 
-### 5.4 Write-off attribution and logging
+### 5.4 Convergence grace
+
+The existing blocker budget and grace semantics remain part of the contract:
+
+- budget = `max(30s, 10 × quietPeriod, 5 × pollInterval)`;
+- grace renewal = one quiet period for a converging observation;
+- hard ceiling = budget + `4 × quietPeriod`;
+- churn that is not converging does not reset or extend the budget.
+
+Predecessor debt may accelerate write-off of a stalled current blocker, but it
+must not abandon a blocker that is actively converging under its own tenure.
+Formally, write-off requires both:
+
+1. the victim ledger has enough unredeemed wait to justify progress; and
+2. the current owner is outside its own convergence grace window, anchored at
+   that owner's first charge time and capped by that owner's ceiling.
+
+Converging observations renew only the current owner's grace window. They do
+not rewrite predecessor segments, and predecessor debt does not shorten a
+fresh owner's grace. This is the R8-4/a6/g4 distinction: stale unresolved wait
+can make a stalled successor progress quickly, but a genuinely converging
+successor gets its grace window on its own clock.
+
+### 5.5 Write-off attribution and logging
 
 A write-off log reports the written-off blocker's own attributed time and any
 explicit unresolved predecessor debt consumed for that decision as separate
@@ -247,7 +315,7 @@ struct WriteOffDecision {
 
 The log is derived from this decision, not from an episode start timestamp.
 
-### 5.5 Multi-victim policy
+### 5.6 Multi-victim policy
 
 The current behavior writes off the head blocker when at least one held victim's
 ledger reaches the write-off threshold. That behavior remains: one blocked
@@ -262,16 +330,16 @@ segment model changes attribution, not the product threshold.
 
 | Requirement | Design transition or invariant |
 |---|---|
-| M1 starvation bound | Write-off checks total unredeemed victim ledger time, paused absence preserved by tombstones. |
-| M2 attribution | Segments are keyed by owner; a blocker cannot be written off before its own charged interval plus allowed unresolved debt reaches budget. |
+| M1 starvation bound | Write-off checks total unredeemed victim ledger time; resolved owners redeem, present-and-unblocked victims discharge stale ledgers, paused absence is preserved by tombstones. |
+| M2 attribution | Segments are keyed by owner; a blocker cannot be written off before its own charged interval plus explicit unresolved predecessor debt reaches budget, and its own convergence grace has expired. |
 | M3 absence pauses | Victim ledger survives absence; `runningSinceNanos` is closed/paused, not aged or deleted. |
-| M4 redemption vs carry | Emission redeems matching owner segments; vanished owners leave segments unredeemed. |
-| M5 same-batch ordering | Batch reducer redeems emitted owners before deriving/charging successor episodes. |
+| M4 redemption vs carry | Yielded `.emissionFinished` redeems matching owner segments; vanished owners leave segments unredeemed until redeemed, consumed, or discharged by an unblocked-present scan. |
+| M5 same-batch ordering | Command stream applies yielded redemptions before the next observe pass charges/consumes those segments; observe-time intents do not redeem. |
 | M6 identity | Segment owners are `RevisionKey`, normalized from numeric revision, not raw filename. |
-| M7 transient occupancy | A transient blocker only accrues the interval it actually owns; its emission redeems only its segment. |
+| M7 transient occupancy | A transient blocker only accrues the interval it actually owns; yielded emission redeems only its segment; its convergence grace is anchored to its own first charge. |
 | M8 hygiene | Segments compact on redemption/write-off, bounded by active+tombstoned victims, wiped at generation swap. |
 | M9 log honesty | `WriteOffDecision` carries attributed/consumed segment durations; logs derive from it. |
-| M10 composition proof | Acceptance requires driver-faithful batteries and control snapshots, not reducer-only injected states. |
+| M10 composition proof | Acceptance requires reconciled driver-faithful batteries and control snapshots, not reducer-only injected states. |
 
 ---
 
@@ -280,19 +348,29 @@ segment model changes attribution, not the product threshold.
 Implementation is not complete until all of these pass against the real driver
 synthesis rule:
 
-1. The accumulated `fw6-watch`, `fw7-watch`, and `fw8-watch` batteries.
-2. All three control snapshots from rounds 6, 7, and 8, with the expected
+1. **Battery reconciliation.** Before old batteries are binding, re-derive each
+   `fw6-watch`, `fw7-watch`, and `fw8-watch` probe expectation from §§4-5.
+   List every expectation that changes from scalar-era semantics with a
+   one-line justification, then commit that reconciliation with the test
+   update. The reconciled expectations are the gate; stale scalar-era asserts
+   are not. Known likely reconciliations include vanished-owner debt carry,
+   b1/W4-2a discharge after present-and-unblocked scans, and e9's bounded
+   non-growing write-off expectation.
+2. The reconciled accumulated `fw6-watch`, `fw7-watch`, and `fw8-watch`
+   batteries.
+3. All three control snapshots from rounds 6, 7, and 8, with the expected
    red/green counterfactuals preserved:
    - d9 red on round 7, green on segment model;
    - e1/e7 red on rounds 6 and 8, green on segment model;
    - h3/h4 red on all scalar-control builds, green on segment model.
-3. The 3000-run sweep with timing-bound invariant N1: no blocker is written
+4. The 3000-run sweep with timing-bound invariant N1: no blocker is written
    off before first charge plus budget, except where the decision explicitly
-   consumes unredeemed predecessor debt.
-4. Existing watcher/folder/fault battery.
-5. Full `swift test`.
-6. `swift build -c release`.
-7. `git diff --check`.
+   consumes unredeemed predecessor debt and the current owner's own convergence
+   grace has expired.
+5. Existing watcher/folder/fault battery.
+6. Full `swift test`.
+7. `swift build -c release`.
+8. `git diff --check`.
 
 Reducer-only tests are useful for red-first development, but they do not count
 as acceptance evidence unless paired with driver-faithful composition tests.
@@ -307,10 +385,17 @@ The implementation plan should be small and staged:
    tests without changing scanner behavior.
 2. Replace scalar `VictimBlockingClock` operations with ledger transitions:
    pause, resume/charge, redeem, consume/write-off, generation clear.
-3. Reorder batch handling so redemption precedes successor charging.
-4. Update write-off logging to derive from structured attribution.
-5. Port/keep the existing tombstone and hygiene checks.
-6. Run the full M10 acceptance gate before any merge or release claim.
+3. Preserve the command protocol: redeem only on yielded `.emissionFinished`;
+   add the pending-emission barrier so successor segment charging/consumption
+   waits for prior intents to settle.
+4. Add debt discharge after one full present-and-unblocked observe pass and
+   after the victim's own successful emission.
+5. Preserve convergence grace on the current owner's own segment, independent
+   of predecessor debt.
+6. Update write-off logging to derive from structured attribution.
+7. Reconcile scalar-era battery expectations against this spec, then port/keep
+   the existing tombstone and hygiene checks.
+8. Run the full M10 acceptance gate before any merge or release claim.
 
 No app-layer work should be mixed into this branch. If the implementation
 reveals that the whole watcher file needs mechanical extraction for readability,
