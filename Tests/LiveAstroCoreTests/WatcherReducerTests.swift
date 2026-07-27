@@ -2158,6 +2158,69 @@ final class WatcherReducerTests: XCTestCase {
                      "when the blocker emits after its victim disappeared, the paused victim clock is stale")
     }
 
+    func testDriverEmissionClearsPausedClockChargedUnderEmittedOwnerBeforeFreshBlockerStarts() {
+        let oldBlocker = revisionName("00001")
+        let freshBlocker = revisionName("00002")
+        let victim = revisionName("00003")
+        let oldIdentity = makeIdentity(1)
+        let victimIdentity = makeIdentity(3)
+        let victimCandidate = makeCandidate(
+            name: victim,
+            identity: victimIdentity,
+            digest: "victim",
+            kind: .numbered(revision: "00003"))
+        var reducer = makeReducer(files: [victim: .ready(victimCandidate)])
+
+        XCTAssertTrue(observeBatch([
+            observation(name: oldBlocker, revision: "00001", outcome: .digested(
+                identity: oldIdentity, digest: "old", byteCount: oldIdentity.size)),
+            observation(name: victim, revision: "00003", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: 10, reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, oldBlocker)
+
+        XCTAssertTrue(observeBatch([
+            observation(name: oldBlocker, revision: "00001", outcome: .digested(
+                identity: oldIdentity, digest: "old", byteCount: oldIdentity.size)),
+            observation(name: victim, revision: "00003", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: 110, reducer: &reducer).isEmpty)
+
+        let completionBatchNanos: UInt64 = 22_000_000_010
+        let effects = observeBatch([
+            observation(name: oldBlocker, revision: "00001", outcome: .digested(
+                identity: oldIdentity, digest: "old", byteCount: oldIdentity.size)),
+            invalidRevision("00002"),
+            observation(name: victim, revision: "00003", outcome: .absent),
+        ], nowNanos: completionBatchNanos, reducer: &reducer)
+
+        guard case .emit(let oldIntent) = effects.first else {
+            return XCTFail("old blocker should emit before the fresh blocker starts")
+        }
+        XCTAssertNil(reducer.state.generation.ordering.activeBlocker)
+        XCTAssertNotNil(reducer.state.generation.ordering.victimClocks[victim],
+                        "the absent victim clock is retained until the owner emission settles")
+
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: oldIntent,
+            outcome: .yielded))).isEmpty)
+
+        XCTAssertNil(reducer.state.generation.ordering.victimClocks[victim],
+                     "the real driver path must clear the paused clock when its charged owner emits")
+
+        let victimReturnNanos = completionBatchNanos &+ 9_000_000_000
+        XCTAssertTrue(observeBatch([
+            invalidRevision("00002"),
+            observation(name: victim, revision: "00003", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: victimReturnNanos, reducer: &reducer).isEmpty)
+
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, freshBlocker)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos,
+                       victimReturnNanos,
+                       "the fresh blocker must receive a fresh budget, not inherited old accrual")
+    }
+
     func testLowerEmissionDoesNotClearPausedClockChargedUnderLaterBlocker() {
         let lower = revisionName("00003")
         let blocker = revisionName("00005")

@@ -42,7 +42,9 @@ struct VictimBlockingClock: Equatable {
         if pausedAtNanos == nil {
             pausedAtNanos = nowNanos
         }
-        chargingBlocker = blocker
+        if chargingBlocker == nil {
+            chargingBlocker = blocker
+        }
     }
 
     mutating func resume(at nowNanos: UInt64) {
@@ -54,6 +56,10 @@ struct VictimBlockingClock: Equatable {
         deadlineNanos = deadlineNanos &+ pausedDuration
         self.pausedAtNanos = nil
         chargingBlocker = nil
+    }
+
+    mutating func charge(under blocker: ChargingBlocker) {
+        chargingBlocker = blocker
     }
 }
 
@@ -422,17 +428,11 @@ struct WatcherReducer {
         of candidate: EmissionCandidate
     ) {
         guard case .numbered(let emittedRevision) = candidate.kind else { return }
-        let emitted = (name: candidate.name, revision: emittedRevision)
+        let emittedOwner = ChargingBlocker(name: candidate.name, revision: emittedRevision)
         for name in Array(state.generation.ordering.victimClocks.keys) {
-            guard let victimRevision = revisionOrder.revision(in: name),
-                  let chargingBlocker = state.generation.ordering
+            guard let chargingBlocker = state.generation.ordering
                     .victimClocks[name]?.chargingBlocker,
-                  !revisionOrder.orderedBefore(
-                    emitted,
-                    (name: chargingBlocker.name, revision: chargingBlocker.revision)),
-                  revisionOrder.orderedBefore(
-                    (name: candidate.name, revision: emittedRevision),
-                    (name: name, revision: victimRevision))
+                  chargingBlocker == emittedOwner
             else { continue }
             state.generation.ordering.victimClocks[name] = nil
         }
@@ -597,6 +597,9 @@ struct WatcherReducer {
             let victimNames = Set(potential[victimStart...].map(\.observation.name))
 
             let blockerName = blocker.observation.name
+            let chargingBlocker = blocker.revision.map {
+                ChargingBlocker(name: blockerName, revision: $0)
+            }
             retainVictimClocks(
                 currentVictims: victimNames,
                 blocker: blocker,
@@ -605,19 +608,30 @@ struct WatcherReducer {
             for victim in victimNames {
                 if var clock = state.generation.ordering.victimClocks[victim] {
                     clock.resume(at: nowNanos)
+                    if let chargingBlocker {
+                        clock.charge(under: chargingBlocker)
+                    }
                     state.generation.ordering.victimClocks[victim] = clock
                     continue
                 }
                 if let active = state.generation.ordering.activeBlocker,
                    active.victims.contains(victim) {
-                    state.generation.ordering.victimClocks[victim] = VictimBlockingClock(
+                    var clock = VictimBlockingClock(
                         startNanos: active.startNanos,
                         deadlineNanos: active.deadlineNanos)
+                    if let chargingBlocker {
+                        clock.charge(under: chargingBlocker)
+                    }
+                    state.generation.ordering.victimClocks[victim] = clock
                     continue
                 }
-                state.generation.ordering.victimClocks[victim] = VictimBlockingClock(
+                var clock = VictimBlockingClock(
                     startNanos: nowNanos,
                     deadlineNanos: nowNanos &+ blockingBudgetNanos)
+                if let chargingBlocker {
+                    clock.charge(under: chargingBlocker)
+                }
+                state.generation.ordering.victimClocks[victim] = clock
             }
 
             let victimClocks = victimNames.compactMap {
