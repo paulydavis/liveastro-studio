@@ -255,6 +255,12 @@ successful emission also clears its ledger. This preserves the round-6 b1 /
 W4-2a behavior: a victim unblocked for a long interval starts a later fresh
 blocker with a fresh budget, not hours-stale debt.
 
+For discharge, **unblocked** is a file-state/numeric-order fact: the victim is
+present and there is no unready lower revision in the current generation. It is
+derived from file states, not from `BlockingEpisode`, segment charging, or the
+pending-emission barrier. A barrier-deferred successor may pause charging, but
+it does not make a victim unblocked if an unready lower revision still exists.
+
 ### 5.3 Starvation is bounded over unredeemed wait
 
 Under uniform redemption, a victim can wait longer than one budget across a
