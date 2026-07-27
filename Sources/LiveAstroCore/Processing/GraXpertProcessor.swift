@@ -5,10 +5,12 @@ public struct GraXpertProcessor: Processor {
     private let runner: ProcessRunner
     private let denoiseStrength: Double
     private let fileManager: FileManager
+    public static let defaultTimeoutSeconds: TimeInterval = 30 * 60
 
-    public init(executable: URL, runner: ProcessRunner = FoundationProcessRunner(),
+    public init(executable: URL, runner: ProcessRunner? = nil,
                 denoiseStrength: Double = 0.5, fileManager: FileManager = .default) {
-        self.executable = executable; self.runner = runner
+        self.executable = executable
+        self.runner = runner ?? FoundationProcessRunner(timeoutSeconds: Self.defaultTimeoutSeconds)
         self.denoiseStrength = denoiseStrength; self.fileManager = fileManager
     }
 
@@ -20,8 +22,11 @@ public struct GraXpertProcessor: Processor {
         return fileManager.fileExists(atPath: url.path) ? url : nil
     }
 
-    public func process(masterURL: URL, outputURL: URL, log: ((String) -> Void)?) throws {
+    public func process(masterURL: URL, outputURL: URL, log: ((String) -> Void)?) throws -> URL {
         guard isAvailable else { throw ProcessorError.notAvailable }
+        for url in outputVariants(for: outputURL) {
+            try? fileManager.removeItem(at: url)
+        }
         let bgTmp = outputURL.deletingLastPathComponent()
             .appendingPathComponent("graxpert-bg-\(UUID().uuidString).fits")
         defer {
@@ -42,9 +47,10 @@ public struct GraXpertProcessor: Processor {
         let c2 = try runner.run(executable: executable, arguments: dnArgs, log: log)
         guard c2 == 0 else { throw ProcessorError.stepFailed(cmd: "denoising", code: c2) }
 
-        guard firstExistingOutput(for: outputURL) != nil else {
+        guard let produced = firstExistingOutput(for: outputURL) else {
             throw ProcessorError.noOutput
         }
+        return produced
     }
 
     private func firstExistingOutput(for requested: URL) -> URL? {

@@ -137,6 +137,7 @@ public enum OBSMessage {
 
     private static func encode(op: Int, d: [String: Any]) -> String {
         let envelope: [String: Any] = ["op": op, "d": d]
+        guard JSONSerialization.isValidJSONObject(envelope) else { return "{}" }
         guard
             let data = try? JSONSerialization.data(withJSONObject: envelope),
             let text = String(data: data, encoding: .utf8)

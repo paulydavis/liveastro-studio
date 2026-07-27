@@ -194,6 +194,9 @@ public enum FITSReader {
                                     default defaultValue: Double,
                                     cards: [String: String]) throws -> Double {
         guard let raw = cards[key] else { return defaultValue }
+        guard !raw.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return defaultValue
+        }
         let fitsNumber = raw
             .replacingOccurrences(of: "D", with: "E")
             .replacingOccurrences(of: "d", with: "E")

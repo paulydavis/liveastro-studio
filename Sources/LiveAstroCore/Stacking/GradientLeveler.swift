@@ -4,7 +4,7 @@
 /// (spec: gradient leveling + scale normalization).
 /// For each channel where BOTH the sub and reference models have coefficients,
 /// evaluates each model's surface with its OWN degree, then applies the fused form
-///   out = clamp( surfRef + (x − surfSub) · scale, 0, 1 )
+///   out = min( surfRef + (x − surfSub) · scale, 1 )
 /// per pixel. This levels the sub's background onto the reference surface AND scales
 /// the leveled signal about that per-pixel reference-background pivot — the correct
 /// pivot for both a scalar-background sub (regime 1) and a gradient sky (regime 2).
@@ -91,7 +91,7 @@ public enum GradientLeveler {
                             // NaN hardening: if surface values or result are non-finite,
                             // passthrough original pixel. Swift's min/max do NOT sanitize NaN.
                             if result.isFinite {
-                                buf[i] = min(max(result, 0), 1)
+                                buf[i] = min(result, 1)
                             }
                             // else: leave buf[i] at its original value (passthrough)
                         }

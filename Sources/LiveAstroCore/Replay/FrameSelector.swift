@@ -78,17 +78,23 @@ public enum FrameSelector {
         // Clamp to ≥ 1: a window of 0 (or less) takes .suffix(0) → empty window →
         // sorted[0] on an empty array → crash. One kept-median is the minimum baseline.
         let baselineWindow = max(1, rawBaselineWindow)
-        // Below this the baseline is numerically meaningless (all-dark frames);
-        // relative deviation would explode, so keep everything instead.
-        let minimumMeaningfulMedian = 1e-12
+        // Relative comparisons get unstable near zero after dark calibration.
+        // Use an absolute denominator floor so a real cloud step is still visible,
+        // while tiny dark-noise jitter stays below the threshold.
+        let minimumRelativeScale = 0.01
+        let darkDropoutDeviation = -0.8
         var kept: [Int] = [0]
         var pendingHighStep: [Int] = []
         for i in 1..<(medians.count - 1) {
             let window = kept.suffix(baselineWindow).map { medians[$0] }
             let sorted = window.sorted()
             let baseline = sorted[sorted.count / 2]
-            guard baseline > minimumMeaningfulMedian else { kept.append(i); continue }
-            let highDeviation = (medians[i] - baseline) / baseline
+            let relativeScale = max(abs(baseline), minimumRelativeScale)
+            let highDeviation = (medians[i] - baseline) / relativeScale
+            if highDeviation < darkDropoutDeviation {
+                pendingHighStep.removeAll()
+                continue
+            }
             if highDeviation <= deviationThreshold {
                 pendingHighStep.removeAll()
                 kept.append(i)
@@ -103,6 +109,9 @@ public enum FrameSelector {
                     pendingHighStep.removeAll()
                 }
             }
+        }
+        if !pendingHighStep.isEmpty {
+            kept.append(contentsOf: pendingHighStep)
         }
         kept.append(medians.count - 1)
         return kept

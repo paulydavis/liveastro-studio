@@ -216,6 +216,13 @@ private actor InboundQueue {
         // Future dequeue() calls will throw via the terminalError path.
     }
 
+    func cancelPendingDequeue() {
+        if let continuation = pending {
+            pending = nil
+            continuation.resume(throwing: CancellationError())
+        }
+    }
+
     func resetForConnect() {
         terminalError = nil
     }
@@ -228,17 +235,21 @@ private actor InboundQueue {
         if !buffer.isEmpty { return buffer.removeFirst() }
 
         // Otherwise suspend until enqueue or finish.
-        return try await withCheckedThrowingContinuation { continuation in
-            // Check again inside the actor to avoid a TOCTOU race on buffer.
-            if let err = self.terminalError {
-                continuation.resume(throwing: err)
-                return
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                // Check again inside the actor to avoid a TOCTOU race on buffer.
+                if let err = self.terminalError {
+                    continuation.resume(throwing: err)
+                    return
+                }
+                if !self.buffer.isEmpty {
+                    continuation.resume(returning: self.buffer.removeFirst())
+                    return
+                }
+                self.pending = continuation
             }
-            if !self.buffer.isEmpty {
-                continuation.resume(returning: self.buffer.removeFirst())
-                return
-            }
-            self.pending = continuation
+        } onCancel: {
+            Task { await self.cancelPendingDequeue() }
         }
     }
 }

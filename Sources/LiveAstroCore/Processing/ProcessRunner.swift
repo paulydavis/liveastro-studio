@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Abstraction over launching an external process. The real implementation
 /// uses Foundation `Process`; tests inject a fake that records commands.
@@ -13,10 +14,12 @@ public enum ProcessRunnerError: Error, Equatable {
 }
 
 public struct FoundationProcessRunner: ProcessRunner {
-    private let timeoutSeconds: TimeInterval
+    public let timeoutSeconds: TimeInterval
+    public let terminationGraceSeconds: TimeInterval
 
-    public init(timeoutSeconds: TimeInterval = 60) {
+    public init(timeoutSeconds: TimeInterval = 60, terminationGraceSeconds: TimeInterval = 2) {
         self.timeoutSeconds = timeoutSeconds
+        self.terminationGraceSeconds = terminationGraceSeconds
     }
 
     public func run(executable: URL, arguments: [String], log: ((String) -> Void)?) throws -> Int32 {
@@ -55,7 +58,10 @@ public struct FoundationProcessRunner: ProcessRunner {
             if process.isRunning {
                 process.terminate()
             }
-            _ = finished.wait(timeout: .now() + 2)
+            if finished.wait(timeout: .now() + terminationGraceSeconds) == .timedOut, process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+                _ = finished.wait(timeout: .now() + 1)
+            }
             throw ProcessRunnerError.timedOut(seconds: timeoutSeconds)
         }
         // Drain any bytes the async handler didn't deliver (process has exited; no block risk).

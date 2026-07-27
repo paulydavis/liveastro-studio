@@ -123,4 +123,14 @@ final class ASIAIRDetectorTests: XCTestCase {
         let found = ASIAIRDetector.detect(volumesRoot: volumes)
         XCTAssertEqual(found?.target, "M 31")
     }
+
+    func testAcceptsASIAIRUSBStorageVolumeLabel() throws {
+        let volumes = try tmp()
+        let usbVol = volumes.appendingPathComponent("T7", isDirectory: true)
+        let target = try makeTarget(usbVol, "NGC 6888")
+        try writeFITS(target, "a.fit", object: "NGC 6888", exposure: 180)
+
+        let found = ASIAIRDetector.detect(volumesRoot: volumes)
+        XCTAssertEqual(found?.target, "NGC 6888")
+    }
 }

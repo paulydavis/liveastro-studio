@@ -35,6 +35,7 @@ final class ImportController {
 
     /// The active one-shot import pipeline (nil unless an import is draining).
     private var importPipeline: SessionPipeline?
+    private var importPrepareGeneration = 0
 
     init(surface: AppSurface) {
         self.surface = surface
@@ -52,20 +53,24 @@ final class ImportController {
         importProcessed = 0
         importTotal = 0
         isImporting = true
+        importPrepareGeneration += 1
+        let generation = importPrepareGeneration
         surface.log("Preparing import from \(folder.path)…")
 
         Task.detached { [weak self, folder, prefix] in
             guard let self else { return }
             let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder)
             await MainActor.run {
-                self.beginImport(from: folder, meta: meta, prefix: prefix)
+                self.beginImport(from: folder, meta: meta, prefix: prefix, generation: generation)
             }
         }
     }
 
     private func beginImport(from folder: URL,
                              meta: (object: String?, exposureSeconds: Double?, fileExtension: String)?,
-                             prefix: String) {
+                             prefix: String,
+                             generation: Int) {
+        guard generation == importPrepareGeneration, isImporting else { return }
         guard !surface.isSessionRunning() else {
             surface.presentError("End the session before importing.")
             isImporting = false
@@ -94,6 +99,7 @@ final class ImportController {
                                               rootDirectory: surface.currentLiveAstroRoot!(),
                                               neutralizeBackground: surface.currentNeutralizeBackground!(),
                                               calibrator: importCalibrator)
+        importPipeline.displayAdjustments = surface.currentDisplayAdjustments?() ?? .neutral
         importPipeline.onImportProgress = { [weak self] processed, total, accepted, rejected in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
@@ -129,9 +135,13 @@ final class ImportController {
                 await MainActor.run {
                     // A zero-match import may also surface as a downstream failure
                     // (nothing to render) — prefer the actionable message.
-                    self.surface.presentError(matchedFrames.value == 0
-                        ? ImportController.noMatchMessage(prefix: prefix)
-                        : "Import failed: \(error)")
+                    if let pipelineError = error as? SessionPipelineError, pipelineError == .shutdownTimeout {
+                        self.surface.presentError("Import failed: the import stalled while reading frames. The session was not finalized; try again from a faster or more stable disk/share.")
+                    } else {
+                        self.surface.presentError(matchedFrames.value == 0
+                            ? ImportController.noMatchMessage(prefix: prefix)
+                            : "Import failed: \(error)")
+                    }
                     self.isImporting = false
                     self.importPipeline = nil
                 }
@@ -140,6 +150,11 @@ final class ImportController {
     }
 
     func cancelImport() {
+        if importPipeline == nil {
+            importPrepareGeneration += 1
+            isImporting = false
+            return
+        }
         importPipeline?.cancelImport()
         importPipeline = nil
     }
@@ -189,12 +204,12 @@ final class ImportController {
                 let proc = GraXpertProcessor(executable: exe)
                 // process() runs synchronously within this task, so the strong `self`
                 // let is safely captured by the progress callback for its duration.
-                try proc.process(masterURL: master, outputURL: out) { m in
+                let produced = try proc.process(masterURL: master, outputURL: out) { m in
                     Task { @MainActor in self.surface.log(m) }
                 }
                 await MainActor.run {
                     self.isProcessing = false
-                    self.surface.log("Processed → \(out.lastPathComponent)")
+                    self.surface.log("Processed → \(produced.lastPathComponent)")
                 }
             } catch {
                 await MainActor.run {

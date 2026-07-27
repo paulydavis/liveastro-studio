@@ -108,6 +108,33 @@ final class FrameSelectorTests: XCTestCase {
         XCTAssertEqual(FrameSelector.qualityGate(medians: medians), Array(0..<8))
     }
 
+    func testQualityGateNearZeroBaselineStillRejectsCloudSpike() {
+        let medians = [0.0, 0.0004, -0.0002, 0.0001, 0.0500, 0.0002, -0.0001]
+        let kept = FrameSelector.qualityGate(medians: medians)
+        XCTAssertFalse(kept.contains(4),
+                       "Dark-calibrated near-zero backgrounds must not disable the cloud gate.")
+        XCTAssertEqual(kept.first, 0)
+        XCTAssertEqual(kept.last, medians.count - 1)
+    }
+
+    func testQualityGateDropsDarkDropoutAndKeepsRecovery() {
+        let medians = [0.1, 0.1, 0.1] + [Double](repeating: 0.001, count: 5) + [Double](repeating: 0.1, count: 4)
+        let kept = FrameSelector.qualityGate(medians: medians)
+        for i in 3...7 {
+            XCTAssertFalse(kept.contains(i), "Dark dropout frame \(i) should not poison the replay baseline.")
+        }
+        for i in 8...11 {
+            XCTAssertTrue(kept.contains(i), "Recovered good frame \(i) should survive after a dropout.")
+        }
+    }
+
+    func testQualityGateAdoptsHighRegimeThatReachesTail() {
+        let medians = [0.020, 0.020, 0.020, 0.020, 0.055, 0.055, 0.055, 0.055]
+        let kept = FrameSelector.qualityGate(medians: medians)
+        XCTAssertEqual(kept, Array(medians.indices),
+                       "A sustained high regime reaching the final frame should not silently discard the transition.")
+    }
+
     func testQualityGateRecoversAfterCloudBand() {
         // Multi-frame cloud band: indices 4...6 all spiked; baseline must not absorb them
         let medians = [0.020, 0.020, 0.020, 0.020, 0.055, 0.060, 0.058, 0.020, 0.020, 0.020]

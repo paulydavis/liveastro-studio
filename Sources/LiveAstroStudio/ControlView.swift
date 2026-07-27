@@ -368,7 +368,7 @@ struct ControlView: View {
                         }
                         .pickerStyle(.segmented)
                         .disabled(model.isRunning || model.importer.isImporting || model.importer.isProcessing)
-                        .help("After stacking, optionally run GraXpert (background extraction + denoise) to write master_processed.fit next to the raw master. Requires GraXpert installed.")
+                        .help("After stacking, optionally run GraXpert (background extraction + denoise) to write a master_processed FITS next to the raw master. Requires GraXpert installed.")
                     }
                     if model.sourceMode == .nativeStack {
                         Section("Calibration") {
@@ -696,7 +696,7 @@ struct ControlView: View {
                     .disabled(model.importer.isProcessing || GraXpertProcessor.defaultExecutable() == nil)
                     .help(GraXpertProcessor.defaultExecutable() == nil
                           ? "GraXpert not found — install from graxpert.com"
-                          : "Run GraXpert on the last stacked master → master_processed.fit")
+                          : "Run GraXpert on the last stacked master → master_processed FITS")
                 }
                 if model.importer.isGeneratingReplay { ProgressView("Rendering replay…") }
                 Text(appVersionText)

@@ -54,6 +54,9 @@ struct AppSurface {
     var currentCalibration: (() -> CalibrationSelection)?
     /// Reads the current `neutralizeBackground` draft flag.
     var currentNeutralizeBackground: (() -> Bool)?
+    /// Reads the current display adjustments so import-generated snapshots/replays
+    /// match the user's persisted visual settings.
+    var currentDisplayAdjustments: (() -> DisplayAdjustments)?
     /// Reads the current `fileNamePrefix` draft field (drives the folder glob and
     /// the zero-match message).
     var currentFileNamePrefix: (() -> String)?
@@ -89,6 +92,7 @@ struct AppSurface {
          makeStackEngine: (() -> StackEngine)? = nil,
          currentCalibration: (() -> CalibrationSelection)? = nil,
          currentNeutralizeBackground: (() -> Bool)? = nil,
+         currentDisplayAdjustments: (() -> DisplayAdjustments)? = nil,
          currentFileNamePrefix: (() -> String)? = nil,
          currentLiveAstroRoot: (() -> URL)? = nil,
          currentProfile: (() -> SessionProfile)? = nil,
@@ -110,6 +114,7 @@ struct AppSurface {
         self.makeStackEngine = makeStackEngine
         self.currentCalibration = currentCalibration
         self.currentNeutralizeBackground = currentNeutralizeBackground
+        self.currentDisplayAdjustments = currentDisplayAdjustments
         self.currentFileNamePrefix = currentFileNamePrefix
         self.currentLiveAstroRoot = currentLiveAstroRoot
         self.currentProfile = currentProfile

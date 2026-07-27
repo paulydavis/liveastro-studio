@@ -50,7 +50,16 @@ public enum ASIAIRDetector {
     }
 
     private static func isPlausibleASIAIRVolume(_ volume: URL) -> Bool {
-        volume.lastPathComponent.lowercased().contains("asiair")
+        let name = volume.lastPathComponent.lowercased()
+        // ASIAIR commonly writes to attached USB storage that macOS exposes under
+        // the drive's own label ("T7", "USB_SSD", etc.). The Autorun/Light/FITS
+        // folder shape is the real discriminator here; exclude obvious backup or
+        // archive mounts so restored copies do not win newest-folder detection.
+        return !isBackupLikeVolumeName(name)
+    }
+
+    private static func isBackupLikeVolumeName(_ name: String) -> Bool {
+        name.contains("backup") || name.contains("archive") || name.contains("clone")
     }
 
     private static func folderContainsFITS(_ folder: URL, fm: FileManager) -> Bool {

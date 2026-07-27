@@ -61,6 +61,23 @@ final class OBSSocketMockTests: XCTestCase {
         XCTAssertEqual(result, "late-delivery")
     }
 
+    func testPendingReceiveCompletesWhenTaskIsCancelled() async throws {
+        let mock = MockOBSSocket()
+        let cancelled = expectation(description: "pending receive cancelled")
+        let receiveTask = Task {
+            do {
+                _ = try await mock.receive()
+            } catch is CancellationError {
+                cancelled.fulfill()
+            }
+        }
+        await Task.yield()
+
+        receiveTask.cancel()
+
+        await fulfillment(of: [cancelled], timeout: 1)
+    }
+
     // MARK: - Reply hook (last-sent keyed reply)
 
     /// The reply hook fires after send() and its return value is enqueued as
@@ -118,4 +135,5 @@ final class OBSSocketMockTests: XCTestCase {
             // expected
         }
     }
+
 }

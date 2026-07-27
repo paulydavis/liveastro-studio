@@ -100,6 +100,18 @@ final class FITSReaderTests: XCTestCase {
         }
     }
 
+    func testBlankBZeroCardUsesDefaultInsteadOfRejectingFile() throws {
+        let data = FITSTestBuilder.header(cards: [
+            ("SIMPLE", "T"), ("BITPIX", "16"), ("NAXIS", "2"),
+            ("NAXIS1", "1"), ("NAXIS2", "1"),
+            ("BZERO", ""),
+        ]) + Data(repeating: 0, count: 2880)
+
+        let header = try FITSReader.readHeader(data)
+
+        XCTAssertEqual(header.bzero, 0)
+    }
+
     func testUnsupportedBitpixThrows() {
         let data = FITSTestBuilder.header(cards: [
             ("SIMPLE", "T"), ("BITPIX", "64"), ("NAXIS", "2"), ("NAXIS1", "1"), ("NAXIS2", "1"),

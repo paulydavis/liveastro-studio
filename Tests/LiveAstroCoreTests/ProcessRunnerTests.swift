@@ -58,6 +58,19 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(start), 2.0)
     }
 
+    func testTimeoutEscalatesPastSIGTERMIgnoringProcessPromptly() throws {
+        let runner = FoundationProcessRunner(timeoutSeconds: 0.1, terminationGraceSeconds: 0.2)
+        let start = Date()
+        XCTAssertThrowsError(try runner.run(
+            executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "trap '' TERM; sleep 30"],
+            log: nil
+        )) {
+            XCTAssertEqual($0 as? ProcessRunnerError, .timedOut(seconds: 0.1))
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.0)
+    }
+
     // A fake conforming type proves the protocol is injectable (used heavily in Task 3).
     private class FakeRunner: ProcessRunner {
         var recorded: [(URL, [String])] = []

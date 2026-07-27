@@ -164,6 +164,7 @@ final class AppModel {
             makeStackEngine: { [weak self] in MainActor.assumeIsolated { self!.makeStackEngine() } },
             currentCalibration: { [weak self] in MainActor.assumeIsolated { self!.calibration } },
             currentNeutralizeBackground: { [weak self] in MainActor.assumeIsolated { self?.neutralizeBackground ?? false } },
+            currentDisplayAdjustments: { [weak self] in MainActor.assumeIsolated { self?.displayAdjustments ?? .neutral } },
             currentFileNamePrefix: { [weak self] in MainActor.assumeIsolated { self?.fileNamePrefix ?? "" } },
             currentLiveAstroRoot: { [weak self] in MainActor.assumeIsolated { self!.liveAstroRoot } },
             currentProfile: { [weak self] in MainActor.assumeIsolated { self!.profile } },

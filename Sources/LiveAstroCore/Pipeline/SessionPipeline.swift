@@ -547,6 +547,7 @@ public final class SessionPipeline {
             }
             break                                                     // a full window, no progress
         }
+        onLog?("Import stalled with no progress — cancelling remaining frames and finalizing completed frames.")
         cancelImport()
         task.cancel()
         if consumeDone.wait(timeout: .now() + drainGraceTimeout) == .success {

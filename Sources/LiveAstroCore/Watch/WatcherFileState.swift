@@ -531,19 +531,28 @@ struct WatcherReducer {
             let blockerName = blocker.observation.name
             if let active = state.generation.ordering.activeBlocker,
                active.blocker != blockerName {
-                guard isSameNumericRevision(active.blocker, blockerName) else {
+                if isSameNumericRevision(active.blocker, blockerName) {
                     state.generation.ordering.activeBlocker = BlockingEpisode(
                         blocker: blockerName,
-                        startNanos: nowNanos,
-                        deadlineNanos: nowNanos &+ blockingBudgetNanos,
+                        startNanos: active.startNanos,
+                        deadlineNanos: active.deadlineNanos,
                         victims: victimNames)
-                    return effects
+                } else {
+                    let continuouslyHeldVictims = active.victims.intersection(victimNames)
+                    let blockerWasVictim = active.victims.contains(blockerName)
+                    let previousBlockerBecameVictim = victimNames.contains(active.blocker)
+                    let preservesAggregateClock = !continuouslyHeldVictims.isEmpty
+                        && !blockerWasVictim
+                        && !previousBlockerBecameVictim
+                    state.generation.ordering.activeBlocker = BlockingEpisode(
+                        blocker: blockerName,
+                        startNanos: preservesAggregateClock ? active.startNanos : nowNanos,
+                        deadlineNanos: preservesAggregateClock
+                            ? active.deadlineNanos
+                            : nowNanos &+ blockingBudgetNanos,
+                        victims: victimNames)
+                    if !preservesAggregateClock { return effects }
                 }
-                state.generation.ordering.activeBlocker = BlockingEpisode(
-                    blocker: blockerName,
-                    startNanos: active.startNanos,
-                    deadlineNanos: active.deadlineNanos,
-                    victims: victimNames)
             } else if state.generation.ordering.activeBlocker == nil {
                 state.generation.ordering.activeBlocker = BlockingEpisode(
                     blocker: blockerName,

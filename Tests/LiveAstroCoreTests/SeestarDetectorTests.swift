@@ -61,7 +61,7 @@ final class SeestarDetectorTests: XCTestCase {
     func testIgnoresBackupVolumeWithSeestarFolderShape() throws {
         let vols = try tmp()
         let realWorks = vols.appendingPathComponent("EMMC Images/MyWorks")
-        let backupWorks = vols.appendingPathComponent("BackupDrive/MyWorks")
+        let backupWorks = vols.appendingPathComponent("MySeestarBackup/MyWorks")
         try FileManager.default.createDirectory(at: realWorks, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: backupWorks, withIntermediateDirectories: true)
         let real = realWorks.appendingPathComponent("M 8_sub")
@@ -75,5 +75,17 @@ final class SeestarDetectorTests: XCTestCase {
 
         let found = SeestarDetector.detect(volumesRoot: vols)
         XCTAssertEqual(found?.target, "M 8")
+    }
+
+    func testAcceptsDuplicateMountedEMMCImagesVolume() throws {
+        let vols = try tmp()
+        let works = vols.appendingPathComponent("EMMC Images-1/MyWorks")
+        try FileManager.default.createDirectory(at: works, withIntermediateDirectories: true)
+        let sub = works.appendingPathComponent("M 42_sub")
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        try Data(count: 8).write(to: sub.appendingPathComponent("Light_M 42_10.0s_LP_1.fit"))
+
+        let found = SeestarDetector.detect(volumesRoot: vols)
+        XCTAssertEqual(found?.target, "M 42")
     }
 }

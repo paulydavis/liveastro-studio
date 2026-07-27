@@ -79,7 +79,7 @@ final class GraXpertProcessorTests: XCTestCase {
         let proc = GraXpertProcessor(executable: exe, runner: runner, denoiseStrength: 0.5)
         let master = tmp.appendingPathComponent("master.fit")
         let out = tmp.appendingPathComponent("master_processed.fit")
-        try proc.process(masterURL: master, outputURL: out, log: nil)
+        _ = try proc.process(masterURL: master, outputURL: out, log: nil)
 
         XCTAssertEqual(runner.calls.count, 2)
         // call 0 = background-extraction
@@ -123,8 +123,10 @@ final class GraXpertProcessorTests: XCTestCase {
         let proc = GraXpertProcessor(executable: exeFile, runner: FitsExtFakeRunner(exitCodes: [0, 0]))
         let master = tmp.appendingPathComponent("master.fit")
         let out = tmp.appendingPathComponent("master_processed.fit")
-        // Should NOT throw — .fits sibling exists even though .fit does not.
-        XCTAssertNoThrow(try proc.process(masterURL: master, outputURL: out, log: nil))
+        // Should NOT throw — .fits sibling exists even though .fit does not,
+        // and the caller should learn the real produced filename.
+        let produced = try proc.process(masterURL: master, outputURL: out, log: nil)
+        XCTAssertEqual(produced.path, out.deletingPathExtension().appendingPathExtension("fits").path)
         // The .fit itself should not exist; the .fits sibling should.
         XCTAssertFalse(FileManager.default.fileExists(atPath: out.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: out.deletingPathExtension().appendingPathExtension("fits").path))
@@ -136,7 +138,7 @@ final class GraXpertProcessorTests: XCTestCase {
         let master = tmp.appendingPathComponent("master.fit")
         let out = tmp.appendingPathComponent("master_processed.fit")
 
-        XCTAssertNoThrow(try proc.process(masterURL: master, outputURL: out, log: nil))
+        let produced = try proc.process(masterURL: master, outputURL: out, log: nil)
 
         XCTAssertEqual(runner.calls.count, 2)
         let bgOutIdx = runner.calls[0].firstIndex(of: "-output")!
@@ -148,7 +150,23 @@ final class GraXpertProcessorTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: bgRequested.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: bgRequested.path + ".fits"),
                        "The real appended background temp must be cleaned up.")
+        XCTAssertEqual(produced.path, out.path + ".fits")
         XCTAssertTrue(FileManager.default.fileExists(atPath: out.path + ".fits"))
+    }
+
+    func testRemovesStaleOutputVariantsBeforeProcessing() throws {
+        let stale = tmp.appendingPathComponent("master_processed.fit.fits")
+        FileManager.default.createFile(atPath: stale.path, contents: Data("stale".utf8))
+        let runner = FakeRunner(exitCodes: [0, 0], writeOutputOnCallIndex: 0)
+        let proc = GraXpertProcessor(executable: exeFile, runner: runner)
+
+        XCTAssertThrowsError(try proc.process(masterURL: tmp.appendingPathComponent("master.fit"),
+                                              outputURL: tmp.appendingPathComponent("master_processed.fit"),
+                                              log: nil)) { err in
+            XCTAssertEqual(err as? ProcessorError, .noOutput)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path),
+                       "Stale denoise output variants must be removed before running so a failed rerun cannot look successful.")
     }
 
     func testIsAvailableReflectsExecutableExistence() {

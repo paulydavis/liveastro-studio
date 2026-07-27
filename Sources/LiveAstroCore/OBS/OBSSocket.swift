@@ -60,7 +60,7 @@ public final class URLSessionOBSSocket: OBSSocket {
         let t = session.webSocketTask(with: url)
         setState(session: session, task: t)
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            openDelegate.awaitOpen(cont)
+            openDelegate.awaitOpen(cont, task: t)
             t.resume()
         }
     }
@@ -125,26 +125,29 @@ public final class URLSessionOBSSocket: OBSSocket {
 private final class OpenDelegate: NSObject, URLSessionWebSocketDelegate {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Error>?
+    private var expectedTask: URLSessionTask?
     private var settled = false
 
-    func awaitOpen(_ cont: CheckedContinuation<Void, Error>) {
+    func awaitOpen(_ cont: CheckedContinuation<Void, Error>, task: URLSessionTask) {
         lock.lock(); defer { lock.unlock() }
         settled = false
+        expectedTask = task
         continuation = cont
     }
 
-    private func resume(_ result: Result<Void, Error>) {
+    private func resume(_ result: Result<Void, Error>, for task: URLSessionTask) {
         lock.lock()
-        guard !settled, let cont = continuation else { lock.unlock(); return }
+        guard task === expectedTask, !settled, let cont = continuation else { lock.unlock(); return }
         settled = true
         continuation = nil
+        expectedTask = nil
         lock.unlock()
         cont.resume(with: result)
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol proto: String?) {
-        resume(.success(()))
+        resume(.success(()), for: webSocketTask)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask,
@@ -152,7 +155,7 @@ private final class OpenDelegate: NSObject, URLSessionWebSocketDelegate {
         // Fires for connection failures (refused/unreachable) before an open,
         // and for normal closes after. Only the pre-open case still has a
         // pending continuation; post-open completions are a no-op here.
-        resume(.failure(error ?? OBSSocketError.notConnected))
+        resume(.failure(error ?? OBSSocketError.notConnected), for: task)
     }
 }
 

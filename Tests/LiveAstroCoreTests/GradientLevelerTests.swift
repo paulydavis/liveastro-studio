@@ -37,12 +37,12 @@ final class GradientLevelerTests: XCTestCase {
         XCTAssertEqual(out.pixels, [0.5, 0.6, 0.7])
     }
 
-    func testClampsToUnitRange() {
+    func testClampsHighButPreservesNegativeNoise() {
         let a = img(1, 1, 3, [0.05, 0.95, 0.5])
         let sub = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0.2, 0, 0], [-0.2, 0, 0], [0, 0, 0]])
         let ref = Model(degree: 1, width: 1, height: 1, coeffPerChannel: [[0, 0, 0], [0, 0, 0], [0, 0, 0]])
         let out = GradientLeveler.apply(a, subModel: sub, refModel: ref)
-        XCTAssertEqual(out.pixels[0], 0.0, accuracy: 1e-6)        // 0.05 - 0.2 → clamp 0
+        XCTAssertEqual(out.pixels[0], -0.15, accuracy: 1e-6)      // 0.05 - 0.2 → preserve negative calibrated noise
         XCTAssertEqual(out.pixels[1], 1.0, accuracy: 1e-6)        // 0.95 - (-0.2) → clamp 1
     }
 

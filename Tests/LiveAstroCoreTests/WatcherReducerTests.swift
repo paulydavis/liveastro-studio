@@ -222,6 +222,51 @@ final class WatcherReducerTests: XCTestCase {
                        "the second blocker role starts a new episode at the transition")
     }
 
+    func testAggregateBlockerChurnDoesNotStarveContinuouslyHeldVictim() {
+        let firstBlocker = revisionName("00001")
+        let secondBlocker = revisionName("00002")
+        let victim = revisionName("00003")
+        let victimIdentity = makeIdentity(3)
+        var reducer = makeReducer(files: [
+            victim: .ready(makeCandidate(
+                name: victim,
+                identity: victimIdentity,
+                digest: "victim",
+                kind: .numbered(revision: "00003"))),
+        ])
+
+        XCTAssertTrue(observeBatch([
+            invalidRevision("00001"),
+            observation(name: secondBlocker, revision: "00002", outcome: .absent),
+            observation(name: victim, revision: "00003", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: 10, reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, firstBlocker)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos, 10)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.victims, [victim])
+
+        XCTAssertTrue(observeBatch([
+            observation(name: firstBlocker, revision: "00001", outcome: .absent),
+            invalidRevision("00002"),
+            observation(name: victim, revision: "00003", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: 20, reducer: &reducer).isEmpty)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, secondBlocker)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.startNanos, 10,
+                       "the continuously held victim owns the aggregate starvation clock")
+
+        let released = observeBatch([
+            invalidRevision("00001"),
+            observation(name: secondBlocker, revision: "00002", outcome: .absent),
+            observation(name: victim, revision: "00003", outcome: .identityUnchanged(
+                identity: victimIdentity)),
+        ], nowNanos: 30_000_000_010, reducer: &reducer)
+
+        XCTAssertEqual(emittedNames(in: released), [victim])
+        XCTAssertEqual(reducer.state.generation.files[firstBlocker], .writtenOff)
+        XCTAssertNil(reducer.state.generation.ordering.activeBlocker)
+    }
+
     func testVictimDisappearanceDestroysEpisodeAndReappearanceStartsFresh() {
         var reducer = makeReducer()
 

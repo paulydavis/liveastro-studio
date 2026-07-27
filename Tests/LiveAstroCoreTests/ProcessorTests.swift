@@ -19,12 +19,13 @@ final class ProcessorTests: XCTestCase {
     // A trivial conforming type proves the protocol shape compiles/usable.
     private struct StubProcessor: Processor {
         var name = "Stub"; var isAvailable = true
-        func process(masterURL: URL, outputURL: URL, log: ((String)->Void)?) throws { log?("ran") }
+        func process(masterURL: URL, outputURL: URL, log: ((String)->Void)?) throws -> URL { log?("ran"); return outputURL }
     }
     func testProtocolIsUsable() throws {
         var msgs: [String] = []
         let p: Processor = StubProcessor()
-        try p.process(masterURL: URL(fileURLWithPath: "/a"), outputURL: URL(fileURLWithPath: "/b")) { msgs.append($0) }
+        let output = try p.process(masterURL: URL(fileURLWithPath: "/a"), outputURL: URL(fileURLWithPath: "/b")) { msgs.append($0) }
         XCTAssertEqual(p.name, "Stub"); XCTAssertTrue(p.isAvailable); XCTAssertEqual(msgs, ["ran"])
+        XCTAssertEqual(output.path, "/b")
     }
 }

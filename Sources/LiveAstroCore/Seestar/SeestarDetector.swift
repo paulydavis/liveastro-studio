@@ -40,7 +40,14 @@ public enum SeestarDetector {
 
     private static func isPlausibleSeestarVolume(_ volume: URL) -> Bool {
         let name = volume.lastPathComponent.lowercased()
-        return name == "emmc images" || name.contains("seestar")
+        guard !isBackupLikeVolumeName(name) else { return false }
+        return name == "emmc images"
+            || name.range(of: #"^emmc images-\d+$"#, options: .regularExpression) != nil
+            || name.contains("seestar")
+    }
+
+    private static func isBackupLikeVolumeName(_ name: String) -> Bool {
+        name.contains("backup") || name.contains("archive") || name.contains("clone")
     }
 
     /// Parse "..._10.0s_..." → 10.0
