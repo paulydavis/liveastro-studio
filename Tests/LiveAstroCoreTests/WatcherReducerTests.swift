@@ -2130,6 +2130,32 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(reducer.state.lastEmittedDigestByName["live_stack.fit"], "new")
     }
 
+    func testNumberedEmissionClearsPausedVictimClockWhenEpisodeAlreadyDissolved() {
+        let blocker = "live_stack_00001.fit"
+        let victim = "live_stack_00002.fit"
+        let identity = makeIdentity(1)
+        let candidate = makeCandidate(
+            name: blocker,
+            identity: identity,
+            digest: "blocker-complete",
+            kind: .numbered(revision: "00001"))
+        let intent = EmissionIntent(
+            generation: FolderGeneration(rawValue: 1),
+            candidate: candidate)
+        var pausedClock = VictimBlockingClock(startNanos: 10, deadlineNanos: 30_000_000_010)
+        pausedClock.pause(at: 20)
+        var reducer = makeReducer(
+            files: [blocker: .ready(candidate)],
+            victimClocks: [victim: pausedClock])
+
+        XCTAssertTrue(reducer.reduce(.emissionFinished(EmissionResult(
+            intent: intent,
+            outcome: .yielded))).isEmpty)
+
+        XCTAssertNil(reducer.state.generation.ordering.victimClocks[victim],
+                     "when the blocker emits after its victim disappeared, the paused victim clock is stale")
+    }
+
     func testCurrentGenerationRejectedEmissionPreservesReadyStateAndDigest() {
         let identity = makeIdentity(1)
         let candidate = makeCandidate(
@@ -2210,17 +2236,20 @@ final class WatcherReducerTests: XCTestCase {
         files: [String: FileState] = [:],
         digests: [String: String] = [:],
         activeBlocker: BlockingEpisode? = nil,
+        victimClocks: [String: VictimBlockingClock] = [:],
         digestPolicy: StackFileWatcher.DigestPolicy = .mutableStackerOutput,
         filePrefix: String? = "live_stack",
         quietPeriodNanos: UInt64 = 100,
         pollIntervalNanos: UInt64 = 1_000
     ) -> WatcherReducer {
-        WatcherReducer(
+        var ordering = RevisionOrderingState(activeBlocker: activeBlocker)
+        ordering.victimClocks = victimClocks
+        return WatcherReducer(
             state: WatcherState(
                 generation: GenerationState(
                     id: FolderGeneration(rawValue: generation),
                     files: files,
-                    ordering: RevisionOrderingState(activeBlocker: activeBlocker)),
+                    ordering: ordering),
                 lastEmittedDigestByName: digests),
             configuration: makeConfiguration(
                 digestPolicy: digestPolicy,

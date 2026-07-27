@@ -1724,6 +1724,50 @@ final class StackFileWatcherTests: XCTestCase {
                       "no write-off for a file that recovered inside the budget — got \(logs.all)")
     }
 
+    /// Round5 R5-1 (driver/reducer composition, red-first): the reducer can pause a victim
+    /// clock across absence only if the driver continues reporting that absent victim. The
+    /// first absent scan prunes the victim's file state, so a real scan loop must also look
+    /// at clock-bearing names when synthesizing `.absent`; otherwise the second absent scan
+    /// forgets the paused clock and a returning victim gets a fresh budget.
+    func testMutablePolicy_multiScanVictimAbsencePausesClockThroughDriverTombstone() async throws {
+        let clock = ManualClock()
+        watcher = try makeManualWatcher(policy: .mutableStackerOutput, clock: clock,
+                                        prefix: "live_stack")
+        let logs = LogBox()
+        watcher.onLog = { logs.append($0) }
+        try watcher.start()
+        let full = makeFITS(0.5, size: 64)
+        let blocker = tmp.appendingPathComponent("live_stack_00001.fit")
+        let victim = tmp.appendingPathComponent("live_stack_00002.fit")
+        try full.prefix(full.count / 2).write(to: blocker) // invalid, but present
+        try makeFITS(0.2).write(to: victim)
+
+        watcher.scanNow()                 // first sighting: _00001 blocks _00002
+        watcher.scanNow()                 // _00002 digest pending, victim clock active
+        clock.advance(seconds: 3601)
+        watcher.scanNow()                 // _00002 ready, still held behind _00001
+        clock.advance(seconds: 14_000)
+        watcher.scanNow()                 // about half the budget is consumed while blocked
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "arrange: still inside the blocking budget — got \(logs.all)")
+
+        try FileManager.default.removeItem(at: victim)
+        for _ in 0..<5 {
+            clock.advance(seconds: 20_000)
+            watcher.scanNow()             // multi-scan absence: no wall time should be charged
+        }
+        XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
+                      "an absent victim pauses the budget; no write-off while nobody is blocked")
+
+        try makeFITS(0.2).write(to: victim)
+        watcher.scanNow()                 // victim returns; the old paused clock should resume
+        clock.advance(seconds: 19_000)    // enough only if the pre-absence blocked time survived
+        watcher.scanNow()
+
+        XCTAssertEqual(logs.all.filter { $0.contains("abandoning") }.count, 1,
+                       "returning victim must resume the old clock, not receive a fresh full budget; got \(logs.all)")
+    }
+
     /// Review11 finding 4 (P2, red-first): the old write-off counted 5 consecutive invalid
     /// SCANS — at the supported 10 ms poll that elapsed in ~100 ms of wall time, discarding a
     /// recoverable paused write. Post-fix the write-off is monotonic-time-denominated: with a

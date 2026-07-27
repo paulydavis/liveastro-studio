@@ -380,7 +380,10 @@ struct WatcherReducer {
 
     private mutating func reconcileActiveBlocker(afterEmitting candidate: EmissionCandidate) {
         state.generation.ordering.victimClocks[candidate.name] = nil
-        guard var episode = state.generation.ordering.activeBlocker else { return }
+        guard var episode = state.generation.ordering.activeBlocker else {
+            clearPausedVictimClocksResolvedByEmission(of: candidate)
+            return
+        }
 
         if candidate.name == episode.blocker {
             state.generation.ordering.activeBlocker = nil
@@ -405,6 +408,20 @@ struct WatcherReducer {
         else { return }
         state.generation.ordering.activeBlocker = nil
         state.generation.ordering.victimClocks.removeAll()
+    }
+
+    private mutating func clearPausedVictimClocksResolvedByEmission(
+        of candidate: EmissionCandidate
+    ) {
+        guard case .numbered(let emittedRevision) = candidate.kind else { return }
+        for name in Array(state.generation.ordering.victimClocks.keys) {
+            guard let victimRevision = revisionOrder.revision(in: name),
+                  revisionOrder.orderedBefore(
+                    (name: candidate.name, revision: emittedRevision),
+                    (name: name, revision: victimRevision))
+            else { continue }
+            state.generation.ordering.victimClocks[name] = nil
+        }
     }
 
     private struct ClassifiedObservation {
