@@ -26,6 +26,7 @@ struct RevisionOrderingState {
     var activeBlocker: BlockingEpisode?
     var victimLedgers: [String: VictimWaitLedger] = [:]
     var pendingEmissionOwners: Set<RevisionKey> = []
+    var ownerGraceUntil: [RevisionKey: UInt64] = [:]
 }
 
 struct RevisionKey: Hashable, Equatable {
@@ -509,7 +510,7 @@ struct WatcherReducer {
                 state.generation.ordering.victimLedgers[victim] = nil
             }
         }
-        // Task 7 extends this function with ownerGraceUntil[owner] = nil (M8 hygiene).
+        state.generation.ordering.ownerGraceUntil[owner] = nil   // M8 hygiene
     }
 
     private struct ClassifiedObservation {
@@ -672,55 +673,79 @@ struct WatcherReducer {
 
             let victimStart = potential.index(after: blockerIndex)
             let blocker = potential[blockerIndex]
-            guard victimStart < potential.endIndex else {
-                state.generation.ordering.activeBlocker = nil
-                break blockerScan
-            }
             let victimNames = Set(potential[victimStart...].map(\.observation.name))
 
             let blockerName = blocker.observation.name
-            let blockerOwner = blocker.revision.map(RevisionKey.init)
-            if let blockerOwner, hasPendingLowerOwner(before: blockerOwner) {
-                // A lower revision's emission intent is still unsettled: defer this
-                // successor owner's charging, consumption, and write-off until it
-                // settles. Pausing matters — a segment left running through a barrier
-                // pass would silently extend under the deferred owner, which is
-                // exactly what the barrier forbids. The barrier defers ledger
-                // operations only; file-state updates, intent recording, and mark
-                // drops proceeded normally above.
+            guard let blockerOwner = blocker.revision.map(RevisionKey.init) else {
+                break blockerScan   // unreachable: `numbered` items always parse a revision
+            }
+
+            state.generation.ordering.activeBlocker = BlockingEpisode(
+                blocker: blockerName,
+                owner: blockerOwner,
+                victims: victimNames)   // nil (episode-less) when victimNames is empty — lone blockers own nothing
+
+            guard !victimNames.isEmpty else { break blockerScan }
+
+            // Pending-emission barrier (§4): defer open/extend/consume/write-off while a
+            // lower owner's intent is unsettled. Pause so no segment silently extends.
+            if hasPendingLowerOwner(before: blockerOwner) {
                 for victim in victimNames {
                     state.generation.ordering.victimLedgers[victim]?.pause(at: nowNanos)
                 }
                 break blockerScan
             }
+
+            // Charge (§4 step 5): one running segment per victim, keyed by the current owner.
             for victim in victimNames {
-                guard let blockerOwner else { continue }
                 state.generation.ordering.victimLedgers[victim, default: VictimWaitLedger()]
                     .startOrContinue(owner: blockerOwner, at: nowNanos)
             }
 
-            state.generation.ordering.activeBlocker = blockerOwner.flatMap {
-                BlockingEpisode(blocker: blockerName, owner: $0, victims: victimNames)
+            // Convergence grace (§5.4): renew the CURRENT owner only.
+            if blocker.isConverging {
+                noteConvergingOwner(blockerOwner, at: nowNanos)
             }
-            // Convergence grace returns in Task 7 (ownerGraceUntil)
-            guard victimNames.contains(where: { victim in
-                guard let ledger = state.generation.ordering.victimLedgers[victim] else { return false }
-                return totalWaitWriteOffCandidate(victimLedger: ledger, nowNanos: nowNanos)
-            }) else { break blockerScan }
 
-            let heldNanos = victimNames
-                .compactMap { state.generation.ordering.victimLedgers[$0]?.totalUnredeemedNanos(at: nowNanos) }
-                .max() ?? 0
-            state.generation.files[blockerName] = .writtenOff
-            for victim in victimNames {
-                state.generation.ordering.victimLedgers[victim] = nil   // TEMPORARY — Task 7 consumes per decision
+            // Write-off (§§5.5-5.6): ONE blocked victim with a justified decision suffices.
+            var justified: (victim: String, decision: WriteOffDecision)?
+            for victim in victimNames.sorted() {
+                guard let ledger = state.generation.ordering.victimLedgers[victim],
+                      let decision = writeOffDecision(
+                          for: blockerOwner,
+                          blockerName: blockerName,
+                          victimLedger: ledger,
+                          nowNanos: nowNanos)
+                else { continue }
+                justified = (victim, decision)
+                break
             }
+            guard let (justifyingVictim, decision) = justified else { break blockerScan }
+
+            writeOffDecisionHookForTesting?(decision, nowNanos)
+            state.generation.files[blockerName] = .writtenOff
+            var consumption = decision.consumedSegments
+            consumption[decision.blocker] = decision.attributedNanos   // the terminal owner's own segment dies with it
+            state.generation.ordering.victimLedgers[justifyingVictim]?.consume(consumption, at: nowNanos)
+            if state.generation.ordering.victimLedgers[justifyingVictim]?.isEmpty == true {
+                state.generation.ordering.victimLedgers[justifyingVictim] = nil
+            }
+            // Other victims keep their segments: the written-off owner never emitted, so per
+            // §5.2 their attributed wait stays owed; the next pass discharges them if the
+            // write-off left them unblocked.
             state.generation.ordering.activeBlocker = nil
-            let heldSeconds = Int((Double(heldNanos) / 1_000_000_000).rounded())
-            effects.append(.log(
-                "revision \(blocker.revision ?? "") blocked emissions for \(heldSeconds)s "
-                + "without completing — abandoning it; later revisions proceed "
-                + "(frame lost: \(blockerName))"))
+            state.generation.ordering.ownerGraceUntil[decision.blocker] = nil
+
+            let heldSeconds = Int((Double(decision.attributedNanos) / 1_000_000_000).rounded())
+            var message = "revision \(blocker.revision ?? decision.blocker.normalizedDigits) "
+                + "blocked emissions for \(heldSeconds)s without completing — abandoning it; "
+                + "later revisions proceed (frame lost: \(decision.blockerNameForLog))"
+            if !decision.consumedSegments.isEmpty {
+                message += "; consumed predecessor debt: "
+                    + formatConsumedSegments(decision.consumedSegments)
+            }
+            effects.append(.log(message))
+            continue blockerScan   // re-derive the next blocker; newly unblocked ready files emit this pass
         }
 
         // End-of-pass ledger settlement (M3 tombstones + §5.2 discharge). Runs on every
@@ -734,6 +759,14 @@ struct WatcherReducer {
                 state.generation.ordering.victimLedgers[name]?.pause(at: nowNanos)  // tombstone / not charged
             }
         }
+
+        // ownerGraceUntil holds entries only for owners that still matter: live segments
+        // or the current head blocker. Everything else (vanished never-charged owners,
+        // discharged debt) is pruned so the map is empty at quiescence (H2).
+        let liveOwners = Set(state.generation.ordering.victimLedgers.values.flatMap { $0.segments.keys })
+        let headOwner = state.generation.ordering.activeBlocker?.owner
+        state.generation.ordering.ownerGraceUntil = state.generation.ordering.ownerGraceUntil
+            .filter { liveOwners.contains($0.key) || $0.key == headOwner }
         return effects
     }
 
@@ -743,13 +776,76 @@ struct WatcherReducer {
         }
     }
 
-    // TEMPORARY Task-3 gate: total-wait only. Task 7 replaces this with
-    // writeOffDecision(for:blockerName:victimLedger:nowNanos:).
-    private func totalWaitWriteOffCandidate(
+    /// Test-only observation point for the N1 sweep (Task 8). Nil in production.
+    var writeOffDecisionHookForTesting: ((WriteOffDecision, UInt64) -> Void)?
+
+    /// §§5.4-5.6. Nil when the ledger lacks budget-worth of unredeemed wait, or when
+    /// the current owner is still inside its own convergence grace window.
+    /// `consumedSegments` = predecessor debt only, oldest owner first, truncating,
+    /// zero-amount entries excluded. Budget/grace/ceiling reuse the reducer properties.
+    func writeOffDecision(
+        for blocker: RevisionKey,
+        blockerName: String,
         victimLedger: VictimWaitLedger,
         nowNanos: UInt64
+    ) -> WriteOffDecision? {
+        let budget = blockingBudgetNanos
+        guard victimLedger.totalUnredeemedNanos(at: nowNanos) >= budget else { return nil }
+        guard currentOwnerGraceExpired(owner: blocker, in: victimLedger, nowNanos: nowNanos)
+        else { return nil }
+
+        let attributedNanos = victimLedger.segments[blocker]?.totalNanos(at: nowNanos) ?? 0
+        var remaining = budget > attributedNanos ? budget - attributedNanos : 0
+        var consumed: [RevisionKey: UInt64] = [:]
+        let predecessors = victimLedger.segments.keys
+            .filter { $0 != blocker }
+            .sorted { revisionOrder.orderedBefore($0, $1) }
+        for owner in predecessors {
+            guard remaining > 0, let segment = victimLedger.segments[owner] else { continue }
+            let amount = min(segment.totalNanos(at: nowNanos), remaining)
+            guard amount > 0 else { continue }   // zero-amount entries pollute the decision map
+            consumed[owner] = amount
+            remaining -= amount
+        }
+        return WriteOffDecision(
+            blocker: blocker,
+            blockerNameForLog: blockerName,
+            attributedNanos: attributedNanos,
+            consumedSegments: consumed)
+    }
+
+    /// §5.4: base tenure is one grace period from the owner's own first charge;
+    /// converging observations renew it (ownerGraceUntil); the hard cap is the
+    /// owner-anchored ceiling. Predecessor debt never shortens a fresh owner's grace,
+    /// and grace never rewrites predecessor segments.
+    private func currentOwnerGraceExpired(
+        owner: RevisionKey,
+        in ledger: VictimWaitLedger,
+        nowNanos: UInt64
     ) -> Bool {
-        victimLedger.totalUnredeemedNanos(at: nowNanos) >= blockingBudgetNanos
+        guard let segment = ledger.segments[owner] else { return false }
+        let ceiling = segment.firstChargeNanos &+ blockingCeilingNanos
+        if nowNanos >= ceiling { return true }
+        if let renewedUntil = state.generation.ordering.ownerGraceUntil[owner],
+           nowNanos < renewedUntil {
+            return false
+        }
+        return nowNanos >= segment.firstChargeNanos &+ blockingGraceNanos
+    }
+
+    mutating func noteConvergingOwner(_ owner: RevisionKey, at nowNanos: UInt64) {
+        state.generation.ordering.ownerGraceUntil[owner] = nowNanos &+ blockingGraceNanos
+    }
+
+    private func formatSeconds(_ nanos: UInt64) -> String {
+        String(format: "%.1fs", Double(nanos) / 1_000_000_000)
+    }
+
+    private func formatConsumedSegments(_ segments: [RevisionKey: UInt64]) -> String {
+        segments
+            .sorted { revisionOrder.orderedBefore($0.key, $1.key) }
+            .map { "\($0.key.normalizedDigits)=\(formatSeconds($0.value))" }
+            .joined(separator: ", ")
     }
 
     /// Discharge predicate (§5.2). Present and unblocked is a batch/file-state/numeric-order
