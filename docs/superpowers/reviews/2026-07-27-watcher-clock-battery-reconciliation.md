@@ -46,6 +46,26 @@ The reconciled expectations are the gate; stale scalar-era asserts are not.
   the interim lone-blocker deletion; invalid-lower passed via the charging path
   retaining the ledger; barrier passed via the explicit barrier pause).
 
+- **Task 9 regeneration: no expectation changed.** Before running, every accrual
+  comment in `WatcherSegmentBatteryTests.swift` was recomputed independently against
+  the implemented digest-gate and ledger semantics (three-sighting readiness with
+  `firstObservedNanos` at sighting 2; `startOrContinue` charging; barrier pause;
+  end-of-pass discharge/pause; write-off = unredeemed total ≥ budget with owner grace
+  expired). Recomputed write-off instants — d1: 36s, d2: 55s, d9: 61s, d4: 33s
+  (own 10s + carried 1=20.0s), C2: 30s (own 1s + carried 1=29.0s), e1: 33s, e7: 42s,
+  h3: 43s, h4: 56s, c3: 60s (≤ 62s bound), S5: 37s (≤ 40s bound), b1: 130s,
+  e9: 30+3·cycles — all matched the plan asserts exactly; 13/13 passed on the first
+  run with zero edits to expectations or production code.
+- **Absent-observation fidelity note (Task 9).** The `ScriptedWatcherDriver` passes
+  scripted batches through verbatim (the plan's control-portable harness); it does not
+  re-implement the real watcher's absent synthesis (`files` ∪ ledger-tombstone keys).
+  Fidelity was checked test-by-test instead: every behavior-relevant synthesis site
+  (c3's vanished padding twin, d2/d9/h3 victim flicker, d4/C2 vanished owners) carries
+  an explicit `.absent` entry, and every omitted tracked name is a provable classify
+  no-op (settled → `withReplacement(nil)`; written-off → ignored; invalid-only owners
+  never enter `files` or ledger keys), so the scripted batches are observationally
+  identical to synthesized ones.
+
 ## Control-snapshot matrix (filled in by Task 10)
 
 Binding rows (round-8 control table): d9 red on `6cb370a` only; e1/e7 red on
