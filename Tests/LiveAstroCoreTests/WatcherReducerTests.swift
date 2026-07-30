@@ -2800,4 +2800,113 @@ final class WatcherReducerTests: XCTestCase {
             2_000)
         XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, successor)
     }
+
+    func testSegmentModel_b1DischargesDebtAfterPresentUnblockedObservePass() {
+        // Development probe: reducer-only, injected ledger. b1/W4-2a provenance: round-4
+        // W4-2a (stale clocks age while unblocked), round-5 "W4-2a fully closed".
+        // Driver-faithful acceptance: WatcherSegmentBatteryTests.test_b1_*.
+        let victim = revisionName("00003")
+        var ledger = VictimWaitLedger()
+        ledger.startOrContinue(owner: RevisionKey("1"), at: 0)
+        ledger.pause(at: 29_000_000_000)
+        var reducer = makeReducer(victimLedgers: [victim: ledger])
+
+        // One full pass: victim present (first .digested sighting → .observing is enough —
+        // discharge needs presence, not readiness), and no lower revision in the batch.
+        _ = observeBatch([
+            observation(name: victim, revision: "00003", outcome: .digested(
+                identity: makeIdentity(3),
+                digest: "victim",
+                byteCount: makeIdentity(3).size))
+        ], nowNanos: 30_000_000_000, reducer: &reducer)
+
+        XCTAssertNil(reducer.state.generation.ordering.victimLedgers[victim],
+                     "a present-and-unblocked pass discharges stale debt (§5.2)")
+    }
+
+    func testSegmentModelInvalidLowerWithoutFilesEntryStillBlocksDischarge() {
+        // Development probe: reducer-only, injected ledger.
+        let victim = revisionName("00003")
+        var ledger = VictimWaitLedger()
+        ledger.startOrContinue(owner: RevisionKey("2"), at: 0)
+        ledger.pause(at: 10_000_000_000)
+        var reducer = makeReducer(victimLedgers: [victim: ledger])
+
+        _ = observeBatch([
+            invalidRevision("00002"),   // present, unready, and NEVER in state.generation.files
+            observation(name: victim, revision: "00003", outcome: .digested(
+                identity: makeIdentity(3),
+                digest: "victim",
+                byteCount: makeIdentity(3).size))
+        ], nowNanos: 11_000_000_000, reducer: &reducer)
+
+        XCTAssertNotNil(reducer.state.generation.ordering.victimLedgers[victim],
+                        "an invalid lower revision is batch-present and unready — the victim is blocked")
+    }
+
+    func testSegmentModelBarrierDeferredSuccessorStillMeansVictimIsBlocked() {
+        // Development probe: reducer-only, injected states. The barrier is not an
+        // unblocked signal (§5.2): an unready lower revision keeps the victim blocked
+        // even while charging is barrier-deferred.
+        let victim = revisionName("00003")
+        var ledger = VictimWaitLedger()
+        ledger.startOrContinue(owner: RevisionKey("1"), at: 0)
+        ledger.pause(at: 10_000_000_000)
+        var ordering = RevisionOrderingState(activeBlocker: nil)
+        ordering.victimLedgers = [victim: ledger]
+        ordering.pendingEmissionOwners = [RevisionKey("1")]
+        var reducer = WatcherReducer(
+            state: WatcherState(
+                generation: GenerationState(
+                    id: FolderGeneration(rawValue: 1),
+                    files: [victim: .ready(makeCandidate(
+                        name: victim,
+                        identity: makeIdentity(3),
+                        digest: "victim",
+                        kind: .numbered(revision: "00003")))],
+                    ordering: ordering),
+                lastEmittedDigestByName: [:]),
+            configuration: makeConfiguration())
+
+        _ = observeBatch([
+            invalidRevision("00002"),
+            observation(name: victim, revision: "00003",
+                        outcome: .identityUnchanged(identity: makeIdentity(3))),
+        ], nowNanos: 11_000_000_000, reducer: &reducer)
+
+        XCTAssertNotNil(reducer.state.generation.ordering.victimLedgers[victim])
+    }
+
+    func testSegmentModelAllReadyPassPausesAbsentVictimLedgerInsteadOfDeleting() {
+        // Development probe: reducer-only, injected ledger and .ready state. True-red
+        // probe for Task 6: the interim all-ready branch wipes victimLedgers wholesale;
+        // the end-of-pass settlement must instead pause (tombstone) an absent victim's
+        // charged ledger so its accrual survives the pass (M3).
+        let ready = revisionName("00001")
+        let victim = revisionName("00003")
+        var ledger = VictimWaitLedger()
+        ledger.startOrContinue(owner: RevisionKey("2"), at: 0)
+        ledger.pause(at: 5_000_000_000)
+        var reducer = makeReducer(
+            files: [ready: .ready(makeCandidate(
+                name: ready,
+                identity: makeIdentity(1),
+                digest: "ready",
+                kind: .numbered(revision: "00001")))],
+            victimLedgers: [victim: ledger])
+
+        _ = observeBatch([
+            observation(name: ready, revision: "00001",
+                        outcome: .identityUnchanged(identity: makeIdentity(1))),
+            observation(name: victim, revision: "00003", outcome: .absent),
+        ], nowNanos: 10_000_000_000, reducer: &reducer)
+
+        XCTAssertNotNil(reducer.state.generation.ordering.victimLedgers[victim],
+                        "an absent victim's ledger is paused (tombstoned), never deleted, on an all-ready pass")
+        XCTAssertEqual(
+            reducer.state.generation.ordering.victimLedgers[victim]?
+                .segments[RevisionKey("2")]?.accruedNanos,
+            5_000_000_000,
+            "the tombstone pause preserves accrual across the absence")
+    }
 }

@@ -637,7 +637,7 @@ struct WatcherReducer {
             return effects
         }
 
-        while true {
+        blockerScan: while true {
             let potential = numbered.filter {
                 participatesInNumberedOrdering(
                     state.generation.files[$0.observation.name])
@@ -646,8 +646,6 @@ struct WatcherReducer {
                 readyCandidate(in: state.generation.files[$0.observation.name]) == nil
             }) else {
                 state.generation.ordering.activeBlocker = nil
-                // TEMPORARY — Task 6 replaces with end-of-pass pause/discharge
-                state.generation.ordering.victimLedgers.removeAll()
                 for item in potential {
                     appendIntent(
                         named: item.observation.name,
@@ -657,7 +655,7 @@ struct WatcherReducer {
                         pendingOwners: &pendingOwners)
                 }
                 state.generation.ordering.pendingEmissionOwners = pendingOwners
-                return effects
+                break blockerScan
             }
 
             for item in potential[..<blockerIndex] {
@@ -675,23 +673,13 @@ struct WatcherReducer {
             let victimStart = potential.index(after: blockerIndex)
             let blocker = potential[blockerIndex]
             guard victimStart < potential.endIndex else {
-                retainVictimLedgers(
-                    currentVictims: [],
-                    blocker: blocker,
-                    classifiedByName: classifiedByName,
-                    nowNanos: nowNanos)
                 state.generation.ordering.activeBlocker = nil
-                return effects
+                break blockerScan
             }
             let victimNames = Set(potential[victimStart...].map(\.observation.name))
 
             let blockerName = blocker.observation.name
             let blockerOwner = blocker.revision.map(RevisionKey.init)
-            retainVictimLedgers(
-                currentVictims: victimNames,
-                blocker: blocker,
-                classifiedByName: classifiedByName,
-                nowNanos: nowNanos)
             if let blockerOwner, hasPendingLowerOwner(before: blockerOwner) {
                 // A lower revision's emission intent is still unsettled: defer this
                 // successor owner's charging, consumption, and write-off until it
@@ -703,8 +691,7 @@ struct WatcherReducer {
                 for victim in victimNames {
                     state.generation.ordering.victimLedgers[victim]?.pause(at: nowNanos)
                 }
-                return effects   // interim; Task 6 turns this into `break blockerScan` so the
-                                 // end-of-pass pause/discharge settlement still runs
+                break blockerScan
             }
             for victim in victimNames {
                 guard let blockerOwner else { continue }
@@ -719,7 +706,7 @@ struct WatcherReducer {
             guard victimNames.contains(where: { victim in
                 guard let ledger = state.generation.ordering.victimLedgers[victim] else { return false }
                 return totalWaitWriteOffCandidate(victimLedger: ledger, nowNanos: nowNanos)
-            }) else { return effects }
+            }) else { break blockerScan }
 
             let heldNanos = victimNames
                 .compactMap { state.generation.ordering.victimLedgers[$0]?.totalUnredeemedNanos(at: nowNanos) }
@@ -735,6 +722,19 @@ struct WatcherReducer {
                 + "without completing — abandoning it; later revisions proceed "
                 + "(frame lost: \(blockerName))"))
         }
+
+        // End-of-pass ledger settlement (M3 tombstones + §5.2 discharge). Runs on every
+        // exit from blockerScan — including barrier deferrals and write-off passes.
+        let currentVictims = state.generation.ordering.activeBlocker?.victims ?? []
+        for name in Array(state.generation.ordering.victimLedgers.keys) {
+            if currentVictims.contains(name) { continue }          // charging this pass
+            if isPresentAndUnblocked(name: name, classifiedByName: classifiedByName) {
+                state.generation.ordering.victimLedgers[name] = nil // discharge (§5.2)
+            } else {
+                state.generation.ordering.victimLedgers[name]?.pause(at: nowNanos)  // tombstone / not charged
+            }
+        }
+        return effects
     }
 
     private func hasPendingLowerOwner(before owner: RevisionKey) -> Bool {
@@ -752,40 +752,30 @@ struct WatcherReducer {
         victimLedger.totalUnredeemedNanos(at: nowNanos) >= blockingBudgetNanos
     }
 
-    private mutating func retainVictimLedgers(
-        currentVictims: Set<String>,
-        blocker: ClassifiedObservation,
-        classifiedByName: [String: ClassifiedObservation],
-        nowNanos: UInt64
-    ) {
-        for name in Array(state.generation.ordering.victimLedgers.keys) {
-            if currentVictims.contains(name) { continue }
-            guard shouldPauseVictimLedger(
-                named: name,
-                behind: blocker,
-                classifiedByName: classifiedByName)
-            else {
-                // TEMPORARY — Task 6 pauses instead of deleting outside the blocker path
-                state.generation.ordering.victimLedgers[name] = nil
-                continue
-            }
-            state.generation.ordering.victimLedgers[name]?.pause(at: nowNanos)
-        }
-    }
-
-    private func shouldPauseVictimLedger(
-        named name: String,
-        behind blocker: ClassifiedObservation,
+    /// Discharge predicate (§5.2). Present and unblocked is a batch/file-state/numeric-order
+    /// fact: the victim appeared present in THIS batch and no batch-present lower revision
+    /// is unready. Never derived from BlockingEpisode, charging, or pendingEmissionOwners.
+    private func isPresentAndUnblocked(
+        name: String,
         classifiedByName: [String: ClassifiedObservation]
     ) -> Bool {
-        guard let blockerRevision = blocker.revision,
-              let victimRevision = revisionOrder.revision(in: name),
-              let victim = classifiedByName[name],
-              !victim.isPresent
+        guard let victim = classifiedByName[name],
+              victim.isPresent,
+              let victimRevision = victim.revision
         else { return false }
-        return revisionOrder.orderedBefore(
-            (name: blocker.observation.name, revision: blockerRevision),
-            (name: name, revision: victimRevision))
+        for item in classifiedByName.values {
+            guard item.observation.name != name,
+                  item.isPresent,
+                  let revision = item.revision,
+                  revisionOrder.orderedBefore(
+                      (name: item.observation.name, revision: revision),
+                      (name: name, revision: victimRevision)),
+                  participatesInNumberedOrdering(state.generation.files[item.observation.name]),
+                  readyCandidate(in: state.generation.files[item.observation.name]) == nil
+            else { continue }
+            return false
+        }
+        return true
     }
 
     private func isTerminal(_ fileState: FileState?) -> Bool {

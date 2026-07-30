@@ -31,6 +31,21 @@ The reconciled expectations are the gate; stale scalar-era asserts are not.
 | padding twins | round-6 ("padding twins get their own budgets") + round-7 R7-2 | Tie-break asymmetry; twins conflated or asymmetric. | Victims keyed by filename get separate ledgers; owners keyed by `RevisionKey` redeem symmetrically. | §3.1 |
 | barrier cost | spec §4 (pending-emission barrier) | n/a (new mechanism) | Repeated pending lower emissions delay successor charging by at most the barrier passes — no accrual reset. | §4 |
 
+## Plan deviations during execution
+
+- **Task 6 red-step mispredicted the exit branch.** The single-file b1 batch reaches
+  the lone-blocker branch (the unready victim itself is selected as blocker with zero
+  victims), whose interim `retainVictimLedgers` else-arm deletes the ledger;
+  present-unblocked Nil-asserts therefore cannot be red on the interim shape (they pass
+  accidentally, before the discharge scan exists). True red supplied by the all-ready
+  absent-victim pause probe
+  (`testSegmentModelAllReadyPassPausesAbsentVictimLedgerInsteadOfDeleting`: interim
+  all-ready `removeAll()` deletes a charged absent victim's ledger → red; end-of-pass
+  settlement pauses it → green). The original three Step-1/2 tests are retained as
+  final-behavior pins, not red-first evidence (pre-Step-4 observations: b1 passed via
+  the interim lone-blocker deletion; invalid-lower passed via the charging path
+  retaining the ledger; barrier passed via the explicit barrier pause).
+
 ## Control-snapshot matrix (filled in by Task 10)
 
 Binding rows (round-8 control table): d9 red on `6cb370a` only; e1/e7 red on
