@@ -24,7 +24,7 @@ struct GenerationState {
 
 struct RevisionOrderingState {
     var activeBlocker: BlockingEpisode?
-    var victimClocks: [String: VictimBlockingClock] = [:]
+    var victimLedgers: [String: VictimWaitLedger] = [:]
 }
 
 struct RevisionKey: Hashable, Equatable {
@@ -140,42 +140,6 @@ struct WriteOffDecision: Equatable {
     let consumedSegments: [RevisionKey: UInt64]
 }
 
-struct ChargingBlocker: Equatable {
-    let name: String
-    let revision: String
-}
-
-struct VictimBlockingClock: Equatable {
-    var startNanos: UInt64
-    var deadlineNanos: UInt64
-    var pausedAtNanos: UInt64?
-    var chargingBlocker: ChargingBlocker?
-
-    mutating func pause(at nowNanos: UInt64, chargedUnder blocker: ChargingBlocker) {
-        if pausedAtNanos == nil {
-            pausedAtNanos = nowNanos
-        }
-        if chargingBlocker == nil {
-            chargingBlocker = blocker
-        }
-    }
-
-    mutating func resume(at nowNanos: UInt64) {
-        guard let pausedAtNanos else { return }
-        let pausedDuration = nowNanos >= pausedAtNanos
-            ? nowNanos - pausedAtNanos
-            : 0
-        startNanos = startNanos &+ pausedDuration
-        deadlineNanos = deadlineNanos &+ pausedDuration
-        self.pausedAtNanos = nil
-        chargingBlocker = nil
-    }
-
-    mutating func charge(under blocker: ChargingBlocker) {
-        chargingBlocker = blocker
-    }
-}
-
 enum FileState: Equatable {
     case observing(stat: FileIdentity)
     case digestPending(PendingDigest)
@@ -211,20 +175,13 @@ enum ReplacementProgress: Equatable {
 
 struct BlockingEpisode: Equatable {
     let blocker: String
-    let startNanos: UInt64
-    var deadlineNanos: UInt64
+    let owner: RevisionKey
     private(set) var victims: Set<String>
 
-    init?(
-        blocker: String,
-        startNanos: UInt64,
-        deadlineNanos: UInt64,
-        victims: Set<String>
-    ) {
+    init?(blocker: String, owner: RevisionKey, victims: Set<String>) {
         guard !victims.isEmpty else { return nil }
         self.blocker = blocker
-        self.startNanos = startNanos
-        self.deadlineNanos = deadlineNanos
+        self.owner = owner
         self.victims = victims
     }
 
@@ -506,15 +463,16 @@ struct WatcherReducer {
     }
 
     private mutating func reconcileActiveBlocker(afterEmitting candidate: EmissionCandidate) {
-        state.generation.ordering.victimClocks[candidate.name] = nil
+        state.generation.ordering.victimLedgers[candidate.name] = nil
         guard var episode = state.generation.ordering.activeBlocker else {
-            clearPausedVictimClocksResolvedByEmission(of: candidate)
+            clearLedgersResolvedByEmission(of: candidate)
             return
         }
 
         if candidate.name == episode.blocker {
             state.generation.ordering.activeBlocker = nil
-            state.generation.ordering.victimClocks.removeAll()
+            // TEMPORARY broad clear — replaced by owner-keyed redemption in Task 4
+            state.generation.ordering.victimLedgers.removeAll()
             return
         }
 
@@ -523,7 +481,8 @@ struct WatcherReducer {
                 state.generation.ordering.activeBlocker = episode
             } else {
                 state.generation.ordering.activeBlocker = nil
-                state.generation.ordering.victimClocks.removeAll()
+                // TEMPORARY broad clear — replaced by owner-keyed redemption in Task 4
+                state.generation.ordering.victimLedgers.removeAll()
             }
         }
 
@@ -534,20 +493,17 @@ struct WatcherReducer {
               revisionOrder.compare(blockerRevision, mark) != .orderedDescending
         else { return }
         state.generation.ordering.activeBlocker = nil
-        state.generation.ordering.victimClocks.removeAll()
+        // TEMPORARY broad clear — replaced by owner-keyed redemption in Task 4
+        state.generation.ordering.victimLedgers.removeAll()
     }
 
-    private mutating func clearPausedVictimClocksResolvedByEmission(
-        of candidate: EmissionCandidate
-    ) {
-        guard case .numbered(let emittedRevision) = candidate.kind else { return }
-        let emittedOwner = ChargingBlocker(name: candidate.name, revision: emittedRevision)
-        for name in Array(state.generation.ordering.victimClocks.keys) {
-            guard let chargingBlocker = state.generation.ordering
-                    .victimClocks[name]?.chargingBlocker,
-                  chargingBlocker == emittedOwner
-            else { continue }
-            state.generation.ordering.victimClocks[name] = nil
+    private mutating func clearLedgersResolvedByEmission(of candidate: EmissionCandidate) {
+        guard let emittedOwner = revisionOrder.revisionKey(in: candidate.name) else { return }
+        for name in Array(state.generation.ordering.victimLedgers.keys) {
+            state.generation.ordering.victimLedgers[name]?.redeem(owner: emittedOwner)
+            if state.generation.ordering.victimLedgers[name]?.isEmpty == true {
+                state.generation.ordering.victimLedgers[name] = nil
+            }
         }
     }
 
@@ -613,7 +569,7 @@ struct WatcherReducer {
                 else { continue }
                 state.generation.files[name] = .droppedOutOfOrder
             }
-            state.generation.ordering.victimClocks[name] = nil
+            state.generation.ordering.victimLedgers[name] = nil
             effects.append(.log(
                 "revision \(revision) arrived out of order — skipped (high-water \(mark))"))
         }
@@ -657,7 +613,7 @@ struct WatcherReducer {
             uniqueKeysWithValues: classified.map { ($0.observation.name, $0) })
         guard revisionOrderingEnabled else {
             state.generation.ordering.activeBlocker = nil
-            state.generation.ordering.victimClocks.removeAll()
+            state.generation.ordering.victimLedgers.removeAll()
             for item in numbered {
                 appendIntent(
                     named: item.observation.name,
@@ -677,7 +633,8 @@ struct WatcherReducer {
                 readyCandidate(in: state.generation.files[$0.observation.name]) == nil
             }) else {
                 state.generation.ordering.activeBlocker = nil
-                state.generation.ordering.victimClocks.removeAll()
+                // TEMPORARY — Task 6 replaces with end-of-pass pause/discharge
+                state.generation.ordering.victimLedgers.removeAll()
                 for item in potential {
                     appendIntent(
                         named: item.observation.name,
@@ -699,7 +656,7 @@ struct WatcherReducer {
             let victimStart = potential.index(after: blockerIndex)
             let blocker = potential[blockerIndex]
             guard victimStart < potential.endIndex else {
-                retainVictimClocks(
+                retainVictimLedgers(
                     currentVictims: [],
                     blocker: blocker,
                     classifiedByName: classifiedByName,
@@ -710,99 +667,36 @@ struct WatcherReducer {
             let victimNames = Set(potential[victimStart...].map(\.observation.name))
 
             let blockerName = blocker.observation.name
-            let chargingBlocker = blocker.revision.map {
-                ChargingBlocker(name: blockerName, revision: $0)
-            }
-            retainVictimClocks(
+            let blockerOwner = blocker.revision.map(RevisionKey.init)
+            retainVictimLedgers(
                 currentVictims: victimNames,
                 blocker: blocker,
                 classifiedByName: classifiedByName,
                 nowNanos: nowNanos)
             for victim in victimNames {
-                if var clock = state.generation.ordering.victimClocks[victim] {
-                    clock.resume(at: nowNanos)
-                    if let chargingBlocker {
-                        clock.charge(under: chargingBlocker)
-                    }
-                    state.generation.ordering.victimClocks[victim] = clock
-                    continue
-                }
-                if let active = state.generation.ordering.activeBlocker,
-                   active.victims.contains(victim) {
-                    var clock = VictimBlockingClock(
-                        startNanos: active.startNanos,
-                        deadlineNanos: active.deadlineNanos)
-                    if let chargingBlocker {
-                        clock.charge(under: chargingBlocker)
-                    }
-                    state.generation.ordering.victimClocks[victim] = clock
-                    continue
-                }
-                var clock = VictimBlockingClock(
-                    startNanos: nowNanos,
-                    deadlineNanos: nowNanos &+ blockingBudgetNanos)
-                if let chargingBlocker {
-                    clock.charge(under: chargingBlocker)
-                }
-                state.generation.ordering.victimClocks[victim] = clock
+                guard let blockerOwner else { continue }
+                state.generation.ordering.victimLedgers[victim, default: VictimWaitLedger()]
+                    .startOrContinue(owner: blockerOwner, at: nowNanos)
             }
 
-            let victimClocks = victimNames.compactMap {
-                state.generation.ordering.victimClocks[$0]
+            state.generation.ordering.activeBlocker = blockerOwner.flatMap {
+                BlockingEpisode(blocker: blockerName, owner: $0, victims: victimNames)
             }
-            state.generation.ordering.activeBlocker = BlockingEpisode(
-                blocker: blockerName,
-                startNanos: victimClocks.map(\.startNanos).min() ?? nowNanos,
-                deadlineNanos: victimClocks.map(\.deadlineNanos).min()
-                    ?? (nowNanos &+ blockingBudgetNanos),
-                victims: victimNames)
-
-            guard var episode = state.generation.ordering.activeBlocker else {
-                return effects
-            }
-            guard episode.refreshVictims(victimNames) else {
-                state.generation.ordering.activeBlocker = nil
-                return effects
-            }
-            if blocker.isConverging {
-                for victim in victimNames {
-                    guard var clock = state.generation.ordering.victimClocks[victim] else {
-                        continue
-                    }
-                    let victimCeiling = clock.startNanos &+ blockingCeilingNanos
-                    let renewed = min(nowNanos &+ blockingGraceNanos, victimCeiling)
-                    if renewed > clock.deadlineNanos {
-                        clock.deadlineNanos = renewed
-                        state.generation.ordering.victimClocks[victim] = clock
-                    }
-                }
-            }
-            let refreshedClocks = victimNames.compactMap {
-                state.generation.ordering.victimClocks[$0]
-            }
-            episode = BlockingEpisode(
-                blocker: blockerName,
-                startNanos: refreshedClocks.map(\.startNanos).min() ?? episode.startNanos,
-                deadlineNanos: refreshedClocks.map(\.deadlineNanos).min()
-                    ?? episode.deadlineNanos,
-                victims: victimNames) ?? episode
-            state.generation.ordering.activeBlocker = episode
+            // Convergence grace returns in Task 7 (ownerGraceUntil)
             guard victimNames.contains(where: { victim in
-                guard let clock = state.generation.ordering.victimClocks[victim] else {
-                    return false
-                }
-                return nowNanos >= min(
-                    clock.deadlineNanos,
-                    clock.startNanos &+ blockingCeilingNanos)
+                guard let ledger = state.generation.ordering.victimLedgers[victim] else { return false }
+                return totalWaitWriteOffCandidate(victimLedger: ledger, nowNanos: nowNanos)
             }) else { return effects }
 
+            let heldNanos = victimNames
+                .compactMap { state.generation.ordering.victimLedgers[$0]?.totalUnredeemedNanos(at: nowNanos) }
+                .max() ?? 0
             state.generation.files[blockerName] = .writtenOff
             for victim in victimNames {
-                state.generation.ordering.victimClocks[victim] = nil
+                state.generation.ordering.victimLedgers[victim] = nil   // TEMPORARY — Task 7 consumes per decision
             }
             state.generation.ordering.activeBlocker = nil
-            let heldSeconds = Int(
-                (Double(nowNanos &- episode.startNanos) / 1_000_000_000).rounded())
+            let heldSeconds = Int((Double(heldNanos) / 1_000_000_000).rounded())
             effects.append(.log(
                 "revision \(blocker.revision ?? "") blocked emissions for \(heldSeconds)s "
                 + "without completing — abandoning it; later revisions proceed "
@@ -810,32 +704,37 @@ struct WatcherReducer {
         }
     }
 
-    private mutating func retainVictimClocks(
+    // TEMPORARY Task-3 gate: total-wait only. Task 7 replaces this with
+    // writeOffDecision(for:blockerName:victimLedger:nowNanos:).
+    private func totalWaitWriteOffCandidate(
+        victimLedger: VictimWaitLedger,
+        nowNanos: UInt64
+    ) -> Bool {
+        victimLedger.totalUnredeemedNanos(at: nowNanos) >= blockingBudgetNanos
+    }
+
+    private mutating func retainVictimLedgers(
         currentVictims: Set<String>,
         blocker: ClassifiedObservation,
         classifiedByName: [String: ClassifiedObservation],
         nowNanos: UInt64
     ) {
-        for name in Array(state.generation.ordering.victimClocks.keys) {
+        for name in Array(state.generation.ordering.victimLedgers.keys) {
             if currentVictims.contains(name) { continue }
-            guard shouldPauseVictimClock(
+            guard shouldPauseVictimLedger(
                 named: name,
                 behind: blocker,
-                classifiedByName: classifiedByName),
-                let blockerRevision = blocker.revision
+                classifiedByName: classifiedByName)
             else {
-                state.generation.ordering.victimClocks[name] = nil
+                // TEMPORARY — Task 6 pauses instead of deleting outside the blocker path
+                state.generation.ordering.victimLedgers[name] = nil
                 continue
             }
-            state.generation.ordering.victimClocks[name]?.pause(
-                at: nowNanos,
-                chargedUnder: ChargingBlocker(
-                    name: blocker.observation.name,
-                    revision: blockerRevision))
+            state.generation.ordering.victimLedgers[name]?.pause(at: nowNanos)
         }
     }
 
-    private func shouldPauseVictimClock(
+    private func shouldPauseVictimLedger(
         named name: String,
         behind blocker: ClassifiedObservation,
         classifiedByName: [String: ClassifiedObservation]

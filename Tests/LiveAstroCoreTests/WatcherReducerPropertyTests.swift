@@ -364,7 +364,8 @@ final class WatcherReducerPropertyTests: XCTestCase {
             ], nowNanos: firstTime, reducer: &reducer)
             transition += 1
             XCTAssertEqual(
-                reducer.state.generation.ordering.activeBlocker?.startNanos,
+                reducer.state.generation.ordering.victimLedgers[revisionName(victimRevision)]?
+                    .segments[RevisionKey(returningRevision)]?.firstChargeNanos,
                 firstTime,
                 "seed=\(Self.seed) transition=\(transition)")
 
@@ -393,7 +394,8 @@ final class WatcherReducerPropertyTests: XCTestCase {
                 returning,
                 "seed=\(Self.seed) transition=\(transition)")
             XCTAssertEqual(
-                reducer.state.generation.ordering.activeBlocker?.startNanos,
+                reducer.state.generation.ordering.victimLedgers[revisionName(victimRevision)]?
+                    .segments[RevisionKey(returningRevision)]?.firstChargeNanos,
                 firstTime,
                 "seed=\(Self.seed) transition=\(transition) victim clock reset unexpectedly")
         }
