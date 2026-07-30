@@ -2453,4 +2453,54 @@ final class WatcherReducerTests: XCTestCase {
             digest: digest,
             byteCount: identity.size)
     }
+
+    func testRevisionKeyNormalizesPaddingAndUsesNumericOrdering() {
+        let order = NumberedRevisionOrder(prefix: "live_stack")
+
+        XCTAssertEqual(
+            order.revisionKey(in: "live_stack_7.fit"),
+            order.revisionKey(in: "live_stack_007.fit"))
+        XCTAssertTrue(order.orderedBefore(RevisionKey("9"), RevisionKey("10")))
+        XCTAssertFalse(order.orderedBefore(RevisionKey("10"), RevisionKey("9")))
+        // The §3.1 ban on lexicographic RevisionKey ordering, pinned as a sort:
+        XCTAssertEqual(
+            [RevisionKey("10"), RevisionKey("9")].sorted { order.orderedBefore($0, $1) },
+            [RevisionKey("9"), RevisionKey("10")])
+    }
+
+    func testVictimWaitLedgerAccruesPausesRedeemsAndTotalsSegments() {
+        let order = NumberedRevisionOrder(prefix: "live_stack")
+        var ledger = VictimWaitLedger()
+        let first = RevisionKey("1")
+        let second = RevisionKey("2")
+
+        ledger.startOrContinue(owner: first, at: 10)
+        ledger.pause(at: 30)
+        XCTAssertEqual(ledger.totalUnredeemedNanos(at: 100), 20)
+
+        ledger.startOrContinue(owner: second, at: 100)
+        XCTAssertEqual(ledger.totalUnredeemedNanos(at: 120), 40)
+
+        ledger.redeem(owner: first)
+        XCTAssertEqual(ledger.totalUnredeemedNanos(at: 120), 20)
+        XCTAssertEqual(
+            ledger.segments.keys.sorted { order.orderedBefore($0, $1) },
+            [second])
+    }
+
+    func testVictimWaitLedgerConsumeTruncatesAndPreservesRemainder() {
+        var ledger = VictimWaitLedger()
+        ledger.startOrContinue(owner: RevisionKey("1"), at: 0)
+        ledger.pause(at: 40)                                  // owner 1 holds 40
+        ledger.startOrContinue(owner: RevisionKey("2"), at: 100)
+        ledger.pause(at: 130)                                 // owner 2 holds 30
+
+        ledger.consume([RevisionKey("1"): 25, RevisionKey("2"): 30], at: 200)
+
+        XCTAssertEqual(ledger.segments[RevisionKey("1")]?.accruedNanos, 15,
+                       "partial consumption truncates; the remainder is still owed")
+        XCTAssertNil(ledger.segments[RevisionKey("2")],
+                     "full consumption removes the segment")
+        XCTAssertEqual(ledger.totalUnredeemedNanos(at: 200), 15)
+    }
 }

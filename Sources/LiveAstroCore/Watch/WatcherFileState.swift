@@ -27,6 +27,119 @@ struct RevisionOrderingState {
     var victimClocks: [String: VictimBlockingClock] = [:]
 }
 
+struct RevisionKey: Hashable, Equatable {
+    let normalizedDigits: String
+
+    init(_ digits: String) {
+        let stripped = digits.drop { $0 == "0" }
+        normalizedDigits = stripped.isEmpty ? "0" : String(stripped)
+    }
+}
+
+struct AccrualSegment: Equatable {
+    let owner: RevisionKey
+    var firstChargeNanos: UInt64
+    var accruedNanos: UInt64
+    var runningSinceNanos: UInt64?
+
+    var isRunning: Bool {
+        runningSinceNanos != nil
+    }
+
+    func totalNanos(at nowNanos: UInt64) -> UInt64 {
+        guard let runningSinceNanos else { return accruedNanos }
+        return accruedNanos &+ (nowNanos >= runningSinceNanos ? nowNanos - runningSinceNanos : 0)
+    }
+}
+
+struct VictimWaitLedger: Equatable {
+    var segments: [RevisionKey: AccrualSegment] = [:]
+    var pausedAtNanos: UInt64?
+
+    var isEmpty: Bool {
+        segments.isEmpty
+    }
+
+    mutating func startOrContinue(owner: RevisionKey, at nowNanos: UInt64) {
+        pauseRunning(at: nowNanos)
+        pausedAtNanos = nil
+        if var segment = segments[owner] {
+            if segment.runningSinceNanos == nil {
+                segment.runningSinceNanos = nowNanos
+            }
+            segments[owner] = segment
+        } else {
+            segments[owner] = AccrualSegment(
+                owner: owner,
+                firstChargeNanos: nowNanos,
+                accruedNanos: 0,
+                runningSinceNanos: nowNanos)
+        }
+    }
+
+    mutating func pause(at nowNanos: UInt64) {
+        pauseRunning(at: nowNanos)
+        if pausedAtNanos == nil {
+            pausedAtNanos = nowNanos
+        }
+    }
+
+    mutating func pauseRunning(at nowNanos: UInt64) {
+        for key in segments.keys {
+            guard var segment = segments[key],
+                  let runningSinceNanos = segment.runningSinceNanos else { continue }
+            segment.accruedNanos = segment.accruedNanos &+ (nowNanos >= runningSinceNanos ? nowNanos - runningSinceNanos : 0)
+            segment.runningSinceNanos = nil
+            segments[key] = segment
+        }
+    }
+
+    mutating func redeem(owner: RevisionKey) {
+        segments.removeValue(forKey: owner)
+        if segments.isEmpty {
+            pausedAtNanos = nil
+        }
+    }
+
+    /// Write-off consumption TRUNCATES (§5.6 rationale): a single write-off consumes
+    /// exactly the debt that justified it; any remainder is still-unresolved wait and
+    /// keeps counting toward the NEXT blocker's write-off progress, so escalation
+    /// stays bounded over unredeemed wait (M1) instead of granting the next blocker
+    /// a silently discounted budget. (The alternative — deleting whole segments on
+    /// partial consumption — would erase owed wait the decision never claimed.)
+    mutating func consume(_ consumed: [RevisionKey: UInt64], at nowNanos: UInt64) {
+        pauseRunning(at: nowNanos)
+        for (owner, amount) in consumed {
+            guard var segment = segments[owner] else { continue }
+            if segment.accruedNanos > amount {
+                segment.accruedNanos -= amount
+                segments[owner] = segment
+            } else {
+                segments.removeValue(forKey: owner)
+            }
+        }
+        if segments.isEmpty {
+            pausedAtNanos = nil
+        }
+    }
+
+    func totalUnredeemedNanos(at nowNanos: UInt64) -> UInt64 {
+        segments.values.reduce(0) { partial, segment in
+            partial &+ segment.totalNanos(at: nowNanos)
+        }
+    }
+}
+
+/// `consumedSegments` holds PREDECESSOR debt only — the blocker's own key must never
+/// appear in it (M9: own time and inherited debt are separate facts). Zero-amount
+/// entries are excluded at construction (Task 7).
+struct WriteOffDecision: Equatable {
+    let blocker: RevisionKey
+    let blockerNameForLog: String
+    let attributedNanos: UInt64
+    let consumedSegments: [RevisionKey: UInt64]
+}
+
 struct ChargingBlocker: Equatable {
     let name: String
     let revision: String
@@ -1030,7 +1143,7 @@ struct WatcherReducer {
 
 }
 
-private struct NumberedRevisionOrder {
+struct NumberedRevisionOrder {
     private let regex: NSRegularExpression?
 
     init(prefix: String?) {
@@ -1054,6 +1167,14 @@ private struct NumberedRevisionOrder {
         guard ImageLoader.fitsExtensions.contains(fileExtension)
                 || ImageLoader.bitmapExtensions.contains(fileExtension) else { return nil }
         return String(name[digitsRange])
+    }
+
+    func revisionKey(in name: String) -> RevisionKey? {
+        revision(in: name).map(RevisionKey.init)
+    }
+
+    func orderedBefore(_ lhs: RevisionKey, _ rhs: RevisionKey) -> Bool {
+        compare(lhs.normalizedDigits, rhs.normalizedDigits) == .orderedAscending
     }
 
     func compare(_ lhs: String, _ rhs: String) -> ComparisonResult {
