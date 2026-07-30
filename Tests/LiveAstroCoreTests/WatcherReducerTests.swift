@@ -2586,4 +2586,136 @@ final class WatcherReducerTests: XCTestCase {
                      "full consumption removes the segment")
         XCTAssertEqual(ledger.totalUnredeemedNanos(at: 200), 15)
     }
+
+    func testSegmentModel_d9RedeemsPausedDebtOnYieldedOwnerEmission() {
+        // Development probe: reducer-only, injected .ready states.
+        // Driver-faithful acceptance: WatcherSegmentBatteryTests.test_d9_* (Task 9).
+        let ownerName = revisionName("00001")
+        let victim = revisionName("00002")
+        let owner = RevisionKey("1")
+        var ledger = VictimWaitLedger()
+        ledger.startOrContinue(owner: owner, at: 0)
+        ledger.pause(at: 22_000_000_000)
+
+        let ownerCandidate = makeCandidate(
+            name: ownerName,
+            identity: makeIdentity(1),
+            digest: "owner",
+            kind: .numbered(revision: "00001"))
+        var reducer = makeReducer(
+            files: [ownerName: .ready(ownerCandidate)],
+            victimLedgers: [victim: ledger])
+
+        let effects = reducer.reduce(.emissionFinished(EmissionResult(
+            intent: EmissionIntent(
+                generation: reducer.state.generation.id,
+                candidate: ownerCandidate),
+            outcome: .yielded)))
+
+        XCTAssertTrue(effects.isEmpty)
+        XCTAssertNil(reducer.state.generation.ordering.victimLedgers[victim],
+                     "owner 1's paused segment was the only debt; redemption empties and removes the ledger")
+    }
+
+    func testSegmentModel_d4VanishedOwnerDebtSurvivesUnrelatedSuccessorEmission() {
+        // Development probe: reducer-only, injected states. d4 provenance: round-8 M4
+        // ("vanished = still owed"), round-7 fix direction ("d4's vanished-owner carry
+        // is preserved"). Driver-faithful acceptance: WatcherSegmentBatteryTests.test_d4_*.
+        let successorName = revisionName("00002")
+        let victim = revisionName("00005")
+        var ledger = VictimWaitLedger()
+        ledger.startOrContinue(owner: RevisionKey("1"), at: 0)   // owner 1 later vanished
+        ledger.pause(at: 10_000_000_000)                          // 10s unresolved debt
+        ledger.startOrContinue(owner: RevisionKey("2"), at: 12_000_000_000)
+        ledger.pause(at: 20_000_000_000)                          // owner 2 holds 8s
+
+        let successorCandidate = makeCandidate(
+            name: successorName,
+            identity: makeIdentity(2),
+            digest: "successor",
+            kind: .numbered(revision: "00002"))
+        var reducer = makeReducer(
+            files: [
+                successorName: .ready(successorCandidate),
+                victim: .ready(makeCandidate(
+                    name: victim,
+                    identity: makeIdentity(5),
+                    digest: "victim",
+                    kind: .numbered(revision: "00005")))
+            ],
+            activeBlocker: BlockingEpisode(
+                blocker: successorName,
+                owner: RevisionKey("2"),
+                victims: [victim]),
+            victimLedgers: [victim: ledger])
+
+        _ = reducer.reduce(.emissionFinished(EmissionResult(
+            intent: EmissionIntent(
+                generation: reducer.state.generation.id,
+                candidate: successorCandidate),
+            outcome: .yielded)))
+
+        XCTAssertNil(
+            reducer.state.generation.ordering.victimLedgers[victim]?.segments[RevisionKey("2")],
+            "the emitting owner's own segment is redeemed")
+        XCTAssertEqual(
+            reducer.state.generation.ordering.victimLedgers[victim]?.segments[RevisionKey("1")]?.accruedNanos,
+            10_000_000_000,
+            "the vanished owner's carried debt must survive an unrelated successor's emission (d4)")
+    }
+
+    func testSegmentModelRejectedEmissionDoesNotRedeemDebt() {
+        // Development probe: reducer-only, injected states.
+        let ownerName = revisionName("00001")
+        let victim = revisionName("00002")
+        let owner = RevisionKey("1")
+        var ledger = VictimWaitLedger()
+        ledger.startOrContinue(owner: owner, at: 0)
+        ledger.pause(at: 10_000_000_000)
+
+        let ownerCandidate = makeCandidate(
+            name: ownerName,
+            identity: makeIdentity(1),
+            digest: "owner",
+            kind: .numbered(revision: "00001"))
+        var reducer = makeReducer(
+            files: [ownerName: .ready(ownerCandidate)],
+            victimLedgers: [victim: ledger])
+
+        _ = reducer.reduce(.emissionFinished(EmissionResult(
+            intent: EmissionIntent(
+                generation: reducer.state.generation.id,
+                candidate: ownerCandidate),
+            outcome: .rejected)))
+
+        XCTAssertNotNil(reducer.state.generation.ordering.victimLedgers[victim]?.segments[owner],
+                        "a rejected emission is not stream progress and redeems nothing")
+    }
+
+    func testSegmentModelVictimOwnYieldedEmissionClearsItsLedger() {
+        // Development probe: reducer-only, injected states. §5.2: "The victim's own
+        // successful emission also clears its ledger."
+        let victim = revisionName("00003")
+        var ledger = VictimWaitLedger()
+        ledger.startOrContinue(owner: RevisionKey("1"), at: 0)   // stale predecessor debt
+        ledger.pause(at: 9_000_000_000)
+
+        let victimCandidate = makeCandidate(
+            name: victim,
+            identity: makeIdentity(3),
+            digest: "victim",
+            kind: .numbered(revision: "00003"))
+        var reducer = makeReducer(
+            files: [victim: .ready(victimCandidate)],
+            victimLedgers: [victim: ledger])
+
+        _ = reducer.reduce(.emissionFinished(EmissionResult(
+            intent: EmissionIntent(
+                generation: reducer.state.generation.id,
+                candidate: victimCandidate),
+            outcome: .yielded)))
+
+        XCTAssertNil(reducer.state.generation.ordering.victimLedgers[victim],
+                     "the victim emitted — no owed wait can explain any future hold")
+    }
 }

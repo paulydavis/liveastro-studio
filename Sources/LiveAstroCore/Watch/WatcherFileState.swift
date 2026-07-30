@@ -463,27 +463,27 @@ struct WatcherReducer {
     }
 
     private mutating func reconcileActiveBlocker(afterEmitting candidate: EmissionCandidate) {
+        // (b) The emitting victim's own ledger discharges (§5.2): its emission proves
+        // no owed wait explains any future hold on it.
         state.generation.ordering.victimLedgers[candidate.name] = nil
-        guard var episode = state.generation.ordering.activeBlocker else {
-            clearLedgersResolvedByEmission(of: candidate)
-            return
+
+        // (a) Owner-keyed redemption — uniform over running and paused segments (§5.1).
+        // This replaces every scalar-era removeAll(): other owners' unredeemed segments
+        // (vanished predecessors, still-live blockers) must survive this emission (d4, e1).
+        if let owner = revisionOrder.revisionKey(in: candidate.name) {
+            redeemSegments(for: owner)
         }
 
+        guard var episode = state.generation.ordering.activeBlocker else { return }
+
         if candidate.name == episode.blocker {
-            state.generation.ordering.activeBlocker = nil
-            // TEMPORARY broad clear — replaced by owner-keyed redemption in Task 4
-            state.generation.ordering.victimLedgers.removeAll()
+            state.generation.ordering.activeBlocker = nil   // episode over; ledgers already settled above
             return
         }
 
         if episode.victims.contains(candidate.name) {
-            if episode.removeVictim(named: candidate.name) {
-                state.generation.ordering.activeBlocker = episode
-            } else {
-                state.generation.ordering.activeBlocker = nil
-                // TEMPORARY broad clear — replaced by owner-keyed redemption in Task 4
-                state.generation.ordering.victimLedgers.removeAll()
-            }
+            state.generation.ordering.activeBlocker =
+                episode.removeVictim(named: candidate.name) ? episode : nil
         }
 
         guard state.generation.ordering.activeBlocker != nil,
@@ -492,19 +492,17 @@ struct WatcherReducer {
               let mark = derivedRevisionHighWater,
               revisionOrder.compare(blockerRevision, mark) != .orderedDescending
         else { return }
-        state.generation.ordering.activeBlocker = nil
-        // TEMPORARY broad clear — replaced by owner-keyed redemption in Task 4
-        state.generation.ordering.victimLedgers.removeAll()
+        state.generation.ordering.activeBlocker = nil       // episode inconsistent with the derived mark
     }
 
-    private mutating func clearLedgersResolvedByEmission(of candidate: EmissionCandidate) {
-        guard let emittedOwner = revisionOrder.revisionKey(in: candidate.name) else { return }
-        for name in Array(state.generation.ordering.victimLedgers.keys) {
-            state.generation.ordering.victimLedgers[name]?.redeem(owner: emittedOwner)
-            if state.generation.ordering.victimLedgers[name]?.isEmpty == true {
-                state.generation.ordering.victimLedgers[name] = nil
+    private mutating func redeemSegments(for owner: RevisionKey) {
+        for victim in Array(state.generation.ordering.victimLedgers.keys) {
+            state.generation.ordering.victimLedgers[victim]?.redeem(owner: owner)
+            if state.generation.ordering.victimLedgers[victim]?.isEmpty == true {
+                state.generation.ordering.victimLedgers[victim] = nil
             }
         }
+        // Task 7 extends this function with ownerGraceUntil[owner] = nil (M8 hygiene).
     }
 
     private struct ClassifiedObservation {
