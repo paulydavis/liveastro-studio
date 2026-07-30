@@ -2718,4 +2718,86 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertNil(reducer.state.generation.ordering.victimLedgers[victim],
                      "the victim emitted — no owed wait can explain any future hold")
     }
+
+    func testSegmentModel_h4DefersSuccessorChargingUntilPendingEmissionSettles() {
+        // Development probe: reducer-only, injected .ready states (an unready file cannot
+        // become ready and emit in a single sighting — see Global Constraints).
+        // Driver-faithful acceptance: WatcherSegmentBatteryTests.test_h4_*.
+        let resolving = revisionName("00001")
+        let victim = revisionName("00003")
+        let resolvingCandidate = makeCandidate(
+            name: resolving,
+            identity: makeIdentity(1),
+            digest: "resolved",
+            kind: .numbered(revision: "00001"))
+        var reducer = makeReducer(files: [
+            resolving: .ready(resolvingCandidate),
+            victim: .ready(makeCandidate(
+                name: victim,
+                identity: makeIdentity(3),
+                digest: "victim",
+                kind: .numbered(revision: "00003")))
+        ])
+
+        let effects = observeBatch([
+            observation(name: resolving, revision: "00001",
+                        outcome: .identityUnchanged(identity: makeIdentity(1))),
+            invalidRevision("00002"),
+            observation(name: victim, revision: "00003",
+                        outcome: .identityUnchanged(identity: makeIdentity(3))),
+        ], nowNanos: 1_000, reducer: &reducer)
+
+        XCTAssertEqual(emittedNames(in: effects), [resolving])
+        XCTAssertTrue(reducer.state.generation.ordering.victimLedgers.isEmpty,
+                      "successor charging is barrier-deferred in the intent's own pass")
+        XCTAssertEqual(reducer.state.generation.ordering.pendingEmissionOwners, [RevisionKey("1")])
+    }
+
+    func testSegmentModelSuccessorChargesAfterPendingEmissionSettles() {
+        // Development probe: reducer-only, injected .ready states.
+        let resolving = revisionName("00001")
+        let successor = revisionName("00002")
+        let victim = revisionName("00003")
+        let resolvingCandidate = makeCandidate(
+            name: resolving,
+            identity: makeIdentity(1),
+            digest: "resolved",
+            kind: .numbered(revision: "00001"))
+        var reducer = makeReducer(files: [
+            resolving: .ready(resolvingCandidate),
+            victim: .ready(makeCandidate(
+                name: victim,
+                identity: makeIdentity(3),
+                digest: "victim",
+                kind: .numbered(revision: "00003")))
+        ])
+
+        let effects = observeBatch([
+            observation(name: resolving, revision: "00001",
+                        outcome: .identityUnchanged(identity: makeIdentity(1))),
+            invalidRevision("00002"),
+            observation(name: victim, revision: "00003",
+                        outcome: .identityUnchanged(identity: makeIdentity(3))),
+        ], nowNanos: 1_000, reducer: &reducer)
+        guard case .emit(let intent) = effects.first else {
+            return XCTFail("expected the resolving revision's emission intent")
+        }
+
+        _ = reducer.reduce(.emissionFinished(EmissionResult(intent: intent, outcome: .yielded)))
+        XCTAssertTrue(reducer.state.generation.ordering.pendingEmissionOwners.isEmpty,
+                      "settlement removes the pending owner for every terminal outcome")
+
+        _ = observeBatch([
+            observation(name: resolving, revision: "00001",
+                        outcome: .identityUnchanged(identity: makeIdentity(1))),
+            invalidRevision("00002"),
+            observation(name: victim, revision: "00003",
+                        outcome: .identityUnchanged(identity: makeIdentity(3))),
+        ], nowNanos: 2_000, reducer: &reducer)
+
+        XCTAssertEqual(
+            reducer.state.generation.ordering.victimLedgers[victim]?.segments[RevisionKey("2")]?.firstChargeNanos,
+            2_000)
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, successor)
+    }
 }

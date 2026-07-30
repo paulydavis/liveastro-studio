@@ -25,6 +25,7 @@ struct GenerationState {
 struct RevisionOrderingState {
     var activeBlocker: BlockingEpisode?
     var victimLedgers: [String: VictimWaitLedger] = [:]
+    var pendingEmissionOwners: Set<RevisionKey> = []
 }
 
 struct RevisionKey: Hashable, Equatable {
@@ -348,6 +349,12 @@ struct WatcherReducer {
             return reduce(batch)
         case .emissionFinished(let result):
             guard result.intent.generation == state.generation.id else { return [] }
+            // The pending-emission barrier lifts on every terminal outcome
+            // (yielded, rejected, or stale candidate state below) — a settled
+            // intent must never keep deferring successor charging.
+            if let owner = revisionOrder.revisionKey(in: result.intent.candidate.name) {
+                state.generation.ordering.pendingEmissionOwners.remove(owner)
+            }
             let candidate = result.intent.candidate
             if case .settled(let settlement) = state.generation.files[candidate.name],
                settlement.replacement == .ready(candidate) {
@@ -580,18 +587,23 @@ struct WatcherReducer {
     ) -> [WatcherEffect] {
         var effects: [WatcherEffect] = []
         var intentNames: Set<String> = []
+        var pendingOwners = state.generation.ordering.pendingEmissionOwners
 
         func appendIntent(
             named name: String,
             state: WatcherState,
             to effects: inout [WatcherEffect],
-            intentNames: inout Set<String>
+            intentNames: inout Set<String>,
+            pendingOwners: inout Set<RevisionKey>
         ) {
             guard intentNames.insert(name).inserted else { return }
             guard let candidate = readyCandidate(in: state.generation.files[name]) else { return }
             effects.append(.emit(EmissionIntent(
                 generation: state.generation.id,
                 candidate: candidate)))
+            if let owner = revisionOrder.revisionKey(in: candidate.name) {
+                pendingOwners.insert(owner)
+            }
         }
 
         for item in classified where item.isPresent && item.revision == nil {
@@ -599,7 +611,8 @@ struct WatcherReducer {
                 named: item.observation.name,
                 state: state,
                 to: &effects,
-                intentNames: &intentNames)
+                intentNames: &intentNames,
+                pendingOwners: &pendingOwners)
         }
 
         let numbered = classified.filter { item in
@@ -612,12 +625,14 @@ struct WatcherReducer {
         guard revisionOrderingEnabled else {
             state.generation.ordering.activeBlocker = nil
             state.generation.ordering.victimLedgers.removeAll()
+            state.generation.ordering.pendingEmissionOwners.removeAll()
             for item in numbered {
                 appendIntent(
                     named: item.observation.name,
                     state: state,
                     to: &effects,
-                    intentNames: &intentNames)
+                    intentNames: &intentNames,
+                    pendingOwners: &pendingOwners)
             }
             return effects
         }
@@ -638,8 +653,10 @@ struct WatcherReducer {
                         named: item.observation.name,
                         state: state,
                         to: &effects,
-                        intentNames: &intentNames)
+                        intentNames: &intentNames,
+                        pendingOwners: &pendingOwners)
                 }
+                state.generation.ordering.pendingEmissionOwners = pendingOwners
                 return effects
             }
 
@@ -648,8 +665,12 @@ struct WatcherReducer {
                     named: item.observation.name,
                     state: state,
                     to: &effects,
-                    intentNames: &intentNames)
+                    intentNames: &intentNames,
+                    pendingOwners: &pendingOwners)
             }
+            // Written back before the barrier check so it sees both prior-pass
+            // unsettled owners and this pass's intents.
+            state.generation.ordering.pendingEmissionOwners = pendingOwners
 
             let victimStart = potential.index(after: blockerIndex)
             let blocker = potential[blockerIndex]
@@ -671,6 +692,20 @@ struct WatcherReducer {
                 blocker: blocker,
                 classifiedByName: classifiedByName,
                 nowNanos: nowNanos)
+            if let blockerOwner, hasPendingLowerOwner(before: blockerOwner) {
+                // A lower revision's emission intent is still unsettled: defer this
+                // successor owner's charging, consumption, and write-off until it
+                // settles. Pausing matters — a segment left running through a barrier
+                // pass would silently extend under the deferred owner, which is
+                // exactly what the barrier forbids. The barrier defers ledger
+                // operations only; file-state updates, intent recording, and mark
+                // drops proceeded normally above.
+                for victim in victimNames {
+                    state.generation.ordering.victimLedgers[victim]?.pause(at: nowNanos)
+                }
+                return effects   // interim; Task 6 turns this into `break blockerScan` so the
+                                 // end-of-pass pause/discharge settlement still runs
+            }
             for victim in victimNames {
                 guard let blockerOwner else { continue }
                 state.generation.ordering.victimLedgers[victim, default: VictimWaitLedger()]
@@ -699,6 +734,12 @@ struct WatcherReducer {
                 "revision \(blocker.revision ?? "") blocked emissions for \(heldSeconds)s "
                 + "without completing — abandoning it; later revisions proceed "
                 + "(frame lost: \(blockerName))"))
+        }
+    }
+
+    private func hasPendingLowerOwner(before owner: RevisionKey) -> Bool {
+        state.generation.ordering.pendingEmissionOwners.contains { pending in
+            revisionOrder.orderedBefore(pending, owner)
         }
     }
 
