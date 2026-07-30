@@ -448,6 +448,115 @@ final class WatcherReducerPropertyTests: XCTestCase {
         }
     }
 
+    func testDriverFaithfulSweepHoldsTimingBoundInvariantN1() {
+        // ≥3000 runs across both digest policies (1500 × 2). Commands only; the hook
+        // observes decisions; per-pass snapshots supply exact anchors for N1.
+        let runsPerPolicy = 1_500
+        for policy in [StackFileWatcher.DigestPolicy.mutableStackerOutput, .immutableAfterPublish] {
+            var immutableDecisions = 0
+            for run in 0..<runsPerPolicy {
+                var generator = SplitMix64(seed: Self.seed ^ UInt64(run) &* 0x9E37)
+                var reducer = WatcherReducer(
+                    state: WatcherState(
+                        generation: GenerationState(
+                            id: FolderGeneration(rawValue: 1),
+                            files: [:],
+                            ordering: RevisionOrderingState(activeBlocker: nil)),
+                        lastEmittedDigestByName: [:]),
+                    configuration: WatcherReducerConfiguration(
+                        digestPolicy: policy,
+                        filePrefix: "live_stack",
+                        quietPeriodNanos: 100_000_000,
+                        pollIntervalNanos: 1_000_000_000))
+
+                // Per-pass snapshots taken BEFORE each observe: exact N1 anchors.
+                var snapshotLedgers: [String: VictimWaitLedger] = [:]
+                var snapshotGrace: [RevisionKey: UInt64] = [:]
+                var pendingNow: UInt64 = 0
+                var violations: [String] = []
+                reducer.writeOffDecisionHookForTesting = { decision, now in
+                    let budget: UInt64 = 30_000_000_000     // budget at this config; cross-checked below
+                    let grace: UInt64 = 100_000_000
+                    let ceiling: UInt64 = 30_400_000_000
+                    let firstCharge = snapshotLedgers.values
+                        .compactMap { $0.segments[decision.blocker]?.firstChargeNanos }
+                        .min() ?? pendingNow                 // segment opened this pass
+                    if now < firstCharge &+ budget {
+                        if decision.consumedSegments.isEmpty {
+                            violations.append("early write-off without explicit predecessor debt at \(now)")
+                        }
+                        let renewal = snapshotGrace[decision.blocker] ?? 0
+                        let graceEdge = min(firstCharge &+ ceiling,
+                                            max(firstCharge &+ grace, renewal))
+                        if now < graceEdge {
+                            violations.append("write-off inside the owner's own grace at \(now)")
+                        }
+                    }
+                }
+                XCTAssertEqual(reducer.blockingBudgetNanos, 30_000_000_000)
+                XCTAssertEqual(reducer.blockingGraceNanos, 100_000_000)
+                XCTAssertEqual(reducer.blockingCeilingNanos, 30_400_000_000)
+
+                var digestsByName: [String: String] = [:]
+                var now: UInt64 = 0
+                var unsettled: [EmissionIntent] = []
+                for _ in 0..<120 {
+                    now &+= 1_000_000_000
+                    pendingNow = now
+                    snapshotLedgers = reducer.state.generation.ordering.victimLedgers
+                    snapshotGrace = reducer.state.generation.ordering.ownerGraceUntil
+
+                    var entries: [FileObservation] = []
+                    for value in 1...6 {
+                        let revision = String(value)
+                        let name = revisionName(revision)
+                        let identity = makeIdentity(Int64(value))
+                        let roll = generator.next() % 100
+                        let outcome: ObservationOutcome
+                        switch roll {
+                        case ..<15: outcome = .absent
+                        case ..<40: outcome = .invalid
+                        case ..<50: outcome = .unstable(identity: identity)
+                        case ..<60:
+                            digestsByName[name] = "churn-\(generator.next() % 1_000)"
+                            outcome = .digested(
+                                identity: identity,
+                                digest: digestsByName[name]!,
+                                byteCount: identity.size)
+                        default:
+                            let digest = digestsByName[name] ?? "stable-\(value)"
+                            digestsByName[name] = digest
+                            outcome = .digested(
+                                identity: identity, digest: digest, byteCount: identity.size)
+                        }
+                        entries.append(makeObservation(name: name, revision: revision, outcome: outcome))
+                    }
+                    let effects = reduce(entries, nowNanos: now, reducer: &reducer)
+                    for effect in effects {
+                        if case .emit(let intent) = effect { unsettled.append(intent) }
+                        if case .log(let line) = effect, policy == .immutableAfterPublish,
+                           line.contains("abandoning") {
+                            immutableDecisions += 1
+                        }
+                    }
+                    while !unsettled.isEmpty {
+                        let intent = unsettled.removeFirst()
+                        let outcome: EmissionResult.Outcome =
+                            generator.next() % 5 == 0 ? .rejected : .yielded
+                        _ = reducer.reduce(.emissionFinished(EmissionResult(
+                            intent: intent, outcome: outcome)))
+                    }
+                    XCTAssertTrue(violations.isEmpty,
+                                  "seed=\(Self.seed) run=\(run) policy=\(policy): \(violations)")
+                }
+            }
+            if policy == .immutableAfterPublish {
+                XCTAssertEqual(immutableDecisions, 0,
+                               "ordering (and write-off) is mutable-policy-only")
+            }
+        }
+    }
+
     private func makeReducer(
         files: [String: FileState] = [:],
         digests: [String: String] = [:]
