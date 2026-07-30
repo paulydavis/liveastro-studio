@@ -71,3 +71,99 @@ The reconciled expectations are the gate; stale scalar-era asserts are not.
 Binding rows (round-8 control table): d9 red on `6cb370a` only; e1/e7 red on
 `0ec11f8` and `fe843eb`; h3/h4 red on all three. All other probes: record the
 observed result per snapshot with a one-line explanation (informative, not binding).
+
+### Run record (Task 10, 2026-07-30)
+
+`WatcherSegmentBatteryTests.swift` copied byte-identical from `458ba11` (where it
+is 13/13 green) into a fresh `git worktree` at each control sha; run with
+`swift test --filter WatcherSegmentBatteryTests`, one worktree at a time. The
+battery compiled cleanly at all three shas (Step-1 API precheck printed `4`
+three times as expected). All 13 tests executed at every sha — no skips, no
+crashes.
+
+### Observed matrix (13 tests × 3 shas)
+
+| Battery test | `0ec11f8` (r6) | `6cb370a` (r7) | `fe843eb` (r8) |
+|---|---|---|---|
+| `test_d1_ownerEmissionWhileVictimPresentGivesSuccessorFreshBudget` | FAIL | FAIL | FAIL |
+| `test_d2_ownerEmissionDuringVictimAbsenceRedeemsPausedDebt` | pass | pass | pass |
+| `test_d9_freshSuccessorArrivingWithOwnersEmissionGetsFullBudget` | pass | FAIL | pass |
+| `test_d4_vanishedOwnerDebtSurvivesUnrelatedEmissionAndIsConsumedHonestly` | FAIL | FAIL | FAIL |
+| `test_C2_acceleratedWriteOffAfterVanishedOwnerKeepsLogHonest` | FAIL | FAIL | FAIL |
+| `test_e1_transientLowerEmissionDoesNotClearLiveStalledBlockerCharge` | FAIL | FAIL | FAIL |
+| `test_e7_adversarialLowerArrivalsDoNotGrowTheStalledBlockersHold` | FAIL | FAIL | FAIL |
+| `test_h3_paddingRenameDuringAbsenceStillRedeemsOnEmission` | pass | pass | pass |
+| `test_h4_sameBatchPresentHandoffDoesNotInheritRedeemedTime` | FAIL | FAIL | FAIL |
+| `test_c3_victimPaddingChurnBehindStalledBlockerStaysBounded` | pass | pass | pass |
+| `test_S5_victimFlickerPausesButStillReachesWriteOffWithinCeiling` | pass | pass | pass |
+| `test_b1_freshBlockerAfterLongUnblockedStretchGetsFullBudget` | pass | pass | pass |
+| `test_e9_writeOffBoundGrowsOnlyByPerCyclePauseCostNeverResets` | FAIL | FAIL | FAIL |
+
+Failing-assert messages for red cells (first failure per test; identical across
+shas unless noted):
+
+- d9 @ `6cb370a` (line 203): "d9 regression: successor written off at t=38s on
+  inherited debt" — the round-7 structurally-dead guard, as the round-8 table
+  describes.
+- d1 (line 142): "successor written off at t=30s — inherited accrual (d1/C3)";
+  write-off log shows the full inherited 30s.
+- d4 (lines 241/247/249/250): `XCTAssertTrue failed` (no message) — vanished-owner
+  carry and truncating consumption asserts, unrepresentable in the scalar model.
+- C2 (log-honesty assert): `("30") is greater than ("2")` — the write-off log
+  claims the inherited 30s as the fresh blocker's own time.
+- e1 (line 306): `XCTAssertTrue failed` (no message) — stalled blocker's charge
+  cleared/hijacked by the transient lower emission.
+- e7: "premature write-off at t=30s — transient inherited the charge".
+- h4 (line 401): "h4: same-batch handoff inherited the old owner's 25s (t=30s)".
+- e9: "cycles=2: premature write-off at t=30s".
+
+### Binding-row verdicts
+
+| Binding row | Expected (r6/r7/r8) | Observed | Verdict |
+|---|---|---|---|
+| d9 | green / **RED** / green | pass / FAIL / pass | **MATCH** |
+| e1 | **RED** / green / **RED** | FAIL / FAIL / FAIL | **DEVIATION** (`6cb370a` expected green, observed red) |
+| e7 | **RED** / green / **RED** | FAIL / FAIL / FAIL | **DEVIATION** (`6cb370a` expected green, observed red) |
+| h3 | **RED** / **RED** / **RED** | pass / pass / pass | **DEVIATION** (green on all three; expected red on all three) |
+| h4 | **RED** / **RED** / **RED** | FAIL / FAIL / FAIL | **MATCH** |
+
+**STOP-THE-LINE:** three binding rows deviate from the round-8 control table
+(`2026-07-27-cold-review-round8.md` §3, verified identical to the plan's
+transcription):
+
+1. **h3 is green on all three control snapshots** where the round-8 table
+   records `9.0s ✗` on all three. The regenerated h3 test does not discriminate
+   the padding-rename-during-absence redemption defect on any scalar-era
+   snapshot. Recorded as observed; per the plan's stop-the-line rule this is
+   reported for controller triage of the battery's helper/choreography layer
+   (never its assertions), not rationalized here.
+2. **e1 is red on `6cb370a`** where the table records `3.0s/30s ✓` (green).
+3. **e7 is red on `6cb370a`** (message: "premature write-off at t=30s —
+   transient inherited the charge") where the table records `36.0s ✓` (green).
+
+No conclusion is drawn here about whether the deviation lies in the regenerated
+probes' choreography or in the round-8 table's characterization of the round-7
+snapshot; that determination belongs to the triage that resolves this finding.
+The counterfactual half of the acceptance gate is **not satisfied** until the
+binding matrix is reconciled.
+
+### Informative rows (observed, one-line explanations)
+
+- **d1** red ×3 — expected (C3/C2 class): successor inherits the victim's
+  accrual and is written off at t=30s of zero own tenure on every scalar
+  snapshot.
+- **C2** red ×3 — expected: the lying write-off log reports inherited time as
+  the fresh blocker's own on every scalar snapshot.
+- **d2** green ×3 — anticipated red on `6cb370a`; observed green: the battery's
+  d2 choreography does not reach the round-7 paused-debt defect on control code
+  (flagged to triage alongside the h3 finding, same absence/redemption family).
+- **b1** green ×3 — expected: fresh-blocker-after-quiescence closed since
+  round 5.
+- **c3** green ×3 — the scalar model already bounds victim padding churn behind
+  a stalled blocker (≤62s bound holds).
+- **S5** green ×3 — flicker pause + ceiling behavior already satisfied by the
+  scalar pause machinery.
+- **e9** red ×3 — scalar snapshots write off prematurely at t=30s from cycle 2
+  (inherited accrual defeats the per-cycle bound the segment model pins).
+- **d4** red ×3 — vanished-owner debt carry with honest truncating consumption
+  is the segment model's headline capability; no scalar snapshot has it.
