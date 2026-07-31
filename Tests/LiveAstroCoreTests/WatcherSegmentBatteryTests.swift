@@ -351,6 +351,14 @@ final class WatcherSegmentBatteryTests: XCTestCase {
     // h3 — owner padding-renames during the victim's absence; its emission must still
     // redeem. Provenance: round-8 R8-2 + control table (RED on all three: 9.0s).
     // Spec §3.1 (RevisionKey normalization).
+    // DISCRIMINATIVE INGREDIENTS (broadened from the R8-2 shape after control runs):
+    // (1) the fresh stalled blocker 00009 arrives in the SAME observe batch where the
+    // renamed owner 007 emits — the episode is already re-assigned, so scalar builds
+    // never reach their dissolution-time clears; (2) the victim STAYS PRESENT — an
+    // absent victim dissolves the episode and round-6's over-broad ordering clear
+    // then wipes the clock (accidental green). Red mechanisms per sha are recorded in
+    // the reconciliation doc; the segment-green half proves padding-normalized
+    // owner redemption.
     func test_h3_paddingRenameDuringAbsenceStillRedeemsOnEmission() {
         var d = makeDriver()
         let sec: UInt64 = 1_000_000_000
@@ -362,15 +370,26 @@ final class WatcherSegmentBatteryTests: XCTestCase {
         d.observe([invalid("7"), digested("00010", "v", id: 10)], at: 1 * sec)
         d.observe([invalid("7"), digested("00010", "v", id: 10)], at: 2 * sec)
         d.observe([invalid("7"), iu("00010", id: 10)], at: 9 * sec)
-        // Victim goes absent; the owner is renamed to "007" and converges (10s..12s).
-        d.observe([digested("007", "done", id: 7), absent("00010")], at: 10 * sec)
-        d.observe([digested("007", "done", id: 7), absent("00010")], at: 11 * sec)
-        d.observe([digested("007", "done", id: 7), absent("00010")], at: 12 * sec)
+        // The victim STAYS PRESENT through the rename (essential: an absent victim
+        // dissolves the episode on scalar builds, letting round-6's over-broad
+        // ordering clear wipe the clock and go green by accident). The owner is
+        // renamed to "007" and converges (10s..12s); stalled 00009 arrives in the
+        // SAME batch as 007's third sighting/emission at t=12.
+        d.observe([digested("007", "done", id: 7), iu("00010", id: 10)], at: 10 * sec)
+        d.observe([digested("007", "done", id: 7), iu("00010", id: 10)], at: 11 * sec)
+        d.observe([digested("007", "done", id: 7), invalid("00009"), iu("00010", id: 10)], at: 12 * sec)
         XCTAssertEqual(d.emitted.map(\.candidate.name), [revisionName("007")])
         d.settleAll(.yielded)
 
-        // Fresh stalled 9 appears as the victim returns at 13s: RevisionKey("7") ==
-        // RevisionKey("007") redeemed the paused 10s => no write-off before t=43s.
+        // Segment-model accrual: the victim charges RUNNING under owner 7/007 from
+        // t=0 to t=12 (12s; padding rename keeps the same RevisionKey). At t=12 the
+        // pending-emission barrier pauses charging; 007's yielded settlement redeems
+        // ALL owner-7 segments (RevisionKey("007") == RevisionKey("7") — the h3
+        // property). 00009 first-charges at t=13; unredeemed total = t-13 reaches the
+        // 30s budget exactly at t=43 => no write-off before then. Scalar builds retain
+        // the stale ~12s (r6: episode-alive skips the clear; r7: running clocks are
+        // never paused so the paused-only clear misses; r8: charge re-stamped to the
+        // transient blocker defeats equality) => premature write-off ~t=30, in-loop.
         for tick in 13...42 {
             d.observe([invalid("00009"), digested("00010", "v", id: 10)], at: UInt64(tick) * sec)
             XCTAssertTrue(d.abandonLogs.isEmpty,

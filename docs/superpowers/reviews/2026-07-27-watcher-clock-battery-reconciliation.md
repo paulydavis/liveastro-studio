@@ -92,7 +92,7 @@ crashes.
 | `test_C2_acceleratedWriteOffAfterVanishedOwnerKeepsLogHonest` | FAIL | FAIL | FAIL |
 | `test_e1_transientLowerEmissionDoesNotClearLiveStalledBlockerCharge` | FAIL | FAIL | FAIL |
 | `test_e7_adversarialLowerArrivalsDoNotGrowTheStalledBlockersHold` | FAIL | FAIL | FAIL |
-| `test_h3_paddingRenameDuringAbsenceStillRedeemsOnEmission` | pass | pass | pass |
+| `test_h3_paddingRenameDuringAbsenceStillRedeemsOnEmission` | FAIL (t=30) | FAIL (t=30) | FAIL (t=30) | *(after the 2026-07-31 rework — see triage record below; the original regeneration was pass/pass/pass)* |
 | `test_h4_sameBatchPresentHandoffDoesNotInheritRedeemedTime` | FAIL | FAIL | FAIL |
 | `test_c3_victimPaddingChurnBehindStalledBlockerStaysBounded` | pass | pass | pass |
 | `test_S5_victimFlickerPausesButStillReachesWriteOffWithinCeiling` | pass | pass | pass |
@@ -167,3 +167,54 @@ binding matrix is reconciled.
   (inherited accrual defeats the per-cycle bound the segment model pins).
 - **d4** red ×3 — vanished-owner debt carry with honest truncating consumption
   is the segment model's headline capability; no scalar snapshot has it.
+
+
+### Triage record (2026-07-31) — deviations resolved; binding matrix amended
+
+The 2026-07-30 run deviated from the round-8 binding table on three rows. Triage
+outcome (controller-verified, per-sha mechanism evidence):
+
+**h3 — battery fault, fixed (choreography only; assertions untouched).** The
+regenerated h3 lost two discriminative ingredients of the historical R8-2 shape:
+the fresh blocker must arrive in the SAME batch as the renamed owner's emission
+(a later arrival lands on scalar dissolution clears), and the victim must STAY
+PRESENT (an absent victim dissolves the episode, and round-6's over-broad
+ordering clear then wipes the clock — an accidental green, because r6's defect
+was OVER-clearing, which the h3 asserts cannot catch). Reworked h3 (victim
+`00010` present throughout; `00009` arrives in the t=12 emission batch;
+segment-model write-off assert unchanged at t=43): **green on the segment
+model, RED at t=30 on all three controls.** Red mechanisms per sha: r6 —
+episode alive at settlement, dissolution clear never runs, stale 12s retained;
+r7 — running clocks carry a nil charge, the paused-only equality clear skips
+them (see below); r8 — charge re-stamped to the transient episode blocker,
+equality defeated. Binding row restored: RED / RED / RED.
+
+**e1/e7 — binding cells amended for `6cb370a`: green → RED (justified).** The
+round-8 table's `6cb370a` green cells encoded the ROUND-7-ERA probes, which used
+paused-clock shapes tuned to r7's equality clear. The regenerated probes use
+present (running-clock) victims — and on `6cb370a`,
+`clearPausedVictimClocksResolvedByEmission` (line 421) begins
+`guard let chargingBlocker = ...victimClocks[name]?.chargingBlocker` where the
+charge is stamped ONLY at pause time: a running clock has a nil charge and is
+skipped by every emission — never redeemed. That is round-8 finding C3
+("running clocks never reset on owner emission") reached through the running
+branch: a genuine scalar defect, line-confirmed. Observed failures: e1 premature
+write-off (foreign accrual), e7 "premature write-off at t=30s — transient
+inherited the charge". Discrimination is STRENGTHENED (red on an additional
+defective build); the essential cells — red on the defect-bearing `0ec11f8`
+and `fe843eb`, green on the segment model — are unchanged. Amended binding
+matrix for e1/e7: RED / RED / RED.
+
+**Amended binding matrix (final):** d9 green/RED/green (unchanged, matched);
+h4 RED/RED/RED (unchanged, matched); h3 RED/RED/RED (restored by rework);
+e1 RED/RED/RED and e7 RED/RED/RED (amended with the C3-mechanism
+justification above). Informative: d2 green on `6cb370a` (single-flicker
+pause/redemption worked for paused clocks in r7 — consistent with the same
+nil-charge asymmetry that fails e1/e7 there).
+
+Post-triage verification: full battery on the segment model = 13/13 green;
+h3 re-run RED at t=30 on all three control worktrees; e1/e7 re-confirmed RED on
+`6cb370a` with captured output. Controller performed this triage directly after
+the triage agent was lost to two API interruptions; its uncommitted h3
+same-batch groundwork was reviewed, extended (present-victim ingredient), and
+incorporated.
