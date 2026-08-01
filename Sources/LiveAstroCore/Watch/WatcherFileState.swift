@@ -201,12 +201,6 @@ struct BlockingEpisode: Equatable {
         self.victims = victims
     }
 
-    mutating func refreshVictims(_ victims: Set<String>) -> Bool {
-        guard !victims.isEmpty else { return false }
-        self.victims = victims
-        return true
-    }
-
     mutating func removeVictim(named name: String) -> Bool {
         victims.remove(name)
         return !victims.isEmpty
@@ -385,6 +379,7 @@ struct WatcherReducer {
                     state.generation.files[candidate.name] = .settled(
                         settlement.withReplacement(.ignoredOutOfOrder(
                             identity: candidate.identity)))
+                    state.generation.ordering.victimLedgers[candidate.name] = nil  // aligned with applyMarkDrops
                     return [.log(
                         "revision \(revision) arrived out of order — skipped "
                             + "(high-water \(mark))")]
@@ -407,6 +402,7 @@ struct WatcherReducer {
                         mark: mark)
                 else { return [] }
                 state.generation.files[candidate.name] = .droppedOutOfOrder
+                state.generation.ordering.victimLedgers[candidate.name] = nil  // aligned with applyMarkDrops
                 return [.log(
                     "revision \(revision) arrived out of order — skipped (high-water \(mark))")]
             }
@@ -728,8 +724,11 @@ struct WatcherReducer {
             }
 
             // Write-off (§§5.5-5.6): ONE blocked victim with a justified decision suffices.
+            // Victims are scanned in numeric revision order (determinism only: with the
+            // cross-ledger consumption below, the justifier choice no longer selects who
+            // "loses" segments).
             var justified: (victim: String, decision: WriteOffDecision)?
-            for victim in victimNames.sorted() {
+            for victim in orderedVictimNames(victimNames) {
                 guard let ledger = state.generation.ordering.victimLedgers[victim] else { continue }
                 if barrierDeferred {
                     // §4 dependence: the decision may not rest on any pending owner.
@@ -808,6 +807,16 @@ struct WatcherReducer {
         }
     }
 
+    /// Deterministic victim scan order: numeric revision order via the shared comparator
+    /// (never lexicographic — `"10" < "9"` is a correctness bug per §3.1).
+    private func orderedVictimNames(_ names: Set<String>) -> [String] {
+        names.sorted { lhs, rhs in
+            revisionOrder.orderedBefore(
+                (name: lhs, revision: revisionOrder.revision(in: lhs)),
+                (name: rhs, revision: revisionOrder.revision(in: rhs)))
+        }
+    }
+
     /// R9-F2: a written-off owner's segments are consumed from every victim's ledger —
     /// the owner is abandoned and the write-off resolved its debt for all of them.
     private mutating func consumeSegmentsEverywhere(ownedBy owner: RevisionKey) {
@@ -823,7 +832,8 @@ struct WatcherReducer {
 
     /// §§5.4-5.6. Nil when the ledger lacks budget-worth of unredeemed wait, or when
     /// the current owner is still inside its own convergence grace window.
-    /// `consumedSegments` = predecessor debt only, oldest owner first, truncating,
+    /// `consumedSegments` = predecessor debt only, oldest debt first (ascending
+    /// `firstChargeNanos`, numeric owner order on ties), truncating,
     /// zero-amount entries excluded. Budget/grace/ceiling reuse the reducer properties.
     func writeOffDecision(
         for blocker: RevisionKey,
@@ -839,9 +849,14 @@ struct WatcherReducer {
         let attributedNanos = victimLedger.segments[blocker]?.totalNanos(at: nowNanos) ?? 0
         var remaining = budget > attributedNanos ? budget - attributedNanos : 0
         var consumed: [RevisionKey: UInt64] = [:]
-        let predecessors = victimLedger.segments.keys
-            .filter { $0 != blocker }
-            .sorted { revisionOrder.orderedBefore($0, $1) }
+        let predecessors = victimLedger.segments.values
+            .filter { $0.owner != blocker }
+            .sorted { lhs, rhs in
+                lhs.firstChargeNanos != rhs.firstChargeNanos
+                    ? lhs.firstChargeNanos < rhs.firstChargeNanos
+                    : revisionOrder.orderedBefore(lhs.owner, rhs.owner)
+            }
+            .map(\.owner)
         for owner in predecessors {
             guard remaining > 0, let segment = victimLedger.segments[owner] else { continue }
             let amount = min(segment.totalNanos(at: nowNanos), remaining)

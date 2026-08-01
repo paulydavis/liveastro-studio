@@ -145,8 +145,12 @@ final class WatcherSegmentBatteryTests: XCTestCase {
         d.observe([invalid("00002"), iu("00003", id: 3)], at: 36 * sec)
         XCTAssertEqual(d.abandonLogs.count, 1, "fresh budget exhausts exactly at 30s of own tenure")
         XCTAssertEqual(d.reducer.state.generation.files[revisionName("00002")], .writtenOff)
+        // The write-off frees victim 3 in the same pass (blockerScan re-derives).
+        XCTAssertEqual(d.emitted.map(\.candidate.name), [revisionName("00003")])
         d.settleAll(.yielded)
-        XCTAssertTrue(d.emitted.isEmpty)
+        guard case .settled(.emittedNow)? = d.reducer.state.generation.files[revisionName("00003")] else {
+            return XCTFail("victim 3 must settle as emitted after the write-off releases it")
+        }
     }
 
     // d2 — paused-victim redemption. Provenance: round-7 R7-1 fix direction (paused
@@ -625,30 +629,32 @@ final class WatcherSegmentBatteryTests: XCTestCase {
     // round-7 e9 ("bounded at 48.0s, identical at 20/60/100 cycles"), spec §§4, 5.3.
     func test_e9_writeOffBoundGrowsOnlyByPerCyclePauseCostNeverResets() {
         let sec: UInt64 = 1_000_000_000
-        for cycles in [2, 5] {
+        // Blocker 00030 / victim 00040 keep every transient lower (up to 00020)
+        // genuinely BELOW the blocker at all three cycle counts.
+        for cycles in [2, 5, 20] {
             var d = makeDriver()
-            d.observe([invalid("00010"), digested("00020", "v", id: 20)], at: 0)
-            d.observe([invalid("00010"), digested("00020", "v", id: 20)], at: 1 * sec)
-            d.observe([invalid("00010"), digested("00020", "v", id: 20)], at: 2 * sec)
+            d.observe([invalid("00030"), digested("00040", "v", id: 40)], at: 0)
+            d.observe([invalid("00030"), digested("00040", "v", id: 40)], at: 1 * sec)
+            d.observe([invalid("00030"), digested("00040", "v", id: 40)], at: 2 * sec)
             var tick: UInt64 = 3
             for lower in 1...cycles {
                 let revision = String(format: "%05d", lower)
                 for _ in 0..<3 {
                     d.observe([digested(revision, "low-\(lower)", id: Int64(lower)),
-                               invalid("00010"), iu("00020", id: 20)], at: tick * sec)
+                               invalid("00030"), iu("00040", id: 40)], at: tick * sec)
                     tick += 1
                 }
                 d.settleAll(.yielded)
             }
-            // Owner 10's accrual = wall - 3*cycles; budget reached at 30 + 3*cycles.
+            // Owner 30's accrual = wall - 3*cycles; budget reached at 30 + 3*cycles.
             let bound = UInt64(30 + 3 * cycles)
             while tick < bound {
-                d.observe([invalid("00010"), iu("00020", id: 20)], at: tick * sec)
+                d.observe([invalid("00030"), iu("00040", id: 40)], at: tick * sec)
                 XCTAssertTrue(d.abandonLogs.isEmpty,
                               "cycles=\(cycles): premature write-off at t=\(tick)s")
                 tick += 1
             }
-            d.observe([invalid("00010"), iu("00020", id: 20)], at: bound * sec)
+            d.observe([invalid("00030"), iu("00040", id: 40)], at: bound * sec)
             XCTAssertEqual(d.abandonLogs.count, 1,
                            "cycles=\(cycles): bound is budget + per-cycle cost — no compounding, no reset")
         }
