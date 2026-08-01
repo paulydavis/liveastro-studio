@@ -273,6 +273,41 @@ appearing — with "blocked emissions for 30s" and no predecessor clause; post-f
 it survives to t=60 (29s own tenure + the named 1s of owner-6 debt,
 "consumed predecessor debt: 6=1.0s").
 
+### N2 — wall-clock invariant added to the sweep (round 9 instrument upgrade)
+
+The N1 sweep (`testDriverFaithfulSweepHoldsTimingBoundInvariantsN1AndN2`) now
+also checks N2: for every write-off decision, the justifying victim's
+cumulative PRESENT-AND-BLOCKED wall time — accumulated by the harness from the
+batches it constructs (present victim + batch-present unready lower on
+pre-pass file states), never from reducer clocks — must be ≤ ceiling + one
+poll tick. Owner-attributed time freezes during barrier pauses; wall time does
+not, so N2 is the invariant that would have caught R9-F1 (N1 cannot: it is
+anchored at `firstChargeNanos`, which the over-broad pause also freezes). The
+reducer's test hook now passes the justifying victim's name alongside the
+decision.
+
+Wall re-anchor rules (each verified against sweep counterexamples before
+adoption):
+1. empty unredeemed ledger at a pass boundary (all past wait settled);
+2. a yielded emission that redeems a segment the victim held (§5.3 chain case:
+   sequential emitting blockers legitimately exceed one ceiling of wall time);
+3. a write-off that consumed segments from the victim's ledger — adjudicated
+   progress (checked AFTER the decision's own N2 assertion, so the triggering
+   decision is still judged against pre-write-off wall time);
+4. ticks whose wait is provisionally attributed to an in-flight emission (a
+   pending owner holding a segment in the victim's ledger) are not counted:
+   yield redeems and re-anchors; rejection makes the tick the spec's
+   event-bounded barrier cost (§4). An R9-F1-style over-broad pause freezes
+   charging while NO pending owner is in the ledger, so those ticks count.
+
+A deterministic S9-family anchor (`testDriverFaithfulS9ShapeHoldsWallClockInvariantN2`)
+pins sensitivity. **Sensitivity demonstration (performed once, then restored):**
+with the R9-F1 fix locally flipped back to the whole-ledger barrier pause, the
+sweep reported N2 violations across many runs (e.g. run 30: 33.0s, run 1415:
+34.0s present-and-blocked) and the anchor failed with 45.0s wall vs the 31.4s
+bound — the exact S9 signature. With the fix restored, all 8 property tests
+pass.
+
 **Timing recompute for barrier-adjacent probes (no asserts changed).** Re-derived
 per the accrual comments: in e1, e7, e9, and h4 the non-pending owner's segment
 is already PAUSED at every barrier tick — the transient occupant's own

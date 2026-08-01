@@ -747,7 +747,7 @@ struct WatcherReducer {
             }
             guard let (justifyingVictim, decision) = justified else { break blockerScan }
 
-            writeOffDecisionHookForTesting?(decision, nowNanos)
+            writeOffDecisionHookForTesting?(decision, justifyingVictim, nowNanos)
             state.generation.files[blockerName] = .writtenOff
             // Predecessor-debt consumption (truncating) applies to the justifying ledger:
             // exactly the debt the decision claimed (§5.5).
@@ -827,8 +827,9 @@ struct WatcherReducer {
         }
     }
 
-    /// Test-only observation point for the N1 sweep (Task 8). Nil in production.
-    var writeOffDecisionHookForTesting: ((WriteOffDecision, UInt64) -> Void)?
+    /// Test-only observation point for the N1/N2 sweeps (Task 8, round 9). Nil in
+    /// production. Arguments: decision, justifying victim name, decision-time nanos.
+    var writeOffDecisionHookForTesting: ((WriteOffDecision, String, UInt64) -> Void)?
 
     /// §§5.4-5.6. Nil when the ledger lacks budget-worth of unredeemed wait, or when
     /// the current owner is still inside its own convergence grace window.

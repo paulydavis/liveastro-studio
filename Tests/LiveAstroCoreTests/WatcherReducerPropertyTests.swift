@@ -448,10 +448,18 @@ final class WatcherReducerPropertyTests: XCTestCase {
         }
     }
 
-    func testDriverFaithfulSweepHoldsTimingBoundInvariantN1() {
+    func testDriverFaithfulSweepHoldsTimingBoundInvariantsN1AndN2() {
         // ≥3000 runs across both digest policies (1500 × 2). Commands only; the hook
-        // observes decisions; per-pass snapshots supply exact anchors for N1.
+        // observes decisions; per-pass snapshots supply exact anchors for N1. N2
+        // (round 9) additionally bounds the JUSTIFIER's cumulative present-and-blocked
+        // wall time — accumulated by the harness from the batches it constructs, and
+        // re-anchored only when the victim's unredeemed ledger empties or observed
+        // stream progress redeems a segment it held. Owner-attributed time freezes
+        // during barrier pauses; wall time does not, so N2 catches an over-broad
+        // barrier (R9-F1) that N1 cannot see.
         let runsPerPolicy = 1_500
+        let pollTick: UInt64 = 1_000_000_000
+        let order = NumberedRevisionOrder(prefix: "live_stack")
         for policy in [StackFileWatcher.DigestPolicy.mutableStackerOutput, .immutableAfterPublish] {
             var immutableDecisions = 0
             for run in 0..<runsPerPolicy {
@@ -472,9 +480,10 @@ final class WatcherReducerPropertyTests: XCTestCase {
                 // Per-pass snapshots taken BEFORE each observe: exact N1 anchors.
                 var snapshotLedgers: [String: VictimWaitLedger] = [:]
                 var snapshotGrace: [RevisionKey: UInt64] = [:]
+                var wallBlockedNanos: [String: UInt64] = [:]
                 var pendingNow: UInt64 = 0
                 var violations: [String] = []
-                reducer.writeOffDecisionHookForTesting = { decision, now in
+                reducer.writeOffDecisionHookForTesting = { decision, justifyingVictim, now in
                     let budget: UInt64 = 30_000_000_000     // budget at this config; cross-checked below
                     let grace: UInt64 = 100_000_000
                     let ceiling: UInt64 = 30_400_000_000
@@ -492,6 +501,22 @@ final class WatcherReducerPropertyTests: XCTestCase {
                             violations.append("write-off inside the owner's own grace at \(now)")
                         }
                     }
+                    // N2: the justifying victim's cumulative present-and-blocked wall
+                    // time (harness-accumulated) must be within ceiling + one poll tick.
+                    let wall = wallBlockedNanos[justifyingVictim] ?? 0
+                    if wall > ceiling &+ pollTick {
+                        violations.append("N2: justifier \(justifyingVictim) waited "
+                            + "\(Double(wall) / 1e9)s present-and-blocked > ceiling+tick at \(now)")
+                    }
+                    // A write-off is adjudicated progress for every victim it consumed
+                    // wait from (the abandoned owner's segments die in ALL ledgers,
+                    // R9-F2): re-anchor them — AFTER the check above, so the decision
+                    // itself is still judged against the pre-write-off wall time.
+                    for (victim, ledger) in snapshotLedgers
+                    where ledger.segments[decision.blocker] != nil {
+                        wallBlockedNanos[victim] = 0
+                    }
+                    wallBlockedNanos[justifyingVictim] = 0
                 }
                 XCTAssertEqual(reducer.blockingBudgetNanos, 30_000_000_000)
                 XCTAssertEqual(reducer.blockingGraceNanos, 100_000_000)
@@ -501,12 +526,13 @@ final class WatcherReducerPropertyTests: XCTestCase {
                 var now: UInt64 = 0
                 var unsettled: [EmissionIntent] = []
                 for _ in 0..<120 {
-                    now &+= 1_000_000_000
+                    now &+= pollTick
                     pendingNow = now
                     snapshotLedgers = reducer.state.generation.ordering.victimLedgers
                     snapshotGrace = reducer.state.generation.ordering.ownerGraceUntil
 
                     var entries: [FileObservation] = []
+                    var present = [Bool](repeating: false, count: 7)
                     for value in 1...6 {
                         let revision = String(value)
                         let name = revisionName(revision)
@@ -529,9 +555,49 @@ final class WatcherReducerPropertyTests: XCTestCase {
                             outcome = .digested(
                                 identity: identity, digest: digest, byteCount: identity.size)
                         }
+                        present[value] = outcome != .absent
                         entries.append(makeObservation(name: name, revision: revision, outcome: outcome))
                     }
+
+                    // N2 bookkeeping: re-anchor victims whose unredeemed ledger is
+                    // empty at the pass boundary (their past wait is fully settled).
+                    for value in 1...6 {
+                        let name = revisionName(String(value))
+                        if snapshotLedgers[name]?.segments.isEmpty != false {
+                            wallBlockedNanos[name] = 0
+                        }
+                    }
+                    let prePassFiles = reducer.state.generation.files
+
                     let effects = reduce(entries, nowNanos: now, reducer: &reducer)
+
+                    // Accumulate one poll tick of present-and-blocked wall time per
+                    // victim (blockedness judged from THIS batch's presence and the
+                    // pre-pass file states of lower revisions) — EXCEPT ticks whose
+                    // wait is provisionally attributed to an in-flight emission: when
+                    // a pending owner holds a segment in the victim's ledger, the
+                    // barrier has paused exactly that owner's charge pending its
+                    // settlement (yield → redeemed and re-anchored below; rejection →
+                    // the tick is the spec's event-bounded barrier cost, §4). An
+                    // over-broad barrier (R9-F1) pauses charging while NO pending
+                    // owner is in the ledger, so those ticks still count.
+                    let pendingOwnersNow = reducer.state.generation.ordering.pendingEmissionOwners
+                    for value in 1...6 where present[value] {
+                        let name = revisionName(String(value))
+                        let blocked = (1..<value).contains { lower in
+                            present[lower] && isUnreadyBlockerState(
+                                prePassFiles[revisionName(String(lower))])
+                        }
+                        guard blocked else { continue }
+                        let ledgerOwners = reducer.state.generation.ordering
+                            .victimLedgers[name]?.segments.keys
+                        let attributedToInFlightOwner = ledgerOwners.map {
+                            !pendingOwnersNow.isDisjoint(with: $0)
+                        } ?? false
+                        if !attributedToInFlightOwner {
+                            wallBlockedNanos[name, default: 0] &+= pollTick
+                        }
+                    }
                     for effect in effects {
                         if case .emit(let intent) = effect { unsettled.append(intent) }
                         if case .log(let line) = effect, policy == .immutableAfterPublish,
@@ -543,6 +609,18 @@ final class WatcherReducerPropertyTests: XCTestCase {
                         let intent = unsettled.removeFirst()
                         let outcome: EmissionResult.Outcome =
                             generator.next() % 5 == 0 ? .rejected : .yielded
+                        if outcome == .yielded {
+                            // Observed stream progress re-anchors N2 for every victim
+                            // whose ledger held the emitting owner's segment, and for
+                            // the emitter itself (its own wait is cleared, §5.2).
+                            if let owner = order.revisionKey(in: intent.candidate.name) {
+                                for (victim, ledger) in reducer.state.generation.ordering.victimLedgers
+                                where ledger.segments[owner] != nil {
+                                    wallBlockedNanos[victim] = 0
+                                }
+                            }
+                            wallBlockedNanos[intent.candidate.name] = 0
+                        }
                         _ = reducer.reduce(.emissionFinished(EmissionResult(
                             intent: intent, outcome: outcome)))
                     }
@@ -554,6 +632,124 @@ final class WatcherReducerPropertyTests: XCTestCase {
                 XCTAssertEqual(immutableDecisions, 0,
                                "ordering (and write-off) is mutable-policy-only")
             }
+        }
+    }
+
+    func testDriverFaithfulS9ShapeHoldsWallClockInvariantN2() {
+        // Deterministic S9-family anchor for N2 (round 9): settled r_1 is rewritten in
+        // place and emits every 3 ticks while r_2 stalls and victim r_3 stays present
+        // and blocked. r_1 never charges r_3's ledger, so no redemption ever re-anchors
+        // the wall accumulator — exactly the regime where an over-broad barrier (R9-F1)
+        // freezes owner-attributed time while wall time keeps growing. With the
+        // dependence-scoped barrier, the write-off lands with wall ≤ ceiling + 1 tick.
+        let pollTick: UInt64 = 1_000_000_000
+        var reducer = WatcherReducer(
+            state: WatcherState(
+                generation: GenerationState(
+                    id: FolderGeneration(rawValue: 1),
+                    files: [:],
+                    ordering: RevisionOrderingState(activeBlocker: nil)),
+                lastEmittedDigestByName: [:]),
+            configuration: WatcherReducerConfiguration(
+                digestPolicy: .mutableStackerOutput,
+                filePrefix: "live_stack",
+                quietPeriodNanos: 100_000_000,
+                pollIntervalNanos: pollTick))
+        let ceiling = reducer.blockingCeilingNanos
+
+        var wallBlockedNanos: [String: UInt64] = [:]
+        var decisions: [(victim: String, wallNanos: UInt64, nowNanos: UInt64)] = []
+        reducer.writeOffDecisionHookForTesting = { _, justifyingVictim, now in
+            decisions.append((justifyingVictim, wallBlockedNanos[justifyingVictim] ?? 0, now))
+        }
+
+        let one = revisionName("1")
+        let two = revisionName("2")
+        let three = revisionName("3")
+        for tick in 1...60 {
+            let now = UInt64(tick) * pollTick
+            var entries: [FileObservation] = []
+            var presentNames: [String] = []
+            if tick <= 3 {
+                entries.append(makeObservation(name: one, revision: "1", outcome: .digested(
+                    identity: makeIdentity(101), digest: "v0", byteCount: makeIdentity(101).size)))
+                presentNames = [one]
+            } else {
+                let version = (tick - 4) / 3 + 1
+                let identity = makeIdentity(Int64(200 + version))
+                entries = [
+                    makeObservation(name: one, revision: "1", outcome: .digested(
+                        identity: identity, digest: "rw-\(version)", byteCount: identity.size)),
+                    makeObservation(name: two, revision: "2", outcome: .invalid),
+                    makeObservation(name: three, revision: "3", outcome: .digested(
+                        identity: makeIdentity(3), digest: "v", byteCount: makeIdentity(3).size)),
+                ]
+                presentNames = [one, two, three]
+            }
+
+            // N2 bookkeeping, identical rules to the sweep.
+            for name in [one, two, three] {
+                if reducer.state.generation.ordering.victimLedgers[name]?.segments.isEmpty != false {
+                    wallBlockedNanos[name] = 0
+                }
+            }
+            let prePassFiles = reducer.state.generation.files
+
+            let effects = reduce(entries, nowNanos: now, reducer: &reducer)
+
+            let pendingOwnersNow = reducer.state.generation.ordering.pendingEmissionOwners
+            for (index, name) in presentNames.enumerated() where index > 0 {
+                let blocked = presentNames[..<index].contains { lower in
+                    isUnreadyBlockerState(prePassFiles[lower])
+                }
+                guard blocked else { continue }
+                let ledgerOwners = reducer.state.generation.ordering.victimLedgers[name]?.segments.keys
+                let attributedToInFlightOwner = ledgerOwners.map {
+                    !pendingOwnersNow.isDisjoint(with: $0)
+                } ?? false
+                if !attributedToInFlightOwner {
+                    wallBlockedNanos[name, default: 0] &+= pollTick
+                }
+            }
+
+            for case .emit(let intent) in effects {
+                let outcome: EmissionResult.Outcome =
+                    reducer.shouldExecuteEmission(intent) ? .yielded : .rejected
+                if outcome == .yielded {
+                    let owner = RevisionKey("1")   // only r_1 ever emits in this shape
+                    for (victim, ledger) in reducer.state.generation.ordering.victimLedgers
+                    where ledger.segments[owner] != nil {
+                        wallBlockedNanos[victim] = 0
+                    }
+                    wallBlockedNanos[intent.candidate.name] = 0
+                }
+                _ = reducer.reduce(.emissionFinished(EmissionResult(intent: intent, outcome: outcome)))
+            }
+        }
+
+        XCTAssertEqual(decisions.count, 1, "the stalled r_2 must be written off exactly once")
+        XCTAssertEqual(reducer.state.generation.files[two], .writtenOff)
+        for decision in decisions {
+            XCTAssertEqual(decision.victim, three)
+            XCTAssertLessThanOrEqual(
+                decision.wallNanos,
+                ceiling &+ pollTick,
+                "N2 violated: justifier \(decision.victim) accumulated "
+                    + "\(Double(decision.wallNanos) / 1e9)s of present-and-blocked wall time "
+                    + "before the write-off at \(Double(decision.nowNanos) / 1e9)s "
+                    + "(ceiling \(Double(ceiling) / 1e9)s + one tick)")
+        }
+    }
+
+    /// N2 blockedness predicate (mirrors the reducer's participates/ready facts on the
+    /// PRE-pass file state): nil/observing/digestPending block; ready, terminal, and
+    /// settled states do not.
+    private func isUnreadyBlockerState(_ state: FileState?) -> Bool {
+        switch state {
+        case nil, .observing, .digestPending:
+            return true
+        case .ready, .settled, .droppedOutOfOrder, .writtenOff:
+            return false
         }
     }
 
