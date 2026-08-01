@@ -308,6 +308,50 @@ sweep reported N2 violations across many runs (e.g. run 30: 33.0s, run 1415:
 bound — the exact S9 signature. With the fix restored, all 8 property tests
 pass.
 
+### Round-9 control-matrix delta (new/changed battery tests only)
+
+The current battery file was copied byte-identical into fresh worktrees at the
+three control shas; only the two new probes (S9, S4) and the two changed probes
+(d1 asserts, e9 cycle counts) were run (`swift test --filter`, one worktree at
+a time; worktrees removed and pruned afterward).
+
+| Battery test | `0ec11f8` (r6) | `6cb370a` (r7) | `fe843eb` (r8) |
+|---|---|---|---|
+| `test_S9_inPlaceRewritingLowerDoesNotDelayStalledBlockerWriteOff` (new) | pass | pass | pass |
+| `test_S4_paddingTwinOfWrittenOffOwnerGetsFreshBudgetAndHonestAttribution` (new) | FAIL | FAIL | FAIL |
+| `test_d1_...` (changed asserts) | FAIL (cell unchanged) | FAIL (cell unchanged) | FAIL (cell unchanged) |
+| `test_e9_...` (cycles {2,5,20}) | FAIL (cell unchanged) | FAIL (cell unchanged) | FAIL (cell unchanged) |
+
+Mechanisms:
+
+- **S4 red ×3** — on every scalar sha the twin's write-off log reads "blocked
+  emissions for 30s" where honest attribution is 29s own tenure plus a named
+  1s of owner-6 debt ("Optional(30) is not equal to Optional(29)"; no
+  "consumed predecessor debt" clause exists). Structurally guaranteed red: the
+  scalar model has no consumedSegments concept, so the M9 log-honesty half of
+  S4 is unrepresentable there.
+- **S9 green ×3 — deviation from the round-9 expectation ("both new tests red
+  on scalar builds"), recorded with mechanism.** S9 pins R9-F1, a defect in
+  the pending-emission barrier — a segment-model mechanism THIS branch
+  introduced; no scalar build has any barrier. In the S9 shape one episode
+  (blocker 2, present victim) survives untouched from first charge to
+  write-off, so each scalar sha's defect never engages: r6's over-broad
+  ordering clear runs only at episode dissolution (episode never dissolves);
+  r7's paused-only emission clear skips the victim's RUNNING clock (round-8
+  C3 asymmetry — here that makes the clock accrue wall-continuously, which is
+  the correct bound); r8's charge re-stamp targets the current episode
+  blocker, which is already owner 2 (no-op). The scalar clock therefore
+  charges wall-continuously and the write-off lands in [30s, 31.4s] — the
+  green is mechanistically forced, not an accident of choreography. The
+  segment-green half of S9 remains binding evidence for the R9-F1 fix
+  (red-first proof: 45.0s pre-fix, 30.0s post-fix on this branch).
+- **d1 / e9 red ×3, cells unchanged** — same first failures as the recorded
+  matrix (d1: "successor written off at t=30s — inherited accrual"; e9:
+  "cycles=2: premature write-off at t=30s"). The d1 assert change and e9
+  extension did not flip any control cell (both fail in-loop before reaching
+  the new asserts; e9's cycles=20 additionally shows three write-offs on
+  scalar builds — the compounding class the probe pins).
+
 **Timing recompute for barrier-adjacent probes (no asserts changed).** Re-derived
 per the accrual comments: in e1, e7, e9, and h4 the non-pending owner's segment
 is already PAUSED at every barrier tick — the transient occupant's own
