@@ -96,6 +96,20 @@ struct VictimWaitLedger: Equatable {
         }
     }
 
+    /// Barrier-scoped pause (§4 dependence, R9-F1): freezes only the given (pending)
+    /// owners' running segments. Other owners' running segments keep accruing — the
+    /// victim is present and still genuinely waiting on them. Never stamps
+    /// `pausedAtNanos`: that marker means absence, and the victim is not absent.
+    mutating func pauseSegments(ownedBy owners: Set<RevisionKey>, at nowNanos: UInt64) {
+        for owner in owners {
+            guard var segment = segments[owner],
+                  let runningSinceNanos = segment.runningSinceNanos else { continue }
+            segment.accruedNanos = segment.accruedNanos &+ (nowNanos >= runningSinceNanos ? nowNanos - runningSinceNanos : 0)
+            segment.runningSinceNanos = nil
+            segments[owner] = segment
+        }
+    }
+
     mutating func redeem(owner: RevisionKey) {
         segments.removeValue(forKey: owner)
         if segments.isEmpty {
@@ -687,35 +701,47 @@ struct WatcherReducer {
 
             guard !victimNames.isEmpty else { break blockerScan }
 
-            // Pending-emission barrier (§4): defer open/extend/consume/write-off while a
-            // lower owner's intent is unsettled. Pause so no segment silently extends.
-            if hasPendingLowerOwner(before: blockerOwner) {
+            // Pending-emission barrier (§4, scoped by DEPENDENCE — R9-F1): while a lower
+            // owner's intent is unsettled, defer only what depends on the PENDING owners:
+            // opening/extending the current head's segment, consuming pending owners'
+            // segments, and any write-off decision whose justifying ledger contains them.
+            // Segments owned by non-pending owners keep running — the barrier is an
+            // attribution-ordering rule, not a global pause (an in-place-rewriting settled
+            // lower would otherwise freeze the stalled head's charge every emission cycle).
+            let barrierDeferred = hasPendingLowerOwner(before: blockerOwner)
+            if barrierDeferred {
                 for victim in victimNames {
-                    state.generation.ordering.victimLedgers[victim]?.pause(at: nowNanos)
+                    state.generation.ordering.victimLedgers[victim]?
+                        .pauseSegments(ownedBy: pendingOwners, at: nowNanos)
                 }
-                break blockerScan
-            }
+            } else {
+                // Charge (§4 step 5): one running segment per victim, keyed by the current owner.
+                for victim in victimNames {
+                    state.generation.ordering.victimLedgers[victim, default: VictimWaitLedger()]
+                        .startOrContinue(owner: blockerOwner, at: nowNanos)
+                }
 
-            // Charge (§4 step 5): one running segment per victim, keyed by the current owner.
-            for victim in victimNames {
-                state.generation.ordering.victimLedgers[victim, default: VictimWaitLedger()]
-                    .startOrContinue(owner: blockerOwner, at: nowNanos)
-            }
-
-            // Convergence grace (§5.4): renew the CURRENT owner only.
-            if blocker.isConverging {
-                noteConvergingOwner(blockerOwner, at: nowNanos)
+                // Convergence grace (§5.4): renew the CURRENT owner only.
+                if blocker.isConverging {
+                    noteConvergingOwner(blockerOwner, at: nowNanos)
+                }
             }
 
             // Write-off (§§5.5-5.6): ONE blocked victim with a justified decision suffices.
             var justified: (victim: String, decision: WriteOffDecision)?
             for victim in victimNames.sorted() {
-                guard let ledger = state.generation.ordering.victimLedgers[victim],
-                      let decision = writeOffDecision(
-                          for: blockerOwner,
-                          blockerName: blockerName,
-                          victimLedger: ledger,
-                          nowNanos: nowNanos)
+                guard let ledger = state.generation.ordering.victimLedgers[victim] else { continue }
+                if barrierDeferred {
+                    // §4 dependence: the decision may not rest on any pending owner.
+                    guard !pendingOwners.contains(blockerOwner),
+                          pendingOwners.isDisjoint(with: ledger.segments.keys)
+                    else { continue }
+                }
+                guard let decision = writeOffDecision(
+                    for: blockerOwner,
+                    blockerName: blockerName,
+                    victimLedger: ledger,
+                    nowNanos: nowNanos)
                 else { continue }
                 justified = (victim, decision)
                 break

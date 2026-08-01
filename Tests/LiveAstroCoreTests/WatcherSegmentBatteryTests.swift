@@ -424,6 +424,68 @@ final class WatcherSegmentBatteryTests: XCTestCase {
         XCTAssertEqual(d.abandonLogs.count, 1)
     }
 
+    // S9 — settled lower REWRITTEN IN PLACE below a stalled blocker: the pending-
+    // emission barrier must defer only work that DEPENDS on the pending owner (§4),
+    // never pause the stalled blocker's own running charge. Provenance: round-9 cold
+    // review R9-F1 (S9 probe: 44s wall-clock present-and-blocked vs [budget=30s,
+    // ceiling=32s]); the rewriter never occupies the head-blocker slot, so its
+    // recurring emission cycle must cost the victim nothing.
+    // Expected on scalar controls: RED (broad clears/hijacks, no owner-keyed segments).
+    func test_S9_inPlaceRewritingLowerDoesNotDelayStalledBlockerWriteOff() {
+        var d = makeDriver()
+        let sec: UInt64 = 1_000_000_000
+
+        // Establish r_1 as a settled emission (ticks 0-2; three-sighting digest gate).
+        d.observe([digested("00001", "v0", id: 1)], at: 0)
+        d.observe([digested("00001", "v0", id: 1)], at: 1 * sec)
+        d.observe([digested("00001", "v0", id: 1)], at: 2 * sec)
+        XCTAssertEqual(d.emitted.map(\.candidate.name), [revisionName("00001")])
+        d.settleAll(.yielded)
+
+        // From t=3: stalled 2 + victim 3 (present and blocked EVERY tick from t=3, so
+        // cumulative present-and-blocked wall time = t-3), while settled r_1 is
+        // rewritten in place on a 3-tick cycle (replacement observing → digestPending
+        // → ready+emit at every t ≡ 2 (mod 3) from t=5). r_1 never re-enters numbered
+        // ordering while unready (settled files do not participate), so owner 2's
+        // segment must charge CONTINUOUSLY from t=3: unredeemed total reaches the 30s
+        // budget at t=33 (grace 0.1s long expired; t=33 is not a barrier tick).
+        // Defective barrier (whole-ledger pause each emission tick) accrues 2s per
+        // 3-tick cycle => write-off slips to t=48 (45s of wall), past ceiling+tick.
+        var rewriteEmissions = 0
+        var tick: UInt64 = 3
+        while tick <= 60 {
+            let version = Int((tick - 3) / 3) + 1
+            d.observe([
+                digested("00001", "rw-\(version)", id: Int64(100 + version)),
+                invalid("00002"),
+                digested("00003", "v", id: 3),
+            ], at: tick * sec)
+            rewriteEmissions += d.emitted.filter { $0.candidate.name == revisionName("00001") }.count
+            d.settleAll(.yielded)
+            if !d.abandonLogs.isEmpty { break }
+            tick += 1
+        }
+        XCTAssertGreaterThanOrEqual(rewriteEmissions, 8,
+                                    "probe shape: the settled lower must emit repeatedly while 2 stalls")
+        XCTAssertEqual(d.abandonLogs.count, 1, "stalled 2 must be written off (S9)")
+        let wallNanos = d.abandonLogs[0].nanos - 3 * sec
+        XCTAssertGreaterThanOrEqual(wallNanos, 30 * sec,
+                                    "write-off before the victim's own budget of present-and-blocked time")
+        XCTAssertLessThanOrEqual(wallNanos, 30 * sec + 400_000_000 + 1 * sec,
+                                 "S9/R9-F1: \(Double(wallNanos) / 1e9)s of present-and-blocked wall time "
+                                     + "exceeds ceiling (30.4s) + one poll tick — the barrier paused the "
+                                     + "non-pending owner's running segment on every rewrite emission")
+        XCTAssertEqual(d.reducer.state.generation.files[revisionName("00002")], .writtenOff)
+        let line = d.abandonLogs[0].line
+        XCTAssertEqual(ownSeconds(in: line), 30, "owner 2's own attributed time is the full budget: \(line)")
+        XCTAssertFalse(line.contains("consumed predecessor debt"),
+                       "no predecessor debt exists in this shape: \(line)")
+        // The write-off frees the victim in the same pass.
+        guard case .settled(.emittedNow)? = d.reducer.state.generation.files[revisionName("00003")] else {
+            return XCTFail("victim 3 must emit once the written-off blocker is gone")
+        }
+    }
+
     // c3 + padding twins — victim identity churn between padding variants stays
     // bounded, each twin holding its own filename-keyed ledger. Provenance: rounds 4-6
     // ("identity churn r_10<->r_010 ... bounded (62.0s)"), round-6 "padding twins get

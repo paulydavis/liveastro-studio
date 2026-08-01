@@ -218,3 +218,39 @@ h3 re-run RED at t=30 on all three control worktrees; e1/e7 re-confirmed RED on
 the triage agent was lost to two API interruptions; its uncommitted h3
 same-batch groundwork was reviewed, extended (present-victim ingredient), and
 incorporated.
+
+## Round 9 (2026-08-01) — external cold-review fixes
+
+### R9-F1 — barrier scoped by dependence (spec §4)
+
+The round-9 cold review proved the pending-emission barrier over-broad: it
+paused ALL current victims' whole ledgers whenever any lower owner's intent was
+pending, recurring every emission cycle. Regime S9 (settled lower rewritten in
+place emitting every ~3 ticks, stalled middle, ready high victim): the middle
+blocker's running charge froze one tick per cycle, so the victim saw ~45s of
+present-and-blocked wall time before write-off vs the [budget 30s, ceiling
+30.4s] bound (probe measured 44s at 2s poll). Spec §4 qualifies the barrier by
+dependence ("must not open, extend, consume, or write off successor-owner
+segments **that depend on those pending owners**"). Fix: during a barrier pass,
+only the PENDING owners' segments pause; non-pending running segments keep
+accruing; opening/resuming the head's segment stays deferred; a write-off is
+permitted iff the justifying ledger contains no pending owner's segment and the
+head owner itself is not pending. End-of-pass settlement (absence pause /
+discharge) untouched.
+
+New battery probe: `test_S9_inPlaceRewritingLowerDoesNotDelayStalledBlockerWriteOff`
+(driver-faithful S9 shape; asserts write-off within [budget, ceiling]+1 tick of
+cumulative present-and-blocked wall time). Red-first evidence: on pre-fix code
+the write-off landed at t=48 (45.0s of wall), failing the 31.4s bound; green at
+t=33 (30.0s) after the fix.
+
+**Timing recompute for barrier-adjacent probes (no asserts changed).** Re-derived
+per the accrual comments: in e1, e7, e9, and h4 the non-pending owner's segment
+is already PAUSED at every barrier tick — the transient occupant's own
+`startOrContinue` paused it when it took the head slot (h4/d1/d9: the emitting
+owner's segment is the pending one and pauses either way). R9-F1 changes only
+RUNNING non-pending segments, which occur solely in the S9 family (a settled
+in-place rewriter that never occupies the head slot). Expected write-off
+instants therefore stay exactly d1: 36s, d9: 61s, e1: 33s, e7: 42s, h3: 43s,
+h4: 56s, e9: 30+3·cycles — confirmed by a full battery run with zero edits to
+existing expectations.
