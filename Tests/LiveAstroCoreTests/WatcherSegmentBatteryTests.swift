@@ -486,6 +486,53 @@ final class WatcherSegmentBatteryTests: XCTestCase {
         }
     }
 
+    // S4 — padding twin of a WRITTEN-OFF owner. Provenance: round-9 cold review R9-F2:
+    // write-off consumed only the justifying victim's ledger copy; the surviving copy
+    // under the other victim handed twin r_05 (same RevisionKey) the dead owner's
+    // firstChargeNanos => written off 0.0s after appearing, "blocked for 30s" logged,
+    // consumedSegments=[] — the same stall billed twice, second frame lost (M2/M9).
+    // Round-9 interpretation of spec §4 step 3: write-off consumes the abandoned
+    // owner's segments across ALL victims' ledgers. Expected on scalar controls: RED.
+    func test_S4_paddingTwinOfWrittenOffOwnerGetsFreshBudgetAndHonestAttribution() {
+        var d = makeDriver()
+        let sec: UInt64 = 1_000_000_000
+
+        // Phase 1: stalled 5 blocks victims 6 (unready — the numerically-first
+        // justifier) and 7 (ready by t=2) from t=0; both charge under owner 5.
+        for tick in 0...29 {
+            d.observe([invalid("00005"), invalid("00006"), digested("00007", "v", id: 7)],
+                      at: UInt64(tick) * sec)
+            XCTAssertTrue(d.abandonLogs.isEmpty, "premature write-off of 5 at t=\(tick)s")
+        }
+        d.observe([invalid("00005"), invalid("00006"), digested("00007", "v", id: 7)], at: 30 * sec)
+        XCTAssertEqual(d.abandonLogs.count, 1, "owner 5 written off at exactly one budget")
+        XCTAssertEqual(d.reducer.state.generation.files[revisionName("00005")], .writtenOff)
+        XCTAssertEqual(ownSeconds(in: d.abandonLogs[0].line), 30)
+
+        // Phase 2: twin 005 (RevisionKey "5" — the written-off owner's key) arrives
+        // stalling at t=31 and heads the line over 6 and 7. Its budget/grace must
+        // anchor at ITS first charge (t=31). Ledger 7 legitimately carries 1s of
+        // owner-6 debt (6 headed during t=30..31 and never emitted), so ledger 7
+        // reaches budget at t=60: 29s of twin tenure + 1s consumed from 6 — the twin
+        // survives its own budget less only the NAMED predecessor second. A surviving
+        // owner-5 copy (R9-F2 defect) instead fires at t=31 with a lying 30s log.
+        for tick in 31...59 {
+            d.observe([invalid("005"), invalid("00006"), digested("00007", "v", id: 7)],
+                      at: UInt64(tick) * sec)
+            XCTAssertEqual(d.abandonLogs.count, 1,
+                           "twin written off after \(tick - 31)s of own tenure — inherited the "
+                               + "dead owner's segment copy (R9-F2); log: \(d.abandonLogs.last?.line ?? "")")
+        }
+        d.observe([invalid("005"), invalid("00006"), digested("00007", "v", id: 7)], at: 60 * sec)
+        XCTAssertEqual(d.abandonLogs.count, 2, "twin write-off lands when ITS OWN ledger justifies it")
+        let line = d.abandonLogs[1].line
+        XCTAssertEqual(ownSeconds(in: line), 29,
+                       "own-time clause is the twin's own tenure (t=31..60), never the dead owner's 30s: \(line)")
+        XCTAssertTrue(line.contains("consumed predecessor debt") && line.contains("6=1.0s"),
+                      "the 1s of owner-6 debt is named as a separate fact: \(line)")
+        XCTAssertEqual(d.reducer.state.generation.files[revisionName("005")], .writtenOff)
+    }
+
     // c3 + padding twins — victim identity churn between padding variants stays
     // bounded, each twin holding its own filename-keyed ledger. Provenance: rounds 4-6
     // ("identity churn r_10<->r_010 ... bounded (62.0s)"), round-6 "padding twins get

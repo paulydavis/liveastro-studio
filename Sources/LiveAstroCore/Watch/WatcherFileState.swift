@@ -750,15 +750,21 @@ struct WatcherReducer {
 
             writeOffDecisionHookForTesting?(decision, nowNanos)
             state.generation.files[blockerName] = .writtenOff
-            var consumption = decision.consumedSegments
-            consumption[decision.blocker] = decision.attributedNanos   // the terminal owner's own segment dies with it
-            state.generation.ordering.victimLedgers[justifyingVictim]?.consume(consumption, at: nowNanos)
+            // Predecessor-debt consumption (truncating) applies to the justifying ledger:
+            // exactly the debt the decision claimed (§5.5).
+            state.generation.ordering.victimLedgers[justifyingVictim]?
+                .consume(decision.consumedSegments, at: nowNanos)
             if state.generation.ordering.victimLedgers[justifyingVictim]?.isEmpty == true {
                 state.generation.ordering.victimLedgers[justifyingVictim] = nil
             }
-            // Other victims keep their segments: the written-off owner never emitted, so per
-            // §5.2 their attributed wait stays owed; the next pass discharges them if the
-            // write-off left them unblocked.
+            // R9-F2 (§4 step 3, consume-across-all-ledgers): the write-off resolves the
+            // abandoned owner's debt for EVERY victim, not only the justifier. A surviving
+            // copy under another victim would hand a later same-RevisionKey blocker
+            // (padding twin) the dead owner's firstChargeNanos — instant write-off, zero
+            // own tenure, dishonest log (M2/M9). Other owners' segments in those ledgers
+            // remain owed (§5.2); the next pass discharges them if the write-off left
+            // their victims unblocked.
+            consumeSegmentsEverywhere(ownedBy: decision.blocker)
             state.generation.ordering.activeBlocker = nil
             state.generation.ordering.ownerGraceUntil[decision.blocker] = nil
 
@@ -799,6 +805,16 @@ struct WatcherReducer {
     private func hasPendingLowerOwner(before owner: RevisionKey) -> Bool {
         state.generation.ordering.pendingEmissionOwners.contains { pending in
             revisionOrder.orderedBefore(pending, owner)
+        }
+    }
+
+    /// R9-F2: a written-off owner's segments are consumed from every victim's ledger —
+    /// the owner is abandoned and the write-off resolved its debt for all of them.
+    private mutating func consumeSegmentsEverywhere(ownedBy owner: RevisionKey) {
+        for victim in Array(state.generation.ordering.victimLedgers.keys) {
+            guard var ledger = state.generation.ordering.victimLedgers[victim],
+                  ledger.segments.removeValue(forKey: owner) != nil else { continue }
+            state.generation.ordering.victimLedgers[victim] = ledger.isEmpty ? nil : ledger
         }
     }
 

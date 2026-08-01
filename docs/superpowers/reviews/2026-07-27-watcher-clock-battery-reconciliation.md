@@ -244,6 +244,35 @@ cumulative present-and-blocked wall time). Red-first evidence: on pre-fix code
 the write-off landed at t=48 (45.0s of wall), failing the 31.4s bound; green at
 t=33 (30.0s) after the fix.
 
+### R9-F2 — write-off consumes the abandoned owner across ALL ledgers (spec-interpretation record)
+
+Proven defect: with owner r_5 stalled over victims r_6 (justifier) and r_7, the
+write-off consumed only r_6's ledger copy of owner 5. r_7's surviving copy then
+let padding twin r_05 (same `RevisionKey`) resume the dead owner's segment with
+the ORIGINAL `firstChargeNanos`: the twin was written off 0.0s after appearing,
+logged "blocked for 30s", `consumedSegments=[]` — the same wall-clock stall
+billed twice and a second frame lost (M2/M9 violations).
+
+**Interpretation recorded for the maintainer's merge review:** spec §4 step 3,
+"written-off owners consume the segments used to justify their write-off", is
+read as consume-across-all-ledgers for the written-off owner's own segments.
+The owner is abandoned; the write-off resolves ITS debt for every victim, not
+only the justifier. This is the only reading consistent with M2 (a blocker
+cannot be written off before its own charged interval plus explicit predecessor
+debt reaches budget — a same-key successor inherits zero) and M9 (logs derive
+from the decision, never from another owner's stale accrual). The justifier-only
+reading leaves an unconsumable twin-bait copy; predecessor-debt consumption
+(`consumedSegments`) remains justifier-ledger-only and truncating, since that is
+the debt the decision explicitly claimed. Other owners' segments in non-justifier
+ledgers remain owed per §5.2 and discharge on the next unblocked pass.
+
+New battery probe: `test_S4_paddingTwinOfWrittenOffOwnerGetsFreshBudgetAndHonestAttribution`
+(driver-faithful S4 shape: two victims, write-off, twin appears unready).
+Red-first evidence: pre-fix, the twin was written off at t=31 — 0s after
+appearing — with "blocked emissions for 30s" and no predecessor clause; post-fix
+it survives to t=60 (29s own tenure + the named 1s of owner-6 debt,
+"consumed predecessor debt: 6=1.0s").
+
 **Timing recompute for barrier-adjacent probes (no asserts changed).** Re-derived
 per the accrual comments: in e1, e7, e9, and h4 the non-pending owner's segment
 is already PAUSED at every barrier tick — the transient occupant's own
