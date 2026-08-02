@@ -16,8 +16,14 @@ Modes:
   golden  --m8 M8.fit --out Tests/LiveAstroCoreTests/Fixtures
       Emit the 64x64 float32 golden crop (input + expected at strength 0.5).
 
-Gate (all at strength 0.5, spec-verbatim): bg luma sigma down >=40%, coarse chroma
-sigma down >=50%, star FWHM delta <=2%, Veil filament contrast preserved >=95%.
+Gate (all at strength 0.5, spec §3 as amended 2026-08-02, owner-approved):
+  - bg luma sigma and coarse chroma sigma are measured on the flattest 10% of a
+    32x32 luma-MAD tile grid (min 20 tiles; per-tile sigma, median across tiles);
+  - effective targets: bg >= min(40%, 0.7*bound), chroma >= min(50%, 0.7*bound),
+    where bound = the reduction a blur-everything pass (all guard/blend weights
+    forced to 1, same radii/passes) attains on those same tiles, computed here;
+  - star FWHM delta <= 2% (whole field) and Veil filament contrast preserved
+    >= 95% — the unchanged anti-gaming guards.
 If the gate fails: STOP. Wavelet fallback (approach B) is an owner decision.
 
 The constants below are the sweep's starting values. The values recorded in
@@ -287,9 +293,19 @@ def denoise(img, s, linear):
     return np.stack([stage2_luma(img[0], s, linear)])
 
 
-# ---- gate metrics -----------------------------------------------------------
+# ---- gate metrics (spec §3 as amended 2026-08-02) ---------------------------
+# Metric-definition constants (spec-fixed by the amendment, NOT sweep values):
+FLATTEST_FRACTION = 0.10   # flattest 10% of the tile grid
+MIN_FLAT_TILES = 20        # minimum tile count
+BOUND_FACTOR = 0.7         # effective target = min(cap, BOUND_FACTOR * bound)
+BG_TARGET_CAP = 0.40       # bg luma sigma reduction cap
+CHROMA_TARGET_CAP = 0.50   # coarse chroma sigma reduction cap
+
+
 def sky_mask(y, tiles=TILES):
-    """Darkest 30% of tiles by median -> per-pixel sky mask."""
+    """Darkest 30% of tiles by median -> per-pixel mask. Kept ONLY as the
+    background/threshold estimator inside star_fwhm_median (whole-field FWHM
+    guard, unchanged by the amendment); noise metrics use flattest_tiles."""
     med, _, row_tile, col_tile = tile_grid(y, tiles)
     cut = percentile_nearest(med, 30.0)
     tile_sky = med <= cut
@@ -301,16 +317,67 @@ def mad_sigma(v):
     return 1.4826 * upper_median(np.abs(np.asarray(v).ravel() - m))
 
 
-def bg_luma_sigma(y, mask):
-    return mad_sigma(y[mask])
+def flattest_tiles(y, tiles=TILES):
+    """Amended spec §3 noise-measurement region: the flattest 10% of the
+    tiles x tiles grid ranked by luma MAD-sigma (stable sort; minimum
+    MIN_FLAT_TILES tiles). Selection is computed on the BEFORE luma and reused
+    for the after and bound images so all three see identical pixels.
+    Returns (coords, row_edges, col_edges) on the tile_grid integer edge grid."""
+    h, w = y.shape
+    _, sig, _, _ = tile_grid(y, tiles)
+    n = max(MIN_FLAT_TILES, int(math.floor(tiles * tiles * FLATTEST_FRACTION)))
+    order = np.argsort(sig, axis=None, kind="stable")
+    coords = [(int(i) // tiles, int(i) % tiles) for i in order[:n]]
+    re_ = [ty * h // tiles for ty in range(tiles + 1)]
+    ce_ = [tx * w // tiles for tx in range(tiles + 1)]
+    return coords, re_, ce_
 
 
-def chroma_mottle_sigma(c1, c2, mask):
-    """Coarse-scale (8x block-mean) chroma sigma over sky tiles (spec metric 2)."""
-    md = block_down(mask.astype(float), 8) > 0.5
-    s1 = mad_sigma(block_down(c1, 8)[md])
-    s2 = mad_sigma(block_down(c2, 8)[md])
-    return float(np.hypot(s1, s2))
+def flat_bg_sigma(y, coords, re_, ce_):
+    """Metric 1 (amended): per-tile full-res luma MAD-sigma on the flattest
+    tiles, median across tiles. Per-tile measurement is immune to tile-to-tile
+    background level offsets (the failure mode of the old union-mask metric)."""
+    return float(np.median([mad_sigma(y[re_[ty]:re_[ty + 1], ce_[tx]:ce_[tx + 1]])
+                            for ty, tx in coords]))
+
+
+def flat_chroma_sigma(c1, c2, coords, re_, ce_, d=8):
+    """Metric 2 (amended): coarse-scale (8x block-mean) chroma sigma measured
+    per flattest tile (hypot of the two opponent channels), median across tiles."""
+    c1d, c2d = block_down(c1, d), block_down(c2, d)
+    sh, sw = c1d.shape
+    sigs = []
+    for ty, tx in coords:
+        r0 = min(re_[ty] // d, sh - 1)
+        r1 = max(r0 + 1, min(sh, re_[ty + 1] // d))
+        x0 = min(ce_[tx] // d, sw - 1)
+        x1 = max(x0 + 1, min(sw, ce_[tx + 1] // d))
+        s1 = mad_sigma(c1d[r0:r1, x0:x1])
+        s2 = mad_sigma(c2d[r0:r1, x0:x1])
+        sigs.append(float(np.hypot(s1, s2)))
+    return float(np.median(sigs))
+
+
+def denoise_bound(img, s):
+    """Achievability bound (amended spec §3): the same pipeline shape with every
+    guard/blend weight forced to 1 — blur everything, no guards, the theoretical
+    maximum reduction for this pipeline. Same radii, passes and downsample as
+    the real stages; ONLY the weights differ. Returns (y, c1, c2) of the bound
+    image for measurement on the flattest tiles."""
+    y, c1, c2 = opponent(img)
+    h, w = y.shape
+    r = chroma_radius(s)
+    out = []
+    for c in (c1, c2):
+        cd = block_down(c, CHROMA_DOWN)
+        cb = cd
+        for _ in range(CHROMA_PASSES):
+            cb = box_blur(cb, r)
+        out.append(c + upsample_bilinear(cb - cd, w, h, CHROMA_DOWN))
+    b = y
+    for _ in range(LUMA_PASSES):
+        b = box_blur(b, luma_radius(s))
+    return b, out[0], out[1]
 
 
 def star_fwhm_median(y, n_stars=40, exclusion=12):
@@ -393,18 +460,18 @@ def run_metrics(args):
     datasets = []
     for name, img in (("M8", m8), ("Veil", veil)):
         y0, c10, c20 = opponent(img)
-        mask = sky_mask(y0)
-        bg0 = bg_luma_sigma(y0, mask)
-        ch0 = chroma_mottle_sigma(c10, c20, mask)
+        coords, re_, ce_ = flattest_tiles(y0)
+        bg0 = flat_bg_sigma(y0, coords, re_, ce_)
+        ch0 = flat_chroma_sigma(c10, c20, coords, re_, ce_)
         fw0, nstars = star_fwhm_median(y0)
         fc0 = filament_contrast(y0, *fila) if name == "Veil" else float("nan")
-        datasets.append((name, img, mask, bg0, ch0, fw0, nstars, fc0))
+        datasets.append((name, img, coords, re_, ce_, bg0, ch0, fw0, nstars, fc0))
 
-    def deltas(name, img, s, mask, bg0, ch0, fw0, fc0):
+    def deltas(name, img, s, coords, re_, ce_, bg0, ch0, fw0, fc0):
         out = denoise(img, s, linear=False)
         y1, c11, c21 = opponent(out)
-        bg1 = bg_luma_sigma(y1, mask)
-        ch1 = chroma_mottle_sigma(c11, c21, mask)
+        bg1 = flat_bg_sigma(y1, coords, re_, ce_)
+        ch1 = flat_chroma_sigma(c11, c21, coords, re_, ce_)
         fw1, _ = star_fwhm_median(y1)
         fc1 = filament_contrast(y1, *fila) if name == "Veil" else float("nan")
         d_bg, d_ch = 1 - bg1 / bg0, 1 - ch1 / ch0
@@ -412,58 +479,97 @@ def run_metrics(args):
         pres = fc1 / fc0 if fc0 == fc0 and fc0 > 0 else float("nan")
         return out, bg1, ch1, fw1, fc1, d_bg, d_ch, d_fw, pres
 
+    def bounds(img, s, coords, re_, ce_, bg0, ch0):
+        # Achievability bound + effective targets (amended spec §3), measured
+        # on the SAME flattest tiles as the real metrics.
+        yb, c1b, c2b = denoise_bound(img, s)
+        b_bg = 1 - flat_bg_sigma(yb, coords, re_, ce_) / bg0
+        b_ch = 1 - flat_chroma_sigma(c1b, c2b, coords, re_, ce_) / ch0
+        t_bg = min(BG_TARGET_CAP, BOUND_FACTOR * b_bg)
+        t_ch = min(CHROMA_TARGET_CAP, BOUND_FACTOR * b_ch)
+        return b_bg, b_ch, t_bg, t_ch
+
     if args.sweep_gains:
         # Coarse blend-gain grid at s=0.5 (T1-BINDING gains): the amplitude
-        # min(1, gain*s) is what makes the 50%/40% gate reachable at s=0.5.
-        # Pick the smallest pair that clears every gate threshold with margin,
+        # min(1, gain*s) is what makes the effective targets reachable at s=0.5.
+        # Pick the smallest pair that clears every effective target with margin,
         # set CHROMA_BLEND_GAIN / LUMA_BLEND_GAIN in the constants block, then
         # re-run WITHOUT --sweep-gains: the gate table (and the results doc)
-        # records the chosen values alongside the other constants.
+        # records the chosen values alongside the other constants. The bound
+        # (and hence the targets) is gain-independent — printed once per dataset.
         saved = (CHROMA_BLEND_GAIN, LUMA_BLEND_GAIN)
-        print("| dataset | chromaGain | lumaGain | Δbgσ@0.5 | Δchromaσ@0.5 | ΔFWHM@0.5 | filament preserved |")
-        print("|---|---|---|---|---|---|---|")
+        targets = {}
+        for name, img, coords, re_, ce_, bg0, ch0, fw0, nstars, fc0 in datasets:
+            b_bg, b_ch, t_bg, t_ch = bounds(img, 0.5, coords, re_, ce_, bg0, ch0)
+            targets[name] = (t_bg, t_ch)
+            print(f"{name} @0.5: bgσ bound {b_bg:+.1%} target {t_bg:+.1%} | "
+                  f"chromaσ bound {b_ch:+.1%} target {t_ch:+.1%}")
+        print("| dataset | chromaGain | lumaGain | Δbgσ@0.5 | bgσ target | Δchromaσ@0.5 | chromaσ target | ΔFWHM@0.5 | filament preserved |")
+        print("|---|---|---|---|---|---|---|---|---|")
         for cg in (1.5, 2.0, 2.5, 3.0):
             for lg in (1.5, 2.0, 2.5, 3.0):
                 CHROMA_BLEND_GAIN, LUMA_BLEND_GAIN = cg, lg
-                for name, img, mask, bg0, ch0, fw0, nstars, fc0 in datasets:
+                for name, img, coords, re_, ce_, bg0, ch0, fw0, nstars, fc0 in datasets:
                     _, _, _, _, _, d_bg, d_ch, d_fw, pres = deltas(
-                        name, img, 0.5, mask, bg0, ch0, fw0, fc0)
-                    print(f"| {name} | {cg} | {lg} | {d_bg:+.1%} | {d_ch:+.1%} "
+                        name, img, 0.5, coords, re_, ce_, bg0, ch0, fw0, fc0)
+                    t_bg, t_ch = targets[name]
+                    print(f"| {name} | {cg} | {lg} | {d_bg:+.1%} | {t_bg:+.1%} "
+                          f"| {d_ch:+.1%} | {t_ch:+.1%} "
                           f"| {d_fw:.2%} | {pres:.1%} |")
         CHROMA_BLEND_GAIN, LUMA_BLEND_GAIN = saved
         return
 
-    print("| dataset | strength | bgσ before | bgσ after | Δbgσ | chromaσ before | chromaσ after | Δchromaσ | FWHM before | FWHM after | ΔFWHM | filament before | after | preserved |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| dataset | strength | bgσ before | bgσ after | Δbgσ | bgσ bound | bgσ target | chromaσ before | chromaσ after | Δchromaσ | chromaσ bound | chromaσ target | FWHM before | FWHM after | ΔFWHM | filament before | after | preserved |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     gate_ok = True
     gate_invalid = False
-    for name, img, mask, bg0, ch0, fw0, nstars, fc0 in datasets:
+    for name, img, coords, re_, ce_, bg0, ch0, fw0, nstars, fc0 in datasets:
         save_png(img, ab / f"{name}_before.png")
         for s in (0.25, 0.5, 0.75, 1.0):
             out, bg1, ch1, fw1, fc1, d_bg, d_ch, d_fw, pres = deltas(
-                name, img, s, mask, bg0, ch0, fw0, fc0)
+                name, img, s, coords, re_, ce_, bg0, ch0, fw0, fc0)
+            b_bg, b_ch, t_bg, t_ch = bounds(img, s, coords, re_, ce_, bg0, ch0)
             print(f"| {name} | {s} | {bg0:.5f} | {bg1:.5f} | {d_bg:+.1%} "
+                  f"| {b_bg:+.1%} | {t_bg:+.1%} "
                   f"| {ch0:.5f} | {ch1:.5f} | {d_ch:+.1%} "
+                  f"| {b_ch:+.1%} | {t_ch:+.1%} "
                   f"| {fw0:.2f} ({nstars}★) | {fw1:.2f} | {d_fw:.2%} "
                   f"| {fc0:.4f} | {fc1:.4f} | {pres:.1%} |")
             save_png(out, ab / f"{name}_after_s{s}.png")
             if s == 0.5:
-                # NaN-strict verdict: an unmeasurable metric can never count as a
-                # pass. Also require a usable star sample (nstars >= 10) and a
-                # positive filament baseline (fc0 > 0) before judging at all.
-                gate_metrics = [d_bg, d_ch, d_fw] + ([pres] if name == "Veil" else [])
+                # NaN-strict verdict: an unmeasurable metric (or bound) can never
+                # count as a pass. Also require a usable star sample (nstars >=
+                # 10) and a positive filament baseline (fc0 > 0) before judging.
+                gate_metrics = [d_bg, d_ch, d_fw, b_bg, b_ch] + (
+                    [pres] if name == "Veil" else [])
                 if (any(m != m for m in gate_metrics) or nstars < 10
                         or (name == "Veil" and not fc0 > 0)):
                     print(f"GATE INVALID: metric unmeasurable on {name} "
-                          f"(NaN gate metric, nstars={nstars} < 10, or filament "
-                          "fc0 <= 0) — fix the measurement (star threshold / "
-                          "filament window) before judging PASS/FAIL.")
+                          f"(NaN gate metric/bound, nstars={nstars} < 10, or "
+                          "filament fc0 <= 0) — fix the measurement (star "
+                          "threshold / filament window) before judging PASS/FAIL.")
                     gate_invalid = True
                     gate_ok = False
-                elif d_bg < 0.40 or d_ch < 0.50 or d_fw > 0.02:
-                    gate_ok = False
-                elif name == "Veil" and pres < 0.95:
-                    gate_ok = False
+                else:
+                    for label, meas, bnd, tgt, ok in (
+                            ("bgσ", d_bg, b_bg, t_bg, d_bg >= t_bg),
+                            ("chromaσ", d_ch, b_ch, t_ch, d_ch >= t_ch)):
+                        print(f"GATE {name} {label}: measured {meas:+.1%} | "
+                              f"bound {bnd:+.1%} | effective target {tgt:+.1%} "
+                              f"| {'PASS' if ok else 'FAIL'}")
+                        if not ok:
+                            gate_ok = False
+                    ok_fw = d_fw <= 0.02
+                    print(f"GATE {name} FWHM: measured {d_fw:.2%} | limit 2.00% "
+                          f"| {'PASS' if ok_fw else 'FAIL'}")
+                    if not ok_fw:
+                        gate_ok = False
+                    if name == "Veil":
+                        ok_fc = pres >= 0.95
+                        print(f"GATE {name} filament: preserved {pres:.1%} | "
+                              f"limit 95.0% | {'PASS' if ok_fc else 'FAIL'}")
+                        if not ok_fc:
+                            gate_ok = False
     verdict = "PASS" if gate_ok else ("INVALID" if gate_invalid else "FAIL")
     print(f"\nGATE at strength 0.5: {verdict}")
     if not gate_ok:

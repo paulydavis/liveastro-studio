@@ -1,6 +1,7 @@
-# Denoise Prototype Results (Task 1 gate)
+# Denoise Prototype Results (Task 1 gate — amended, PASSED)
 
 **Spec:** docs/superpowers/specs/2026-08-02-native-noise-reduction-design.md §3
+*as amended 2026-08-02 (owner-approved, spec commit f1ac6ba)*
 **Script:** Scripts/prototypes/denoise_prototype.py @ this commit (feature/native-noise-reduction, Task 1)
 **Datasets:** ~/Documents/LiveAstro/2026-07-08-m8lagoon-3/master.fit,
               ~/Documents/LiveAstro/2026-07-12-ngc6960/master.fit
@@ -15,64 +16,72 @@ rim of the arc: broad nebular ridge peaking at rows ~1648–1660, contrast 0.129
 no pixel in the window above 0.69 — window chosen to exclude bright stars; the
 plan's default cols 2000..2100 falls outside this 2029-px-wide master)
 **A/B PNGs:** ~/Desktop/denoise-ab/ (outside the repo, for owner eyeballing;
-files are `.ppm` — matplotlib was unavailable, the script's PPM fallback was used)
+files are `.ppm` — matplotlib was unavailable, the script's PPM fallback was used.
+Constants are unchanged from the first run, so the re-run regenerated them
+byte-identical.)
 
-## Gate table (observed)
+## Amendment note
 
-| dataset | strength | bgσ before | bgσ after | Δbgσ | chromaσ before | chromaσ after | Δchromaσ | FWHM before | FWHM after | ΔFWHM | filament before | after | preserved |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| M8 | 0.25 | 0.02379 | 0.02121 | +10.8% | 0.03979 | 0.03591 | +9.8% | 10.44 (24★) | 10.42 | 0.19% | nan | nan | nan% |
-| M8 | 0.5 | 0.02379 | 0.01971 | +17.1% | 0.03979 | 0.03285 | +17.5% | 10.44 (24★) | 10.40 | 0.35% | nan | nan | nan% |
-| M8 | 0.75 | 0.02379 | 0.01971 | +17.1% | 0.03979 | 0.03226 | +18.9% | 10.44 (24★) | 10.40 | 0.35% | nan | nan | nan% |
-| M8 | 1.0 | 0.02379 | 0.01971 | +17.2% | 0.03979 | 0.03202 | +19.5% | 10.44 (24★) | 10.38 | 0.49% | nan | nan | nan% |
-| Veil | 0.25 | 0.04885 | 0.03611 | +26.1% | 0.04911 | 0.03929 | +20.0% | 12.47 (14★) | 11.45 | 8.21% | 0.1294 | 0.1257 | 97.1% |
-| Veil | 0.5 | 0.04885 | 0.02492 | +49.0% | 0.04911 | 0.02955 | +39.8% | 12.47 (14★) | 12.42 | 0.39% | 0.1294 | 0.1236 | 95.5% |
-| Veil | 0.75 | 0.04885 | 0.02492 | +49.0% | 0.04911 | 0.02912 | +40.7% | 12.47 (14★) | 12.42 | 0.39% | 0.1294 | 0.1236 | 95.5% |
-| Veil | 1.0 | 0.04885 | 0.02379 | +51.3% | 0.04911 | 0.02898 | +41.0% | 12.47 (14★) | 12.33 | 1.09% | 0.1294 | 0.1213 | 93.7% |
+The first gate run (commit 5014d97) FAILED **validly** under the original
+whole-field absolute metrics, and its blur-everything upper-bound analysis showed
+the failure was metric-structural: M8's darkest-30%-tiles mask is dominated by
+static Sagittarius background structure, capping *any* algorithm at +21–30%
+against 40%/50% absolute gates. The owner approved a gate amendment (spec commit
+`f1ac6ba220dccfa47f00d2c520c279c0ca227152`):
 
-GATE at strength 0.5: **FAIL** (verdict VALID: no NaN gate metric, nstars 24/14 ≥ 10, fc0 = 0.1294 > 0)
+- **Noise metrics** (bg luma sigma, coarse chroma sigma) are measured on the
+  **flattest 10% of a 32×32 luma-MAD tile grid** (minimum 20 tiles; per-tile
+  sigma, median across tiles; selection fixed on the before-image luma).
+- **Effective targets:** bg ≥ min(40%, 0.7 × bound), chroma ≥ min(50%,
+  0.7 × bound), where **bound** = the reduction the blur-everything pass (all
+  guard/blend weights forced to 1, same radii/passes) attains on those same
+  tiles, computed in-script per dataset and strength.
+- FWHM ≤ 2% (whole field), filament ≥ 95%, NaN-strict validity (nstars ≥ 10,
+  fc0 > 0, non-NaN metrics *and* bounds), and the A/B eyeball including the
+  tile-seam check are all **unchanged** — these are the anti-gaming guards.
 
-Failing cells at s=0.5: M8 Δbgσ +17.1% (< 40%), M8 Δchromaσ +17.5% (< 50%),
-Veil Δchromaσ +39.8% (< 50%). Passing cells: Veil Δbgσ +49.0% (≥ 40%),
-ΔFWHM 0.35% / 0.39% (≤ 2%), Veil filament preserved 95.5% (≥ 95%).
+This re-run used the **same T1-BINDING constants as the first run** (no
+re-tuning was needed; the gain re-sweep was not required). The original-metric
+gate table and bound analysis are preserved in git history at commit 5014d97.
 
-**STOP per plan Step 5 / spec §3:** the wavelet fallback (approach B) decision
-belongs to the owner at this gate. No Swift was written.
+## Gate table (observed; measured / bound / effective target per noise metric)
 
-## Why the gate cannot be met with these constants (upper-bound analysis)
+| dataset | strength | bgσ before | bgσ after | Δbgσ | bgσ bound | bgσ target | chromaσ before | chromaσ after | Δchromaσ | chromaσ bound | chromaσ target | FWHM before | FWHM after | ΔFWHM | filament before | after | preserved |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| M8 | 0.25 | 0.01508 | 0.01238 | +17.9% | +38.7% | +27.1% | 0.01969 | 0.01482 | +24.8% | +55.2% | +38.6% | 10.44 (24★) | 10.42 | 0.19% | nan | nan | nan% |
+| M8 | 0.5 | 0.01508 | 0.01016 | +32.6% | +43.2% | +30.3% | 0.01969 | 0.01000 | +49.2% | +57.7% | +40.4% | 10.44 (24★) | 10.40 | 0.35% | nan | nan | nan% |
+| M8 | 0.75 | 0.01508 | 0.01016 | +32.6% | +43.2% | +30.3% | 0.01969 | 0.00939 | +52.3% | +60.9% | +42.6% | 10.44 (24★) | 10.40 | 0.35% | nan | nan | nan% |
+| M8 | 1.0 | 0.01508 | 0.00996 | +33.9% | +44.8% | +31.4% | 0.01969 | 0.00889 | +54.9% | +61.7% | +43.2% | 10.44 (24★) | 10.38 | 0.49% | nan | nan | nan% |
+| Veil | 0.25 | 0.03504 | 0.02552 | +27.2% | +57.8% | +40.0% | 0.03514 | 0.02586 | +26.4% | +68.8% | +48.1% | 12.47 (14★) | 11.45 | 8.21% | 0.1294 | 0.1257 | 97.1% |
+| Veil | 0.5 | 0.03504 | 0.01543 | +56.0% | +64.7% | +40.0% | 0.03514 | 0.01701 | +51.6% | +70.1% | +49.1% | 12.47 (14★) | 12.42 | 0.39% | 0.1294 | 0.1236 | 95.5% |
+| Veil | 0.75 | 0.03504 | 0.01543 | +56.0% | +64.7% | +40.0% | 0.03514 | 0.01661 | +52.7% | +71.2% | +49.8% | 12.47 (14★) | 12.42 | 0.39% | 0.1294 | 0.1236 | 95.5% |
+| Veil | 1.0 | 0.03504 | 0.01429 | +59.2% | +68.2% | +40.0% | 0.03514 | 0.01645 | +53.2% | +71.6% | +50.0% | 12.47 (14★) | 12.33 | 1.09% | 0.1294 | 0.1213 | 93.7% |
 
-The failure is structural, not a tuning shortfall. Setting every blend weight to 1
-(blur everything, no guards — the theoretical maximum for this pipeline shape)
-gives on the sky-mask metrics:
+Per-metric gate lines at s=0.5 (script output, verbatim):
 
-| dataset | metric | gate | best observed @0.5 | blur-all upper bound (default radii) | bound at extreme radii |
-|---|---|---|---|---|---|
-| M8 | Δbgσ | ≥ 40% | +17.1% | +21.1% (r=3×2) | +30.4% (r=12×3) |
-| M8 | Δchromaσ | ≥ 50% | +17.5% | +21.9% (d=4, r=5×3) | +25.1% (d=4, r=12×3) |
-| Veil | Δbgσ | ≥ 40% | +49.0% | +55.9% | +68.1% |
-| Veil | Δchromaσ | ≥ 50% | +39.8% | +58.7% | +61.4% |
+```
+GATE M8 bgσ: measured +32.6% | bound +43.2% | effective target +30.3% | PASS
+GATE M8 chromaσ: measured +49.2% | bound +57.7% | effective target +40.4% | PASS
+GATE M8 FWHM: measured 0.35% | limit 2.00% | PASS
+GATE Veil bgσ: measured +56.0% | bound +64.7% | effective target +40.0% | PASS
+GATE Veil chromaσ: measured +51.6% | bound +70.1% | effective target +49.1% | PASS
+GATE Veil FWHM: measured 0.39% | limit 2.00% | PASS
+GATE Veil filament: preserved 95.5% | limit 95.0% | PASS
+```
 
-On M8 the sky-mask MAD sigma (luma) and 8×-block chroma sigma are dominated by
-static large-scale background structure (widespread Sagittarius nebulosity /
-gradients across the darkest-30%-tiles mask), which local smoothing cannot and
-should not remove — both M8 gates sit far above the blur-everything bound for any
-constants. Veil Δchromaσ ≥ 50% is above what remains once any luma-edge guard is
-applied (guard-free bound +58.7%, observed +39.8% with the weakest defensible
-guard). The blend-gain sweep saturates at gain ≥ 2.0 (min(1, gain·0.5) = 1), so no
-gain value changes this.
+GATE at strength 0.5: **PASS** (verdict VALID: no NaN gate metric or bound,
+nstars 24/14 ≥ 10, fc0 = 0.1294 > 0; exit 0)
 
-Blend-gain sweep summary (grid {1.5, 2.0, 2.5, 3.0}² at s=0.5, run with the
-original spec starting constants): all pairs with gain ≥ 2.0 are identical
-(amplitude saturated at 1); best cells still missed every failing gate above
-(max Δchromaσ +11.5%, M8 Δbgσ +18.1%, Veil ΔFWHM 5.94% pre-tuning). Chosen
-2.0 / 2.0 — the smallest saturating pair.
+On the flattest tiles both datasets clear their effective targets with margin:
+M8 bgσ +32.6% vs target +30.3% (bound-capped: 0.7 × 43.2%), M8 chromaσ +49.2%
+vs +40.4%; Veil bgσ +56.0% vs the absolute 40% cap, Veil chromaσ +51.6% vs
++49.1%. The whole-field guards hold: ΔFWHM 0.35%/0.39% ≤ 2%, Veil filament
+95.5% ≥ 95%.
 
-## BEST-OBSERVED CONSTANTS (NOT graduated to Swift — gate FAILED)
+## VALIDATED CONSTANTS (BINDING — mirror verbatim into Denoiser.K, Task 2)
 
-These are the constants of the recorded gate table (set in the script), reached by
-iterating the T1-BINDING values from the spec starting points. They fix the two
-fixable failures (Veil ΔFWHM 5.94%→0.39% via LUMA_RESIDUAL_K 2.5→1.5 +
-LUMA_SIGMA_PROTECT_K 3→6; weight starvation via CHROMA_EDGE_GRAD 0.08→0.25):
+Identical to the first run's best-observed constants (reached by iterating the
+plan's T1-BINDING starting values; the amendment required no further tuning):
 
 | constant | value |
 |---|---|
@@ -91,24 +100,38 @@ LUMA_SIGMA_PROTECT_K 3→6; weight starvation via CHROMA_EDGE_GRAD 0.08→0.25):
 | STRUCTURED_TILE_FLOOR | 0.15 |
 | TILES / MAX_TILE_SAMPLES / BACKGROUND_PERCENTILE / MIN_DIM | 32 / 1024 / 20 / 64 |
 
-## Fixture effect-size floors (recorded; moot until an approach passes the gate)
+Metric-definition constants fixed by the amendment (not sweep values, but the
+Swift-side gate/golden tooling must use the same definitions):
+FLATTEST_FRACTION 0.10, MIN_FLAT_TILES 20, BOUND_FACTOR 0.7,
+BG_TARGET_CAP 0.40, CHROMA_TARGET_CAP 0.50.
+
+## Fixture effect-size floors (BINDING for DenoiserTests)
 
 | assertion constant | value | derivation |
 |---|---|---|
-| s1MinChromaReduction | 0.125 | stage-1-only coarse chroma reduction @0.5: M8 +17.5%, Veil +39.8%; min minus 5 pt margin |
-| s2MinSigmaReduction | 0.121 | stage-2-only bg sigma reduction @0.5: M8 +17.1%, Veil +49.0%; min minus 5 pt margin |
+| s1MinChromaReduction | 0.442 | stage-1-only coarse chroma reduction @0.5 under the amended metric: M8 +49.2%, Veil +51.6%; min minus 5 pt margin |
+| s2MinSigmaReduction | 0.276 | stage-2-only flat-tile bg sigma reduction @0.5 under the amended metric: M8 +32.6%, Veil +56.0%; min minus 5 pt margin |
 
-(Measured by disabling the other stage via an external driver that monkeypatches
-it to identity — the committed script was not modified.)
+(Stage-only reductions equal the full-run reductions exactly: the opponent
+round-trip returns stage-2's luma and stage-1's chroma unchanged — recombine
+gives Y' = y2, C1' = c1', C2' = c2' algebraically — so stage 2 never moves the
+chroma metric and stage 1 never moves the luma metric. Verified empirically in
+the first run via the external monkeypatch driver; the committed script was
+not modified.)
 
-## Linear-domain check
+## Linear-domain check (amended metric)
 
-Observed linear-domain run on the raw (unstretched) M8 master at 0.5:
-bg sigma reduction +16.8%, FWHM delta 0.00% (3.54 → 3.54 px, 40 stars) —
-constant CHROMA_EDGE_GRAD_LINEAR = 0.025 validated here (spec §2.3 "linear-domain
-strength mapping"; stage-2 thresholds are sigma-relative and therefore domain-free).
+Observed linear-domain run on the raw (unstretched) M8 master at 0.5, measured
+on the flattest tiles of the raw luma: flat bg sigma reduction +41.7%
+(0.000026 → 0.000015), FWHM delta 0.00% (3.54 → 3.54 px, 40 stars) — constant
+CHROMA_EDGE_GRAD_LINEAR = 0.025 validated here (spec §2.3 "linear-domain
+strength mapping"; stage-2 thresholds are sigma-relative and therefore
+domain-free).
 
 ## Eyeball A/B notes
+
+Constants unchanged from the first run; the re-run regenerated byte-identical
+PPMs, so the first run's eyeball findings stand:
 
 - Veil s=0.5: chroma mottle and luma grain visibly reduced; arc rim, star
   profiles, and faint outer shell intact. No visible rectangular tile seams at
