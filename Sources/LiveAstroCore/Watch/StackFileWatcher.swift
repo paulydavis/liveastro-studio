@@ -587,7 +587,7 @@ public final class StackFileWatcher {
         guard folderFD >= 0, let names = Self.enumerateDirectory(fd: folderFD) else { return }
         let trackedNames = reducer.orderedNamesForScan(names.filter(isTrackedFileName))
         let absentCandidateNames = Set(reducer.state.generation.files.keys)
-            .union(reducer.state.generation.ordering.victimClocks.keys)
+            .union(reducer.state.generation.ordering.victimLedgers.keys)
         var observations: [FileObservation] = []
         observations.reserveCapacity(trackedNames.count + absentCandidateNames.count)
 

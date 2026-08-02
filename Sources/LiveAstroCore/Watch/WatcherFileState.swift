@@ -24,43 +24,136 @@ struct GenerationState {
 
 struct RevisionOrderingState {
     var activeBlocker: BlockingEpisode?
-    var victimClocks: [String: VictimBlockingClock] = [:]
+    var victimLedgers: [String: VictimWaitLedger] = [:]
+    var pendingEmissionOwners: Set<RevisionKey> = []
+    var ownerGraceUntil: [RevisionKey: UInt64] = [:]
 }
 
-struct ChargingBlocker: Equatable {
-    let name: String
-    let revision: String
+struct RevisionKey: Hashable, Equatable {
+    let normalizedDigits: String
+
+    init(_ digits: String) {
+        let stripped = digits.drop { $0 == "0" }
+        normalizedDigits = stripped.isEmpty ? "0" : String(stripped)
+    }
 }
 
-struct VictimBlockingClock: Equatable {
-    var startNanos: UInt64
-    var deadlineNanos: UInt64
+struct AccrualSegment: Equatable {
+    let owner: RevisionKey
+    var firstChargeNanos: UInt64
+    var accruedNanos: UInt64
+    var runningSinceNanos: UInt64?
+
+    var isRunning: Bool {
+        runningSinceNanos != nil
+    }
+
+    func totalNanos(at nowNanos: UInt64) -> UInt64 {
+        guard let runningSinceNanos else { return accruedNanos }
+        return accruedNanos &+ (nowNanos >= runningSinceNanos ? nowNanos - runningSinceNanos : 0)
+    }
+}
+
+struct VictimWaitLedger: Equatable {
+    var segments: [RevisionKey: AccrualSegment] = [:]
     var pausedAtNanos: UInt64?
-    var chargingBlocker: ChargingBlocker?
 
-    mutating func pause(at nowNanos: UInt64, chargedUnder blocker: ChargingBlocker) {
+    var isEmpty: Bool {
+        segments.isEmpty
+    }
+
+    mutating func startOrContinue(owner: RevisionKey, at nowNanos: UInt64) {
+        pauseRunning(at: nowNanos)
+        pausedAtNanos = nil
+        if var segment = segments[owner] {
+            if segment.runningSinceNanos == nil {
+                segment.runningSinceNanos = nowNanos
+            }
+            segments[owner] = segment
+        } else {
+            segments[owner] = AccrualSegment(
+                owner: owner,
+                firstChargeNanos: nowNanos,
+                accruedNanos: 0,
+                runningSinceNanos: nowNanos)
+        }
+    }
+
+    mutating func pause(at nowNanos: UInt64) {
+        pauseRunning(at: nowNanos)
         if pausedAtNanos == nil {
             pausedAtNanos = nowNanos
         }
-        if chargingBlocker == nil {
-            chargingBlocker = blocker
+    }
+
+    mutating func pauseRunning(at nowNanos: UInt64) {
+        for key in segments.keys {
+            guard var segment = segments[key],
+                  let runningSinceNanos = segment.runningSinceNanos else { continue }
+            segment.accruedNanos = segment.accruedNanos &+ (nowNanos >= runningSinceNanos ? nowNanos - runningSinceNanos : 0)
+            segment.runningSinceNanos = nil
+            segments[key] = segment
         }
     }
 
-    mutating func resume(at nowNanos: UInt64) {
-        guard let pausedAtNanos else { return }
-        let pausedDuration = nowNanos >= pausedAtNanos
-            ? nowNanos - pausedAtNanos
-            : 0
-        startNanos = startNanos &+ pausedDuration
-        deadlineNanos = deadlineNanos &+ pausedDuration
-        self.pausedAtNanos = nil
-        chargingBlocker = nil
+    /// Barrier-scoped pause (§4 dependence, R9-F1): freezes only the given (pending)
+    /// owners' running segments. Other owners' running segments keep accruing — the
+    /// victim is present and still genuinely waiting on them. Never stamps
+    /// `pausedAtNanos`: that marker means absence, and the victim is not absent.
+    mutating func pauseSegments(ownedBy owners: Set<RevisionKey>, at nowNanos: UInt64) {
+        for owner in owners {
+            guard var segment = segments[owner],
+                  let runningSinceNanos = segment.runningSinceNanos else { continue }
+            segment.accruedNanos = segment.accruedNanos &+ (nowNanos >= runningSinceNanos ? nowNanos - runningSinceNanos : 0)
+            segment.runningSinceNanos = nil
+            segments[owner] = segment
+        }
     }
 
-    mutating func charge(under blocker: ChargingBlocker) {
-        chargingBlocker = blocker
+    mutating func redeem(owner: RevisionKey) {
+        segments.removeValue(forKey: owner)
+        if segments.isEmpty {
+            pausedAtNanos = nil
+        }
     }
+
+    /// Write-off consumption TRUNCATES (§5.6 rationale): a single write-off consumes
+    /// exactly the debt that justified it; any remainder is still-unresolved wait and
+    /// keeps counting toward the NEXT blocker's write-off progress, so escalation
+    /// stays bounded over unredeemed wait (M1) instead of granting the next blocker
+    /// a silently discounted budget. (The alternative — deleting whole segments on
+    /// partial consumption — would erase owed wait the decision never claimed.)
+    mutating func consume(_ consumed: [RevisionKey: UInt64], at nowNanos: UInt64) {
+        pauseRunning(at: nowNanos)
+        for (owner, amount) in consumed {
+            guard var segment = segments[owner] else { continue }
+            if segment.accruedNanos > amount {
+                segment.accruedNanos -= amount
+                segments[owner] = segment
+            } else {
+                segments.removeValue(forKey: owner)
+            }
+        }
+        if segments.isEmpty {
+            pausedAtNanos = nil
+        }
+    }
+
+    func totalUnredeemedNanos(at nowNanos: UInt64) -> UInt64 {
+        segments.values.reduce(0) { partial, segment in
+            partial &+ segment.totalNanos(at: nowNanos)
+        }
+    }
+}
+
+/// `consumedSegments` holds PREDECESSOR debt only — the blocker's own key must never
+/// appear in it (M9: own time and inherited debt are separate facts). Zero-amount
+/// entries are excluded at construction (Task 7).
+struct WriteOffDecision: Equatable {
+    let blocker: RevisionKey
+    let blockerNameForLog: String
+    let attributedNanos: UInt64
+    let consumedSegments: [RevisionKey: UInt64]
 }
 
 enum FileState: Equatable {
@@ -98,27 +191,14 @@ enum ReplacementProgress: Equatable {
 
 struct BlockingEpisode: Equatable {
     let blocker: String
-    let startNanos: UInt64
-    var deadlineNanos: UInt64
+    let owner: RevisionKey
     private(set) var victims: Set<String>
 
-    init?(
-        blocker: String,
-        startNanos: UInt64,
-        deadlineNanos: UInt64,
-        victims: Set<String>
-    ) {
+    init?(blocker: String, owner: RevisionKey, victims: Set<String>) {
         guard !victims.isEmpty else { return nil }
         self.blocker = blocker
-        self.startNanos = startNanos
-        self.deadlineNanos = deadlineNanos
+        self.owner = owner
         self.victims = victims
-    }
-
-    mutating func refreshVictims(_ victims: Set<String>) -> Bool {
-        guard !victims.isEmpty else { return false }
-        self.victims = victims
-        return true
     }
 
     mutating func removeVictim(named name: String) -> Bool {
@@ -278,6 +358,12 @@ struct WatcherReducer {
             return reduce(batch)
         case .emissionFinished(let result):
             guard result.intent.generation == state.generation.id else { return [] }
+            // The pending-emission barrier lifts on every terminal outcome
+            // (yielded, rejected, or stale candidate state below) — a settled
+            // intent must never keep deferring successor charging.
+            if let owner = revisionOrder.revisionKey(in: result.intent.candidate.name) {
+                state.generation.ordering.pendingEmissionOwners.remove(owner)
+            }
             let candidate = result.intent.candidate
             if case .settled(let settlement) = state.generation.files[candidate.name],
                settlement.replacement == .ready(candidate) {
@@ -293,6 +379,7 @@ struct WatcherReducer {
                     state.generation.files[candidate.name] = .settled(
                         settlement.withReplacement(.ignoredOutOfOrder(
                             identity: candidate.identity)))
+                    state.generation.ordering.victimLedgers[candidate.name] = nil  // aligned with applyMarkDrops
                     return [.log(
                         "revision \(revision) arrived out of order — skipped "
                             + "(high-water \(mark))")]
@@ -315,6 +402,7 @@ struct WatcherReducer {
                         mark: mark)
                 else { return [] }
                 state.generation.files[candidate.name] = .droppedOutOfOrder
+                state.generation.ordering.victimLedgers[candidate.name] = nil  // aligned with applyMarkDrops
                 return [.log(
                     "revision \(revision) arrived out of order — skipped (high-water \(mark))")]
             }
@@ -393,25 +481,27 @@ struct WatcherReducer {
     }
 
     private mutating func reconcileActiveBlocker(afterEmitting candidate: EmissionCandidate) {
-        state.generation.ordering.victimClocks[candidate.name] = nil
-        guard var episode = state.generation.ordering.activeBlocker else {
-            clearPausedVictimClocksResolvedByEmission(of: candidate)
-            return
+        // (b) The emitting victim's own ledger discharges (§5.2): its emission proves
+        // no owed wait explains any future hold on it.
+        state.generation.ordering.victimLedgers[candidate.name] = nil
+
+        // (a) Owner-keyed redemption — uniform over running and paused segments (§5.1).
+        // This replaces every scalar-era removeAll(): other owners' unredeemed segments
+        // (vanished predecessors, still-live blockers) must survive this emission (d4, e1).
+        if let owner = revisionOrder.revisionKey(in: candidate.name) {
+            redeemSegments(for: owner)
         }
 
+        guard var episode = state.generation.ordering.activeBlocker else { return }
+
         if candidate.name == episode.blocker {
-            state.generation.ordering.activeBlocker = nil
-            state.generation.ordering.victimClocks.removeAll()
+            state.generation.ordering.activeBlocker = nil   // episode over; ledgers already settled above
             return
         }
 
         if episode.victims.contains(candidate.name) {
-            if episode.removeVictim(named: candidate.name) {
-                state.generation.ordering.activeBlocker = episode
-            } else {
-                state.generation.ordering.activeBlocker = nil
-                state.generation.ordering.victimClocks.removeAll()
-            }
+            state.generation.ordering.activeBlocker =
+                episode.removeVictim(named: candidate.name) ? episode : nil
         }
 
         guard state.generation.ordering.activeBlocker != nil,
@@ -420,22 +510,17 @@ struct WatcherReducer {
               let mark = derivedRevisionHighWater,
               revisionOrder.compare(blockerRevision, mark) != .orderedDescending
         else { return }
-        state.generation.ordering.activeBlocker = nil
-        state.generation.ordering.victimClocks.removeAll()
+        state.generation.ordering.activeBlocker = nil       // episode inconsistent with the derived mark
     }
 
-    private mutating func clearPausedVictimClocksResolvedByEmission(
-        of candidate: EmissionCandidate
-    ) {
-        guard case .numbered(let emittedRevision) = candidate.kind else { return }
-        let emittedOwner = ChargingBlocker(name: candidate.name, revision: emittedRevision)
-        for name in Array(state.generation.ordering.victimClocks.keys) {
-            guard let chargingBlocker = state.generation.ordering
-                    .victimClocks[name]?.chargingBlocker,
-                  chargingBlocker == emittedOwner
-            else { continue }
-            state.generation.ordering.victimClocks[name] = nil
+    private mutating func redeemSegments(for owner: RevisionKey) {
+        for victim in Array(state.generation.ordering.victimLedgers.keys) {
+            state.generation.ordering.victimLedgers[victim]?.redeem(owner: owner)
+            if state.generation.ordering.victimLedgers[victim]?.isEmpty == true {
+                state.generation.ordering.victimLedgers[victim] = nil
+            }
         }
+        state.generation.ordering.ownerGraceUntil[owner] = nil   // M8 hygiene
     }
 
     private struct ClassifiedObservation {
@@ -500,7 +585,7 @@ struct WatcherReducer {
                 else { continue }
                 state.generation.files[name] = .droppedOutOfOrder
             }
-            state.generation.ordering.victimClocks[name] = nil
+            state.generation.ordering.victimLedgers[name] = nil
             effects.append(.log(
                 "revision \(revision) arrived out of order — skipped (high-water \(mark))"))
         }
@@ -513,18 +598,23 @@ struct WatcherReducer {
     ) -> [WatcherEffect] {
         var effects: [WatcherEffect] = []
         var intentNames: Set<String> = []
+        var pendingOwners = state.generation.ordering.pendingEmissionOwners
 
         func appendIntent(
             named name: String,
             state: WatcherState,
             to effects: inout [WatcherEffect],
-            intentNames: inout Set<String>
+            intentNames: inout Set<String>,
+            pendingOwners: inout Set<RevisionKey>
         ) {
             guard intentNames.insert(name).inserted else { return }
             guard let candidate = readyCandidate(in: state.generation.files[name]) else { return }
             effects.append(.emit(EmissionIntent(
                 generation: state.generation.id,
                 candidate: candidate)))
+            if let owner = revisionOrder.revisionKey(in: candidate.name) {
+                pendingOwners.insert(owner)
+            }
         }
 
         for item in classified where item.isPresent && item.revision == nil {
@@ -532,7 +622,8 @@ struct WatcherReducer {
                 named: item.observation.name,
                 state: state,
                 to: &effects,
-                intentNames: &intentNames)
+                intentNames: &intentNames,
+                pendingOwners: &pendingOwners)
         }
 
         let numbered = classified.filter { item in
@@ -544,18 +635,20 @@ struct WatcherReducer {
             uniqueKeysWithValues: classified.map { ($0.observation.name, $0) })
         guard revisionOrderingEnabled else {
             state.generation.ordering.activeBlocker = nil
-            state.generation.ordering.victimClocks.removeAll()
+            state.generation.ordering.victimLedgers.removeAll()
+            state.generation.ordering.pendingEmissionOwners.removeAll()
             for item in numbered {
                 appendIntent(
                     named: item.observation.name,
                     state: state,
                     to: &effects,
-                    intentNames: &intentNames)
+                    intentNames: &intentNames,
+                    pendingOwners: &pendingOwners)
             }
             return effects
         }
 
-        while true {
+        blockerScan: while true {
             let potential = numbered.filter {
                 participatesInNumberedOrdering(
                     state.generation.files[$0.observation.name])
@@ -564,15 +657,16 @@ struct WatcherReducer {
                 readyCandidate(in: state.generation.files[$0.observation.name]) == nil
             }) else {
                 state.generation.ordering.activeBlocker = nil
-                state.generation.ordering.victimClocks.removeAll()
                 for item in potential {
                     appendIntent(
                         named: item.observation.name,
                         state: state,
                         to: &effects,
-                        intentNames: &intentNames)
+                        intentNames: &intentNames,
+                        pendingOwners: &pendingOwners)
                 }
-                return effects
+                state.generation.ordering.pendingEmissionOwners = pendingOwners
+                break blockerScan
             }
 
             for item in potential[..<blockerIndex] {
@@ -580,161 +674,262 @@ struct WatcherReducer {
                     named: item.observation.name,
                     state: state,
                     to: &effects,
-                    intentNames: &intentNames)
+                    intentNames: &intentNames,
+                    pendingOwners: &pendingOwners)
             }
+            // Written back before the barrier check so it sees both prior-pass
+            // unsettled owners and this pass's intents.
+            state.generation.ordering.pendingEmissionOwners = pendingOwners
 
             let victimStart = potential.index(after: blockerIndex)
             let blocker = potential[blockerIndex]
-            guard victimStart < potential.endIndex else {
-                retainVictimClocks(
-                    currentVictims: [],
-                    blocker: blocker,
-                    classifiedByName: classifiedByName,
-                    nowNanos: nowNanos)
-                state.generation.ordering.activeBlocker = nil
-                return effects
-            }
             let victimNames = Set(potential[victimStart...].map(\.observation.name))
 
             let blockerName = blocker.observation.name
-            let chargingBlocker = blocker.revision.map {
-                ChargingBlocker(name: blockerName, revision: $0)
-            }
-            retainVictimClocks(
-                currentVictims: victimNames,
-                blocker: blocker,
-                classifiedByName: classifiedByName,
-                nowNanos: nowNanos)
-            for victim in victimNames {
-                if var clock = state.generation.ordering.victimClocks[victim] {
-                    clock.resume(at: nowNanos)
-                    if let chargingBlocker {
-                        clock.charge(under: chargingBlocker)
-                    }
-                    state.generation.ordering.victimClocks[victim] = clock
-                    continue
-                }
-                if let active = state.generation.ordering.activeBlocker,
-                   active.victims.contains(victim) {
-                    var clock = VictimBlockingClock(
-                        startNanos: active.startNanos,
-                        deadlineNanos: active.deadlineNanos)
-                    if let chargingBlocker {
-                        clock.charge(under: chargingBlocker)
-                    }
-                    state.generation.ordering.victimClocks[victim] = clock
-                    continue
-                }
-                var clock = VictimBlockingClock(
-                    startNanos: nowNanos,
-                    deadlineNanos: nowNanos &+ blockingBudgetNanos)
-                if let chargingBlocker {
-                    clock.charge(under: chargingBlocker)
-                }
-                state.generation.ordering.victimClocks[victim] = clock
+            guard let blockerOwner = blocker.revision.map(RevisionKey.init) else {
+                break blockerScan   // unreachable: `numbered` items always parse a revision
             }
 
-            let victimClocks = victimNames.compactMap {
-                state.generation.ordering.victimClocks[$0]
-            }
             state.generation.ordering.activeBlocker = BlockingEpisode(
                 blocker: blockerName,
-                startNanos: victimClocks.map(\.startNanos).min() ?? nowNanos,
-                deadlineNanos: victimClocks.map(\.deadlineNanos).min()
-                    ?? (nowNanos &+ blockingBudgetNanos),
-                victims: victimNames)
+                owner: blockerOwner,
+                victims: victimNames)   // nil (episode-less) when victimNames is empty — lone blockers own nothing
 
-            guard var episode = state.generation.ordering.activeBlocker else {
-                return effects
-            }
-            guard episode.refreshVictims(victimNames) else {
-                state.generation.ordering.activeBlocker = nil
-                return effects
-            }
-            if blocker.isConverging {
+            guard !victimNames.isEmpty else { break blockerScan }
+
+            // Pending-emission barrier (§4, scoped by DEPENDENCE — R9-F1): while a lower
+            // owner's intent is unsettled, defer only what depends on the PENDING owners:
+            // opening/extending the current head's segment, consuming pending owners'
+            // segments, and any write-off decision whose justifying ledger contains them.
+            // Segments owned by non-pending owners keep running — the barrier is an
+            // attribution-ordering rule, not a global pause (an in-place-rewriting settled
+            // lower would otherwise freeze the stalled head's charge every emission cycle).
+            let barrierDeferred = hasPendingLowerOwner(before: blockerOwner)
+            if barrierDeferred {
                 for victim in victimNames {
-                    guard var clock = state.generation.ordering.victimClocks[victim] else {
-                        continue
-                    }
-                    let victimCeiling = clock.startNanos &+ blockingCeilingNanos
-                    let renewed = min(nowNanos &+ blockingGraceNanos, victimCeiling)
-                    if renewed > clock.deadlineNanos {
-                        clock.deadlineNanos = renewed
-                        state.generation.ordering.victimClocks[victim] = clock
-                    }
+                    state.generation.ordering.victimLedgers[victim]?
+                        .pauseSegments(ownedBy: pendingOwners, at: nowNanos)
                 }
-            }
-            let refreshedClocks = victimNames.compactMap {
-                state.generation.ordering.victimClocks[$0]
-            }
-            episode = BlockingEpisode(
-                blocker: blockerName,
-                startNanos: refreshedClocks.map(\.startNanos).min() ?? episode.startNanos,
-                deadlineNanos: refreshedClocks.map(\.deadlineNanos).min()
-                    ?? episode.deadlineNanos,
-                victims: victimNames) ?? episode
-            state.generation.ordering.activeBlocker = episode
-            guard victimNames.contains(where: { victim in
-                guard let clock = state.generation.ordering.victimClocks[victim] else {
-                    return false
+            } else {
+                // Charge (§4 step 5): one running segment per victim, keyed by the current owner.
+                for victim in victimNames {
+                    state.generation.ordering.victimLedgers[victim, default: VictimWaitLedger()]
+                        .startOrContinue(owner: blockerOwner, at: nowNanos)
                 }
-                return nowNanos >= min(
-                    clock.deadlineNanos,
-                    clock.startNanos &+ blockingCeilingNanos)
-            }) else { return effects }
 
+                // Convergence grace (§5.4): renew the CURRENT owner only.
+                if blocker.isConverging {
+                    noteConvergingOwner(blockerOwner, at: nowNanos)
+                }
+            }
+
+            // Write-off (§§5.5-5.6): ONE blocked victim with a justified decision suffices.
+            // Victims are scanned in numeric revision order (determinism only: with the
+            // cross-ledger consumption below, the justifier choice no longer selects who
+            // "loses" segments).
+            var justified: (victim: String, decision: WriteOffDecision)?
+            for victim in orderedVictimNames(victimNames) {
+                guard let ledger = state.generation.ordering.victimLedgers[victim] else { continue }
+                if barrierDeferred {
+                    // §4 dependence: the decision may not rest on any pending owner.
+                    guard !pendingOwners.contains(blockerOwner),
+                          pendingOwners.isDisjoint(with: ledger.segments.keys)
+                    else { continue }
+                }
+                guard let decision = writeOffDecision(
+                    for: blockerOwner,
+                    blockerName: blockerName,
+                    victimLedger: ledger,
+                    nowNanos: nowNanos)
+                else { continue }
+                justified = (victim, decision)
+                break
+            }
+            guard let (justifyingVictim, decision) = justified else { break blockerScan }
+
+            writeOffDecisionHookForTesting?(decision, justifyingVictim, nowNanos)
             state.generation.files[blockerName] = .writtenOff
-            for victim in victimNames {
-                state.generation.ordering.victimClocks[victim] = nil
+            // Predecessor-debt consumption (truncating) applies to the justifying ledger:
+            // exactly the debt the decision claimed (§5.5).
+            state.generation.ordering.victimLedgers[justifyingVictim]?
+                .consume(decision.consumedSegments, at: nowNanos)
+            if state.generation.ordering.victimLedgers[justifyingVictim]?.isEmpty == true {
+                state.generation.ordering.victimLedgers[justifyingVictim] = nil
             }
+            // R9-F2 (§4 step 3, consume-across-all-ledgers): the write-off resolves the
+            // abandoned owner's debt for EVERY victim, not only the justifier. A surviving
+            // copy under another victim would hand a later same-RevisionKey blocker
+            // (padding twin) the dead owner's firstChargeNanos — instant write-off, zero
+            // own tenure, dishonest log (M2/M9). Other owners' segments in those ledgers
+            // remain owed (§5.2); the next pass discharges them if the write-off left
+            // their victims unblocked.
+            consumeSegmentsEverywhere(ownedBy: decision.blocker)
             state.generation.ordering.activeBlocker = nil
-            let heldSeconds = Int(
-                (Double(nowNanos &- episode.startNanos) / 1_000_000_000).rounded())
-            effects.append(.log(
-                "revision \(blocker.revision ?? "") blocked emissions for \(heldSeconds)s "
-                + "without completing — abandoning it; later revisions proceed "
-                + "(frame lost: \(blockerName))"))
-        }
-    }
+            state.generation.ordering.ownerGraceUntil[decision.blocker] = nil
 
-    private mutating func retainVictimClocks(
-        currentVictims: Set<String>,
-        blocker: ClassifiedObservation,
-        classifiedByName: [String: ClassifiedObservation],
-        nowNanos: UInt64
-    ) {
-        for name in Array(state.generation.ordering.victimClocks.keys) {
-            if currentVictims.contains(name) { continue }
-            guard shouldPauseVictimClock(
-                named: name,
-                behind: blocker,
-                classifiedByName: classifiedByName),
-                let blockerRevision = blocker.revision
-            else {
-                state.generation.ordering.victimClocks[name] = nil
-                continue
+            let heldSeconds = Int((Double(decision.attributedNanos) / 1_000_000_000).rounded())
+            var message = "revision \(blocker.revision ?? decision.blocker.normalizedDigits) "
+                + "blocked emissions for \(heldSeconds)s without completing — abandoning it; "
+                + "later revisions proceed (frame lost: \(decision.blockerNameForLog))"
+            if !decision.consumedSegments.isEmpty {
+                message += "; consumed predecessor debt: "
+                    + formatConsumedSegments(decision.consumedSegments)
             }
-            state.generation.ordering.victimClocks[name]?.pause(
-                at: nowNanos,
-                chargedUnder: ChargingBlocker(
-                    name: blocker.observation.name,
-                    revision: blockerRevision))
+            effects.append(.log(message))
+            continue blockerScan   // re-derive the next blocker; newly unblocked ready files emit this pass
+        }
+
+        // End-of-pass ledger settlement (M3 tombstones + §5.2 discharge). Runs on every
+        // exit from blockerScan — including barrier deferrals and write-off passes.
+        let currentVictims = state.generation.ordering.activeBlocker?.victims ?? []
+        for name in Array(state.generation.ordering.victimLedgers.keys) {
+            if currentVictims.contains(name) { continue }          // charging this pass
+            if isPresentAndUnblocked(name: name, classifiedByName: classifiedByName) {
+                state.generation.ordering.victimLedgers[name] = nil // discharge (§5.2)
+            } else {
+                state.generation.ordering.victimLedgers[name]?.pause(at: nowNanos)  // tombstone / not charged
+            }
+        }
+
+        // ownerGraceUntil holds entries only for owners that still matter: live segments
+        // or the current head blocker. Everything else (vanished never-charged owners,
+        // discharged debt) is pruned so the map is empty at quiescence (H2).
+        let liveOwners = Set(state.generation.ordering.victimLedgers.values.flatMap { $0.segments.keys })
+        let headOwner = state.generation.ordering.activeBlocker?.owner
+        state.generation.ordering.ownerGraceUntil = state.generation.ordering.ownerGraceUntil
+            .filter { liveOwners.contains($0.key) || $0.key == headOwner }
+        return effects
+    }
+
+    private func hasPendingLowerOwner(before owner: RevisionKey) -> Bool {
+        state.generation.ordering.pendingEmissionOwners.contains { pending in
+            revisionOrder.orderedBefore(pending, owner)
         }
     }
 
-    private func shouldPauseVictimClock(
-        named name: String,
-        behind blocker: ClassifiedObservation,
+    /// Deterministic victim scan order: numeric revision order via the shared comparator
+    /// (never lexicographic — `"10" < "9"` is a correctness bug per §3.1).
+    private func orderedVictimNames(_ names: Set<String>) -> [String] {
+        names.sorted { lhs, rhs in
+            revisionOrder.orderedBefore(
+                (name: lhs, revision: revisionOrder.revision(in: lhs)),
+                (name: rhs, revision: revisionOrder.revision(in: rhs)))
+        }
+    }
+
+    /// R9-F2: a written-off owner's segments are consumed from every victim's ledger —
+    /// the owner is abandoned and the write-off resolved its debt for all of them.
+    private mutating func consumeSegmentsEverywhere(ownedBy owner: RevisionKey) {
+        for victim in Array(state.generation.ordering.victimLedgers.keys) {
+            guard var ledger = state.generation.ordering.victimLedgers[victim],
+                  ledger.segments.removeValue(forKey: owner) != nil else { continue }
+            state.generation.ordering.victimLedgers[victim] = ledger.isEmpty ? nil : ledger
+        }
+    }
+
+    /// Test-only observation point for the N1/N2 sweeps (Task 8, round 9). Nil in
+    /// production. Arguments: decision, justifying victim name, decision-time nanos.
+    var writeOffDecisionHookForTesting: ((WriteOffDecision, String, UInt64) -> Void)?
+
+    /// §§5.4-5.6. Nil when the ledger lacks budget-worth of unredeemed wait, or when
+    /// the current owner is still inside its own convergence grace window.
+    /// `consumedSegments` = predecessor debt only, oldest debt first (ascending
+    /// `firstChargeNanos`, numeric owner order on ties), truncating,
+    /// zero-amount entries excluded. Budget/grace/ceiling reuse the reducer properties.
+    func writeOffDecision(
+        for blocker: RevisionKey,
+        blockerName: String,
+        victimLedger: VictimWaitLedger,
+        nowNanos: UInt64
+    ) -> WriteOffDecision? {
+        let budget = blockingBudgetNanos
+        guard victimLedger.totalUnredeemedNanos(at: nowNanos) >= budget else { return nil }
+        guard currentOwnerGraceExpired(owner: blocker, in: victimLedger, nowNanos: nowNanos)
+        else { return nil }
+
+        let attributedNanos = victimLedger.segments[blocker]?.totalNanos(at: nowNanos) ?? 0
+        var remaining = budget > attributedNanos ? budget - attributedNanos : 0
+        var consumed: [RevisionKey: UInt64] = [:]
+        let predecessors = victimLedger.segments.values
+            .filter { $0.owner != blocker }
+            .sorted { lhs, rhs in
+                lhs.firstChargeNanos != rhs.firstChargeNanos
+                    ? lhs.firstChargeNanos < rhs.firstChargeNanos
+                    : revisionOrder.orderedBefore(lhs.owner, rhs.owner)
+            }
+            .map(\.owner)
+        for owner in predecessors {
+            guard remaining > 0, let segment = victimLedger.segments[owner] else { continue }
+            let amount = min(segment.totalNanos(at: nowNanos), remaining)
+            guard amount > 0 else { continue }   // zero-amount entries pollute the decision map
+            consumed[owner] = amount
+            remaining -= amount
+        }
+        return WriteOffDecision(
+            blocker: blocker,
+            blockerNameForLog: blockerName,
+            attributedNanos: attributedNanos,
+            consumedSegments: consumed)
+    }
+
+    /// §5.4: base tenure is one grace period from the owner's own first charge;
+    /// converging observations renew it (ownerGraceUntil); the hard cap is the
+    /// owner-anchored ceiling. Predecessor debt never shortens a fresh owner's grace,
+    /// and grace never rewrites predecessor segments.
+    private func currentOwnerGraceExpired(
+        owner: RevisionKey,
+        in ledger: VictimWaitLedger,
+        nowNanos: UInt64
+    ) -> Bool {
+        guard let segment = ledger.segments[owner] else { return false }
+        let ceiling = segment.firstChargeNanos &+ blockingCeilingNanos
+        if nowNanos >= ceiling { return true }
+        if let renewedUntil = state.generation.ordering.ownerGraceUntil[owner],
+           nowNanos < renewedUntil {
+            return false
+        }
+        return nowNanos >= segment.firstChargeNanos &+ blockingGraceNanos
+    }
+
+    mutating func noteConvergingOwner(_ owner: RevisionKey, at nowNanos: UInt64) {
+        state.generation.ordering.ownerGraceUntil[owner] = nowNanos &+ blockingGraceNanos
+    }
+
+    private func formatSeconds(_ nanos: UInt64) -> String {
+        String(format: "%.1fs", Double(nanos) / 1_000_000_000)
+    }
+
+    private func formatConsumedSegments(_ segments: [RevisionKey: UInt64]) -> String {
+        segments
+            .sorted { revisionOrder.orderedBefore($0.key, $1.key) }
+            .map { "\($0.key.normalizedDigits)=\(formatSeconds($0.value))" }
+            .joined(separator: ", ")
+    }
+
+    /// Discharge predicate (§5.2). Present and unblocked is a batch/file-state/numeric-order
+    /// fact: the victim appeared present in THIS batch and no batch-present lower revision
+    /// is unready. Never derived from BlockingEpisode, charging, or pendingEmissionOwners.
+    private func isPresentAndUnblocked(
+        name: String,
         classifiedByName: [String: ClassifiedObservation]
     ) -> Bool {
-        guard let blockerRevision = blocker.revision,
-              let victimRevision = revisionOrder.revision(in: name),
-              let victim = classifiedByName[name],
-              !victim.isPresent
+        guard let victim = classifiedByName[name],
+              victim.isPresent,
+              let victimRevision = victim.revision
         else { return false }
-        return revisionOrder.orderedBefore(
-            (name: blocker.observation.name, revision: blockerRevision),
-            (name: name, revision: victimRevision))
+        for item in classifiedByName.values {
+            guard item.observation.name != name,
+                  item.isPresent,
+                  let revision = item.revision,
+                  revisionOrder.orderedBefore(
+                      (name: item.observation.name, revision: revision),
+                      (name: name, revision: victimRevision)),
+                  participatesInNumberedOrdering(state.generation.files[item.observation.name]),
+                  readyCandidate(in: state.generation.files[item.observation.name]) == nil
+            else { continue }
+            return false
+        }
+        return true
     }
 
     private func isTerminal(_ fileState: FileState?) -> Bool {
@@ -1030,7 +1225,7 @@ struct WatcherReducer {
 
 }
 
-private struct NumberedRevisionOrder {
+struct NumberedRevisionOrder {
     private let regex: NSRegularExpression?
 
     init(prefix: String?) {
@@ -1054,6 +1249,14 @@ private struct NumberedRevisionOrder {
         guard ImageLoader.fitsExtensions.contains(fileExtension)
                 || ImageLoader.bitmapExtensions.contains(fileExtension) else { return nil }
         return String(name[digitsRange])
+    }
+
+    func revisionKey(in name: String) -> RevisionKey? {
+        revision(in: name).map(RevisionKey.init)
+    }
+
+    func orderedBefore(_ lhs: RevisionKey, _ rhs: RevisionKey) -> Bool {
+        compare(lhs.normalizedDigits, rhs.normalizedDigits) == .orderedAscending
     }
 
     func compare(_ lhs: String, _ rhs: String) -> ComparisonResult {
