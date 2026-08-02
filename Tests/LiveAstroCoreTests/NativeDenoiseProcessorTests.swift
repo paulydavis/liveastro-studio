@@ -62,6 +62,60 @@ final class NativeDenoiseProcessorTests: XCTestCase {
         XCTAssertNoThrow(try FITSReader.readHeader(try Data(contentsOf: out)))   // real FITS replaced the stale file
     }
 
+    /// Replacement failures must never destroy a prior good output
+    /// (Paul's post-merge P2 finding: remove-then-move window).
+    /// The failing FileManager intercepts both the legacy moveItem path and the
+    /// atomic replaceItem path, simulating a swap failure AFTER the temp write.
+    func testPriorOutputSurvivesFailedReplacement() throws {
+        let dir = try sandbox()
+        let master = dir.appendingPathComponent("master.fit")
+        let out = dir.appendingPathComponent("master_processed.fit")
+        _ = try writeMaster(master)
+        let priorBytes = Data("prior good processed master".utf8)
+        try priorBytes.write(to: out)
+
+        let failing = ReplacementFailingFileManager()
+        XCTAssertThrowsError(try NativeDenoiseProcessor(strength: 0.5, fileManager: failing)
+            .process(masterURL: master, outputURL: out, log: nil))
+        XCTAssertEqual(try Data(contentsOf: out), priorBytes,
+                       "prior good output must survive a failed replacement")
+    }
+
+    // MARK: - FileReplace helper contract
+
+    func testFileReplaceReplacesExistingDestinationAndConsumesTemp() throws {
+        let dir = try sandbox()
+        let dest = dir.appendingPathComponent("dest.bin")
+        let temp = dir.appendingPathComponent("temp.bin")
+        try Data("old".utf8).write(to: dest)
+        try Data("new".utf8).write(to: temp)
+        try FileReplace.replaceItem(at: dest, withItemAt: temp)
+        XCTAssertEqual(try Data(contentsOf: dest), Data("new".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temp.path))
+    }
+
+    func testFileReplaceMovesWhenNoDestinationExists() throws {
+        let dir = try sandbox()
+        let dest = dir.appendingPathComponent("dest.bin")
+        let temp = dir.appendingPathComponent("temp.bin")
+        try Data("new".utf8).write(to: temp)
+        try FileReplace.replaceItem(at: dest, withItemAt: temp)
+        XCTAssertEqual(try Data(contentsOf: dest), Data("new".utf8))
+    }
+
+    func testFileReplacePreservesDestinationWhenReplacementFails() throws {
+        let dir = try sandbox()
+        let dest = dir.appendingPathComponent("dest.bin")
+        let temp = dir.appendingPathComponent("temp.bin")
+        try Data("old".utf8).write(to: dest)
+        try Data("new".utf8).write(to: temp)
+        let failing = ReplacementFailingFileManager()
+        XCTAssertThrowsError(try FileReplace.replaceItem(at: dest, withItemAt: temp,
+                                                         fileManager: failing))
+        XCTAssertEqual(try Data(contentsOf: dest), Data("old".utf8),
+                       "destination must be preserved on failure")
+    }
+
     func testMissingMasterThrows() throws {
         let dir = try sandbox()
         XCTAssertThrowsError(try NativeDenoiseProcessor()
@@ -84,5 +138,19 @@ final class NativeDenoiseProcessorTests: XCTestCase {
     func testAlwaysAvailable() {
         XCTAssertTrue(NativeDenoiseProcessor().isAvailable)     // spec §2.3
         XCTAssertEqual(NativeDenoiseProcessor().name, "Native NR")
+    }
+}
+
+/// Fails every swap primitive while leaving reads/writes/removes intact —
+/// simulates "the final replacement failed" without touching earlier steps.
+private final class ReplacementFailingFileManager: FileManager {
+    override func moveItem(at srcURL: URL, to dstURL: URL) throws {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    override func replaceItem(at originalItemURL: URL, withItemAt newItemURL: URL,
+                              backupItemName: String?,
+                              options: FileManager.ItemReplacementOptions = [],
+                              resultingItemURL resultingURL: AutoreleasingUnsafeMutablePointer<NSURL?>?) throws {
+        throw CocoaError(.fileWriteUnknown)
     }
 }

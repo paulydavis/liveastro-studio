@@ -61,10 +61,14 @@ public struct GraXpertProcessor: Processor {
         } else {
             finalProduced = outputURL
         }
-        for url in outputVariants(for: outputURL) {
+        // Replace the target variant atomically FIRST (a prior good output at
+        // finalProduced survives a failed replacement), then clear stale sibling
+        // variants only after success. On failure everything prior is preserved.
+        try FileReplace.replaceItem(at: finalProduced, withItemAt: produced,
+                                    fileManager: fileManager)
+        for url in outputVariants(for: outputURL) where url.path != finalProduced.path {
             try? fileManager.removeItem(at: url)
         }
-        try fileManager.moveItem(at: produced, to: finalProduced)
         return finalProduced
     }
 

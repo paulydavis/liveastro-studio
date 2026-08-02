@@ -38,15 +38,15 @@ public struct NativeDenoiseProcessor: Processor {
                                      metadata: metadata, stackCount: stackCount,
                                      totalExposureSeconds: totalExp)
 
-        // Temp + rename: no partial master_processed.fit is ever observable.
+        // Temp + atomic replace: no partial master_processed.fit is ever
+        // observable, and a prior good output survives a failed replacement
+        // (FileReplace preserves the original on failure).
         let tmp = outputURL.deletingLastPathComponent()
             .appendingPathComponent(".native-denoise-\(UUID().uuidString).fit")
         do {
             try out.write(to: tmp)
-            if fileManager.fileExists(atPath: outputURL.path) {
-                try fileManager.removeItem(at: outputURL)
-            }
-            try fileManager.moveItem(at: tmp, to: outputURL)
+            try FileReplace.replaceItem(at: outputURL, withItemAt: tmp,
+                                        fileManager: fileManager)
         } catch {
             try? fileManager.removeItem(at: tmp)
             throw error
