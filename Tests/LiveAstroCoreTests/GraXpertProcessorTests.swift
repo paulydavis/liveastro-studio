@@ -179,3 +179,43 @@ final class GraXpertProcessorTests: XCTestCase {
         XCTAssertFalse(absent.isAvailable)
     }
 }
+
+/// Belt-and-suspenders (Paul's 48fcfbc review note): GraXpert's own final
+/// replacement, like Native NR's, must preserve a prior good output when the
+/// swap fails. The shared FileReplace helper carries the guarantee; this pins
+/// it at the GraXpert call site with an injected swap failure.
+extension GraXpertProcessorTests {
+    func testPriorOutputSurvivesFailedFinalReplacement() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let exe = dir.appendingPathComponent("graxpert")
+        FileManager.default.createFile(atPath: exe.path, contents: Data())
+        let out = dir.appendingPathComponent("master_processed.fit")
+        let master = dir.appendingPathComponent("master.fit")
+        FileManager.default.createFile(atPath: master.path, contents: Data("m".utf8))
+        let priorBytes = Data("prior good processed master".utf8)
+        try priorBytes.write(to: out)
+
+        // Both steps succeed and write their exact -output paths; the injected
+        // FileManager then fails the final swap primitives.
+        let runner = FakeRunner(exitCodes: [0, 0], writeOutputOnCallIndices: [0, 1])
+        let proc = GraXpertProcessor(executable: exe, runner: runner,
+                                     fileManager: GraXpertSwapFailingFileManager())
+        XCTAssertThrowsError(try proc.process(masterURL: master, outputURL: out, log: nil))
+        XCTAssertEqual(try Data(contentsOf: out), priorBytes,
+                       "prior good output must survive a failed final replacement")
+    }
+}
+
+private final class GraXpertSwapFailingFileManager: FileManager {
+    override func moveItem(at srcURL: URL, to dstURL: URL) throws {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    override func replaceItem(at originalItemURL: URL, withItemAt newItemURL: URL,
+                              backupItemName: String?,
+                              options: FileManager.ItemReplacementOptions = [],
+                              resultingItemURL resultingURL: AutoreleasingUnsafeMutablePointer<NSURL?>?) throws {
+        throw CocoaError(.fileWriteUnknown)
+    }
+}
