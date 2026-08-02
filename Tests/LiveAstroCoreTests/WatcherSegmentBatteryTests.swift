@@ -155,7 +155,10 @@ final class WatcherSegmentBatteryTests: XCTestCase {
 
     // d2 — paused-victim redemption. Provenance: round-7 R7-1 fix direction (paused
     // charge must clear when its owner emits), spec §5.1 "d9's paused case".
-    // Expected on controls: RED on 6cb370a (structurally-dead clear), green elsewhere.
+    // Observed on controls: green on all three (informative, non-binding — recorded in
+    // the reconciliation doc). On 6cb370a the paused-clock equality clear handles this
+    // single-flicker shape correctly; r7's defect bites running clocks (e1/e7), not
+    // this paused case.
     func test_d2_ownerEmissionDuringVictimAbsenceRedeemsPausedDebt() {
         var d = makeDriver()
         let sec: UInt64 = 1_000_000_000
