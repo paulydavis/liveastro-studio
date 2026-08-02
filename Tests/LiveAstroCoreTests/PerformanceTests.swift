@@ -158,4 +158,44 @@ final class PerformanceTests: XCTestCase {
                    rcdElapsed, bilinearElapsed, ratio))
         #endif
     }
+
+    // MARK: – Denoiser perf pin (native-noise-reduction spec §4: ≤ 1.0 s at 26 MP release)
+
+    /// Full-sensor 3-channel display-domain frame at Medium strength.
+    /// Run only in release — debug builds have no optimisations.
+    func testDenoise26MPWithin1Second() throws {
+        #if DEBUG
+        throw XCTSkip("perf pin is meaningful only with optimizations — run: swift test -c release --filter PerformanceTests")
+        #else
+        let width = 6248, height = 4176            // ~26 MP, ASI2600MC-Air sensor size
+        var rng: UInt64 = 0xD15C_0DE5
+        @inline(__always) func nextF() -> Float {
+            rng = rng &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Float(rng >> 33) / Float(1 << 31)
+        }
+        // Memory note: at 26MP x 3ch the engine's transient working set is
+        // ~1.5-2 GB (input copy + sanitized copy + Y/C1/C2 planes + blur/gradient
+        // scratch, each ~104 MB, several alive at once) — within target-hardware
+        // budget; buffers free as each stage's locals go out of scope.
+        var pixels = [Float](repeating: 0, count: width * height * 3)
+        for i in 0..<pixels.count { pixels[i] = 0.2 + nextF() * 0.1 }
+        let img = AstroImage(width: width, height: height, channels: 3,
+                             pixels: pixels, sourceIsLinear: false)
+
+        _ = Denoiser.apply(                       // warm-up on a small frame
+            AstroImage(width: 128, height: 128, channels: 3,
+                       pixels: [Float](repeating: 0.2, count: 128 * 128 * 3),
+                       sourceIsLinear: false), strength: 0.5)
+
+        let start = Date()
+        _ = Denoiser.apply(img, strength: 0.5)
+        let elapsed = Date().timeIntervalSince(start)
+        print(String(format: "PerformanceTests · 26 MP Denoiser.apply elapsed: %.2f s", elapsed))
+        XCTAssertLessThan(elapsed, 1.0,
+            String(format: "Denoise perf pin FAILED: %.2f s (limit 1.0 s, spec §4). " +
+                   "Sanctioned ladder: sliding-window box blur, then Accelerate/vImage; " +
+                   "Metal is out of scope. Regenerate the Swift golden pin after ANY " +
+                   "summation-order change (DUMP_DENOISE_GOLDENS).", elapsed))
+        #endif
+    }
 }

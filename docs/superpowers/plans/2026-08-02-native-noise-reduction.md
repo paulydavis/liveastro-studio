@@ -21,12 +21,12 @@ Binding items copied from the spec (§ references are to the spec):
 - **Display placement** (§2.2): applied in `SessionPipeline.displayCGImage` "**after** stretch and DBE, before CGImage packing — … this placement makes broadcast, snapshots, `latest.png`, and replay all inherit it automatically while `master.fit` stays raw."
 - **`master.fit` is never mutated** (§ non-goals). The master path writes `master_processed.fit` with the existing temp+rename no-partial-files pattern (§5).
 - **Default OFF + Codable back-compat** (§2.2): `denoiseStrength` "0…1, default **0 / off** for the first release … Codable backward-compatible like every prior adjustment field." Slider follows the DBE pattern including the drag-end `{ editing in if !editing { applyDisplayAdjustments() } }` gotcha.
-- **Prototype-first gate is binding** (§3): Task 1 runs on the real M8 (`~/Documents/LiveAstro/2026-07-08-m8lagoon-3`) and Veil masters, A/B'd with metrics **before any Swift is written**. Gate thresholds, verbatim:
-  - background luma sigma reduction ≥ 40% at Medium strength (slider 0.5);
-  - chroma mottle (coarse-scale sigma of the opponent chroma channels) reduction ≥ 50%;
-  - star FWHM change ≤ 2%;
-  - filament contrast (line profile across the Veil arc) preserved ≥ 95%;
-  - A/B PNGs produced for owner eyeballing.
+- **Prototype-first gate is binding** (§3 as amended 2026-08-02, owner-approved, spec commit f1ac6ba): Task 1 runs on the real M8 (`~/Documents/LiveAstro/2026-07-08-m8lagoon-3`) and Veil masters, A/B'd with metrics **before any Swift is written**. Noise metrics are measured on the **flattest tiles** — the flattest 10% of a 32×32 tile grid ranked by luma MAD-sigma, minimum 20 tiles — and each noise target is capped by the field's own **achievability bound**: the reduction a blur-everything pass (every guard/blend weight forced to 1, same radii/passes/downsample) attains on those same tiles, computed by the prototype itself. Gate thresholds at Medium strength (slider 0.5):
+  - background luma sigma reduction on flattest tiles ≥ min(40%, 0.7 × achievability bound);
+  - coarse-chroma sigma reduction on flattest tiles ≥ min(50%, 0.7 × achievability bound);
+  - star FWHM change ≤ 2% (whole field — the anti-gaming guard, unchanged);
+  - filament contrast (line profile across the Veil arc) preserved ≥ 95% (unchanged);
+  - A/B PNGs produced for owner eyeballing, explicitly including a tile-seam check.
 - **Validated constants are verbatim-binding** (§3): "The validated kernel sizes, thresholds, and strength curve become the Swift constants, verbatim." If the guided-filter approach cannot hit the gate numbers, "the fallback is à-trous wavelet thresholding (approach B), **decided at the gate, not improvised mid-port**." A gate failure is a STOP — bring the decision back to the owner.
 - **Performance pin** (§4): "≤ 1.0 s per application at 26MP in release", pinned by a release-mode performance test like the RCD pin. Accelerate/vImage is the sanctioned escalation if the pin fails; Metal is out of scope. Do not micro-optimize past the pin without need.
 - **Branch discipline:** all work on `feature/native-noise-reduction`, never `main` (house rule). The branch merges **only after an external review round** (spec §6 post-merge adversarial + quality review per repo practice); completing this plan is not merge authorization.
@@ -121,8 +121,14 @@ Modes:
   golden  --m8 M8.fit --out Tests/LiveAstroCoreTests/Fixtures
       Emit the 64x64 float32 golden crop (input + expected at strength 0.5).
 
-Gate (all at strength 0.5, spec-verbatim): bg luma sigma down >=40%, coarse chroma
-sigma down >=50%, star FWHM delta <=2%, Veil filament contrast preserved >=95%.
+Gate (all at strength 0.5, spec §3 as amended 2026-08-02, owner-approved):
+  - bg luma sigma and coarse chroma sigma are measured on the flattest 10% of a
+    32x32 luma-MAD tile grid (min 20 tiles; per-tile sigma, median across tiles);
+  - effective targets: bg >= min(40%, 0.7*bound), chroma >= min(50%, 0.7*bound),
+    where bound = the reduction a blur-everything pass (all guard/blend weights
+    forced to 1, same radii/passes) attains on those same tiles, computed here;
+  - star FWHM delta <= 2% (whole field) and Veil filament contrast preserved
+    >= 95% — the unchanged anti-gaming guards.
 If the gate fails: STOP. Wavelet fallback (approach B) is an owner decision.
 
 The constants below are the sweep's starting values. The values recorded in
@@ -392,9 +398,19 @@ def denoise(img, s, linear):
     return np.stack([stage2_luma(img[0], s, linear)])
 
 
-# ---- gate metrics -----------------------------------------------------------
+# ---- gate metrics (spec §3 as amended 2026-08-02) ---------------------------
+# Metric-definition constants (spec-fixed by the amendment, NOT sweep values):
+FLATTEST_FRACTION = 0.10   # flattest 10% of the tile grid
+MIN_FLAT_TILES = 20        # minimum tile count
+BOUND_FACTOR = 0.7         # effective target = min(cap, BOUND_FACTOR * bound)
+BG_TARGET_CAP = 0.40       # bg luma sigma reduction cap
+CHROMA_TARGET_CAP = 0.50   # coarse chroma sigma reduction cap
+
+
 def sky_mask(y, tiles=TILES):
-    """Darkest 30% of tiles by median -> per-pixel sky mask."""
+    """Darkest 30% of tiles by median -> per-pixel mask. Kept ONLY as the
+    background/threshold estimator inside star_fwhm_median (whole-field FWHM
+    guard, unchanged by the amendment); noise metrics use flattest_tiles."""
     med, _, row_tile, col_tile = tile_grid(y, tiles)
     cut = percentile_nearest(med, 30.0)
     tile_sky = med <= cut
@@ -406,16 +422,67 @@ def mad_sigma(v):
     return 1.4826 * upper_median(np.abs(np.asarray(v).ravel() - m))
 
 
-def bg_luma_sigma(y, mask):
-    return mad_sigma(y[mask])
+def flattest_tiles(y, tiles=TILES):
+    """Amended spec §3 noise-measurement region: the flattest 10% of the
+    tiles x tiles grid ranked by luma MAD-sigma (stable sort; minimum
+    MIN_FLAT_TILES tiles). Selection is computed on the BEFORE luma and reused
+    for the after and bound images so all three see identical pixels.
+    Returns (coords, row_edges, col_edges) on the tile_grid integer edge grid."""
+    h, w = y.shape
+    _, sig, _, _ = tile_grid(y, tiles)
+    n = max(MIN_FLAT_TILES, int(math.floor(tiles * tiles * FLATTEST_FRACTION)))
+    order = np.argsort(sig, axis=None, kind="stable")
+    coords = [(int(i) // tiles, int(i) % tiles) for i in order[:n]]
+    re_ = [ty * h // tiles for ty in range(tiles + 1)]
+    ce_ = [tx * w // tiles for tx in range(tiles + 1)]
+    return coords, re_, ce_
 
 
-def chroma_mottle_sigma(c1, c2, mask):
-    """Coarse-scale (8x block-mean) chroma sigma over sky tiles (spec metric 2)."""
-    md = block_down(mask.astype(float), 8) > 0.5
-    s1 = mad_sigma(block_down(c1, 8)[md])
-    s2 = mad_sigma(block_down(c2, 8)[md])
-    return float(np.hypot(s1, s2))
+def flat_bg_sigma(y, coords, re_, ce_):
+    """Metric 1 (amended): per-tile full-res luma MAD-sigma on the flattest
+    tiles, median across tiles. Per-tile measurement is immune to tile-to-tile
+    background level offsets (the failure mode of the old union-mask metric)."""
+    return float(np.median([mad_sigma(y[re_[ty]:re_[ty + 1], ce_[tx]:ce_[tx + 1]])
+                            for ty, tx in coords]))
+
+
+def flat_chroma_sigma(c1, c2, coords, re_, ce_, d=8):
+    """Metric 2 (amended): coarse-scale (8x block-mean) chroma sigma measured
+    per flattest tile (hypot of the two opponent channels), median across tiles."""
+    c1d, c2d = block_down(c1, d), block_down(c2, d)
+    sh, sw = c1d.shape
+    sigs = []
+    for ty, tx in coords:
+        r0 = min(re_[ty] // d, sh - 1)
+        r1 = max(r0 + 1, min(sh, re_[ty + 1] // d))
+        x0 = min(ce_[tx] // d, sw - 1)
+        x1 = max(x0 + 1, min(sw, ce_[tx + 1] // d))
+        s1 = mad_sigma(c1d[r0:r1, x0:x1])
+        s2 = mad_sigma(c2d[r0:r1, x0:x1])
+        sigs.append(float(np.hypot(s1, s2)))
+    return float(np.median(sigs))
+
+
+def denoise_bound(img, s):
+    """Achievability bound (amended spec §3): the same pipeline shape with every
+    guard/blend weight forced to 1 — blur everything, no guards, the theoretical
+    maximum reduction for this pipeline. Same radii, passes and downsample as
+    the real stages; ONLY the weights differ. Returns (y, c1, c2) of the bound
+    image for measurement on the flattest tiles."""
+    y, c1, c2 = opponent(img)
+    h, w = y.shape
+    r = chroma_radius(s)
+    out = []
+    for c in (c1, c2):
+        cd = block_down(c, CHROMA_DOWN)
+        cb = cd
+        for _ in range(CHROMA_PASSES):
+            cb = box_blur(cb, r)
+        out.append(c + upsample_bilinear(cb - cd, w, h, CHROMA_DOWN))
+    b = y
+    for _ in range(LUMA_PASSES):
+        b = box_blur(b, luma_radius(s))
+    return b, out[0], out[1]
 
 
 def star_fwhm_median(y, n_stars=40, exclusion=12):
@@ -632,7 +699,7 @@ python3 Scripts/prototypes/denoise_prototype.py metrics \
   --veil ~/Documents/LiveAstro/2026-07-12-ngc6960/master.fit
 ```
 
-Expected: the markdown metrics table (8 rows: 2 datasets × 4 strengths), A/B PNGs in `~/Desktop/denoise-ab/`, and a final `GATE at strength 0.5: PASS` (exit 0). A `GATE INVALID: metric unmeasurable` line means the *measurement* is broken (NaN gate metric, < 10 stars, or a non-positive filament baseline) — fix the star threshold or filament window before judging the algorithm; INVALID is not a FAIL of the denoiser. Before the gate run, run once with `--sweep-gains` to print the coarse blend-gain grid ({1.5, 2.0, 2.5, 3.0}² at s=0.5), pick the smallest `CHROMA_BLEND_GAIN` / `LUMA_BLEND_GAIN` pair that clears every gate threshold with margin, set them in the constants block, and re-run without the flag — the chosen gains are emitted with the other constants in the results doc. The default `--filament-row/col` window is a starting guess — inspect `Veil_before.png`, pick a window that actually crosses a NGC 6960 filament arc, re-run with explicit values, and record the chosen window in the results doc. Iterate on the `T1-BINDING` constants (edit the constants block, re-run) until the gate passes at 0.5 **and** strength 1.0 doesn't crush faint nebulosity in the eyeball A/B ("keep this kind of nebulosity" — spec §1). In the eyeball A/B also check for visible rectangular tile seams at 1/32-frame boundaries (stage-2 per-tile weights are not interpolated; if seams show, note as a constants/interpolation follow-up for the port).
+Expected: the markdown metrics table (8 rows: 2 datasets × 4 strengths, with measured / bound / effective-target columns for both noise metrics), A/B PNGs in `~/Desktop/denoise-ab/`, per-metric `GATE <dataset> <metric>: measured … | bound … | effective target … | PASS` lines at s=0.5, and a final `GATE at strength 0.5: PASS` (exit 0). A `GATE INVALID: metric unmeasurable` line means the *measurement* is broken (NaN gate metric or bound, < 10 stars, or a non-positive filament baseline) — fix the star threshold or filament window before judging the algorithm; INVALID is not a FAIL of the denoiser. Before the gate run, run once with `--sweep-gains` to print the coarse blend-gain grid ({1.5, 2.0, 2.5, 3.0}² at s=0.5), pick the smallest `CHROMA_BLEND_GAIN` / `LUMA_BLEND_GAIN` pair that clears every effective target with margin, set them in the constants block, and re-run without the flag — the chosen gains are emitted with the other constants in the results doc. The default `--filament-row/col` window is a starting guess — inspect `Veil_before.png`, pick a window that actually crosses a NGC 6960 filament arc, re-run with explicit values, and record the chosen window in the results doc. Iterate on the `T1-BINDING` constants (edit the constants block, re-run) until the gate passes at 0.5 **and** strength 1.0 doesn't crush faint nebulosity in the eyeball A/B ("keep this kind of nebulosity" — spec §1). In the eyeball A/B also check for visible rectangular tile seams at 1/32-frame boundaries (stage-2 per-tile weights are not interpolated; if seams show, note as a constants/interpolation follow-up for the port).
 
 - [ ] **Step 5: GATE.** If after reasonable constant iteration the table cannot meet all four thresholds: **STOP the plan here.** Commit the script + a results doc recording the best-achieved numbers, and report BLOCKED to the owner with the wavelet (approach B) fallback question. Per spec §3 this decision happens at the gate, not mid-port. Do not begin Task 2.
 
@@ -649,8 +716,8 @@ Expected: the markdown metrics table (8 rows: 2 datasets × 4 strengths), A/B PN
 **A/B PNGs:** ~/Desktop/denoise-ab/ (outside the repo, for owner eyeballing;
 files are `.ppm` if matplotlib was unavailable — the script's PPM fallback)
 
-## Gate table (observed)
-<paste the metrics table verbatim>
+## Gate table (observed; measured / bound / effective target per noise metric)
+<paste the metrics table and the per-metric GATE lines verbatim>
 
 GATE at strength 0.5: PASS
 

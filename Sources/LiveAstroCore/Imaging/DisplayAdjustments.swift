@@ -14,6 +14,7 @@ import Foundation
 ///                                             (the display path now uses the multiscale model)
 /// - bgScale:             3.0 neutral         — multiscale DBE top scale (pixels)
 /// - bgSmoothest:         0.5 neutral         — multiscale DBE smoothest octave weight
+/// - denoiseStrength:    0 (off) … 1          — classic two-stage noise reduction (post-stretch)
 public struct DisplayAdjustments: Equatable, Codable {
     public var blackPoint: Double
     public var midtoneStrength: Double
@@ -22,10 +23,12 @@ public struct DisplayAdjustments: Equatable, Codable {
     public var backgroundDegree: Int
     public var bgScale: Double
     public var bgSmoothest: Double
+    public var denoiseStrength: Double
 
     public init(blackPoint: Double = 0, midtoneStrength: Double = 0, saturation: Double = 1,
                 backgroundExtraction: Bool = false, backgroundDegree: Int = 1,
-                bgScale: Double = 3.0, bgSmoothest: Double = 0.5) {
+                bgScale: Double = 3.0, bgSmoothest: Double = 0.5,
+                denoiseStrength: Double = 0) {
         self.blackPoint = blackPoint
         self.midtoneStrength = midtoneStrength
         self.saturation = saturation
@@ -33,6 +36,7 @@ public struct DisplayAdjustments: Equatable, Codable {
         self.backgroundDegree = backgroundDegree
         self.bgScale = bgScale
         self.bgSmoothest = bgSmoothest
+        self.denoiseStrength = denoiseStrength
     }
 
     public static let neutral = DisplayAdjustments()
@@ -40,7 +44,7 @@ public struct DisplayAdjustments: Equatable, Codable {
     // Custom decode so a settings blob written before the DBE fields existed
     // still decodes (missing keys → defaults). Encode stays synthesized.
     private enum CodingKeys: String, CodingKey {
-        case blackPoint, midtoneStrength, saturation, backgroundExtraction, backgroundDegree, bgScale, bgSmoothest
+        case blackPoint, midtoneStrength, saturation, backgroundExtraction, backgroundDegree, bgScale, bgSmoothest, denoiseStrength
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -51,5 +55,6 @@ public struct DisplayAdjustments: Equatable, Codable {
         backgroundDegree = try c.decodeIfPresent(Int.self, forKey: .backgroundDegree) ?? 1
         bgScale = try c.decodeIfPresent(Double.self, forKey: .bgScale) ?? 3.0
         bgSmoothest = try c.decodeIfPresent(Double.self, forKey: .bgSmoothest) ?? 0.5
+        denoiseStrength = try c.decodeIfPresent(Double.self, forKey: .denoiseStrength) ?? 0
     }
 }

@@ -3,10 +3,13 @@ import XCTest
 
 final class ProcessorTests: XCTestCase {
     func testBackendIsCodableStringEnum() throws {
-        XCTAssertEqual(ProcessorBackend.allCases, [.none, .graxpert])
+        XCTAssertEqual(ProcessorBackend.allCases, [.none, .graxpert, .nativeDenoise])
         let data = try JSONEncoder().encode(ProcessorBackend.graxpert)
         XCTAssertEqual(String(data: data, encoding: .utf8), "\"graxpert\"")
         XCTAssertEqual(try JSONDecoder().decode(ProcessorBackend.self, from: data), .graxpert)
+        let nrData = try JSONEncoder().encode(ProcessorBackend.nativeDenoise)
+        XCTAssertEqual(String(data: nrData, encoding: .utf8), "\"nativeDenoise\"")
+        XCTAssertEqual(try JSONDecoder().decode(ProcessorBackend.self, from: nrData), .nativeDenoise)
     }
 
     func testProcessorErrorEquatable() {

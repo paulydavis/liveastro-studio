@@ -13,7 +13,7 @@ public protocol Processor {
 
 /// User-selectable processing backend.
 public enum ProcessorBackend: String, CaseIterable, Codable {
-    case none, graxpert
+    case none, graxpert, nativeDenoise
 }
 
 public enum ProcessorError: Error, Equatable {

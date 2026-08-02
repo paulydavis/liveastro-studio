@@ -78,6 +78,14 @@ final class SessionSettingsTests: XCTestCase {
         XCTAssertEqual(s.processorBackend, .none)     // missing key -> default
         XCTAssertEqual(s.targetName, "M8")            // existing fields intact
     }
+
+    func testNativeDenoiseBackendRoundTrips() throws {
+        var s = SessionSettings.defaults
+        s.processorBackend = .nativeDenoise
+        let round = try JSONDecoder().decode(SessionSettings.self,
+                                             from: JSONEncoder().encode(s))
+        XCTAssertEqual(round.processorBackend, .nativeDenoise)
+    }
 }
 
 final class SessionSettingsDisplayAdjTests: XCTestCase {
@@ -174,6 +182,22 @@ final class SessionSettingsDisplayAdjTests: XCTestCase {
         let json = #"{"sourceModeRaw":"Raw subs (native stacking)","filePrefix":"Light_","neutralizeBackground":false,"subExposureSeconds":60,"targetName":"","calibration":{},"rejectionEnabled":true}"#
         let s = try JSONDecoder().decode(SessionSettings.self, from: Data(json.utf8))
         XCTAssertEqual(s.demosaic, .rcd)
+    }
+
+    func testSettingsBlobWithoutDenoiseKeyDecodesOff() throws {
+        var s = SessionSettings.defaults
+        s.displayAdjustments.denoiseStrength = 0.4
+        let round = try JSONDecoder().decode(SessionSettings.self,
+                                             from: JSONEncoder().encode(s))
+        XCTAssertEqual(round.displayAdjustments.denoiseStrength, 0.4, accuracy: 1e-9)
+        // A LITERAL settings blob whose displayAdjustments predates the denoise key
+        // (same pattern as DisplayAdjustmentsDenoiseTests' missing-key test above):
+        // re-encoding a freshly-constructed struct would always include the key and
+        // prove nothing about the predates-the-key path.
+        let old = #"{"sourceModeRaw":"Stacker output (Siril)","filePrefix":"live_stack","neutralizeBackground":false,"subExposureSeconds":60,"targetName":"M8","calibration":{},"displayAdjustments":{"blackPoint":0.1,"midtoneStrength":-0.3,"saturation":1.5,"backgroundExtraction":true,"backgroundDegree":2,"bgScale":3.0,"bgSmoothest":0.5}}"#
+        let decoded = try JSONDecoder().decode(SessionSettings.self, from: Data(old.utf8))
+        XCTAssertEqual(decoded.displayAdjustments.denoiseStrength, 0)   // absent -> off
+        XCTAssertEqual(decoded.displayAdjustments.blackPoint, 0.1)      // siblings intact
     }
 
     // Encode the current default calibration so the old-blob JSON stays valid if

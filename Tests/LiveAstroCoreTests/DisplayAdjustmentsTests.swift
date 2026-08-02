@@ -70,3 +70,21 @@ final class DisplayAdjustmentsDBEv3Tests: XCTestCase {
         XCTAssertTrue(a.backgroundExtraction)
     }
 }
+
+final class DisplayAdjustmentsDenoiseTests: XCTestCase {
+    func testDenoiseDefaultsOffAndRoundTrips() throws {
+        var a = DisplayAdjustments.neutral
+        XCTAssertEqual(a.denoiseStrength, 0)                 // default OFF (spec §2.2)
+        a.denoiseStrength = 0.6
+        let back = try JSONDecoder().decode(DisplayAdjustments.self,
+                                            from: JSONEncoder().encode(a))
+        XCTAssertEqual(back.denoiseStrength, 0.6, accuracy: 1e-9)
+    }
+
+    func testDecodesOldSettingsWithoutDenoiseKey() throws {
+        let old = #"{"blackPoint":0.1,"midtoneStrength":-0.3,"saturation":1.5,"backgroundExtraction":true,"backgroundDegree":2,"bgScale":3.0,"bgSmoothest":0.5}"#
+        let a = try JSONDecoder().decode(DisplayAdjustments.self, from: Data(old.utf8))
+        XCTAssertEqual(a.denoiseStrength, 0)                 // absent -> off
+        XCTAssertEqual(a.blackPoint, 0.1)
+    }
+}

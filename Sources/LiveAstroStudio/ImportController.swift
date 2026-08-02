@@ -22,7 +22,7 @@ final class ImportController {
     /// (read back through `AppSurface.isImporting`) and `startSession`; drives the
     /// import progress bar in the footer.
     var isImporting = false
-    /// True while GraXpert is post-processing a master (processMaster).
+    /// True while a post-process backend (GraXpert or Native NR) is processing a master (processMaster).
     var isProcessing = false
     /// True while a replay render is in flight — set by both `regenerateReplay`
     /// here and `AppModel.endSession()`, which reads/writes it through this
@@ -193,8 +193,17 @@ final class ImportController {
 
     func processMaster(sessionDirectory: URL) {
         guard !isProcessing, !isImporting, !surface.isSessionRunning() else { return }
-        guard surface.currentProcessorBackend?() == .graxpert, let exe = GraXpertProcessor.defaultExecutable() else {
-            surface.presentError("GraXpert not found — install it from graxpert.com"); return
+        let backend = surface.currentProcessorBackend?() ?? ProcessorBackend.none
+        let graxpertExe = GraXpertProcessor.defaultExecutable()
+        switch backend {
+        case .none:
+            return
+        case .graxpert:
+            guard graxpertExe != nil else {
+                surface.presentError("GraXpert not found — install it from graxpert.com"); return
+            }
+        case .nativeDenoise:
+            break   // always available (spec §2.3)
         }
         let master = sessionDirectory.appendingPathComponent("master.fit")
         guard FileManager.default.fileExists(atPath: master.path) else {
@@ -202,12 +211,17 @@ final class ImportController {
             return
         }
         isProcessing = true
-        surface.log("Processing master with GraXpert…")
+        surface.log(backend == .graxpert ? "Processing master with GraXpert…"
+                                         : "Processing master with Native NR…")
         Task.detached { [weak self] in
             guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             do {
                 let out = sessionDirectory.appendingPathComponent("master_processed.fit")
-                let proc = GraXpertProcessor(executable: exe)
+                // graxpertExe was nil-checked above for the .graxpert arm; the force
+                // unwrap is unreachable otherwise.
+                let proc: any Processor = backend == .graxpert
+                    ? GraXpertProcessor(executable: graxpertExe!)
+                    : NativeDenoiseProcessor()
                 // process() runs synchronously within this task, so the strong `self`
                 // let is safely captured by the progress callback for its duration.
                 let produced = try proc.process(masterURL: master, outputURL: out) { m in
