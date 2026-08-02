@@ -53,11 +53,15 @@ Contracts: `strength == 0` returns the input byte-identical (off costs nothing);
 
 Task 1 of the implementation plan is a Python prototype on the real M8 (`~/Documents/LiveAstro/2026-07-08-m8lagoon-3`) and Veil masters, A/B'd with metrics before any Swift is written:
 
-- background luma sigma reduction ≥ 40% at Medium strength (slider 0.5);
-- chroma mottle (coarse-scale sigma of the opponent chroma channels) reduction ≥ 50%;
-- star FWHM change ≤ 2%;
-- filament contrast (line profile across the Veil arc) preserved ≥ 95%;
-- A/B PNGs produced for owner eyeballing.
+Noise metrics are measured on the **flattest tiles** — the flattest 10% of a 32×32 tile grid ranked by luma MAD-sigma, minimum 20 tiles — a true-background proxy, because whole-field sky masks in structure-dense fields (M8's Sagittarius Milky Way has essentially no empty sky) count real signal as noise and are unreachable for any denoiser. Each noise target is capped by the field's own **achievability bound**: the reduction a blur-everything pass attains on those same tiles, computed by the prototype itself. At Medium strength (slider 0.5):
+
+- background luma sigma reduction on flattest tiles ≥ min(40%, 0.7 × achievability bound);
+- coarse-chroma sigma reduction on flattest tiles ≥ min(50%, 0.7 × achievability bound);
+- star FWHM change ≤ 2% (whole field — the anti-gaming guard, unchanged);
+- filament contrast (line profile across the Veil arc) preserved ≥ 95% (unchanged);
+- A/B PNGs produced for owner eyeballing, explicitly including a tile-seam check.
+
+*(Amended 2026-08-02, owner-approved: the original whole-field absolute targets were proven metric-structural — the first gate run's blur-everything bounds showed M8's masks capped at +21–30% for any algorithm. The amendment measures noise where noise is measurable and scales targets by what the field admits; the FWHM/filament/eyeball guards prevent gaming. Recorded in `docs/superpowers/reviews/2026-08-02-denoise-prototype-results.md`.)*
 
 The validated kernel sizes, thresholds, and strength curve become the Swift constants, verbatim — the same pipeline that validated additive-BN, DBE, and RCD. If the guided-filter approach cannot hit these numbers in prototyping, the fallback is à-trous wavelet thresholding (approach B), decided at the gate, not improvised mid-port.
 
