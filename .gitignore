@@ -6,3 +6,4 @@ DerivedData/
 .swiftpm/
 dist/
 .worktrees/
+__pycache__/
