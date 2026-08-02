@@ -69,6 +69,27 @@ final class MockOBSSocket: OBSSocket {
     private var replyHook: ((String) -> String?)?
     private var lastCloseTask: Task<Void, Never>?
 
+    /// Tail of the inbound-mutation task chain. Every fire-and-forget
+    /// test-control mutation (`enqueueInbound`, `finish`, `finishWithError`,
+    /// and `close()`'s terminal) is chained behind the previous one — each
+    /// task awaits its predecessor before touching the actor — so frames
+    /// reach the queue in call order and a terminal can never overtake
+    /// queued frames. Mirrors the `OBSClient.sendChainTail` pattern.
+    private var inboundChainTail: Task<Void, Never>?
+
+    /// Append an inbound-queue mutation to the FIFO chain and return the
+    /// chained task (so callers like `close()` can expose it for awaiting).
+    @discardableResult
+    private func chainInboundMutation(_ operation: @escaping () async -> Void) -> Task<Void, Never> {
+        let previous = inboundChainTail
+        let task = Task {
+            await previous?.value   // FIFO: never overtake an earlier mutation
+            await operation()
+        }
+        inboundChainTail = task
+        return task
+    }
+
     // MARK: - OBSSocket
 
     func connect(url: URL) async throws {
@@ -108,15 +129,16 @@ final class MockOBSSocket: OBSSocket {
     func close() {
         closeCount += 1
         releaseParkedConnects()
-        let task = Task { await queue.finish(throwing: CancellationError()) }
-        lastCloseTask = task
+        lastCloseTask = chainInboundMutation { [queue] in
+            await queue.finish(throwing: CancellationError())
+        }
     }
 
     // MARK: - Test-control API
 
     /// Enqueue a text frame that the next `receive()` call will return.
     func enqueueInbound(_ text: String) {
-        Task { await queue.enqueue(text) }
+        chainInboundMutation { [queue] in await queue.enqueue(text) }
     }
 
     /// Install a hook that fires after each `send(_:)`. The closure receives
@@ -128,12 +150,14 @@ final class MockOBSSocket: OBSSocket {
 
     /// Make the next (or pending) `receive()` throw `error`.
     func finishWithError(_ error: Error) {
-        Task { await queue.finish(throwing: error) }
+        chainInboundMutation { [queue] in await queue.finish(throwing: error) }
     }
 
     /// Make the next (or pending) `receive()` throw `CancellationError`.
     func finish() {
-        Task { await queue.finish(throwing: CancellationError()) }
+        chainInboundMutation { [queue] in
+            await queue.finish(throwing: CancellationError())
+        }
     }
 
     /// Wait until the actor-side effects of the most recent `close()` have
@@ -245,6 +269,16 @@ private actor InboundQueue {
                 if !self.buffer.isEmpty {
                     continuation.resume(returning: self.buffer.removeFirst())
                     return
+                }
+                // Single-consumer invariant: if a dequeue() is already parked
+                // (a cancelled/superseded receive loop that never woke — e.g.
+                // reconnect races on a shared mock), resume the DISPLACED
+                // continuation with CancellationError instead of silently
+                // overwriting it, which would leak it unresumed (SWIFT TASK
+                // CONTINUATION MISUSE). The new consumer then parks normally.
+                if let displaced = self.pending {
+                    self.pending = nil
+                    displaced.resume(throwing: CancellationError())
                 }
                 self.pending = continuation
             }
