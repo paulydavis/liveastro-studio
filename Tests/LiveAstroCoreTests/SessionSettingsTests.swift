@@ -78,6 +78,14 @@ final class SessionSettingsTests: XCTestCase {
         XCTAssertEqual(s.processorBackend, .none)     // missing key -> default
         XCTAssertEqual(s.targetName, "M8")            // existing fields intact
     }
+
+    func testNativeDenoiseBackendRoundTrips() throws {
+        var s = SessionSettings.defaults
+        s.processorBackend = .nativeDenoise
+        let round = try JSONDecoder().decode(SessionSettings.self,
+                                             from: JSONEncoder().encode(s))
+        XCTAssertEqual(round.processorBackend, .nativeDenoise)
+    }
 }
 
 final class SessionSettingsDisplayAdjTests: XCTestCase {

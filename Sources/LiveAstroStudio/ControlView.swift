@@ -365,10 +365,11 @@ struct ControlView: View {
                         Picker("Post-process", selection: $model.processorBackend) {
                             Text("None").tag(ProcessorBackend.none)
                             Text("GraXpert").tag(ProcessorBackend.graxpert)
+                            Text("Native NR").tag(ProcessorBackend.nativeDenoise)
                         }
                         .pickerStyle(.segmented)
                         .disabled(model.isRunning || model.importer.isImporting || model.importer.isProcessing)
-                        .help("After stacking, optionally run GraXpert (background extraction + denoise) to write a master_processed FITS next to the raw master. Requires GraXpert installed.")
+                        .help("After stacking, optionally post-process the master to a master_processed FITS: GraXpert (background extraction + denoise, requires install) or the built-in Native NR denoiser.")
                     }
                     if model.sourceMode == .nativeStack {
                         Section("Calibration") {
@@ -696,14 +697,17 @@ struct ControlView: View {
                         }
                     }
                 }
-                if model.processorBackend == .graxpert, model.sourceMode == .nativeStack, let dir = model.lastSessionDirectory {
+                if model.processorBackend != .none, model.sourceMode == .nativeStack, let dir = model.lastSessionDirectory {
                     Button(model.importer.isProcessing ? "Processing…" : "Process master") {
                         model.importer.processMaster(sessionDirectory: dir)
                     }
-                    .disabled(model.importer.isProcessing || GraXpertProcessor.defaultExecutable() == nil)
-                    .help(GraXpertProcessor.defaultExecutable() == nil
-                          ? "GraXpert not found — install from graxpert.com"
-                          : "Run GraXpert on the last stacked master → master_processed FITS")
+                    .disabled(model.importer.isProcessing
+                              || (model.processorBackend == .graxpert && GraXpertProcessor.defaultExecutable() == nil))
+                    .help(model.processorBackend == .graxpert
+                          ? (GraXpertProcessor.defaultExecutable() == nil
+                             ? "GraXpert not found — install from graxpert.com"
+                             : "Run GraXpert on the last stacked master → master_processed FITS")
+                          : "Run the native denoiser on the last stacked master → master_processed FITS")
                 }
                 if model.importer.isGeneratingReplay { ProgressView("Rendering replay…") }
                 Text(appVersionText)
