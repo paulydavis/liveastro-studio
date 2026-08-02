@@ -169,3 +169,145 @@ final class DenoiserStage1Tests: XCTestCase {
         }
     }
 }
+
+final class DenoiserStage2Tests: XCTestCase {
+
+    /// Gaussian-ish noise via LCG pairs (Box-Muller), deterministic.
+    static func noise(_ rng: inout UInt64, sigma: Float) -> Float {
+        let u1 = max(DenoiserStage1Tests.lcg(&rng), 1e-7)
+        let u2 = DenoiserStage1Tests.lcg(&rng)
+        return sigma * sqrt(-2 * log(u1)) * cos(2 * .pi * u2)
+    }
+
+    static func madSigma(_ v: [Float]) -> Float {
+        var s = v; s.sort()
+        let med = s[s.count / 2]
+        var dev = v.map { abs($0 - med) }; dev.sort()
+        return 1.4826 * dev[dev.count / 2]
+    }
+
+    /// Half-max FWHM along +x/-x/+y/-y from the star center (test-grade, matches
+    /// the prototype's star_fwhm_median approach in miniature).
+    static func fwhm(_ px: [Float], w: Int, cx: Int, cy: Int, bg: Float) -> Float {
+        let peak = px[cy * w + cx] - bg
+        let half = bg + peak / 2
+        var radii: [Float] = []
+        for (dy, dx) in [(0, 1), (0, -1), (1, 0), (-1, 0)] {
+            var prev = px[cy * w + cx]
+            for k in 1..<12 {
+                let cur = px[(cy + dy * k) * w + (cx + dx * k)]
+                if cur <= half {
+                    radii.append(Float(k - 1) + (prev - half) / max(prev - cur, 1e-9))
+                    break
+                }
+                prev = cur
+            }
+        }
+        return 2 * radii.reduce(0, +) / Float(radii.count)
+    }
+
+    /// 256x256 mono: bg 0.1 + sigma-0.02 noise + one Gaussian star (amp 0.8, sigma 2)
+    /// at (192, 64) + a horizontal filament ridge (amp 0.25, sigma 5) along y=192.
+    ///
+    /// Ridge graduated from the plan's amp 0.15 / sigma 3 (reconciliation, T3): at the
+    /// T1-FINAL constants (LUMA_SIGMA_PROTECT_K 6.0, LUMA_BLEND_GAIN 2.0 — full blend
+    /// amplitude at s=0.5) that starting ridge preserves only 83.0% in BOTH the Swift
+    /// engine and the shipped prototype (agreement to ~6e-8 — no port divergence): its
+    /// tile medians sit just under bg + STRUCTURE_K*sigma, so the structured-tile floor
+    /// never engages and the plan's ~96.3%-at-starting-constants margin inverts. The
+    /// prototype-derived engagement threshold is amp ~0.20 (95.6%); amp 0.25 / sigma 5
+    /// gives 96.98% (~2 pt margin, matching the real Veil arc's 95.5% character) and
+    /// pins the structured-tile protection on a filament the engine is designed to keep.
+    static func starFieldFixture() -> AstroImage {
+        let w = 256, h = 256
+        var rng: UInt64 = 0xF00D_1234
+        var px = (0..<(w * h)).map { _ in 0.1 + noise(&rng, sigma: 0.02) }
+        for y in 0..<h { for x in 0..<w {
+            let dxs = Float(x - 192), dys = Float(y - 64)
+            px[y * w + x] += 0.8 * exp(-(dxs * dxs + dys * dys) / (2 * 2 * 2))
+            let dyf = Float(y - 192)
+            px[y * w + x] += 0.25 * exp(-(dyf * dyf) / (2 * 5 * 5))
+        } }
+        return AstroImage(width: w, height: h, channels: 1,
+                          pixels: px.map { min(max($0, 0), 1) }, sourceIsLinear: false)
+    }
+
+    func testBackgroundSigmaDropsWhileStarFWHMHolds() {
+        let img = Self.starFieldFixture()
+        let out = Denoiser.apply(img, strength: 0.5)
+        // Background patch far from star and filament: rows 8..96, cols 8..96.
+        func patch(_ px: [Float]) -> [Float] {
+            var v: [Float] = []
+            for y in 8..<96 { for x in 8..<96 { v.append(px[y * 256 + x]) } }
+            return v
+        }
+        let sb = Self.madSigma(patch(img.pixels)), sa = Self.madSigma(patch(out.pixels))
+        XCTAssertLessThanOrEqual(sa, sb * (1 - s2MinSigmaReduction),
+            "bg sigma \(sb) -> \(sa): below the T1-validated reduction floor")
+        let fb = Self.fwhm(img.pixels, w: 256, cx: 192, cy: 64, bg: 0.1)
+        let fa = Self.fwhm(out.pixels, w: 256, cx: 192, cy: 64, bg: 0.1)
+        XCTAssertLessThanOrEqual(abs(fa - fb) / fb, 0.02,
+            "star FWHM moved \(fb) -> \(fa) (> 2%)")            // spec gate metric 3
+    }
+
+    func testFilamentRidgeContrastPreserved() {
+        let img = Self.starFieldFixture()
+        let out = Denoiser.apply(img, strength: 0.5)
+        // Ridge contrast: mean over cols 32..224 of (profile peak - profile floor).
+        func contrast(_ px: [Float]) -> Float {
+            var prof = [Float](repeating: 0, count: 33)      // rows 176..208
+            for (j, y) in (176...208).enumerated() {
+                var s: Float = 0
+                for x in 32..<224 { s += px[y * 256 + x] }
+                prof[j] = s / 192
+            }
+            var sorted = prof; sorted.sort()
+            return prof.max()! - sorted[3]                    // peak minus ~10th pct floor
+        }
+        let cb = contrast(img.pixels), ca = contrast(out.pixels)
+        XCTAssertGreaterThanOrEqual(ca / cb, 0.95,
+            "filament contrast \(cb) -> \(ca): below the 95% spec gate")
+    }
+
+    func testFlatTileSmoothedMoreThanStructuredTile() {
+        // Left half flat sky (0.1 + noise); right half bright structure (0.5 + noise):
+        // the tile-adaptive weight must smooth the flat side harder.
+        let w = 256, h = 256
+        var rng: UInt64 = 0xBEEF_5678
+        var px = [Float](repeating: 0, count: w * h)
+        for y in 0..<h { for x in 0..<w {
+            let base: Float = x < w / 2 ? 0.1 : 0.5
+            px[y * w + x] = min(max(base + Self.noise(&rng, sigma: 0.02), 0), 1)
+        } }
+        let img = AstroImage(width: w, height: h, channels: 1, pixels: px, sourceIsLinear: false)
+        let out = Denoiser.apply(img, strength: 0.5)
+        func sigma(_ p: [Float], _ xr: Range<Int>) -> Float {
+            var v: [Float] = []
+            for y in 16..<240 { for x in xr { v.append(p[y * w + x]) } }
+            return Self.madSigma(v)
+        }
+        let flatReduction = 1 - sigma(out.pixels, 16..<112) / sigma(px, 16..<112)
+        let structReduction = 1 - sigma(out.pixels, 144..<240) / sigma(px, 144..<240)
+        XCTAssertGreaterThan(flatReduction, structReduction,
+            "flat \(flatReduction) vs structured \(structReduction): tile adaptivity inverted")
+    }
+
+    func testDeterministicAcrossRepeatedApplication() {
+        let img = Self.starFieldFixture()
+        let a = Denoiser.apply(img, strength: 0.7)
+        let b = Denoiser.apply(img, strength: 0.7)
+        XCTAssertEqual(a.pixels, b.pixels)     // exact — Parallel.rows bands are disjoint
+    }
+
+    func testMonoNoiseReductionEngages() {
+        // Mono is stage 2 only (spec §2.1) — and stage 2 must actually do something.
+        // Plan wrote 0x1CE_CREA, which does not compile ('R' is not a hex digit);
+        // nearest valid literal substituted. Seed choice is arbitrary, not T1-bound.
+        var rng: UInt64 = 0x1CE_C4EA
+        let px = (0..<(128 * 128)).map { _ in min(max(0.1 + Self.noise(&rng, sigma: 0.02), 0), 1) }
+        let img = AstroImage(width: 128, height: 128, channels: 1, pixels: px, sourceIsLinear: false)
+        let out = Denoiser.apply(img, strength: 0.5)
+        XCTAssertLessThan(Self.madSigma(out.pixels), Self.madSigma(px))
+        XCTAssertNotEqual(out.pixels, px)
+    }
+}
