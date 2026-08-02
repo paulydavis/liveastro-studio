@@ -438,6 +438,13 @@ struct ControlView: View {
                             }
                             .help("Extra blur on the background model — raise to remove residual blotchiness, lower to track non-smooth gradients.")
                         }
+                        VStack(alignment: .leading) {
+                            Text("Denoise")
+                            Slider(value: $model.displayAdjustments.denoiseStrength, in: 0...1) { editing in
+                                if !editing { model.applyDisplayAdjustments() }
+                            }
+                            .help("Classic noise reduction — smooths background grain and color mottle on the displayed stack. 0 = off. master.fit is never modified.")
+                        }
                         Button("Reset") {
                             model.displayAdjustments = .neutral
                             model.applyDisplayAdjustments()

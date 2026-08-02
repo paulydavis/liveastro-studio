@@ -359,7 +359,14 @@ public final class SessionPipeline {
         let stretched = balanced.sourceIsLinear
             ? AutoStretch.stretch(balanced, blackPoint: adj.blackPoint, midtoneStrength: adj.midtoneStrength)
             : balanced
-        let display = AutoStretch.applySaturation(stretched, adj.saturation)
+        // Denoise AFTER stretch + DBE (the targeted noise is the post-stretch
+        // appearance) and BEFORE saturation/packing, so broadcast, snapshots,
+        // latest.png and replay all inherit it while master.fit stays raw (spec §2.2).
+        // Clamp on APPLY, not in the struct (DisplayAdjustments convention).
+        let denoised = adj.denoiseStrength > 0
+            ? Denoiser.apply(stretched, strength: Float(min(max(adj.denoiseStrength, 0), 1)))
+            : stretched
+        let display = AutoStretch.applySaturation(denoised, adj.saturation)
         guard let cg = AutoStretch.makeCGImage(display) else {
             throw ImageLoaderError.decodeFailed("CGImage packing")
         }
