@@ -13,6 +13,18 @@ import Combine
 /// SwiftUI observers update safely. The underlying `OBSClient` is an actor;
 /// we `await` into it. Combine/`ObservableObject` is Foundation-level and keeps
 /// LiveAstroCore free of SwiftUI/AppKit.
+/// One source in an OBS scene, as reported by GetSceneItemList (preflight
+/// spec §3 — the provisioning primitives' read model).
+public struct OBSSceneItem: Equatable {
+    public let inputName: String
+    public let inputKind: String
+
+    public init(inputName: String, inputKind: String) {
+        self.inputName = inputName
+        self.inputKind = inputKind
+    }
+}
+
 @MainActor
 public final class OBSController: ObservableObject {
 
@@ -301,6 +313,60 @@ public final class OBSController: ObservableObject {
     @discardableResult
     public func setRecording(_ on: Bool) async -> Bool {
         await requestData(on ? "StartRecord" : "StopRecord", nil) != nil
+    }
+
+    // MARK: - Provisioning primitives (preflight spec §3 — additive only; this
+    // controller deliberately has NO remove/delete/rename request anywhere).
+
+    public func sceneItemList(scene: String) async -> [OBSSceneItem]? {
+        guard let data = await requestData("GetSceneItemList", ["sceneName": scene]),
+              let items = data["sceneItems"] as? [[String: Any]] else { return nil }
+        return items.compactMap { item in
+            guard let name = item["sourceName"] as? String else { return nil }
+            return OBSSceneItem(inputName: name,
+                                inputKind: item["inputKind"] as? String ?? "")
+        }
+    }
+
+    public func inputSettings(inputName: String) async -> [String: Any]? {
+        guard let data = await requestData("GetInputSettings", ["inputName": inputName])
+        else { return nil }
+        return data["inputSettings"] as? [String: Any] ?? [:]
+    }
+
+    public func setInputSettings(inputName: String, settings: [String: Any]) async -> Bool {
+        await requestData("SetInputSettings",
+                          ["inputName": inputName, "inputSettings": settings,
+                           "overlay": true]) != nil
+    }
+
+    public func createInput(scene: String, inputName: String,
+                            inputKind: String, settings: [String: Any]) async -> Bool {
+        await requestData("CreateInput",
+                          ["sceneName": scene, "inputName": inputName,
+                           "inputKind": inputKind, "inputSettings": settings]) != nil
+    }
+
+    public func createScene(_ name: String) async -> Bool {
+        await requestData("CreateScene", ["sceneName": name]) != nil
+    }
+
+    /// Fetch the scene names as a value (the same GetSceneList `refreshScenes`
+    /// issues, in OBS's own order), without touching the published state.
+    public func sceneNames() async -> [String]? {
+        guard let data = await requestData("GetSceneList", nil),
+              let scenes = data["scenes"] as? [[String: Any]] else { return nil }
+        return scenes.compactMap { $0["sceneName"] as? String }
+    }
+
+    /// Presence-only stream-key check (spec §3). The key value never reaches a
+    /// log, a published property, or a thrown error — only this Bool leaves.
+    public func streamServiceKeyPresent() async -> Bool? {
+        guard let data = await requestData("GetStreamServiceSettings", nil),
+              let settings = data["streamServiceSettings"] as? [String: Any]
+        else { return nil }
+        let key = settings["key"] as? String ?? ""
+        return !key.isEmpty
     }
 
     // MARK: - Broadcast operations
