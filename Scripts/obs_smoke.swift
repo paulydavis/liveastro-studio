@@ -97,5 +97,59 @@ func run() async -> Int32 {
     return 0
 }
 
+// MARK: - --probe-capture
+
+// --probe-capture: dump every input's kind + settings so the provisioning
+// schema is copied from a REAL OBS, not docs. Usage:
+//   1. In OBS: add a "macOS Screen Capture" source to any scene, set
+//      Method: Window Capture, pick the "LiveAstro Broadcast" window.
+//   2. swift Scripts/obs_smoke.swift "<OBS_WEBSOCKET_PASSWORD>" --probe-capture
+//
+// NOTE: this script's password/host/port handling differs from the plan's
+// example invocation (password is argv[1]; host/port are the hardcoded
+// `host`/`port` constants above, not CLI args) — invoke accordingly.
+@MainActor
+func runProbeCapture() async -> Int32 {
+    let client = OBSClient(socket: URLSessionOBSSocket())
+    do {
+        guard let url = URL(string: "ws://\(host):\(port)") else {
+            print("PROBE FAIL: bad URL")
+            return 1
+        }
+        try await client.connect(url: url, password: password.isEmpty ? nil : password)
+
+        let versionData = try await client.request("GetVersion", data: nil)
+        let obsVersion = versionData["obsVersion"] as? String ?? "?"
+        let wsVersion = versionData["obsWebSocketVersion"] as? String ?? "?"
+        print("obsVersion: \(obsVersion)  (obs-websocket \(wsVersion))")
+
+        let inputs = try await client.request("GetInputList", data: nil)
+        guard let list = inputs["inputs"] as? [[String: Any]] else {
+            print("PROBE FAIL: GetInputList unexpected shape \(inputs)")
+            return 1
+        }
+        for input in list {
+            let name = input["inputName"] as? String ?? "?"
+            let kind = input["inputKind"] as? String ?? "?"
+            let settings = try await client.request("GetInputSettings", data: ["inputName": name])
+            print("=== input \(name) kind=\(kind)")
+            print(String(data: try JSONSerialization.data(
+                withJSONObject: settings["inputSettings"] ?? [:],
+                options: [.prettyPrinted, .sortedKeys]), encoding: .utf8)!)
+        }
+
+        await client.disconnect()
+        return 0
+    } catch {
+        print("PROBE FAIL: \(error)")
+        return 1
+    }
+}
+
+if CommandLine.arguments.contains("--probe-capture") {
+    let exitCode = await runProbeCapture()
+    exit(exitCode)
+}
+
 let exitCode = await run()
 exit(exitCode)
