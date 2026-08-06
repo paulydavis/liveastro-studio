@@ -1,18 +1,6 @@
 import Foundation
 import Combine
 
-/// High-level, UI-facing controller over `OBSClient`.
-///
-/// Owns the connection lifecycle and a small observable state machine
-/// (`disconnected → connecting → connected → streaming`) plus scene/recording
-/// state. All operations except `connect` swallow errors into `onLog` so the
-/// UI never has to `try`; `connect` returns `Bool` so a caller (AppModel, Task 7)
-/// can drive reconnect/backoff.
-///
-/// `@MainActor`: every `@Published` mutation happens on the main actor, so
-/// SwiftUI observers update safely. The underlying `OBSClient` is an actor;
-/// we `await` into it. Combine/`ObservableObject` is Foundation-level and keeps
-/// LiveAstroCore free of SwiftUI/AppKit.
 /// One source in an OBS scene, as reported by GetSceneItemList (preflight
 /// spec §3 — the provisioning primitives' read model).
 public struct OBSSceneItem: Equatable {
@@ -25,6 +13,18 @@ public struct OBSSceneItem: Equatable {
     }
 }
 
+/// High-level, UI-facing controller over `OBSClient`.
+///
+/// Owns the connection lifecycle and a small observable state machine
+/// (`disconnected → connecting → connected → streaming`) plus scene/recording
+/// state. All operations except `connect` swallow errors into `onLog` so the
+/// UI never has to `try`; `connect` returns `Bool` so a caller (AppModel, Task 7)
+/// can drive reconnect/backoff.
+///
+/// `@MainActor`: every `@Published` mutation happens on the main actor, so
+/// SwiftUI observers update safely. The underlying `OBSClient` is an actor;
+/// we `await` into it. Combine/`ObservableObject` is Foundation-level and keeps
+/// LiveAstroCore free of SwiftUI/AppKit.
 @MainActor
 public final class OBSController: ObservableObject {
 
