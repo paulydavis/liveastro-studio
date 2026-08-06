@@ -136,6 +136,15 @@ func runProbeCapture() async -> Int32 {
             print(String(data: try JSONSerialization.data(
                 withJSONObject: settings["inputSettings"] ?? [:],
                 options: [.prettyPrinted, .sortedKeys]), encoding: .utf8)!)
+
+            if kind == "screen_capture" {
+                let propItems = try await client.request("GetInputPropertiesListPropertyItems",
+                                                          data: ["inputName": name, "propertyName": "window"])
+                print("--- window picker items ---")
+                print(String(data: try JSONSerialization.data(
+                    withJSONObject: propItems["propertyItems"] ?? [],
+                    options: [.prettyPrinted, .sortedKeys]), encoding: .utf8)!)
+            }
         }
 
         await client.disconnect()
