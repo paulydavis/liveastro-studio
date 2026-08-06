@@ -1821,6 +1821,30 @@ final class BroadcastControllerTests: XCTestCase {
                        "a correctly-targeted capture must not be rewritten")
     }
 
+    /// Adopt-by-target (T5 review I-2): the user's OWN capture input — their
+    /// name, not ours — already targets the current broadcast window. It is
+    /// adopted untouched: no CreateInput, no SetInputSettings, no CreateScene.
+    func testAdoptByTargetAdoptsUsersOwnCaptureWithoutModifyingIt() async {
+        let h = await makeHarness()
+        h.server.sceneItems = [["sourceName": "macOS Screen Capture",
+                                "inputKind": OBSCaptureSchema.inputKind]]
+        h.server.inputSettings = ["macOS Screen Capture": ["type": 1, "window": 4242]]
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+
+        XCTAssertEqual(h.controller.preflight[.sceneCapture], .ok)
+        let types = sentTypes(h.mock)
+        XCTAssertFalse(types.contains("CreateInput"),
+                       "an adopted user capture must not be re-created")
+        XCTAssertFalse(types.contains("SetInputSettings"),
+                       "a correctly-targeted user capture must never be rewritten")
+        XCTAssertFalse(types.contains("CreateScene"),
+                       "the user's scene already exists — never create another")
+        XCTAssertTrue(h.box.logs.contains {
+            $0.contains("adopted existing capture 'macOS Screen Capture'")
+        }, "the adopt must go through the by-target path — got \(h.box.logs)")
+    }
+
     /// The T1 probe's real-world case: the persisted window id went stale
     /// (window recreated since the last stream). The capture is REPAIRED with
     /// exactly one SetInputSettings targeting the current id — never recreated.
@@ -1993,8 +2017,9 @@ final class BroadcastControllerTests: XCTestCase {
     }
 
     /// The plan's no-removal invariant, pinned across EVERY preflight
-    /// scenario: happy/adopt, repair, create-into-scene, and create-scene runs
-    /// together never send a removal- or rename-type request.
+    /// scenario: happy/adopt-by-name, repair, create-into-scene, create-scene,
+    /// and adopt-by-target runs together never send a removal- or rename-type
+    /// request.
     func testNoRemovalTypeRequestEverSent() async {
         var union = Set<String>()
 
@@ -2030,6 +2055,16 @@ final class BroadcastControllerTests: XCTestCase {
             h.server.scenes = []
             h.server.sceneItems = []
             h.server.inputSettings = [:]
+            h.controller.goLive()
+            await waitUntil { h.controller.broadcastState == .live }
+            union.formUnion(sentTypes(h.mock))
+        }
+        // Adopt-by-target (the user's own correctly-targeted capture).
+        do {
+            let h = await makeHarness()
+            h.server.sceneItems = [["sourceName": "macOS Screen Capture",
+                                    "inputKind": OBSCaptureSchema.inputKind]]
+            h.server.inputSettings = ["macOS Screen Capture": ["type": 1, "window": 4242]]
             h.controller.goLive()
             await waitUntil { h.controller.broadcastState == .live }
             union.formUnion(sentTypes(h.mock))

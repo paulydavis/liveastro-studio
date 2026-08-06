@@ -836,6 +836,12 @@ public final class BroadcastController {
         connectingOrigin = origin   // review10 finding 4: teardown returns here
         broadcastState = .connecting
         goLiveTask = Task { @MainActor in
+            // T5 review I-1: the task is ENQUEUED, not started, when goLive()
+            // returns — a same-segment canceller (endBroadcast/disconnect/
+            // sessionDidEnd) may have superseded this generation before the
+            // body ever runs. Guard before ANY mutation: a superseded task
+            // writes nothing.
+            guard gen == broadcastGeneration, !Task.isCancelled else { return }
             // T5 stages 1+2: OBS running + control link connected.
             preflight.set(.obsRunning, .checking)
             preflight.set(.connected, .checking)
