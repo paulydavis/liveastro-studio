@@ -429,10 +429,10 @@ git commit -m "feat: OBSController v5 provisioning primitives (additive only)"
 
 **Interfaces:**
 - Consumes: Task 2 `PreflightState`, Task 3 `OBSLocalConfig`, Task 4 primitives, Task 1 schema record.
-- Produces:
-  - `enum OBSCaptureSchema` — `static let inputKind: String`; `static func settings(windowTitle: String) -> [String: Any]`; `static func targetsWindow(_ settings: [String: Any], title: String) -> Bool`. **Constants verbatim from the Task 1 probe record** (`docs/superpowers/reviews/2026-08-06-obs-capture-schema.md`).
+- Produces (AMENDED per the T1 probe — OBS 32 binds window capture by numeric CGWindowID only; no title string exists in settings, and saved ids go stale across window recreation, so the id is re-derived from our own window at every Go Live):
+  - `enum OBSCaptureSchema` — `static let inputKind = "screen_capture"`; `static func settings(windowID: UInt32) -> [String: Any]` → `["type": 1, "window": Int(windowID)]` (type 1 = Window Capture; SetInputSettings overlays, so display/show keys are left to OBS defaults); `static func targetsWindow(_ settings: [String: Any], windowID: UInt32) -> Bool` → true iff `settings["type"] as? Int == 1 && settings["window"] as? Int == Int(windowID)`. Grounded in `docs/superpowers/reviews/2026-08-06-obs-capture-schema.md`.
   - `BroadcastController.preflight: PreflightState` (observable, `private(set)`).
-  - `BroadcastDeps` gains `public var openBroadcastWindow: () -> Void = {}` and `public var broadcastWindowTitleRegistered: () -> Bool = { true }` (app wires these in Task 6; defaults keep existing tests source-compatible).
+  - `BroadcastDeps` gains `public var openBroadcastWindow: () -> Void = {}` and `public var broadcastWindowID: () -> UInt32? = { nil }` (current CGWindowID of the "LiveAstro Broadcast" window, nil until it exists; app wires these in Task 6; defaults keep existing tests source-compatible).
   - `static let captureInputName = "LiveAstro Stack"`, `static let starterSceneName = "LiveAstro"` on `BroadcastController`.
   - `public var localConfigURLOverride: URL?` on `BroadcastController` (tests point it at fixtures; nil → `OBSLocalConfig.defaultURL`).
 
@@ -444,9 +444,10 @@ Append to `BroadcastControllerTests.swift`, using its existing controller+script
 // MARK: - Preflight
 
 func testGoLiveHappyChainTurnsAllLinksGreen() async {
-    // Script: connect ok; GetStreamStatus/GetRecordStatus inactive;
-    // GetSceneItemList → [{"sourceName":"LiveAstro Stack","inputKind":OBSCaptureSchema.inputKind}];
-    // GetInputSettings → OBSCaptureSchema.settings(windowTitle:"LiveAstro Broadcast");
+    // deps.broadcastWindowID = { 4242 }. Script: connect ok; GetStreamStatus/
+    // GetRecordStatus inactive; GetSceneItemList →
+    // [{"sourceName":"LiveAstro Stack","inputKind":OBSCaptureSchema.inputKind}];
+    // GetInputSettings → {"type":1,"window":4242};
     // GetStreamServiceSettings → key "k"; StartStream ok + stream-started event.
     // Assert: broadcastState == .live and every PreflightLink is .ok.
 }
@@ -455,9 +456,10 @@ func testAdoptByNameSkipsCreateAndRepair() async {
     // and NO "SetInputSettings".
 }
 func testMistargetedCaptureIsRepairedNotRecreated() async {
-    // GetInputSettings → OBSCaptureSchema.settings(windowTitle:"Some Other Window").
-    // Assert exactly one "SetInputSettings" sent with settings where
-    // OBSCaptureSchema.targetsWindow(_, title: "LiveAstro Broadcast"); no "CreateInput".
+    // deps.broadcastWindowID = { 4242 }; GetInputSettings → {"type":1,"window":999}
+    // (stale id — the T1 probe's real-world case). Assert exactly one
+    // "SetInputSettings" sent whose settings satisfy
+    // OBSCaptureSchema.targetsWindow(_, windowID: 4242); no "CreateInput".
 }
 func testMissingCaptureIsCreatedIntoUsersScene() async {
     // GetSceneItemList → [{"sourceName":"Paul Camera","inputKind":"macos-avcapture"}].
@@ -518,29 +520,32 @@ Expected: compile failure — `preflight` / `OBSCaptureSchema` not defined.
 ```swift
 import Foundation
 
-/// Wire schema for the macOS window-capture input, copied VERBATIM from the
-/// Task-1 probe of real OBS 32 (docs/superpowers/reviews/2026-08-06-obs-
-/// capture-schema.md). If the probe record and these constants disagree, the
+/// Wire schema for the macOS window-capture input, grounded in the Task-1
+/// probe of real OBS 32.1.2 (docs/superpowers/reviews/2026-08-06-obs-capture-
+/// schema.md). OBS persists the binding ONLY as a numeric CGWindowID
+/// ("window") plus a capture-mode discriminator ("type": 1 = Window Capture);
+/// there is NO title/owner string in settings, and a saved id goes stale when
+/// the window is recreated — callers re-derive the id from the live broadcast
+/// window at every Go Live. If the probe record and this file disagree, the
 /// probe record wins — re-run the probe before editing here.
 enum OBSCaptureSchema {
-    static let inputKind = "<VERBATIM FROM PROBE — expected \"screen_capture\">"
+    static let inputKind = "screen_capture"
 
-    /// Settings that bind the capture to the broadcast window by title.
-    static func settings(windowTitle: String) -> [String: Any] {
-        // <VERBATIM KEYS FROM PROBE> — e.g. ["type": 2, "window_name": windowTitle, ...]
-        // The implementer fills the exact dictionary from the probe record.
-        [:]
+    /// Minimal settings that (re)bind the capture to our window. Applied via
+    /// SetInputSettings with overlay:true, so OBS keeps its own defaults for
+    /// display_uuid / show_* keys.
+    static func settings(windowID: UInt32) -> [String: Any] {
+        ["type": 1, "window": Int(windowID)]
     }
 
-    /// Does an existing input's settings target our window?
-    static func targetsWindow(_ settings: [String: Any], title: String) -> Bool {
-        // Compare the probe-identified binding key(s) against `title`.
-        false
+    /// Does an existing input's settings target our window RIGHT NOW?
+    static func targetsWindow(_ settings: [String: Any], windowID: UInt32) -> Bool {
+        settings["type"] as? Int == 1 && settings["window"] as? Int == Int(windowID)
     }
 }
 ```
 
-The two bodies are filled from the probe record — the plan cannot know OBS's exact keys ahead of the gate; the probe record is the single source, and the Task-5 reviewer must diff the constants against `2026-08-06-obs-capture-schema.md`.
+The T5 reviewer must diff this file against `2026-08-06-obs-capture-schema.md`. Because CGWindowIDs are per-window-instance, the repair path is EXPECTED to fire on the first Go Live of each app launch — that is correct behavior, not churn; the log line should read as a rebind, not an error.
 
 - [ ] **Step 4: Implement the stages in BroadcastController**
 
@@ -579,10 +584,18 @@ private var discoveredPasswordFromConfig = false
 private func ensureCaptureStage(gen: Int) async -> Bool {
     preflight.set(.sceneCapture, .checking)
     deps.openBroadcastWindow()
-    // Bounded wait for the window-server title (OBS binds by title).
-    for _ in 0..<20 where !deps.broadcastWindowTitleRegistered() {
+    // Bounded wait for the broadcast window's CGWindowID (OBS binds by id;
+    // T1 probe: ids are per-window-instance, so this is re-derived every time).
+    var windowID: UInt32?
+    for _ in 0..<20 {
+        windowID = deps.broadcastWindowID()
+        if windowID != nil { break }
         try? await Task.sleep(nanoseconds: 100_000_000)
         guard gen == broadcastGeneration, !Task.isCancelled else { return false }
+    }
+    guard let id = windowID else {
+        return failCapture("Broadcast window did not appear",
+                           "Open the broadcast window (Detach), then Go Live again")
     }
     var scene = stackSceneName
     if scene.isEmpty {
@@ -604,28 +617,29 @@ private func ensureCaptureStage(gen: Int) async -> Bool {
           gen == broadcastGeneration
     else { return failCapture("Could not read scene '\(scene)'",
                               "Check the OBS connection, then Go Live again") }
-    let title = "LiveAstro Broadcast"
     if items.contains(where: { $0.inputName == Self.captureInputName }) {
         // Adopt by name; repair only if mistargeted.
         guard let settings = await obs.inputSettings(inputName: Self.captureInputName),
               gen == broadcastGeneration
         else { return failCapture("Could not read the capture source",
                                   "Check the OBS connection, then Go Live again") }
-        if !OBSCaptureSchema.targetsWindow(settings, title: title) {
+        if !OBSCaptureSchema.targetsWindow(settings, windowID: id) {
+            // Expected on the first Go Live of each launch: window ids are
+            // per-instance (T1 probe), so this is a rebind, not damage repair.
             guard await obs.setInputSettings(
                     inputName: Self.captureInputName,
-                    settings: OBSCaptureSchema.settings(windowTitle: title)),
+                    settings: OBSCaptureSchema.settings(windowID: id)),
                   gen == broadcastGeneration
             else { return failCapture("Could not retarget the capture source",
                                       "Point '\(Self.captureInputName)' at the LiveAstro Broadcast window in OBS") }
-            deps.log("OBS: repaired '\(Self.captureInputName)' → LiveAstro Broadcast window")
+            deps.log("OBS: rebound '\(Self.captureInputName)' to the current broadcast window")
         }
-    } else if let adopted = await adoptCaptureByTarget(items: items, title: title, gen: gen) {
+    } else if let adopted = await adoptCaptureByTarget(items: items, windowID: id, gen: gen) {
         if !adopted { return false }        // failure already recorded
     } else {
         guard await obs.createInput(scene: scene, inputName: Self.captureInputName,
                                     inputKind: OBSCaptureSchema.inputKind,
-                                    settings: OBSCaptureSchema.settings(windowTitle: title)),
+                                    settings: OBSCaptureSchema.settings(windowID: id)),
               gen == broadcastGeneration
         else { return failCapture("Could not add the capture source to '\(scene)'",
                                   "Add a macOS Screen Capture of the LiveAstro Broadcast window to that scene") }
@@ -639,11 +653,11 @@ private func ensureCaptureStage(gen: Int) async -> Bool {
 /// (pre-existing user setups keep their own source name). Returns nil when
 /// no candidate exists (caller creates), true on adopt, false on failure.
 private func adoptCaptureByTarget(items: [OBSSceneItem],
-                                  title: String, gen: Int) async -> Bool? {
+                                  windowID: UInt32, gen: Int) async -> Bool? {
     for item in items where item.inputKind == OBSCaptureSchema.inputKind {
         guard let settings = await obs.inputSettings(inputName: item.inputName),
               gen == broadcastGeneration else { return false }
-        if OBSCaptureSchema.targetsWindow(settings, title: title) {
+        if OBSCaptureSchema.targetsWindow(settings, windowID: windowID) {
             deps.log("OBS: adopted existing capture '\(item.inputName)'")
             preflight.set(.sceneCapture, .ok)
             return true
@@ -722,8 +736,9 @@ Where `BroadcastDeps` is constructed in `AppModel.swift`, add:
 
 ```swift
 deps.openBroadcastWindow = { [weak self] in self?.surface.openBroadcastWindow() }
-deps.broadcastWindowTitleRegistered = {
-    NSApp.windows.contains { $0.title == "LiveAstro Broadcast" }
+deps.broadcastWindowID = {
+    NSApp.windows.first { $0.title == "LiveAstro Broadcast" }
+        .map { UInt32($0.windowNumber) }   // NSWindow.windowNumber IS the CGWindowID
 }
 ```
 

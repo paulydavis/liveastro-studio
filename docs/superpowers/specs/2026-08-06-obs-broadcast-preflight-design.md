@@ -66,8 +66,12 @@ Single owner of broadcast choreography, three pieces:
   input already targeting the broadcast window (adopts pre-existing user setups without
   renaming). Found-but-mistargeted → `SetInputSettings` repair. Absent → `CreateInput` into
   the user's scene. No scenes at all → `CreateScene("LiveAstro")` + `CreateInput`. The
-  broadcast window is opened and confirmed registered with the window server (bounded retry)
-  first; `BroadcastWindowConfigurator`'s stable window-server title is the binding key.
+  broadcast window is opened and confirmed present (bounded retry) first.
+  *(Amended 2026-08-06 per the Task-1 probe: OBS 32 persists window capture as a numeric
+  CGWindowID only — no title string exists in settings, and saved ids go stale across window
+  recreation. The app therefore derives the id from its own window (`NSWindow.windowNumber`)
+  at every Go Live and rebinds the source when it differs; the title identifies our window
+  app-side only. A rebind on the first Go Live of each launch is expected behavior.)*
 - **Settings-schema gate (binding):** the exact macOS `screen_capture` input-kind settings
   schema (how OBS 32 encodes "capture this window") is probed against real OBS during
   implementation — create the source by hand once, `GetInputSettings`, copy the schema
