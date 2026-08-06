@@ -24,6 +24,7 @@ final class BroadcastControllerTests: XCTestCase {
         var errors: [String] = []
         var sessionRunning = true
         var launchRequests = 0
+        var windowOpenRequests = 0
     }
 
     final class WeakBox<T: AnyObject> {
@@ -56,12 +57,20 @@ final class BroadcastControllerTests: XCTestCase {
             log: { box.logs.append($0) },
             presentError: { box.errors.append($0) },
             isSessionRunning: { box.sessionRunning },
-            launchOBS: { box.launchRequests += 1 }))
+            launchOBS: { box.launchRequests += 1 },
+            openBroadcastWindow: { box.windowOpenRequests += 1 },
+            broadcastWindowID: { 4242 }))
         controller.confirmPollSeconds = 0
         controller.maxConfirmPolls = 2
         controller.launchRetryDelaySeconds = 0.01
         controller.launchRetryBudgetSeconds = 0.05
         controller.healthPollIntervalSeconds = 0.02
+        // T5 hermeticity: goLive's local-config discovery must never read the
+        // developer machine's real OBS config file — point it at a path that
+        // cannot exist. The config-discovery tests override this with their
+        // own fixture files.
+        controller.localConfigURLOverride = URL(
+            fileURLWithPath: "/nonexistent-\(UUID().uuidString)/config.json")
 
         if connect {
             mock.enqueueInbound(helloFrame())
@@ -1739,5 +1748,332 @@ final class BroadcastControllerTests: XCTestCase {
         h.server.parkTypes = []
         h.mock.enqueueInbound(responseFrame(requestId: h.server.parked[1].id, ok: true))
         await waitUntil { h.controller.broadcastState == .idle }
+    }
+
+    // MARK: - Preflight
+
+    /// True when `link` is currently `.failed` (associated values ignored).
+    private func linkFailed(_ controller: BroadcastController,
+                            _ link: PreflightLink) -> Bool {
+        if case .failed = controller.preflight[link] { return true }
+        return false
+    }
+
+    /// Payloads (`requestData`) of every sent op-6 request of `type`, in order.
+    private func sentPayloads(_ type: String, _ mock: MockOBSSocket) -> [[String: Any]] {
+        mock.sentFrames
+            .filter { $0.contains("\"op\":6") && requestType(fromSent: $0) == type }
+            .map { requestPayload(fromSent: $0) }
+    }
+
+    /// Write an obs-websocket config.json fixture; returns its URL.
+    private func writeConfigFixture(_ json: String) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("las-preflight-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("config.json")
+        try Data(json.utf8).write(to: url)
+        return url
+    }
+
+    /// Script a server that REQUIRES auth: the Identify must carry the auth
+    /// string derived from `expectedPassword` (+ the hello's salt/challenge) or
+    /// the handshake is refused (a non-Identified reply → the client fails).
+    private func installAuthRequiringResponder(_ h: Harness, salt: String,
+                                               challenge: String,
+                                               expectedPassword: String) {
+        let expected = OBSAuth.authString(password: expectedPassword,
+                                          salt: salt, challenge: challenge)
+        let base = h.server.responder()
+        h.mock.replyToLastSent { sent in
+            if sent.contains("\"op\":1") {
+                return identifyAuth(fromSent: sent) == expected
+                    ? identifiedFrame
+                    : #"{"op":9,"d":{}}"#   // not Identified → client throws authFailed
+            }
+            return base(sent)
+        }
+    }
+
+    /// Happy chain: connect ok, both outputs inactive, the capture input is
+    /// already in the scene and targets the current window id (4242), the
+    /// stream key is present, StartStream confirms. Every link ends green.
+    func testGoLiveHappyChainTurnsAllLinksGreen() async {
+        let h = await makeHarness()
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        XCTAssertEqual(h.controller.broadcastState, .live)
+        for link in PreflightLink.chainOrder {
+            XCTAssertEqual(h.controller.preflight[link], .ok, "\(link) must be .ok")
+        }
+    }
+
+    /// Adopt-by-name: a correctly-targeted "LiveAstro Stack" is adopted as-is —
+    /// no CreateInput, no SetInputSettings (additive AND quiet).
+    func testAdoptByNameSkipsCreateAndRepair() async {
+        let h = await makeHarness()
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        let types = sentTypes(h.mock)
+        XCTAssertFalse(types.contains("CreateInput"),
+                       "an adopted capture must not be re-created")
+        XCTAssertFalse(types.contains("SetInputSettings"),
+                       "a correctly-targeted capture must not be rewritten")
+    }
+
+    /// The T1 probe's real-world case: the persisted window id went stale
+    /// (window recreated since the last stream). The capture is REPAIRED with
+    /// exactly one SetInputSettings targeting the current id — never recreated.
+    func testMistargetedCaptureIsRepairedNotRecreated() async {
+        let h = await makeHarness()
+        h.server.inputSettings["LiveAstro Stack"] = ["type": 1, "window": 999]
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+
+        let repairs = sentPayloads("SetInputSettings", h.mock)
+        XCTAssertEqual(repairs.count, 1, "exactly one repair")
+        let settings = repairs.first?["inputSettings"] as? [String: Any] ?? [:]
+        XCTAssertTrue(OBSCaptureSchema.targetsWindow(settings, windowID: 4242),
+                      "the repair must retarget the CURRENT window id — got \(settings)")
+        XCTAssertEqual(sent("CreateInput", h.mock), 0, "repair, never recreate")
+        XCTAssertTrue(h.box.logs.contains { $0.contains("rebound") },
+                      "the rebind is logged as routine, not as damage — got \(h.box.logs)")
+    }
+
+    /// No capture in the user's scene: ONE CreateInput adds "LiveAstro Stack"
+    /// to the user's OWN scene with the probed input kind.
+    func testMissingCaptureIsCreatedIntoUsersScene() async {
+        let h = await makeHarness()
+        h.controller.stackSceneName = "Stack"
+        h.server.sceneItems = [["sourceName": "Paul Camera",
+                                "inputKind": "macos-avcapture"]]
+        h.server.inputSettings = [:]
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+
+        let creates = sentPayloads("CreateInput", h.mock)
+        XCTAssertEqual(creates.count, 1)
+        XCTAssertEqual(creates.first?["sceneName"] as? String, h.controller.stackSceneName)
+        XCTAssertEqual(creates.first?["inputName"] as? String, "LiveAstro Stack")
+        XCTAssertEqual(creates.first?["inputKind"] as? String, OBSCaptureSchema.inputKind)
+    }
+
+    /// Zero scenes in OBS (fresh install): the starter scene "LiveAstro" is
+    /// created, the capture goes into it, and it becomes the stack scene.
+    func testNoScenesCreatesStarterScene() async {
+        let h = await makeHarness()
+        h.controller.stackSceneName = ""
+        h.server.scenes = []
+        h.server.sceneItems = []
+        h.server.inputSettings = [:]
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+
+        let types = sentTypes(h.mock)
+        XCTAssertEqual(sentPayloads("CreateScene", h.mock).first?["sceneName"] as? String,
+                       "LiveAstro")
+        guard let sceneIdx = types.firstIndex(of: "CreateScene"),
+              let inputIdx = types.firstIndex(of: "CreateInput") else {
+            return XCTFail("CreateScene then CreateInput must both be sent — got \(types)")
+        }
+        XCTAssertLessThan(sceneIdx, inputIdx, "the scene must exist before the input")
+        XCTAssertEqual(sentPayloads("CreateInput", h.mock).first?["sceneName"] as? String,
+                       "LiveAstro")
+        XCTAssertEqual(h.controller.stackSceneName, "LiveAstro")
+    }
+
+    /// No stream key in OBS: the chain halts RED at .streamService with a
+    /// remedy pointing at OBS's stream settings; StartStream is never sent.
+    func testMissingStreamKeyHaltsChainRedWithRemedy() async {
+        let h = await makeHarness()
+        h.server.streamKey = ""
+        h.controller.goLive()
+        await waitUntil { self.linkFailed(h.controller, .streamService) }
+        await settle()
+
+        guard case let .failed(reason, remedy) = h.controller.preflight[.streamService] else {
+            return XCTFail("streamService must be .failed — got \(h.controller.preflight[.streamService])")
+        }
+        XCTAssertFalse(reason.isEmpty)
+        XCTAssertTrue(remedy.contains("Settings"), remedy)
+        XCTAssertTrue(remedy.contains("Stream"), remedy)
+        XCTAssertEqual(sent("StartStream", h.mock), 0,
+                       "the chain must halt before StartStream")
+        XCTAssertNotEqual(h.controller.broadcastState, .live)
+    }
+
+    /// Resume semantics: after the stream-key halt, fixing OBS and clicking
+    /// Go Live again keeps the green links (no capture re-provisioning) and
+    /// completes the chain.
+    func testGoLiveResumesFromFirstNonGreen() async {
+        let h = await makeHarness()
+        h.server.streamKey = ""
+        h.controller.goLive()
+        await waitUntil { self.linkFailed(h.controller, .streamService) }
+        await settle()
+        XCTAssertEqual(h.controller.preflight[.sceneCapture], .ok,
+                       "the halt must keep the links that already verified")
+
+        h.server.streamKey = "k"          // the user connected YouTube in OBS
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        XCTAssertEqual(sent("CreateInput", h.mock), 0,
+                       "the resumed attempt must not re-provision the capture")
+        XCTAssertEqual(sent("SetInputSettings", h.mock), 0)
+        for link in PreflightLink.chainOrder {
+            XCTAssertEqual(h.controller.preflight[link], .ok, "\(link) must end .ok")
+        }
+    }
+
+    /// Local-config discovery: with the manual password field EMPTY, the
+    /// config file's port and password drive the connect — the server demands
+    /// auth and only the file's password satisfies it.
+    func testLocalConfigSuppliesPortAndPassword() async throws {
+        let h = await makeHarness(connect: false)
+        h.controller.localConfigURLOverride = try writeConfigFixture(
+            #"{"server_enabled": true, "server_port": 4460, "server_password": "pw"}"#)
+        XCTAssertEqual(h.controller.obsPassword, "")
+
+        let salt = "s4lt+", challenge = "ch4l+"
+        h.mock.enqueueInbound(helloFrame(salt: salt, challenge: challenge))
+        installAuthRequiringResponder(h, salt: salt, challenge: challenge,
+                                      expectedPassword: "pw")
+
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        XCTAssertEqual(h.controller.obsPort, 4460, "the config file's port must be adopted")
+        let identify = h.mock.sentFrames.first { $0.contains("\"op\":1") }
+        XCTAssertEqual(identify.flatMap(identifyAuth(fromSent:)),
+                       OBSAuth.authString(password: "pw", salt: salt, challenge: challenge),
+                       "the handshake must authenticate with the config file's password")
+    }
+
+    /// The manual password field WINS over the config file (an operator
+    /// override is never silently discarded).
+    func testManualPasswordFieldOverridesLocalConfig() async throws {
+        let h = await makeHarness(connect: false)
+        h.controller.localConfigURLOverride = try writeConfigFixture(
+            #"{"server_enabled": true, "server_port": 4455, "server_password": "wrong-from-file"}"#)
+        h.controller.obsPassword = "manual-right"
+
+        let salt = "salt2", challenge = "chal2"
+        h.mock.enqueueInbound(helloFrame(salt: salt, challenge: challenge))
+        installAuthRequiringResponder(h, salt: salt, challenge: challenge,
+                                      expectedPassword: "manual-right")
+
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+        let identify = h.mock.sentFrames.first { $0.contains("\"op\":1") }
+        XCTAssertEqual(identify.flatMap(identifyAuth(fromSent:)),
+                       OBSAuth.authString(password: "manual-right",
+                                          salt: salt, challenge: challenge),
+                       "the manual password field must win over the config file")
+    }
+
+    /// The config file says the WebSocket server is disabled: the .connected
+    /// link fails with the enable-it remedy before any connect is attempted.
+    func testServerDisabledInConfigFailsConnectedLinkWithRemedy() async throws {
+        let h = await makeHarness(connect: false)
+        h.controller.localConfigURLOverride = try writeConfigFixture(
+            #"{"server_enabled": false, "server_port": 4455}"#)
+        XCTAssertEqual(h.controller.broadcastState, .unknown)
+
+        h.controller.goLive()
+        // Discovery is synchronous: the chain halts before any connect attempt.
+        guard case let .failed(reason, remedy) = h.controller.preflight[.connected] else {
+            return XCTFail("preflight[.connected] must be .failed — got \(h.controller.preflight[.connected])")
+        }
+        XCTAssertFalse(reason.isEmpty)
+        XCTAssertTrue(remedy.contains("WebSocket Server Settings"), remedy)
+        XCTAssertEqual(h.controller.broadcastState, .unknown)
+        await settle()
+        XCTAssertEqual(h.mock.connectStartedCount, 0,
+                       "no connect attempt — the config says the server is off")
+        XCTAssertEqual(sent("StartStream", h.mock), 0)
+    }
+
+    /// The plan's no-removal invariant, pinned across EVERY preflight
+    /// scenario: happy/adopt, repair, create-into-scene, and create-scene runs
+    /// together never send a removal- or rename-type request.
+    func testNoRemovalTypeRequestEverSent() async {
+        var union = Set<String>()
+
+        // Happy chain / adopt-by-name.
+        do {
+            let h = await makeHarness()
+            h.controller.goLive()
+            await waitUntil { h.controller.broadcastState == .live }
+            union.formUnion(sentTypes(h.mock))
+        }
+        // Repair (stale window id).
+        do {
+            let h = await makeHarness()
+            h.server.inputSettings["LiveAstro Stack"] = ["type": 1, "window": 999]
+            h.controller.goLive()
+            await waitUntil { h.controller.broadcastState == .live }
+            union.formUnion(sentTypes(h.mock))
+        }
+        // Create into the user's scene.
+        do {
+            let h = await makeHarness()
+            h.controller.stackSceneName = "Stack"
+            h.server.sceneItems = [["sourceName": "Paul Camera",
+                                    "inputKind": "macos-avcapture"]]
+            h.server.inputSettings = [:]
+            h.controller.goLive()
+            await waitUntil { h.controller.broadcastState == .live }
+            union.formUnion(sentTypes(h.mock))
+        }
+        // Create the starter scene.
+        do {
+            let h = await makeHarness()
+            h.server.scenes = []
+            h.server.sceneItems = []
+            h.server.inputSettings = [:]
+            h.controller.goLive()
+            await waitUntil { h.controller.broadcastState == .live }
+            union.formUnion(sentTypes(h.mock))
+        }
+
+        for banned in ["RemoveInput", "RemoveScene", "RemoveSceneItem",
+                       "SetInputName", "SetSceneName"] {
+            XCTAssertFalse(union.contains(banned),
+                           "\(banned) must NEVER be sent — sent types: \(union.sorted())")
+        }
+    }
+
+    /// Cancellation mid-chain (stalled at the capture stage): no StartStream
+    /// is ever sent, and the NEXT goLive starts a clean chain — every link
+    /// resets to .unknown at its entry (cancelled attempts leave no
+    /// half-checked links behind).
+    func testCancellationMidChainLeavesNoStartStream() async {
+        let h = await makeHarness(requestTimeout: 10)
+        h.server.parkTypes = ["GetSceneItemList"]     // stall the sceneCapture stage
+        h.controller.goLive()
+        await waitUntil { h.server.parked.count == 1 }
+        XCTAssertEqual(h.controller.broadcastState, .connecting)
+
+        h.controller.endBroadcast()                   // cancel mid-chain; nothing issued
+        await settle()
+        XCTAssertEqual(sent("StartStream", h.mock), 0,
+                       "a chain cancelled at the capture stage must never reach StartStream")
+        XCTAssertEqual(h.controller.broadcastState, .idle,
+                       "provably-nothing-issued abort lands the attempt's origin")
+
+        h.controller.goLive()                         // the next fresh attempt
+        // The entry reset runs synchronously, before the chain's task starts.
+        for link in PreflightLink.chainOrder {
+            XCTAssertEqual(h.controller.preflight[link], .unknown,
+                           "\(link) must reset to .unknown on the next goLive")
+        }
+
+        // The fresh chain parks at ITS capture read; resume it and complete.
+        await waitUntil { h.server.parked.count == 2 }
+        h.server.parkTypes = []
+        h.mock.enqueueInbound(responseFrame(
+            requestId: h.server.parked[1].id, ok: true,
+            responseData: ["sceneItems": [["sourceName": "LiveAstro Stack",
+                                           "inputKind": "screen_capture"]]]))
+        await waitUntil { h.controller.broadcastState == .live }
     }
 }

@@ -42,6 +42,14 @@ public final class OBSController: ObservableObject {
     @Published public private(set) var sceneNames: [String] = []
     @Published public private(set) var currentScene: String?
 
+    /// Why the most recent connect attempt failed (nil before any attempt and
+    /// after a success). Additive T5 surface: goLive's preflight distinguishes
+    /// "OBS unreachable" (the `.obsRunning` link) from "reachable but the
+    /// password was refused" (the `.connected` link, `.authFailed`). Cleared
+    /// at every connect start; set only by the failing attempt's own epoch —
+    /// the same staleness rule as every other connect landing.
+    public private(set) var lastConnectFailure: OBSClient.OBSError?
+
     /// Diagnostic log sink. Every swallowed error and lifecycle note is emitted here.
     public var onLog: ((String) -> Void)?
 
@@ -139,6 +147,7 @@ public final class OBSController: ObservableObject {
         connectionEpoch += 1                 // connect start
         let epoch = connectionEpoch
         state = .connecting
+        lastConnectFailure = nil             // this attempt owns the outcome
         // Cold2 M-3: published output/scene state resets to NEUTRAL at connect
         // start — under the new epoch, before any seeding. A NON-FATAL seed
         // failure (requests answered but failing) previously left the PREVIOUS
@@ -177,6 +186,7 @@ public final class OBSController: ObservableObject {
         } catch {
             log("connect failed: \(error)")
             guard epoch == connectionEpoch else { return false }   // superseded: touch nothing
+            lastConnectFailure = error as? OBSClient.OBSError
             self.client = nil
             state = .disconnected
             return false
