@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Relicensed under the **MIT License**. Replaced the demosaic path with a
+  clean-room implementation of Malvar–He–Cutler (ICASSP 2004), removing the
+  previous GPL-derived RCD code so the project carries no copyleft dependency.
+  The high-quality demosaic is now "Malvar"; saved settings that named "rcd"
+  load unchanged.
+
+
 ## 3.1.0 — 2026-08-06
 
 Three pillars since 3.0.4, validated on a real-sky Seestar S30 session (IC 1396,

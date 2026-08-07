@@ -28,7 +28,7 @@ public enum Denoiser {
 
     /// T1-validated constants (BINDING): mirrored VERBATIM from the gate-passed
     /// table in docs/superpowers/reviews/2026-08-02-denoise-prototype-results.md
-    /// (spec §3 — additive-BN / DBE / RCD discipline). Do not tune here.
+    /// (spec §3 — additive-BN / DBE prototype-first discipline). Do not tune here.
     enum K {
         static let minDim = 64
         static let tilesPerAxis = 32

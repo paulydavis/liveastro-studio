@@ -113,11 +113,11 @@ final class PerformanceTests: XCTestCase {
         #endif
     }
 
-    // MARK: – RCD vs Bilinear perf pin
+    // MARK: – Malvar vs Bilinear perf pin
 
-    /// 3840×2160 random CFA: assert rcd ≤ 5× bilinear elapsed.
+    /// 3840×2160 random CFA: assert malvar ≤ 5× bilinear elapsed.
     /// Run only in release — debug builds have no optimisations.
-    func testRCDWithin5xBilinear() throws {
+    func testMalvarWithin5xBilinear() throws {
         #if DEBUG
         throw XCTSkip("perf pin is meaningful only with optimizations — run: swift test -c release --filter PerformanceTests")
         #else
@@ -137,25 +137,25 @@ final class PerformanceTests: XCTestCase {
         let tiny = AstroImage(width: 16, height: 16, channels: 1,
                               pixels: [Float](repeating: 0.1, count: 16 * 16), sourceIsLinear: true)
         _ = Debayer.bilinear(cfa: tiny, pattern: .grbg)
-        _ = Debayer.rcd(cfa: tiny, pattern: .grbg)
+        _ = Debayer.malvar(cfa: tiny, pattern: .grbg)
 
         // ── Timed: bilinear ──────────────────────────────────────────────────
         let t0 = Date()
         _ = Debayer.bilinear(cfa: cfa, pattern: .grbg)
         let bilinearElapsed = Date().timeIntervalSince(t0)
 
-        // ── Timed: rcd ───────────────────────────────────────────────────────
+        // ── Timed: malvar ───────────────────────────────────────────────────────
         let t1 = Date()
-        _ = Debayer.rcd(cfa: cfa, pattern: .grbg)
-        let rcdElapsed = Date().timeIntervalSince(t1)
+        _ = Debayer.malvar(cfa: cfa, pattern: .grbg)
+        let malvarElapsed = Date().timeIntervalSince(t1)
 
-        let ratio = rcdElapsed / max(bilinearElapsed, 1e-9)
-        print(String(format: "PerformanceTests · 4K demosaic: bilinear=%.3fs  rcd=%.3fs  ratio=%.2f×",
-                     bilinearElapsed, rcdElapsed, ratio))
+        let ratio = malvarElapsed / max(bilinearElapsed, 1e-9)
+        print(String(format: "PerformanceTests · 4K demosaic: bilinear=%.3fs  malvar=%.3fs  ratio=%.2f×",
+                     bilinearElapsed, malvarElapsed, ratio))
 
         XCTAssertLessThanOrEqual(ratio, 5.0,
-            String(format: "RCD perf pin FAILED: rcd=%.3fs bilinear=%.3fs ratio=%.2f× (limit 5×)",
-                   rcdElapsed, bilinearElapsed, ratio))
+            String(format: "Malvar perf pin FAILED: malvar=%.3fs bilinear=%.3fs ratio=%.2f× (limit 5×)",
+                   malvarElapsed, bilinearElapsed, ratio))
         #endif
     }
 

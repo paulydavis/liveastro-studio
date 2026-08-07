@@ -341,11 +341,11 @@ struct ControlView: View {
                         }
                         HStack(spacing: 6) {
                             Text("Debayer")
-                            InfoButton(text: "RCD keeps star cores sharp and fringe-free (recommended). Bilinear is the legacy demosaic.")
+                            InfoButton(text: "Malvar (high quality) keeps star cores sharp and fringe-free (recommended). Bilinear is the legacy demosaic.")
                             Spacer()
                             Picker("", selection: $model.demosaic) {
                                 Text("Bilinear").tag(DemosaicMethod.bilinear)
-                                Text("RCD").tag(DemosaicMethod.rcd)
+                                Text("Malvar (high quality)").tag(DemosaicMethod.malvar)
                             }
                             .pickerStyle(.segmented)
                             .labelsHidden()

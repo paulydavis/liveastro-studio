@@ -169,19 +169,27 @@ final class SessionSettingsDisplayAdjTests: XCTestCase {
         XCTAssertEqual(s.relayRetentionDays, 7)
     }
 
-    func testDemosaicDefaultsRCDAndRoundTrips() throws {
+    func testDemosaicDefaultsMalvarAndRoundTrips() throws {
         var s = SessionSettings()
-        XCTAssertEqual(s.demosaic, .rcd)              // default is RCD
+        XCTAssertEqual(s.demosaic, .malvar)            // default is Malvar
         s.demosaic = .bilinear
         let data = try JSONEncoder().encode(s)
         let back = try JSONDecoder().decode(SessionSettings.self, from: data)
         XCTAssertEqual(back.demosaic, .bilinear)       // round-trips
     }
 
-    func testDemosaicBackwardCompatDefaultsRCD() throws {
+    func testDemosaicBackwardCompatDefaultsMalvar() throws {
         let json = #"{"sourceModeRaw":"Raw subs (native stacking)","filePrefix":"Light_","neutralizeBackground":false,"subExposureSeconds":60,"targetName":"","calibration":{},"rejectionEnabled":true}"#
         let s = try JSONDecoder().decode(SessionSettings.self, from: Data(json.utf8))
-        XCTAssertEqual(s.demosaic, .rcd)
+        XCTAssertEqual(s.demosaic, .malvar)
+    }
+
+    /// Settings persisted before the clean-room migration stored `"demosaic":"rcd"`.
+    /// It must decode to `.malvar` (never crash), so upgrading keeps the user's config.
+    func testDemosaicLegacyRCDStringDecodesToMalvar() throws {
+        let json = #"{"sourceModeRaw":"Raw subs (native stacking)","filePrefix":"Light_","neutralizeBackground":false,"subExposureSeconds":60,"targetName":"","calibration":{},"rejectionEnabled":true,"demosaic":"rcd"}"#
+        let s = try JSONDecoder().decode(SessionSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(s.demosaic, .malvar)
     }
 
     func testSettingsBlobWithoutDenoiseKeyDecodesOff() throws {
