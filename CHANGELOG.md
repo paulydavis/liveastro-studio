@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- One-button Go Live: pre-flight status panel, OBS WebSocket auto-discovery (no password paste), automatic capture-source provisioning/repair (additive only), stream-key presence check.
+
 ## 3.0.4 — 2026-07-26
 
 Current recommended tester build.
