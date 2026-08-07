@@ -1,8 +1,27 @@
 # Changelog
 
-## Unreleased
+## 3.1.0 — 2026-08-06
 
-- One-button Go Live: pre-flight status panel, OBS WebSocket auto-discovery (no password paste), automatic capture-source provisioning/repair (additive only), stream-key presence check.
+Three pillars since 3.0.4, validated on a real-sky Seestar S30 session (IC 1396,
+339 subs, 0 rejected) that streamed live to YouTube.
+
+**One-button Go Live (OBS broadcast pre-flight).** A single Go Live now launches
+OBS if needed, reads its WebSocket credentials from OBS's own config (no password
+paste), verifies and repairs the broadcast-window capture source in your chosen
+scene (additive only — your camera/scope/other sources are never touched), checks
+the stream service, and starts the stream. A five-link status panel shows each step
+going green, with a reason and fix for any that fail. Recognizes OAuth
+account-linked YouTube/Twitch/Restream as well as pasted stream keys. Help gains
+broadcast-setup recipes (camera PiP, AirPlay phone mirror, NINA, multi-scene).
+
+**Native noise reduction.** A classic, deterministic two-stage denoiser (chroma
+mottle suppression + edge-preserving luma smoothing) in the live-view display path,
+plus a **Native NR** option on the master post-process picker. One Denoise slider;
+default off; `master.fit` is never mutated.
+
+**Watcher segment clock model.** The stack-file watcher's blocker write-off now
+uses per-owner accrual segments, resolving the starvation/attribution family that
+nine review rounds could not close with single-scalar guards.
 
 ## 3.0.4 — 2026-07-26
 
