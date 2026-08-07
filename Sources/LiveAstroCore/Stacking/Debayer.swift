@@ -101,15 +101,19 @@ public enum Debayer {
     /// published mask. Five masks cover every missing-value case; all four Bayer patterns
     /// share the same site-parity scheme as `bilinear`. A 2-pixel border (where the 5×5
     /// window leaves the image), and any image with fewer than `minRows` rows, delegate to
-    /// `bilinear`. Output is clamped to [0, 1] and sanitised so non-finite values never
-    /// propagate. Deterministic: each output row is written by exactly one worker band.
+    /// `bilinear`. Non-finite values are sanitised to 0; the linear range is NOT clamped
+    /// (stack-domain output must preserve negative calibrated values — see the sanitise
+    /// loop). Deterministic: each output row is written by exactly one worker band.
     public static func malvar(cfa: AstroImage, pattern: BayerPattern,
                               minRows: Int = 64) -> AstroImage {
         precondition(cfa.channels == 1, "CFA input must be single-channel")
         let w = cfa.width, h = cfa.height, plane = w * h
         // Base result also fills the 2px border and is the small-image passthrough.
         let base = bilinear(cfa: cfa, pattern: pattern, minRows: minRows)
-        guard h >= minRows else { return base }
+        // The 5×5 interior needs at least a 1px ring around the 2px border, i.e.
+        // width/height ≥ 5; `2..<(w-2)` would trap for w ∈ {3,4}. Below minRows
+        // (or too skinny either way) delegate wholesale to bilinear.
+        guard w >= 5, h >= 5, h >= minRows else { return base }
 
         // Published 5×5 masks (row-major), each summing to its divisor (unity gain).
         // Green at a red or blue site (÷8).
@@ -188,11 +192,14 @@ public enum Debayer {
                         }
                     }
                 }
-                // Sanitise every element: clamp to [0, 1], non-finite → 0. Covers the
-                // bilinear border too, so NaN/Inf inputs never leak into the output.
+                // Sanitise non-finite values (NaN/Inf → 0), covering the bilinear
+                // border too. Deliberately DOES NOT clamp the linear range: this is
+                // stack-domain output feeding the accumulator, and low-clamping to 0
+                // would rectify negative dark-subtracted noise into a positive
+                // background bias (matches bilinear, which never clamps).
                 for k in 0..<o.count {
                     let v = o[k]
-                    o[k] = v.isFinite ? min(max(v, 0), 1) : 0
+                    o[k] = v.isFinite ? v : 0
                 }
             }
         }

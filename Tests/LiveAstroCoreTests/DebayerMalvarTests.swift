@@ -175,4 +175,34 @@ final class DebayerMalvarTests: XCTestCase {
         let b = Debayer.malvar(cfa: cfa, pattern: .bggr, minRows: 8)
         XCTAssertEqual(a.pixels, b.pixels, "malvar must be deterministic for identical input")
     }
+
+    // MARK: - Review regressions
+
+    /// Stack-domain output must NOT be low-clamped: dark-subtracted CFAs carry
+    /// negative noise, and rectifying it to 0 biases the accumulated background.
+    /// A constant negative field (all masks unity-gain) must map to itself.
+    func testNegativeCalibratedValuesArePreserved() {
+        let w = 16, h = 16
+        let px = [Float](repeating: -0.1, count: w * h)
+        let cfa = AstroImage(width: w, height: h, channels: 1, pixels: px, sourceIsLinear: true)
+        let out = Debayer.malvar(cfa: cfa, pattern: .rggb, minRows: 1)
+        let minV = out.pixels.min() ?? 0
+        XCTAssertLessThan(minV, 0, "Malvar must preserve negative stack-domain values, not clamp to 0")
+        // Unity-gain masks on a constant field reproduce the constant.
+        for v in out.pixels { XCTAssertEqual(v, -0.1, accuracy: 1e-5) }
+    }
+
+    /// A tall, skinny CFA (width < 5) must fall back to bilinear, not trap on
+    /// the `2..<(w-2)` interior range.
+    func testTallSkinnyCFAFallsBackWithoutCrash() {
+        let w = 3, h = 96
+        var px = [Float](repeating: 0, count: w * h)
+        for i in 0..<px.count { px[i] = Float(i % 7) / 7 }
+        let cfa = AstroImage(width: w, height: h, channels: 1, pixels: px, sourceIsLinear: true)
+        let out = Debayer.malvar(cfa: cfa, pattern: .grbg)            // default minRows=64, h>=minRows
+        let ref = Debayer.bilinear(cfa: cfa, pattern: .grbg)
+        XCTAssertEqual(out.width, w); XCTAssertEqual(out.height, h); XCTAssertEqual(out.channels, 3)
+        XCTAssertEqual(out.pixels, ref.pixels, "width<5 must delegate wholesale to bilinear")
+    }
+
 }
