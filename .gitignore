@@ -7,3 +7,7 @@ DerivedData/
 dist/
 .worktrees/
 __pycache__/
+
+# Internal review artifacts — keep out of the public repo
+docs/superpowers/reviews/license-audit-2026-08-06/
+README.txt
