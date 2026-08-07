@@ -28,6 +28,10 @@ struct BroadcastView: View {
     @GestureState private var dragStartOffset: CGSize? = nil
     @GestureState private var magnifyStartScale: CGFloat? = nil
 
+    // Last cursor position in view coordinates (top-left origin), tracked for
+    // anchoring pinch/scroll zoom at the pointer ("zoom toward cursor").
+    @State private var lastHoverInView: CGPoint? = nil
+
     var body: some View {
         GeometryReader { geo in
             @Bindable var model = model
@@ -37,6 +41,13 @@ struct BroadcastView: View {
                 in: geo.size)
             ZStack {
                 Color.black
+                // Full-view scroll-wheel catcher (behind the image, never hit-tested
+                // so it can't block drag/pinch). Its NSView fills the whole view, so
+                // the cursor point it reports is in this view's coordinate space —
+                // needed to anchor the zoom at the pointer.
+                ScrollWheelZoom(viewSize: geo.size, fittedSize: fitted, model: model)
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .allowsHitTesting(false)
                 if let cg = model.latestImage {
                     Image(decorative: cg, scale: 1)
                         .resizable()
@@ -46,13 +57,15 @@ struct BroadcastView: View {
                         .offset(model.zoomPan.offset)
                         .gesture(dragGesture(view: geo.size, fitted: fitted, model: model))
                         .gesture(magnifyGesture(view: geo.size, fitted: fitted, model: model))
-                        .overlay(
-                            ScrollWheelZoom(viewSize: geo.size, fittedSize: fitted, model: model)
-                        )
                         .clipped()
                 }
                 overlay(scale: uiScale)
                 controlsOverlay(model: $model, view: geo.size, fitted: fitted)
+            }
+            // Track the cursor in view coordinates (untransformed ZStack space) so
+            // pinch anchors at the pointer too.
+            .onContinuousHover { phase in
+                if case .active(let loc) = phase { lastHoverInView = loc }
             }
             .ignoresSafeArea()
             .background(configuresWindow ? AnyView(BroadcastWindowConfigurator()) : AnyView(EmptyView()))
@@ -99,10 +112,10 @@ struct BroadcastView: View {
             }
             .onChanged { value in
                 let base = magnifyStartScale ?? model.zoomPan.scale
-                model.zoomPan.scale = ZoomPanState.clampScale(base * value)
-                model.zoomPan.offset = ZoomPanState.clampedOffset(
-                    model.zoomPan.offset, scale: model.zoomPan.scale,
-                    viewSize: view, fittedContentSize: fitted)
+                let anchor = lastHoverInView ?? CGPoint(x: view.width / 2, y: view.height / 2)
+                model.zoomPan = ZoomPanState.zoomed(
+                    toScale: base * value, about: anchor, viewSize: view,
+                    from: model.zoomPan, fittedContentSize: fitted)
             }
     }
 
@@ -254,16 +267,18 @@ private struct ScrollWheelZoom: NSViewRepresentable {
                 let delta = event.scrollingDeltaY
                 guard abs(delta) > 0 else { return event }
                 let factor = 1.0 + delta * 0.02
+                // Anchor the zoom at the cursor: flip AppKit's bottom-left y to the
+                // top-left origin ZoomPanState.zoomed expects. view.bounds fills the
+                // whole broadcast view, so this point is in view coordinates.
+                let anchor = CGPoint(x: ptInView.x, y: view.bounds.height - ptInView.y)
                 let viewSize = self.viewSize
                 let fittedSize = self.fittedSize
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    self.model.zoomPan.scale = ZoomPanState.clampScale(self.model.zoomPan.scale * factor)
-                    self.model.zoomPan.offset = ZoomPanState.clampedOffset(
-                        self.model.zoomPan.offset,
-                        scale: self.model.zoomPan.scale,
-                        viewSize: viewSize,
-                        fittedContentSize: fittedSize)
+                    self.model.zoomPan = ZoomPanState.zoomed(
+                        toScale: self.model.zoomPan.scale * factor,
+                        about: anchor, viewSize: viewSize,
+                        from: self.model.zoomPan, fittedContentSize: fittedSize)
                 }
                 return event
             }
