@@ -508,9 +508,12 @@ public final class SessionPipeline {
     @discardableResult
     public func writeMasterSnapshot() -> Bool {
         guard let engine, let dir = session.sessionDirectory else { return false }
-        guard let master0 = engine.currentStack() else { return false }
-        let frameCount = engine.stackFrameCount                       // STACKCNT source (live stack)
-        let master = cropMaster(master0, coverage: engine.currentCoverage())   // crop BEFORE balance
+        // Single locked read of image + coverage + frameCount so a frame commit or
+        // reseed landing mid-snapshot can't tear the file (pixels from one stack state,
+        // STACKCNT/TOTALEXP from another). Nil ⇒ no live stack yet ⇒ write nothing.
+        guard let snap = engine.masterSnapshotState() else { return false }
+        let frameCount = snap.frameCount                              // STACKCNT source (same read as pixels)
+        let master = cropMaster(snap.image, coverage: snap.coverage)   // crop BEFORE balance
         let balanced = neutralizeBackground
             ? AutoStretch.neutralizeBackgroundAdditive(master)
             : master

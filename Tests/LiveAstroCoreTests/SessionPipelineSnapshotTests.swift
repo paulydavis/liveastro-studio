@@ -74,6 +74,47 @@ final class SessionPipelineSnapshotTests: XCTestCase {
         _ = try pipeline.end()
     }
 
+    /// (1b) T3 review fix: the written STACKCNT is bound to the SAME single-locked read
+    /// that produced the master pixels. After N commits the master's STACKCNT header == N
+    /// (and TOTALEXP == N × subExposure) — image + count come from one atomic engine read,
+    /// so a frame commit or reseed can't tear header vs. pixels.
+    func testSnapshotStackcntMatchesFrameCountFromSameRead() throws {
+        let root = try sandbox()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = root.appendingPathComponent("sessions")
+        let source = NativePipelineTests.ControlledLiveSource()
+        let engine = StackEngine()
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine,
+                                       profile: profile(subExposureSeconds: 30),
+                                       rootDirectory: sessions)
+        let lock = NSLock()
+        var accepted = 0
+        let n = 3
+        var gates: [Int: XCTestExpectation] = [:]
+        for i in 1...n { gates[i] = expectation(description: "accepted frame \(i)") }
+        pipeline.onUpdate = { _, _ in
+            lock.withLock { accepted += 1; gates[accepted]?.fulfill() }
+        }
+
+        try pipeline.start()
+        let offsets: [(Double, Double)] = [(0, 0), (1.1, -0.9), (-0.8, 1.2)]
+        for i in 1...n {
+            let (dx, dy) = offsets[i - 1]
+            source.send(FaultMatrixLifecycleTests.starField(name: "n_\(i).fit", dx: dx, dy: dy))
+            wait(for: gates[i]!)
+        }
+        XCTAssertEqual(engine.stackFrameCount, n)
+
+        XCTAssertTrue(pipeline.writeMasterSnapshot())
+        let dir = try XCTUnwrap(pipeline.sessionDir)
+        let header = try FITSReader.readHeader(
+            Data(contentsOf: dir.appendingPathComponent("master.fit")))
+        XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), n)
+        XCTAssertEqual(Double(header.keywords["TOTALEXP"] ?? ""), Double(n) * 30)
+
+        _ = try pipeline.end()
+    }
+
     /// (2) No stack yet (zero commits) → false, and no master.fit is written.
     func testSnapshotReturnsFalseWithNoStack() throws {
         let root = try sandbox()
