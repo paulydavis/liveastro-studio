@@ -78,7 +78,12 @@ Single owner of broadcast choreography, three pieces:
   verbatim into constants — not trusted from docs. Task 1 of the plan; no provisioning code
   ships before the probe.
 - **Stream check:** `GetStreamServiceSettings`; key **presence** only — the value is never
-  logged, stored, or displayed.
+  logged, stored, or displayed. *(Amended 2026-08-06 after the live smoke: an OAuth
+  account-linked service stores NO key in service settings — the link's tokens live in the
+  active profile's `basic.ini` (`[YouTube]`/`[Twitch]`/`[Restream]` sections). Empty key +
+  such a section present → the link passes as "account-linked"; red only when neither key
+  nor linked account exists. Token values are never read into state or logs — section
+  presence only, same hygiene as the password.)*
 
 ## 4. Error handling & safety invariants
 

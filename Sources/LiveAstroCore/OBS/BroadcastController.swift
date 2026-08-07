@@ -632,6 +632,9 @@ public final class BroadcastController {
     public private(set) var preflight = PreflightState()
     /// Tests point this at fixture files; nil → `OBSLocalConfig.defaultURL`.
     public var localConfigURLOverride: URL?
+    /// Tests point this at a fixture obs-root tree for the account-link check;
+    /// nil → the real `~/Library/Application Support/obs-studio`.
+    public var obsRootOverride: URL?
     /// The one input this app may create/modify, and the one scene it may
     /// create (only when the user has ZERO scenes). Nothing in OBS is ever
     /// removed, renamed, or reordered.
@@ -799,6 +802,13 @@ public final class BroadcastController {
 
     /// Stage 4: stream service configured (presence only; spec §3 — the key's
     /// VALUE is never logged, stored, or displayed).
+    ///
+    /// Live-smoke amendment (spec §3, 2026-08-06): an OAuth account-linked
+    /// service stores NO key in the service settings — its tokens live in the
+    /// active profile's basic.ini. An empty key with such a link present
+    /// passes as "account-linked"; red only when NEITHER key nor linked
+    /// account exists. Token values obey the same hygiene as the key: the
+    /// local-config check returns only section presence (Bool).
     private func streamServiceStage(gen: Int) async -> Bool {
         preflight.set(.streamService, .checking)
         let keyPresent = await obs.streamServiceKeyPresent()
@@ -810,6 +820,11 @@ public final class BroadcastController {
             return false
         }
         guard present else {
+            if OBSLocalConfig.activeProfileHasLinkedAccount(obsRoot: obsRootOverride) {
+                preflight.set(.streamService, .ok)
+                deps.log("OBS: stream service account-linked")
+                return true
+            }
             preflight.set(.streamService, .failed(
                 reason: "No stream key configured in OBS",
                 remedy: "OBS → Settings → Stream → connect YouTube (one time)"))

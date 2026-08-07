@@ -71,6 +71,12 @@ final class BroadcastControllerTests: XCTestCase {
         // own fixture files.
         controller.localConfigURLOverride = URL(
             fileURLWithPath: "/nonexistent-\(UUID().uuidString)/config.json")
+        // Same hermeticity for the account-link check: the developer machine's
+        // real obs-studio profile (which may carry a genuine OAuth link) must
+        // never turn a missing-key red test green. Linked-account tests
+        // override this with their own fixture tree.
+        controller.obsRootOverride = URL(
+            fileURLWithPath: "/nonexistent-\(UUID().uuidString)/obs-studio")
 
         if connect {
             mock.enqueueInbound(helloFrame())
@@ -1776,6 +1782,21 @@ final class BroadcastControllerTests: XCTestCase {
         return url
     }
 
+    /// Write an obs-root fixture whose active profile (via global.ini) carries
+    /// an OAuth YouTube link (non-empty RefreshToken); returns the root URL.
+    private func writeLinkedOBSRootFixture() throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("las-obs-root-\(UUID().uuidString)")
+        let profile = root.appendingPathComponent("basic/profiles/Untitled")
+        try FileManager.default.createDirectory(at: profile,
+                                                withIntermediateDirectories: true)
+        try Data("[Basic]\nProfileDir=Untitled\n".utf8)
+            .write(to: root.appendingPathComponent("global.ini"))
+        try Data("[General]\nName=Untitled\n\n[YouTube]\nRefreshToken=fixture-yt-refresh-token\n".utf8)
+            .write(to: profile.appendingPathComponent("basic.ini"))
+        return root
+    }
+
     /// Script a server that REQUIRES auth: the Identify must carry the auth
     /// string derived from `expectedPassword` (+ the hello's salt/challenge) or
     /// the handshake is refused (a non-Identified reply → the client fails).
@@ -1924,6 +1945,31 @@ final class BroadcastControllerTests: XCTestCase {
         XCTAssertEqual(sent("StartStream", h.mock), 0,
                        "the chain must halt before StartStream")
         XCTAssertNotEqual(h.controller.broadcastState, .live)
+    }
+
+    /// The live-smoke gap (spec §3 amendment 2026-08-06): an OAuth
+    /// account-linked YouTube stores NO key in the service settings — the
+    /// link's tokens live in the active profile's basic.ini. Empty key + a
+    /// linked profile → the streamService link passes as "account-linked" and
+    /// the chain proceeds to .live. (The missing-key red test above stays
+    /// valid: its harness obs-root override points at a nonexistent tree.)
+    func testEmptyKeyWithLinkedAccountPassesStreamService() async throws {
+        let h = await makeHarness()
+        h.server.streamKey = ""
+        h.controller.obsRootOverride = try writeLinkedOBSRootFixture()
+
+        h.controller.goLive()
+        await waitUntil { h.controller.broadcastState == .live }
+
+        XCTAssertEqual(h.controller.preflight[.streamService], .ok,
+                       "an account-linked service must pass the stream check")
+        XCTAssertEqual(h.controller.broadcastState, .live)
+        XCTAssertEqual(sent("StartStream", h.mock), 1,
+                       "the chain must proceed through StartStream")
+        XCTAssertTrue(h.box.logs.contains { $0.contains("account-linked") },
+                      "the pass must be logged — got \(h.box.logs)")
+        XCTAssertFalse(h.box.logs.contains { $0.contains("fixture-yt-refresh-token") },
+                       "the token value must never reach any log")
     }
 
     /// Resume semantics: after the stream-key halt, fixing OBS and clicking
