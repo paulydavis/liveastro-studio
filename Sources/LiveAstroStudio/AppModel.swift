@@ -569,7 +569,8 @@ final class AppModel {
                 try? await Task.sleep(nanoseconds: 30_000_000_000)   // 30 s
                 guard let self, self.isRunning, !Task.isCancelled else { return }
                 let action = self.completionDriver.step(
-                    now: Date(), lastAcceptedFrame: self.lastAcceptedFrame,
+                    now: Date(), sessionStart: self.sessionStart ?? Date(),
+                    lastAcceptedFrame: self.lastAcceptedFrame,
                     settings: self.currentSettings().completionSettings)
                 switch action {
                 case .safeguard:

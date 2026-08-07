@@ -511,7 +511,10 @@ public final class SessionPipeline {
         // Single locked read of image + coverage + frameCount so a frame commit or
         // reseed landing mid-snapshot can't tear the file (pixels from one stack state,
         // STACKCNT/TOTALEXP from another). Nil ⇒ no live stack yet ⇒ write nothing.
-        guard let snap = engine.masterSnapshotState() else { return false }
+        guard let snap = engine.masterSnapshotState() else {
+            onLog?("master snapshot skipped — no live stack")
+            return false
+        }
         let frameCount = snap.frameCount                              // STACKCNT source (same read as pixels)
         let master = cropMaster(snap.image, coverage: snap.coverage)   // crop BEFORE balance
         let balanced = neutralizeBackground

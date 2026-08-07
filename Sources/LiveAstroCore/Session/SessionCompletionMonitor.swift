@@ -36,20 +36,17 @@ public enum SessionCompletionMonitor {
         return calendar.date(byAdding: .day, value: 1, to: todayAt) ?? todayAt
     }
 
-    public static func decide(now: Date, lastAcceptedFrame: Date?, settings: CompletionSettings,
+    public static func decide(now: Date, sessionStart: Date, lastAcceptedFrame: Date?, settings: CompletionSettings,
                               safeguardAlreadyFiredThisIdle: Bool, plannedStopAlreadyFired: Bool,
                               calendar: Calendar = .current) -> CompletionAction {
         // Planned stop takes priority when both are due.
         if settings.plannedStopEnabled, !plannedStopAlreadyFired {
-            // Resolve the deadline relative to a reference EARLIER than now so the
-            // "next occurrence" is the one we've reached. Using now itself for a
-            // time that just passed today would roll to tomorrow; so compare the
-            // deadline computed from the start of today.
-            let today = calendar.startOfDay(for: now)
-            var comps = DateComponents(); comps.hour = settings.plannedStopHour; comps.minute = settings.plannedStopMinute
-            if let todayAt = calendar.date(byAdding: comps, to: today), now >= todayAt {
-                return .endSession
-            }
+            // Fire on the FIRST occurrence of H:M *after the session started* (crosses
+            // midnight correctly). An evening session with a 3 AM stop resolves to 3 AM
+            // the next morning, not the 3 AM that already passed today.
+            let deadline = plannedStopDeadline(after: sessionStart, hour: settings.plannedStopHour,
+                                               minute: settings.plannedStopMinute, calendar: calendar)
+            if now >= deadline { return .endSession }
         }
         if settings.idleSafeguardEnabled, !safeguardAlreadyFiredThisIdle, let last = lastAcceptedFrame {
             let elapsed = now.timeIntervalSince(last)

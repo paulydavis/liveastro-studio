@@ -399,7 +399,7 @@ struct ControlView: View {
                                 .help("How long capture may stall before a master snapshot is written. Stacking continues; a resumed feed re-arms the safeguard.")
                         }
                         helpToggle("Auto-stop at a set time", isOn: $model.plannedStopEnabled,
-                                   help: "Runs a full End Session at this time (does not quit the app or stop the broadcast).")
+                                   help: "Runs a full End Session at this time (writes master + replay, ends an owned broadcast). Does not quit the app.")
                         if model.plannedStopEnabled {
                             DatePicker("Stop at", selection: Binding(
                                 get: { Calendar.current.date(bySettingHour: model.plannedStopHour,

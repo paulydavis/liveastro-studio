@@ -9,7 +9,7 @@ public struct SessionCompletionDriver {
     private var lastSeenAcceptedFrame: Date?
     public init() {}
 
-    public mutating func step(now: Date, lastAcceptedFrame: Date?, settings: CompletionSettings,
+    public mutating func step(now: Date, sessionStart: Date, lastAcceptedFrame: Date?, settings: CompletionSettings,
                               calendar: Calendar = .current) -> CompletionAction {
         // Re-arm the safeguard when a NEW accepted frame arrived since we last looked.
         if let last = lastAcceptedFrame, last != lastSeenAcceptedFrame {
@@ -17,7 +17,7 @@ public struct SessionCompletionDriver {
             safeguardFired = false
         }
         let action = SessionCompletionMonitor.decide(
-            now: now, lastAcceptedFrame: lastAcceptedFrame, settings: settings,
+            now: now, sessionStart: sessionStart, lastAcceptedFrame: lastAcceptedFrame, settings: settings,
             safeguardAlreadyFiredThisIdle: safeguardFired,
             plannedStopAlreadyFired: plannedStopFired, calendar: calendar)
         switch action {

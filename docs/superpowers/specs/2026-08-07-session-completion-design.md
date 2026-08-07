@@ -7,13 +7,17 @@ discarded the live master. Two owner-approved triggers make the app aware a
 session has stopped and protect the outputs.
 
 **Decisions (owner, 2026-08-07):** two independent triggers with *different*
-behavior — idle **safeguards and keeps going**, planned-stop **fully ends**;
-neither quits the app or stops an active broadcast. Planned stop is an absolute
+behavior — idle **safeguards and keeps going**, planned-stop **fully ends**
+(including an OBS broadcast LiveAstro owns — a manually-started OBS stream is
+untouched); neither quits the app. Planned stop is an absolute
 clock time. macOS local notifications so alerts reach an away/asleep operator.
 
-**Non-goals:** no auto-quit; no auto-stop of OBS broadcast; no duration or
+**Non-goals:** no auto-quit; no duration or
 frame-count stop inputs (clock time only); no change to the End Session flow
 itself beyond invoking it. Replay is not rendered by the idle safeguard.
+(Planned stop *does* run the full End Session, which stops an OBS broadcast
+LiveAstro owns — the same as clicking End Session; a stream the operator started
+manually in OBS is not touched.)
 
 ## 1. Behaviors
 
@@ -34,7 +38,9 @@ itself beyond invoking it. Replay is not rendered by the idle safeguard.
   day — crosses midnight correctly).
 - At the deadline: run the **full existing End Session** (finalize master +
   render replay + write summary, stop stacking) and post a notification.
-- Does **not** quit the app or stop an active OBS broadcast.
+- Does **not** quit the app. It runs the full End Session, so it **ends an OBS
+  broadcast LiveAstro owns** (started via Go Live), exactly like clicking End
+  Session; a stream the operator started manually in OBS is left untouched.
 
 Both triggers may be armed at once; they are independent. A cloud gap that trips
 the idle safeguard never ends the session — only the planned stop (or the
