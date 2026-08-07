@@ -155,3 +155,9 @@ Release history is summarized in [CHANGELOG.md](CHANGELOG.md).
 Release packaging and notarization notes live in [docs/distribution.md](docs/distribution.md).
 
 Near-term product direction is tracked in [docs/roadmap.md](docs/roadmap.md).
+
+## License
+
+LiveAstro Studio is released under the [MIT License](LICENSE). It vendors no
+third-party source and has no runtime dependencies beyond Apple's SDKs;
+algorithms implemented from published literature are credited in [NOTICE.md](NOTICE.md).
