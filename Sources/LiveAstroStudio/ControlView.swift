@@ -389,6 +389,29 @@ struct ControlView: View {
                             .help("Individual sub-exposure length in seconds; recorded in the session manifest and used for dark-frame matching.")
                         TextField("Notes", text: $model.notes)
                     }
+                    Section("Session end") {
+                        helpToggle("Idle safeguard — save master if capture stalls",
+                                   isOn: $model.idleSafeguardEnabled,
+                                   help: "Writes master.fit and keeps stacking; a cloud gap resumes normally.")
+                        if model.idleSafeguardEnabled {
+                            Stepper("After \(model.idleSafeguardMinutes) min idle",
+                                    value: $model.idleSafeguardMinutes, in: 5...120, step: 5)
+                                .help("How long capture may stall before a master snapshot is written. Stacking continues; a resumed feed re-arms the safeguard.")
+                        }
+                        helpToggle("Auto-stop at a set time", isOn: $model.plannedStopEnabled,
+                                   help: "Runs a full End Session at this time (writes master + replay, ends an owned broadcast). Does not quit the app.")
+                        if model.plannedStopEnabled {
+                            DatePicker("Stop at", selection: Binding(
+                                get: { Calendar.current.date(bySettingHour: model.plannedStopHour,
+                                        minute: model.plannedStopMinute, second: 0, of: Date()) ?? Date() },
+                                set: { newDate in
+                                    let c = Calendar.current.dateComponents([.hour, .minute], from: newDate)
+                                    model.plannedStopHour = c.hour ?? 3
+                                    model.plannedStopMinute = c.minute ?? 0
+                                }), displayedComponents: .hourAndMinute)
+                                .help("Runs a full End Session at this clock time (next occurrence, crosses midnight).")
+                        }
+                    }
                     // Observes the OBSController (Combine ObservableObject) so its
                     // @Published state/scene/record changes re-render this section.
                     OBSSection(model: model)

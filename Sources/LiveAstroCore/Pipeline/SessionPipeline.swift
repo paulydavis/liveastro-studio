@@ -120,6 +120,10 @@ public final class SessionPipeline {
     private let maxKeyframes: Int
     private let neutralizeBackground: Bool
     private let calibrator: Calibrator?
+    /// Injectable for the master-snapshot atomic swap (FileReplace). Tests substitute a
+    /// FileManager whose replace/move throws to prove a prior good master survives a
+    /// failed write. Production uses `.default`.
+    var fileManager: FileManager = .default
     private var recorder: SnapshotRecorder?
     private var consumeTask: Task<Void, Never>?
     private let consumeDone = DispatchSemaphore(value: 0)
@@ -485,6 +489,56 @@ public final class SessionPipeline {
             return image
         }
         return image.cropped(to: rect)
+    }
+
+    /// The running session's directory (nil before start / after teardown). Internal so
+    /// the snapshot path and tests can address `master.fit` without reaching through
+    /// `session`.
+    var sessionDir: URL? { session.sessionDirectory }
+
+    /// Write `master.fit` from the CURRENT live stack WITHOUT ending the session
+    /// (idle safeguard, spec §2). Native mode only. Mirrors the master write inside
+    /// `end()` — cropMaster → additive-only neutralize (when the flag is set) →
+    /// FITSWriter.float32 — but sources the image from the LIVE stack
+    /// (`engine.currentStack()`), not the finalized state. The swap is atomic via
+    /// FileReplace so a prior good master survives a failed write. Does NOT stamp
+    /// `end_time`, stop the engine, or touch running state. Idempotent; callable
+    /// repeatedly. Returns false when this is not a native session, there is no live
+    /// stack yet, or the write failed.
+    @discardableResult
+    public func writeMasterSnapshot() -> Bool {
+        guard let engine, let dir = session.sessionDirectory else { return false }
+        // Single locked read of image + coverage + frameCount so a frame commit or
+        // reseed landing mid-snapshot can't tear the file (pixels from one stack state,
+        // STACKCNT/TOTALEXP from another). Nil ⇒ no live stack yet ⇒ write nothing.
+        guard let snap = engine.masterSnapshotState() else {
+            onLog?("master snapshot skipped — no live stack")
+            return false
+        }
+        let frameCount = snap.frameCount                              // STACKCNT source (same read as pixels)
+        let master = cropMaster(snap.image, coverage: snap.coverage)   // crop BEFORE balance
+        let balanced = neutralizeBackground
+            ? AutoStretch.neutralizeBackgroundAdditive(master)
+            : master
+        let totalExp = Double(frameCount) * profile.subExposureSeconds
+        let data = FITSWriter.float32(
+            width: balanced.width, height: balanced.height,
+            channels: balanced.channels, pixels: balanced.pixels,
+            metadata: sourceMetadata,
+            stackCount: frameCount,
+            totalExposureSeconds: totalExp)
+        let target = dir.appendingPathComponent("master.fit")
+        let tmp = dir.appendingPathComponent(".master-snapshot-\(UUID().uuidString).fit")
+        do {
+            try data.write(to: tmp)
+            try FileReplace.replaceItem(at: target, withItemAt: tmp, fileManager: fileManager)
+            onLog?("master snapshot written (\(frameCount) frames)")
+            return true
+        } catch {
+            try? fileManager.removeItem(at: tmp)
+            onLog?("master snapshot failed: \(error.localizedDescription)")
+            return false
+        }
     }
 
     /// Drain the frame-consuming task with a bounded wait. On the primary timeout the task is

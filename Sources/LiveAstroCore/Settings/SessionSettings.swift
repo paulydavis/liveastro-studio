@@ -20,6 +20,11 @@ public struct SessionSettings: Codable, Equatable {
     public var displayAdjustments: DisplayAdjustments
     public var relayRetentionDays: Int
     public var demosaic: DemosaicMethod
+    public var idleSafeguardEnabled: Bool
+    public var idleSafeguardMinutes: Int
+    public var plannedStopEnabled: Bool
+    public var plannedStopHour: Int
+    public var plannedStopMinute: Int
 
     public init(sourceModeRaw: String, watchFolderPath: String?, filePrefix: String,
                 neutralizeBackground: Bool, subExposureSeconds: Double, targetName: String,
@@ -31,7 +36,12 @@ public struct SessionSettings: Codable, Equatable {
                 processorBackend: ProcessorBackend = .none,
                 displayAdjustments: DisplayAdjustments = .neutral,
                 relayRetentionDays: Int = 7,
-                demosaic: DemosaicMethod = .malvar) {
+                demosaic: DemosaicMethod = .malvar,
+                idleSafeguardEnabled: Bool = true,
+                idleSafeguardMinutes: Int = 15,
+                plannedStopEnabled: Bool = false,
+                plannedStopHour: Int = 3,
+                plannedStopMinute: Int = 0) {
         self.sourceModeRaw = sourceModeRaw; self.watchFolderPath = watchFolderPath
         self.filePrefix = filePrefix; self.neutralizeBackground = neutralizeBackground
         self.subExposureSeconds = subExposureSeconds; self.targetName = targetName
@@ -43,6 +53,11 @@ public struct SessionSettings: Codable, Equatable {
         self.processorBackend = processorBackend; self.displayAdjustments = displayAdjustments
         self.relayRetentionDays = relayRetentionDays
         self.demosaic = demosaic
+        self.idleSafeguardEnabled = idleSafeguardEnabled
+        self.idleSafeguardMinutes = idleSafeguardMinutes
+        self.plannedStopEnabled = plannedStopEnabled
+        self.plannedStopHour = plannedStopHour
+        self.plannedStopMinute = plannedStopMinute
     }
 
     /// Convenience no-arg init that returns the application's fresh-launch defaults.
@@ -55,6 +70,8 @@ public struct SessionSettings: Codable, Equatable {
         case subExposureSeconds, targetName, calibration, rejectionEnabled, rejectionStrength
         case frameWeightingEnabled, backgroundNormalizationEnabled, scaleNormalizationEnabled, processorBackend, displayAdjustments
         case relayRetentionDays, demosaic
+        case idleSafeguardEnabled, idleSafeguardMinutes
+        case plannedStopEnabled, plannedStopHour, plannedStopMinute
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -74,6 +91,20 @@ public struct SessionSettings: Codable, Equatable {
         displayAdjustments = try c.decodeIfPresent(DisplayAdjustments.self, forKey: .displayAdjustments) ?? .neutral
         relayRetentionDays = try c.decodeIfPresent(Int.self, forKey: .relayRetentionDays) ?? 7
         demosaic = try c.decodeIfPresent(DemosaicMethod.self, forKey: .demosaic) ?? .malvar
+        idleSafeguardEnabled = try c.decodeIfPresent(Bool.self, forKey: .idleSafeguardEnabled) ?? true
+        idleSafeguardMinutes = try c.decodeIfPresent(Int.self, forKey: .idleSafeguardMinutes) ?? 15
+        plannedStopEnabled = try c.decodeIfPresent(Bool.self, forKey: .plannedStopEnabled) ?? false
+        plannedStopHour = try c.decodeIfPresent(Int.self, forKey: .plannedStopHour) ?? 3
+        plannedStopMinute = try c.decodeIfPresent(Int.self, forKey: .plannedStopMinute) ?? 0
+    }
+
+    /// The subset the completion monitor needs (Task 1).
+    public var completionSettings: CompletionSettings {
+        CompletionSettings(idleSafeguardEnabled: idleSafeguardEnabled,
+                           idleSafeguardMinutes: idleSafeguardMinutes,
+                           plannedStopEnabled: plannedStopEnabled,
+                           plannedStopHour: plannedStopHour,
+                           plannedStopMinute: plannedStopMinute)
     }
 
     /// Matches the app's fresh-launch defaults (Siril mode, live_stack prefix, 60 s).

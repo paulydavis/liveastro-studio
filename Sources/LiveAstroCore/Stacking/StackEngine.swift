@@ -201,6 +201,21 @@ public final class StackEngine {
         lock.withLock { accumulator?.coverage() }
     }
 
+    /// One-lock read of the live stack for the idle-safeguard master snapshot
+    /// (`SessionPipeline.writeMasterSnapshot`). Returns image, coverage, and frameCount
+    /// from a SINGLE lock acquisition so a frame commit or `reseed()` landing between
+    /// reads can't tear the snapshot (master pixels from one stack state, STACKCNT/
+    /// TOTALEXP from another). A non-throwing, non-mutating sibling of
+    /// `finalizationState()`: pure read, stamps nothing and changes no running state.
+    /// nil when there is no live stack yet (before the seed, or after a reseed cleared
+    /// the accumulator) — the caller then writes nothing.
+    public func masterSnapshotState() -> (image: AstroImage, coverage: [Float]?, frameCount: Int)? {
+        lock.withLock {
+            guard let accumulator else { return nil }
+            return (accumulator.mean(), accumulator.coverage(), accumulator.frameCount)
+        }
+    }
+
     public func process(_ frame: RawFrame) -> StackOutcome {
         lock.withLock { processLocked(frame) }
     }

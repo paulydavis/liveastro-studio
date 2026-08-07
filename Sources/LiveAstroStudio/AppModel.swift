@@ -45,6 +45,17 @@ final class AppModel {
 
     var fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
     var neutralizeBackground = false
+
+    // Session completion draft (bound to the Setup "Session end" group; assembled
+    // into SessionSettings by currentSettings() and restored by loadSettings()).
+    // These are the LIVE values the completion tick reads via
+    // currentSettings().completionSettings — without them the tick would only ever
+    // see SessionSettings defaults (planned stop unreachable in production).
+    var idleSafeguardEnabled = true
+    var idleSafeguardMinutes = 15
+    var plannedStopEnabled = false
+    var plannedStopHour = 3
+    var plannedStopMinute = 0
     var rejectionEnabled = true
     var rejectionStrength: RejectionStrength = .medium
     var frameWeightingEnabled = true
@@ -127,6 +138,19 @@ final class AppModel {
 
     private var pipeline: SessionPipeline?
     private var demoTask: Task<Void, Never>?
+
+    // MARK: - Session completion (spec §2)
+
+    /// Per-session completion state (idle safeguard + planned stop flags, re-arm).
+    private var completionDriver = SessionCompletionDriver()
+    /// Timestamp of the most recent accepted frame; drives the idle safeguard.
+    /// Updated on every accepted frame in both source modes (the `onAccepted`
+    /// hook fires for each accepted update regardless of mode).
+    private(set) var lastAcceptedFrame: Date?
+    /// The 30 s tick that polls `completionDriver`; started on a successful
+    /// `startSession()` and cancelled in `endSession()`.
+    private var completionTick: Task<Void, Never>?
+    private let notifier = SessionNotifier()
 
     init() {
         // Build the seam bundle and the Broadcast controller first. The closures
@@ -248,7 +272,24 @@ final class AppModel {
             processorBackend: processorBackend,
             displayAdjustments: displayAdjustments,
             relayRetentionDays: liveSource.relayRetentionDays,
-            demosaic: demosaic)
+            demosaic: demosaic,
+            idleSafeguardEnabled: idleSafeguardEnabled,
+            idleSafeguardMinutes: idleSafeguardMinutes,
+            plannedStopEnabled: plannedStopEnabled,
+            plannedStopHour: plannedStopHour,
+            plannedStopMinute: plannedStopMinute)
+    }
+
+    /// The live completion subset (idle safeguard + planned stop) read from the
+    /// draft properties — the same values `currentSettings().completionSettings`
+    /// assembles, exposed cheaply for the Live-tab armed status without building a
+    /// whole SessionSettings each render.
+    var completionSettings: CompletionSettings {
+        CompletionSettings(idleSafeguardEnabled: idleSafeguardEnabled,
+                           idleSafeguardMinutes: idleSafeguardMinutes,
+                           plannedStopEnabled: plannedStopEnabled,
+                           plannedStopHour: plannedStopHour,
+                           plannedStopMinute: plannedStopMinute)
     }
 
     func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
@@ -271,6 +312,11 @@ final class AppModel {
         demosaic = s.demosaic
         processorBackend = s.processorBackend
         displayAdjustments = s.displayAdjustments
+        idleSafeguardEnabled = s.idleSafeguardEnabled
+        idleSafeguardMinutes = s.idleSafeguardMinutes
+        plannedStopEnabled = s.plannedStopEnabled
+        plannedStopHour = s.plannedStopHour
+        plannedStopMinute = s.plannedStopMinute
     }
 
     private var lastAdjustmentRender = Date.distantPast
@@ -366,18 +412,29 @@ final class AppModel {
         acceptedCount = 0
         rejectedCount = 0
 
+        // Reset per-session completion state and ask for notification permission
+        // once (no-op if already granted/denied). The tick starts only on success.
+        completionDriver = SessionCompletionDriver()
+        lastAcceptedFrame = nil
+        notifier.requestAuthorizationIfNeeded()
+
         // Every accepted frame feeds scene automation (resets the stall clock,
-        // switches back to the stack scene if we were showing scope-due-to-stall).
-        // Watcher mode has no per-frame accept count (see acceptedCount doc), so
-        // only nativeStack bumps acceptedCount.
+        // switches back to the stack scene if we were showing scope-due-to-stall)
+        // and re-arms the idle safeguard via `lastAcceptedFrame`. The `onAccepted`
+        // hook fires for every accepted update in both modes; only nativeStack
+        // bumps the displayed acceptedCount (see acceptedCount doc).
         let onAccepted: @MainActor () -> Void
         if sourceMode == .nativeStack {
             onAccepted = { [weak self] in
                 self?.acceptedCount += 1
+                self?.lastAcceptedFrame = Date()
                 self?.broadcast.frameAccepted()
             }
         } else {
-            onAccepted = { [weak self] in self?.broadcast.frameAccepted() }
+            onAccepted = { [weak self] in
+                self?.lastAcceptedFrame = Date()
+                self?.broadcast.frameAccepted()
+            }
         }
         wireCallbacks(to: p, onAccepted: onAccepted)
         do {
@@ -390,6 +447,7 @@ final class AppModel {
             replayURL = nil
             log.append("Session started — watching \(folder.path)")
             broadcast.sessionDidStart(subExposureSeconds: profile.subExposureSeconds)
+            startCompletionTick()
         } catch {
             errorMessage = "Start failed: \(error.localizedDescription)"
         }
@@ -497,8 +555,49 @@ final class AppModel {
         }
     }
 
+    /// Polls the completion driver every 30 s while the session runs. The tick is
+    /// generation/teardown-guarded: after each sleep it re-checks `isRunning` and
+    /// cancellation, so a fired action can never land after the session already
+    /// ended. On `.safeguard` it writes a master snapshot (idle safeguard KEEPS the
+    /// session live — it never ends it); on `.endSession` it routes to the existing
+    /// `endSession()` finalize (no parallel path) and stops ticking. Neither branch
+    /// quits the app or stops the broadcast directly.
+    private func startCompletionTick() {
+        completionTick?.cancel()
+        completionTick = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)   // 30 s
+                guard let self, self.isRunning, !Task.isCancelled else { return }
+                let action = self.completionDriver.step(
+                    now: Date(), sessionStart: self.sessionStart ?? Date(),
+                    lastAcceptedFrame: self.lastAcceptedFrame,
+                    settings: self.currentSettings().completionSettings)
+                switch action {
+                case .safeguard:
+                    // Idle capture: persist a master snapshot but keep running. If
+                    // the snapshot could not be written (non-native pipeline or a
+                    // failed write), clear the flag so it retries on the next tick
+                    // rather than being silently consumed.
+                    if self.pipeline?.writeMasterSnapshot() == true {
+                        self.notifier.notifySafeguard()
+                    } else {
+                        self.completionDriver.clearSafeguardForRetry()
+                    }
+                case .endSession:
+                    self.notifier.notifyPlannedStopEnd()
+                    self.endSession()   // existing full finalize; also cancels this tick
+                    return
+                case .none:
+                    break
+                }
+            }
+        }
+    }
+
     func endSession() {
         saveSettings()
+        completionTick?.cancel()
+        completionTick = nil
         guard let p = pipeline else { return }
         guard !importer.isGeneratingReplay else { return }
         importer.isGeneratingReplay = true

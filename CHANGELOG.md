@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Session end: idle safeguard writes the master mid-session (never lose a stack to
+  a quit) and keeps stacking; optional auto-stop at a set clock time runs a full
+  End Session; macOS notifications when either fires.
 - Relicensed under the **MIT License**. Replaced the demosaic path with a
   clean-room implementation of Malvar–He–Cutler (ICASSP 2004), removing the
   previous GPL-derived RCD code so the project carries no copyleft dependency.
