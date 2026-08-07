@@ -81,7 +81,16 @@ public final class BroadcastController {
     // OBS connection config (bound to the settings form).
     public var obsHost = "localhost"
     public var obsPort = 4455
-    public var obsPassword = ""
+    /// Final review M-2: ANY write to this field marks the value as no longer
+    /// config-sourced (`discoveredPasswordFromConfig = false`) — an
+    /// operator-pasted password must never be silently wiped and substituted
+    /// by the auth-failure config re-read retry. The two code paths that DO
+    /// hold a config-sourced value (`applyLocalConfigDiscovery` and the retry
+    /// block's wipe) re-set the flag immediately after their write, so only a
+    /// config-discovered password is ever auto-cleared.
+    public var obsPassword = "" {
+        didSet { discoveredPasswordFromConfig = false }
+    }
     /// Launch OBS (via the app adapter) if the first connect attempt fails.
     public var obsAutoLaunch = true
     /// Also start OBS recording when the stream comes up.

@@ -1994,6 +1994,64 @@ final class BroadcastControllerTests: XCTestCase {
                        "the manual password field must win over the config file")
     }
 
+    /// Final review M-2: an OPERATOR-pasted password survives an auth-failure
+    /// retry. Repro: (1) Go Live with the field empty — discovery adopts the
+    /// config file's password (marking it config-sourced) and the chain halts
+    /// later (no stream key); (2) the operator pastes their own password;
+    /// (3) the link drops and the next Go Live's connect is REFUSED. Pre-fix,
+    /// the stale config-sourced flag made the retry block wipe the pasted
+    /// password and silently substitute the config file's behind SecureField
+    /// dots. Pinned: the pasted password is untouched, the refused handshake
+    /// authenticated with IT (not the config's), and no config re-read retry
+    /// connect was attempted.
+    func testOperatorPastedPasswordSurvivesAuthFailureRetry() async throws {
+        let h = await makeHarness(connect: false)
+        h.controller.obsAutoLaunch = false      // single-shot connects
+        h.controller.localConfigURLOverride = try writeConfigFixture(
+            #"{"server_enabled": true, "server_port": 4455, "server_password": "config-pw"}"#)
+
+        // (1) Empty field → discovery adopts "config-pw"; the server accepts
+        // it, but the chain halts red at the stream-key link.
+        let salt1 = "salt-a", challenge1 = "chal-a"
+        h.mock.enqueueInbound(helloFrame(salt: salt1, challenge: challenge1))
+        installAuthRequiringResponder(h, salt: salt1, challenge: challenge1,
+                                      expectedPassword: "config-pw")
+        h.server.streamKey = ""
+        h.controller.goLive()
+        await waitUntil { self.linkFailed(h.controller, .streamService) }
+        await settle()
+        XCTAssertEqual(h.controller.obsPassword, "config-pw",
+                       "discovery must have adopted the config password")
+
+        // (2) The operator pastes their own password (the remedy's action).
+        h.controller.obsPassword = "operator-pasted"
+
+        // (3) The link drops; the next connect refuses the pasted password.
+        h.controller.disconnect()
+        await waitUntil { h.mock.closeCount == 1 }
+        await h.mock.waitForCloseEffects()
+        h.mock.clearsTerminalOnConnect = true
+        let salt2 = "salt-b", challenge2 = "chal-b"
+        h.mock.enqueueInbound(helloFrame(salt: salt2, challenge: challenge2))
+        installAuthRequiringResponder(h, salt: salt2, challenge: challenge2,
+                                      expectedPassword: "rotated-real")   // paste refused
+        let connectsBefore = h.mock.connectStartedCount
+
+        h.controller.goLive()
+        await waitUntil { self.linkFailed(h.controller, .connected) }
+        await settle()
+
+        XCTAssertEqual(h.controller.obsPassword, "operator-pasted",
+                       "a refused OPERATOR password must never be wiped or replaced")
+        let lastIdentify = h.mock.sentFrames.last { $0.contains("\"op\":1") }
+        XCTAssertEqual(lastIdentify.flatMap(identifyAuth(fromSent:)),
+                       OBSAuth.authString(password: "operator-pasted",
+                                          salt: salt2, challenge: challenge2),
+                       "the refused handshake must have used the operator's paste")
+        XCTAssertEqual(h.mock.connectStartedCount - connectsBefore, 1,
+                       "no config re-read retry connect for an operator password")
+    }
+
     /// The config file says the WebSocket server is disabled: the .connected
     /// link fails with the enable-it remedy before any connect is attempted.
     func testServerDisabledInConfigFailsConnectedLinkWithRemedy() async throws {

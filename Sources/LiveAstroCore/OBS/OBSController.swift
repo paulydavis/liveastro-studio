@@ -138,6 +138,12 @@ public final class OBSController: ObservableObject {
         // the epoch, so every consumer of the old client goes stale.
         teardown()
 
+        // This attempt owns the outcome — cleared BEFORE any early return, so
+        // a prior attempt's `.authFailed` cannot survive an invalid-URL failure
+        // and misdiagnose it (final review M-1: the property's contract is
+        // "cleared at every connect start", including this one).
+        lastConnectFailure = nil
+
         guard let url = URL(string: "ws://\(host):\(port)") else {
             log("connect: invalid host/port \(host):\(port)")
             state = .disconnected
@@ -147,7 +153,6 @@ public final class OBSController: ObservableObject {
         connectionEpoch += 1                 // connect start
         let epoch = connectionEpoch
         state = .connecting
-        lastConnectFailure = nil             // this attempt owns the outcome
         // Cold2 M-3: published output/scene state resets to NEUTRAL at connect
         // start — under the new epoch, before any seeding. A NON-FATAL seed
         // failure (requests answered but failing) previously left the PREVIOUS

@@ -147,10 +147,20 @@ final class AppModel {
                 MainActor.assumeIsolated { self?.openBroadcastWindowHandler?() }
             },
             broadcastWindowID: {
-                // NSWindow.windowNumber IS the CGWindowID.
+                // NSWindow.windowNumber IS the CGWindowID — but it is documented
+                // to be <= 0 whenever the window has no window device (never yet
+                // ordered in, or released after close). Final review F-1: an
+                // invalid id yields nil — the capture stage's bounded poll keeps
+                // waiting — instead of trapping in UInt32.init, and a stale
+                // deviceless window can no longer shadow the freshly opened one.
                 MainActor.assumeIsolated {
-                    NSApp.windows.first { $0.title == "LiveAstro Broadcast" }
-                        .map { UInt32($0.windowNumber) }
+                    NSApp.windows
+                        .filter { $0.title == "LiveAstro Broadcast" }
+                        .compactMap { window in
+                            window.windowNumber > 0
+                                ? UInt32(exactly: window.windowNumber) : nil
+                        }
+                        .first
                 }
             }))
 
