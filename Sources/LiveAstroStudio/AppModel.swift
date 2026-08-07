@@ -50,7 +50,7 @@ final class AppModel {
     var frameWeightingEnabled = true
     var backgroundNormalizationEnabled = true
     var scaleNormalizationEnabled = true
-    var demosaic: DemosaicMethod = .rcd
+    var demosaic: DemosaicMethod = .malvar
     var calibration = CalibrationStore.load(.standard)
     var watchFolder: URL?
     var sourceMode: SourceMode = .stackerOutput {

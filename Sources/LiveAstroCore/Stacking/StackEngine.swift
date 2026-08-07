@@ -356,8 +356,8 @@ public final class StackEngine {
             switch demosaic {
             case .bilinear:
                 rgb = Debayer.bilinear(cfa: frame.image, pattern: pattern, minRows: minRows)
-            case .rcd:
-                rgb = Debayer.rcd(cfa: frame.image, pattern: pattern, minRows: minRows)
+            case .malvar:
+                rgb = Debayer.malvar(cfa: frame.image, pattern: pattern, minRows: minRows)
             }
         } else {
             rgb = frame.image

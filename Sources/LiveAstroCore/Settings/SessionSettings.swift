@@ -31,7 +31,7 @@ public struct SessionSettings: Codable, Equatable {
                 processorBackend: ProcessorBackend = .none,
                 displayAdjustments: DisplayAdjustments = .neutral,
                 relayRetentionDays: Int = 7,
-                demosaic: DemosaicMethod = .rcd) {
+                demosaic: DemosaicMethod = .malvar) {
         self.sourceModeRaw = sourceModeRaw; self.watchFolderPath = watchFolderPath
         self.filePrefix = filePrefix; self.neutralizeBackground = neutralizeBackground
         self.subExposureSeconds = subExposureSeconds; self.targetName = targetName
@@ -73,7 +73,7 @@ public struct SessionSettings: Codable, Equatable {
         processorBackend = try c.decodeIfPresent(ProcessorBackend.self, forKey: .processorBackend) ?? .none
         displayAdjustments = try c.decodeIfPresent(DisplayAdjustments.self, forKey: .displayAdjustments) ?? .neutral
         relayRetentionDays = try c.decodeIfPresent(Int.self, forKey: .relayRetentionDays) ?? 7
-        demosaic = try c.decodeIfPresent(DemosaicMethod.self, forKey: .demosaic) ?? .rcd
+        demosaic = try c.decodeIfPresent(DemosaicMethod.self, forKey: .demosaic) ?? .malvar
     }
 
     /// Matches the app's fresh-launch defaults (Siril mode, live_stack prefix, 60 s).
@@ -88,7 +88,7 @@ public struct SessionSettings: Codable, Equatable {
                         scaleNormalizationEnabled: true,
                         processorBackend: .none, displayAdjustments: .neutral,
                         relayRetentionDays: 7,
-                        demosaic: .rcd)
+                        demosaic: .malvar)
     }
 }
 
