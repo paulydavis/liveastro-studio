@@ -15,6 +15,14 @@ func helloFrame() -> String {
     frameJSON(["op": 0, "d": ["rpcVersion": 1]])
 }
 
+/// The server's Hello (op 0) WITH an authentication challenge (T5 preflight:
+/// the local-config credential tests script a server that requires auth).
+func helloFrame(salt: String, challenge: String) -> String {
+    frameJSON(["op": 0, "d": ["rpcVersion": 1,
+                              "authentication": ["salt": salt,
+                                                 "challenge": challenge]]])
+}
+
 func responseFrame(requestId: String,
                    requestType: String = "X",
                    ok: Bool,
@@ -44,6 +52,23 @@ func requestId(fromSent frame: String) -> String {
 
 func requestType(fromSent frame: String) -> String {
     field(frame, "requestType")
+}
+
+/// The `requestData` payload of a sent op-6 request frame (T5 preflight: the
+/// provisioning tests assert on CreateInput/SetInputSettings payloads).
+func requestPayload(fromSent frame: String) -> [String: Any] {
+    let obj = try! JSONSerialization.jsonObject(
+        with: frame.data(using: .utf8)!) as! [String: Any]
+    let d = obj["d"] as! [String: Any]
+    return d["requestData"] as? [String: Any] ?? [:]
+}
+
+/// The `authentication` string of a sent Identify (op 1) frame, if any.
+func identifyAuth(fromSent frame: String) -> String? {
+    let obj = try! JSONSerialization.jsonObject(
+        with: frame.data(using: .utf8)!) as! [String: Any]
+    let d = obj["d"] as! [String: Any]
+    return d["authentication"] as? String
 }
 
 private func field(_ frame: String, _ key: String) -> String {
@@ -93,6 +118,22 @@ final class ScriptedOBSServer {
     var currentScene = "Stack"
     var streamReactsToRequests = true
     var recordReactsToRequests = true
+    /// T5 preflight modeling: scene contents, per-input settings, and the
+    /// stream-service key the provisioning chain reads/writes. The defaults
+    /// model a READY OBS — the capture input exists, targets the harness's
+    /// broadcast-window id (4242), and a stream key is configured — so the
+    /// pre-T5 lifecycle tests go live through the preflight chain unmodified,
+    /// exactly as they would against a previously provisioned real OBS.
+    /// CreateInput/CreateScene/SetInputSettings mutate this model additively
+    /// (there is deliberately NO remove/rename modeling: the app never sends
+    /// such requests, and the no-removal test pins that).
+    var sceneItems: [[String: Any]] = [
+        ["sourceName": "LiveAstro Stack", "inputKind": "screen_capture"]
+    ]
+    var inputSettings: [String: [String: Any]] = [
+        "LiveAstro Stack": ["type": 1, "window": 4242]
+    ]
+    var streamKey = "k"
     var failTypes: Set<String> = []
     var parkTypes: Set<String> = []
     /// Answer the first N requests of a parked type NORMALLY before parking
@@ -151,6 +192,38 @@ final class ScriptedOBSServer {
             case "StopRecord":
                 if recordReactsToRequests { recordActive = false }
                 return responseFrame(requestId: id, ok: true)
+            case "GetSceneItemList":
+                return responseFrame(requestId: id, ok: true,
+                                     responseData: ["sceneItems": sceneItems])
+            case "GetInputSettings":
+                let name = requestPayload(fromSent: sent)["inputName"] as? String ?? ""
+                guard let settings = inputSettings[name] else {
+                    return responseFrame(requestId: id, ok: false, code: 600)
+                }
+                return responseFrame(requestId: id, ok: true,
+                                     responseData: ["inputSettings": settings])
+            case "SetInputSettings":
+                let payload = requestPayload(fromSent: sent)
+                let name = payload["inputName"] as? String ?? ""
+                let new = payload["inputSettings"] as? [String: Any] ?? [:]
+                inputSettings[name] = (inputSettings[name] ?? [:])
+                    .merging(new) { _, newer in newer }
+                return responseFrame(requestId: id, ok: true)
+            case "CreateInput":
+                let payload = requestPayload(fromSent: sent)
+                let name = payload["inputName"] as? String ?? ""
+                sceneItems.append(["sourceName": name,
+                                   "inputKind": payload["inputKind"] as? String ?? ""])
+                inputSettings[name] = payload["inputSettings"] as? [String: Any] ?? [:]
+                return responseFrame(requestId: id, ok: true)
+            case "CreateScene":
+                scenes.append(requestPayload(fromSent: sent)["sceneName"] as? String ?? "")
+                return responseFrame(requestId: id, ok: true)
+            case "GetStreamServiceSettings":
+                return responseFrame(requestId: id, ok: true, responseData: [
+                    "streamServiceType": "rtmp_common",
+                    "streamServiceSettings": ["key": streamKey]
+                ])
             default:
                 // Covers SetCurrentProgramScene and anything else.
                 return responseFrame(requestId: id, ok: true)

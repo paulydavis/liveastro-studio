@@ -84,6 +84,36 @@ With OBS connected, choose a **Stack scene** and a **Scope scene** to let LiveAs
 
 ---
 
+## Broadcast setups
+
+LiveAstro guarantees only its own "LiveAstro Stack" source; everything else in your scenes is yours.
+
+**Camera picture-in-picture**
+1. Add your camera as a **Video Capture Device** source in the same scene as **LiveAstro Stack**.
+2. Drag and resize it into a corner over the stack.
+3. Reorder sources so the camera sits above **LiveAstro Stack** in the list.
+
+**Seestar / ASIAIR phone app**
+1. AirPlay-mirror the phone to the Mac (Control Center → Screen Mirroring).
+2. In OBS, add a **Window Capture** source targeting the mirrored display/window.
+3. Position it alongside or over **LiveAstro Stack**.
+
+**NINA**
+1. Add a **Window Capture** (or **Display Capture**) source pointed at the NINA window.
+2. Arrange it in the scene next to **LiveAstro Stack**.
+
+**Multi-scene combos + stall auto-switch**
+1. Build separate scenes (e.g. wide shot, scope cam, stack-only) that each include **LiveAstro Stack** or your other sources as desired.
+2. Set **Stack scene** and **Scope scene** under Scene Automation so LiveAstro switches between them automatically on a stall/resume.
+3. Switch scenes manually in OBS any time — LiveAstro treats that as an operator override until the next stall/resume boundary.
+
+**YouTube: stream key vs account link**
+- **Stream key** (OBS → Settings → Stream, pasted from YouTube Studio → Go Live): one-button automation — Go Live works every time with no extra steps in OBS.
+- **Account link** (OBS's YouTube dock, signed in via OAuth): gives you the live chat dock and a fresh broadcast per session, but you must create the broadcast in OBS's YouTube dock *before* clicking Go Live each session — otherwise streaming fails to start.
+- If Go Live fails with an account-linked service, check the YouTube dock for an existing broadcast first; pasting a permanent stream key avoids the per-session step entirely.
+
+---
+
 ## Display Adjustments
 
 Display controls are non-destructive. They change the live view and broadcast window, not the saved linear master.

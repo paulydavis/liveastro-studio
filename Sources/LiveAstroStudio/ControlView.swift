@@ -1005,8 +1005,42 @@ private struct OBSSection: View {
         )
     }
 
+    /// Human label for a pre-flight chain link (Task 6 status panel).
+    private func label(for link: PreflightLink) -> String {
+        switch link {
+        case .obsRunning:    return "OBS running"
+        case .connected:     return "Connected"
+        case .sceneCapture:  return "Stack scene capture"
+        case .streamService: return "Stream service"
+        case .streaming:     return "Streaming"
+        }
+    }
+
     var body: some View {
         Section("OBS") {
+            // Go Live pre-flight chain (T5 state, T6 render): dumbly reflects
+            // model.broadcast.preflight in chain order — no logic here.
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(PreflightLink.chainOrder, id: \.self) { link in
+                    let status = model.broadcast.preflight[link]
+                    HStack(spacing: 6) {
+                        switch status {
+                        case .unknown:  Image(systemName: "circle").foregroundStyle(.secondary)
+                        case .checking: ProgressView().controlSize(.mini)
+                        case .ok:       Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        case .failed:   Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+                        }
+                        Text(label(for: link))
+                        if case .failed(let reason, let remedy) = status {
+                            Text("— \(reason). \(remedy)")
+                                .font(.caption).foregroundStyle(.red)
+                                .lineLimit(2)
+                        }
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+
             // Status line: ● state text, plus a REC dot when recording.
             HStack(spacing: 6) {
                 Image(systemName: "circle.fill")
@@ -1050,7 +1084,7 @@ private struct OBSSection: View {
                 .help("OBS WebSocket server port — default is 4455; change only if you customised it in OBS → Tools → WebSocket Server Settings.")
             SecureField("Password (empty if auth off)", text: $model.broadcast.obsPassword)
                 .disabled(connected)
-                .help("OBS WebSocket password — copy it from OBS → Tools → WebSocket Server Settings → Show Connect Info (it regenerates each time OBS restarts with auto-generate on).")
+                .help("Auto-filled from OBS's local settings when left empty; paste manually only for remote OBS.")
             Toggle("Auto-launch OBS on Go Live", isOn: $model.broadcast.obsAutoLaunch)
                 .help("When OBS is unreachable at Go Live, launch it in the background and retry the connection for up to 20 seconds. Session start and manual Connect never launch OBS.")
 

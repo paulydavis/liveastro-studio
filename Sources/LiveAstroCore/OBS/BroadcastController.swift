@@ -20,15 +20,27 @@ public struct BroadcastDeps {
     /// Requests that the OBS application be launched. Core only asks; the app
     /// adapter owns bundle-id resolution, fallbacks, and launch logging.
     public var launchOBS: () -> Void
+    /// Requests that the "LiveAstro Broadcast" window be opened (or focused)
+    /// so OBS has something to capture. T5 preflight; the app wires it in
+    /// Task 6 — the default no-op keeps existing callers source-compatible.
+    public var openBroadcastWindow: () -> Void
+    /// Current CGWindowID of the "LiveAstro Broadcast" window; nil until it
+    /// exists. Re-derived at EVERY Go Live — the T1 probe showed ids are
+    /// per-window-instance and go stale across window recreation.
+    public var broadcastWindowID: () -> UInt32?
 
     public init(log: @escaping (String) -> Void = { _ in },
                 presentError: @escaping (String) -> Void = { _ in },
                 isSessionRunning: @escaping () -> Bool = { false },
-                launchOBS: @escaping () -> Void = {}) {
+                launchOBS: @escaping () -> Void = {},
+                openBroadcastWindow: @escaping () -> Void = {},
+                broadcastWindowID: @escaping () -> UInt32? = { nil }) {
         self.log = log
         self.presentError = presentError
         self.isSessionRunning = isSessionRunning
         self.launchOBS = launchOBS
+        self.openBroadcastWindow = openBroadcastWindow
+        self.broadcastWindowID = broadcastWindowID
     }
 }
 
@@ -69,7 +81,16 @@ public final class BroadcastController {
     // OBS connection config (bound to the settings form).
     public var obsHost = "localhost"
     public var obsPort = 4455
-    public var obsPassword = ""
+    /// Final review M-2: ANY write to this field marks the value as no longer
+    /// config-sourced (`discoveredPasswordFromConfig = false`) — an
+    /// operator-pasted password must never be silently wiped and substituted
+    /// by the auth-failure config re-read retry. The two code paths that DO
+    /// hold a config-sourced value (`applyLocalConfigDiscovery` and the retry
+    /// block's wipe) re-set the flag immediately after their write, so only a
+    /// config-discovered password is ever auto-cleared.
+    public var obsPassword = "" {
+        didSet { discoveredPasswordFromConfig = false }
+    }
     /// Launch OBS (via the app adapter) if the first connect attempt fails.
     public var obsAutoLaunch = true
     /// Also start OBS recording when the stream comes up.
@@ -603,6 +624,228 @@ public final class BroadcastController {
         return true
     }
 
+    // MARK: - Go Live pre-flight (T5)
+
+    /// The five-link Go Live chain, published for the status panel (Task 6
+    /// renders it dumbly). Written ONLY by goLive's stages at the current
+    /// generation — stale completions never touch it.
+    public private(set) var preflight = PreflightState()
+    /// Tests point this at fixture files; nil → `OBSLocalConfig.defaultURL`.
+    public var localConfigURLOverride: URL?
+    /// Tests point this at a fixture obs-root tree for the account-link check;
+    /// nil → the real `~/Library/Application Support/obs-studio`.
+    public var obsRootOverride: URL?
+    /// The one input this app may create/modify, and the one scene it may
+    /// create (only when the user has ZERO scenes). Nothing in OBS is ever
+    /// removed, renamed, or reordered.
+    public static let captureInputName = "LiveAstro Stack"
+    public static let starterSceneName = "LiveAstro"
+
+    /// True when the password currently in `obsPassword` came from the OBS
+    /// config file (stage 0) rather than the operator — an auth refusal then
+    /// re-reads the file once (regenerated-password case, spec §3).
+    private var discoveredPasswordFromConfig = false
+
+    /// Live-smoke finding 2 (2026-08-06): true when the CURRENT attempt's
+    /// `.streamService` link went `.ok` via account-link detection rather than
+    /// a configured stream key. A YouTube/OBS constraint means StartStream can
+    /// still fail instantly on this basis unless a broadcast was already
+    /// created in OBS's YouTube dock — the `.streaming` failure landing uses
+    /// this to pick the remedy that actually applies (the generic "check your
+    /// stream key" text is wrong here: no key is configured on this path at
+    /// all). Reset at chain entry; set by `streamServiceStage`.
+    private var streamServiceViaAccountLink = false
+
+    /// Whether any link is `.failed` — a HALTED chain. goLive's entry keeps a
+    /// halted chain's green links (resume semantics) and resets anything else:
+    /// a fresh chain trivially, and links left half-checked (`.checking`/`.ok`)
+    /// by a CANCELLED attempt deliberately (bullet 5 of the wire-in: cancelled
+    /// attempts leave links as they were; the next fresh goLive resets).
+    private var preflightHasFailedLink: Bool {
+        PreflightLink.chainOrder.contains {
+            if case .failed = preflight[$0] { return true }
+            return false
+        }
+    }
+
+    /// Stage 0 (synchronous, before connectOBS): discover local credentials.
+    /// The manual password field wins; otherwise adopt the config file's
+    /// port/password. serverEnabled=false is a hard, remediable failure of the
+    /// `.connected` link — the chain halts before any connect is attempted.
+    private func applyLocalConfigDiscovery() -> Bool {
+        guard obsPassword.isEmpty,
+              let cfg = OBSLocalConfig.read(from: localConfigURLOverride
+                                            ?? OBSLocalConfig.defaultURL)
+        else { return true }        // no file / manual override → existing fields
+        guard cfg.serverEnabled else {
+            preflight.set(.connected, .failed(
+                reason: "OBS WebSocket server is disabled",
+                remedy: "OBS → Tools → WebSocket Server Settings → Enable (one time)"))
+            return false
+        }
+        obsPort = cfg.port
+        if let pw = cfg.password { obsPassword = pw }
+        discoveredPasswordFromConfig = cfg.password != nil
+        return true
+    }
+
+    /// Stage 3: ensure the selected stack scene carries our capture source
+    /// (adopt-by-name → adopt-by-target → repair → create; spec §3). Additive
+    /// only. Returns false on any OBS refusal (link set `.failed` inside) AND
+    /// on staleness (generation moved / task cancelled) — stale returns write
+    /// NOTHING; the caller re-checks the generation before landing a state.
+    private func ensureCaptureStage(gen: Int) async -> Bool {
+        preflight.set(.sceneCapture, .checking)
+        deps.openBroadcastWindow()
+        // Bounded wait for the broadcast window's CGWindowID (OBS binds by id;
+        // T1 probe: ids are per-window-instance, so this is re-derived every
+        // time — never trusted from a previous launch).
+        var windowID: UInt32?
+        for _ in 0..<20 {
+            windowID = deps.broadcastWindowID()
+            if windowID != nil { break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard gen == broadcastGeneration, !Task.isCancelled else { return false }
+        }
+        guard let id = windowID else {
+            return failCapture("Broadcast window did not appear",
+                               "Open the broadcast window (Detach), then Go Live again")
+        }
+        var scene = stackSceneName
+        if scene.isEmpty {
+            let names = await obs.sceneNames()
+            guard gen == broadcastGeneration, !Task.isCancelled else { return false }
+            guard let names else {
+                return failCapture("Could not list OBS scenes",
+                                   "Check the OBS connection, then Go Live again")
+            }
+            if let first = names.first {
+                scene = first
+            } else {
+                // Zero scenes (fresh OBS install): the ONE case the app may
+                // create a scene of its own.
+                let created = await obs.createScene(Self.starterSceneName)
+                guard gen == broadcastGeneration, !Task.isCancelled else { return false }
+                guard created else {
+                    return failCapture("Could not create a starter scene",
+                                       "Create any scene in OBS, then Go Live again")
+                }
+                scene = Self.starterSceneName
+            }
+            stackSceneName = scene
+        }
+        let listedItems = await obs.sceneItemList(scene: scene)
+        guard gen == broadcastGeneration, !Task.isCancelled else { return false }
+        guard let items = listedItems else {
+            return failCapture("Could not read scene '\(scene)'",
+                               "Check the OBS connection, then Go Live again")
+        }
+        if items.contains(where: { $0.inputName == Self.captureInputName }) {
+            // Adopt by name; repair only if mistargeted.
+            let readSettings = await obs.inputSettings(inputName: Self.captureInputName)
+            guard gen == broadcastGeneration, !Task.isCancelled else { return false }
+            guard let settings = readSettings else {
+                return failCapture("Could not read the capture source",
+                                   "Check the OBS connection, then Go Live again")
+            }
+            if !OBSCaptureSchema.targetsWindow(settings, windowID: id) {
+                // Expected on the first Go Live of each launch: window ids are
+                // per-instance (T1 probe), so this is a rebind, not damage
+                // repair.
+                let retargeted = await obs.setInputSettings(
+                    inputName: Self.captureInputName,
+                    settings: OBSCaptureSchema.settings(windowID: id))
+                guard gen == broadcastGeneration, !Task.isCancelled else { return false }
+                guard retargeted else {
+                    return failCapture("Could not retarget the capture source",
+                                       "Point '\(Self.captureInputName)' at the LiveAstro Broadcast window in OBS")
+                }
+                deps.log("OBS: rebound '\(Self.captureInputName)' to the current broadcast window")
+            }
+        } else if let adopted = await adoptCaptureByTarget(items: items, windowID: id, gen: gen) {
+            if !adopted { return false }        // stale, or failure already recorded
+        } else {
+            // No adoptable capture anywhere in the scene: create ours.
+            guard gen == broadcastGeneration, !Task.isCancelled else { return false }
+            let created = await obs.createInput(scene: scene,
+                                                inputName: Self.captureInputName,
+                                                inputKind: OBSCaptureSchema.inputKind,
+                                                settings: OBSCaptureSchema.settings(windowID: id))
+            guard gen == broadcastGeneration, !Task.isCancelled else { return false }
+            guard created else {
+                return failCapture("Could not add the capture source to '\(scene)'",
+                                   "Add a macOS Screen Capture of the LiveAstro Broadcast window to that scene")
+            }
+            deps.log("OBS: added '\(Self.captureInputName)' to scene '\(scene)'")
+        }
+        preflight.set(.sceneCapture, .ok)
+        return true
+    }
+
+    /// Adopt any existing capture-kind input already pointing at our window
+    /// (pre-existing user setups keep their own source name). Returns nil when
+    /// no candidate exists (caller creates), true on adopt, false on failure
+    /// or staleness (a stale return writes nothing).
+    private func adoptCaptureByTarget(items: [OBSSceneItem],
+                                      windowID: UInt32, gen: Int) async -> Bool? {
+        for item in items where item.inputKind == OBSCaptureSchema.inputKind {
+            let readSettings = await obs.inputSettings(inputName: item.inputName)
+            guard gen == broadcastGeneration, !Task.isCancelled else { return false }
+            guard let settings = readSettings else {
+                return failCapture("Could not read the capture source '\(item.inputName)'",
+                                   "Check the OBS connection, then Go Live again")
+            }
+            if OBSCaptureSchema.targetsWindow(settings, windowID: windowID) {
+                deps.log("OBS: adopted existing capture '\(item.inputName)'")
+                preflight.set(.sceneCapture, .ok)
+                return true
+            }
+        }
+        return nil
+    }
+
+    private func failCapture(_ reason: String, _ remedy: String) -> Bool {
+        preflight.set(.sceneCapture, .failed(reason: reason, remedy: remedy))
+        deps.log("OBS preflight: \(reason)")
+        return false
+    }
+
+    /// Stage 4: stream service configured (presence only; spec §3 — the key's
+    /// VALUE is never logged, stored, or displayed).
+    ///
+    /// Live-smoke amendment (spec §3, 2026-08-06): an OAuth account-linked
+    /// service stores NO key in the service settings — its tokens live in the
+    /// active profile's basic.ini. An empty key with such a link present
+    /// passes as "account-linked"; red only when NEITHER key nor linked
+    /// account exists. Token values obey the same hygiene as the key: the
+    /// local-config check returns only section presence (Bool).
+    private func streamServiceStage(gen: Int) async -> Bool {
+        preflight.set(.streamService, .checking)
+        let keyPresent = await obs.streamServiceKeyPresent()
+        guard gen == broadcastGeneration, !Task.isCancelled else { return false }
+        guard let present = keyPresent else {
+            preflight.set(.streamService, .failed(
+                reason: "Could not read the stream service settings",
+                remedy: "Check the OBS connection, then Go Live again"))
+            return false
+        }
+        guard present else {
+            if OBSLocalConfig.activeProfileHasLinkedAccount(obsRoot: obsRootOverride) {
+                preflight.set(.streamService, .ok)
+                streamServiceViaAccountLink = true
+                deps.log("OBS: stream service account-linked")
+                return true
+            }
+            preflight.set(.streamService, .failed(
+                reason: "No stream key configured in OBS",
+                remedy: "OBS → Settings → Stream → connect YouTube (one time)"))
+            return false
+        }
+        preflight.set(.streamService, .ok)
+        streamServiceViaAccountLink = false
+        return true
+    }
+
     // MARK: - Broadcast orchestration
 
     public func goLive() {
@@ -611,6 +854,21 @@ public final class BroadcastController {
         // when the reconcile confirmed both outputs inactive.
         guard broadcastState == .idle || broadcastState == .unknown else { return }
         let origin = broadcastState
+        // Live-smoke finding 2: reset at chain entry — the current attempt's
+        // streamServiceStage (which always runs, resume or fresh) recomputes
+        // this before any `.streaming` failure landing can read it.
+        streamServiceViaAccountLink = false
+        // T5 preflight entry (synchronous, before the generation bump): a
+        // HALTED chain — some link `.failed` — RESUMES: its green links stay
+        // and the failed link re-runs (the stages re-verify idempotently).
+        // Anything else starts a clean chain: a fresh attempt trivially, and
+        // links left half-checked by a CANCELLED attempt deliberately (the
+        // cancellation paths write no preflight; the reset happens here).
+        if !preflightHasFailedLink { preflight.reset() }
+        // Stage 0: local credential discovery (spec §3). A disabled WebSocket
+        // server is a hard, remediable `.connected` failure — halt before any
+        // connect attempt; the state was never changed, so origin is kept.
+        guard applyLocalConfigDiscovery() else { return }
         // Every Go Live bumps the generation (review6 P1/P2): the deferred
         // session-end stop and any cancelled earlier attempt are stale from here.
         broadcastGeneration += 1
@@ -618,10 +876,43 @@ public final class BroadcastController {
         connectingOrigin = origin   // review10 finding 4: teardown returns here
         broadcastState = .connecting
         goLiveTask = Task { @MainActor in
-            let connected = await connectOBS(gen: gen)
+            // T5 review I-1: the task is ENQUEUED, not started, when goLive()
+            // returns — a same-segment canceller (endBroadcast/disconnect/
+            // sessionDidEnd) may have superseded this generation before the
+            // body ever runs. Guard before ANY mutation: a superseded task
+            // writes nothing.
+            guard gen == broadcastGeneration, !Task.isCancelled else { return }
+            // T5 stages 1+2: OBS running + control link connected.
+            preflight.set(.obsRunning, .checking)
+            preflight.set(.connected, .checking)
+            var connected = await connectOBS(gen: gen)
             guard gen == broadcastGeneration else { return }   // stale: cancelled/superseded
+            // Regenerated-password case (spec §3): a config-discovered password
+            // OBS now refuses may simply have been rotated in the file — clear
+            // it, re-read the config once, and retry the connect before failing.
+            if !connected, discoveredPasswordFromConfig,
+               obs.lastConnectFailure == .authFailed {
+                obsPassword = ""
+                discoveredPasswordFromConfig = false
+                if applyLocalConfigDiscovery() {
+                    connected = await connectOBS(gen: gen)
+                    guard gen == broadcastGeneration else { return }
+                }
+            }
             guard connected else {
                 deps.presentError("OBS not reachable — is it installed and running?")
+                if obs.lastConnectFailure == .authFailed {
+                    // The handshake REACHED OBS — it is running; the password
+                    // was refused. (The key/password values are never logged.)
+                    preflight.set(.obsRunning, .ok)
+                    preflight.set(.connected, .failed(
+                        reason: "OBS refused the WebSocket password",
+                        remedy: "Paste the password from OBS → Tools → WebSocket Server Settings"))
+                } else {
+                    preflight.set(.obsRunning, .failed(
+                        reason: "OBS is not reachable",
+                        remedy: "Install/launch OBS, then Go Live"))
+                }
                 // Cold2 M-1: ONE honesty policy with runConnectAndReconcile's
                 // failure landing — the link is provably down, so a previously
                 // CONFIRMED .idle is no longer confirmable and demotes to
@@ -632,6 +923,8 @@ public final class BroadcastController {
                 broadcastState = .unknown
                 return
             }
+            preflight.set(.obsRunning, .ok)
+            preflight.set(.connected, .ok)
             // Review7 P1: reconcile with ACTUAL OBS output state before starting
             // anything. Adopting an already-live stream or failing to confirm
             // state ends the attempt right here (never a double StartStream).
@@ -647,7 +940,26 @@ public final class BroadcastController {
             case .bothInactive:
                 break   // genuinely nothing running — proceed with the bring-up
             }
+            // T5 stages 3+4: capture provisioning, then stream-service
+            // presence. Each stage returns false BOTH on a current-generation
+            // failure (the failed link was written inside) and on staleness
+            // (nothing written) — so the landing below must re-check the
+            // generation first: only the CURRENT attempt may land a state.
+            let captureOK = await ensureCaptureStage(gen: gen)
+            guard gen == broadcastGeneration else { return }
+            guard captureOK else {
+                broadcastState = teardownLanding(from: origin)
+                return
+            }
+            let serviceOK = await streamServiceStage(gen: gen)
+            guard gen == broadcastGeneration else { return }
+            guard serviceOK else {
+                broadcastState = teardownLanding(from: origin)
+                return
+            }
             let scene = stackSceneName.isEmpty ? nil : stackSceneName
+            // T5 stage 5: the streaming link settles with the start outcome.
+            preflight.set(.streaming, .checking)
             // Review10 finding 2: an app-issued StartStream is in flight from
             // here until its StartOutcome settles — the ONLY window in which
             // the drain defers a stream-started event (it is our own echo;
@@ -666,6 +978,7 @@ public final class BroadcastController {
             }
             switch outcome {
             case .confirmedLive:
+                preflight.set(.streaming, .ok)
                 broadcastState = .live
                 // Review6 P2: "Record while streaming" — start recording only after
                 // the stream is confirmed up. A recording failure never fails the
@@ -709,6 +1022,16 @@ public final class BroadcastController {
                 // .stopUnconfirmed; sessionDidEnd's .stopping branch leaves the
                 // cleanup alone) and run the confirmed stop in a fresh
                 // unstructured task that no UI cancellation reaches.
+                // Live-smoke finding 2: an account-linked YouTube service has
+                // no key to "check" — the generic remedy is actively wrong on
+                // that path. StartStream failing instantly there is usually
+                // the YouTube/OBS constraint that a broadcast must already
+                // exist in OBS's YouTube dock; explain that instead.
+                preflight.set(.streaming, .failed(
+                    reason: "OBS started but the stream didn't go live",
+                    remedy: streamServiceViaAccountLink
+                        ? "Account-linked YouTube needs a broadcast created in OBS's YouTube dock each session — or paste your permanent stream key (YouTube Studio → Go Live) into OBS → Settings → Stream for one-button Go Live."
+                        : "Check OBS → Settings → Stream (YouTube server + key), then Go Live again"))
                 broadcastGeneration += 1
                 let cleanupGen = broadcastGeneration
                 broadcastState = .stopping
@@ -732,6 +1055,9 @@ public final class BroadcastController {
                 // was enqueued): return to the origin state honestly — a
                 // confirmed .idle stays confirmed; from .unknown stay .unknown.
                 deps.log("OBS: go-live cancelled before anything was issued")
+                preflight.set(.streaming, .failed(
+                    reason: "The go-live was cancelled before the stream was started",
+                    remedy: "Go Live again"))
                 broadcastState = origin
             }
         }

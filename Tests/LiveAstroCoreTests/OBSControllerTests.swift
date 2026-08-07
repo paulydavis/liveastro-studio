@@ -697,4 +697,168 @@ final class OBSControllerTests: XCTestCase {
         XCTAssertFalse(ok)
         XCTAssertEqual(controller.state, .disconnected)
     }
+
+    // MARK: - Provisioning
+
+    /// Extract the `requestData` payload of the last sent op-6 frame of `type`,
+    /// or nil if no such frame was sent.
+    private func sentRequestData(_ mock: MockOBSSocket, type: String) -> [String: Any]? {
+        guard let frame = mock.sentFrames.last(where: {
+            $0.contains("\"op\":6") && requestType(fromSent: $0) == type
+        }) else { return nil }
+        let obj = try! JSONSerialization.jsonObject(
+            with: frame.data(using: .utf8)!) as! [String: Any]
+        let d = obj["d"] as! [String: Any]
+        return d["requestData"] as? [String: Any]
+    }
+
+    /// Connect, then install a responder that answers only `type` with
+    /// `responseData` (everything else gets a bare ok — the pattern the
+    /// broadcast tests use for the request under test).
+    private func makeProvisioningController(
+        answering type: String,
+        ok: Bool = true,
+        responseData: [String: Any] = [:]
+    ) async -> (OBSController, MockOBSSocket) {
+        let mock = MockOBSSocket()
+        let controller = makeController(mock)
+        _ = await connect(controller, mock)
+        mock.replyToLastSent { sent in
+            guard sent.contains("\"op\":6") else { return nil }
+            let id = requestId(fromSent: sent)
+            guard requestType(fromSent: sent) == type else {
+                return responseFrame(requestId: id, ok: true)
+            }
+            return ok
+                ? responseFrame(requestId: id, ok: true, responseData: responseData)
+                : responseFrame(requestId: id, ok: false, code: 500)
+        }
+        return (controller, mock)
+    }
+
+    /// sceneItemList parses sourceName/inputKind pairs and sends the scene name.
+    func testSceneItemListParsesNameAndKind() async {
+        let (controller, mock) = await makeProvisioningController(
+            answering: "GetSceneItemList",
+            responseData: ["sceneItems": [
+                ["sourceName": "LiveAstro Stack", "inputKind": "screen_capture"],
+                ["sourceName": "Paul Camera", "inputKind": "macos-avcapture"]
+            ]])
+
+        let items = await controller.sceneItemList(scene: "Scene")
+        XCTAssertEqual(items, [
+            OBSSceneItem(inputName: "LiveAstro Stack", inputKind: "screen_capture"),
+            OBSSceneItem(inputName: "Paul Camera", inputKind: "macos-avcapture")
+        ])
+        XCTAssertEqual(sentRequestData(mock, type: "GetSceneItemList") as NSDictionary?,
+                       ["sceneName": "Scene"] as NSDictionary,
+                       "the request must carry the scene name")
+        controller.disconnect()
+    }
+
+    /// createInput sends sceneName + inputName + inputKind + inputSettings.
+    func testCreateInputSendsSceneNameKindAndSettings() async {
+        let (controller, mock) = await makeProvisioningController(answering: "CreateInput")
+
+        let settings: [String: Any] = ["display": 1, "show_cursor": false]
+        let ok = await controller.createInput(scene: "S", inputName: "LiveAstro Stack",
+                                              inputKind: "screen_capture", settings: settings)
+        XCTAssertTrue(ok)
+        XCTAssertEqual(sentRequestData(mock, type: "CreateInput") as NSDictionary?,
+                       ["sceneName": "S",
+                        "inputName": "LiveAstro Stack",
+                        "inputKind": "screen_capture",
+                        "inputSettings": ["display": 1, "show_cursor": false]] as NSDictionary)
+        controller.disconnect()
+    }
+
+    /// setInputSettings sends inputName + inputSettings with overlay:true
+    /// (merge, never replace — untouched OBS settings must survive).
+    func testSetInputSettingsSendsOverlayTrue() async {
+        let (controller, mock) = await makeProvisioningController(answering: "SetInputSettings")
+
+        let ok = await controller.setInputSettings(inputName: "LiveAstro Stack",
+                                                   settings: ["show_cursor": false])
+        XCTAssertTrue(ok)
+        let payload = sentRequestData(mock, type: "SetInputSettings")
+        XCTAssertEqual(payload?["inputName"] as? String, "LiveAstro Stack")
+        XCTAssertEqual(payload?["overlay"] as? Bool, true,
+                       "settings must MERGE (overlay:true), never replace")
+        XCTAssertEqual(payload?["inputSettings"] as? NSDictionary,
+                       ["show_cursor": false] as NSDictionary)
+        controller.disconnect()
+    }
+
+    /// createScene sends the scene name.
+    func testCreateSceneSendsName() async {
+        let (controller, mock) = await makeProvisioningController(answering: "CreateScene")
+
+        let ok = await controller.createScene("LiveAstro")
+        XCTAssertTrue(ok)
+        XCTAssertEqual(sentRequestData(mock, type: "CreateScene") as NSDictionary?,
+                       ["sceneName": "LiveAstro"] as NSDictionary)
+        controller.disconnect()
+    }
+
+    /// A non-empty key reports true — and the key VALUE never reaches the
+    /// controller's log sink (Global Constraint: presence check only).
+    func testStreamServiceKeyPresentTrueWhenNonEmpty() async {
+        let mock = MockOBSSocket()
+        let controller = makeController(mock)
+        var logs: [String] = []
+        controller.onLog = { logs.append($0) }   // installed BEFORE any traffic
+        _ = await connect(controller, mock)
+        mock.replyToLastSent { sent in
+            guard sent.contains("\"op\":6") else { return nil }
+            let id = requestId(fromSent: sent)
+            guard requestType(fromSent: sent) == "GetStreamServiceSettings" else {
+                return responseFrame(requestId: id, ok: true)
+            }
+            return responseFrame(requestId: id, ok: true, responseData: [
+                "streamServiceType": "rtmp_common",
+                "streamServiceSettings": ["key": "SECRET",
+                                          "server": "rtmps://a.rtmps.youtube.com/live2"]
+            ])
+        }
+
+        let present = await controller.streamServiceKeyPresent()
+        XCTAssertEqual(present, true)
+        XCTAssertFalse(logs.contains { $0.contains("SECRET") },
+                       "the stream key value must never reach the log sink")
+        controller.disconnect()
+    }
+
+    /// An empty key reports false (configured service, missing key).
+    func testStreamServiceKeyPresentFalseWhenEmpty() async {
+        let (controller, _) = await makeProvisioningController(
+            answering: "GetStreamServiceSettings",
+            responseData: ["streamServiceSettings": ["key": "",
+                                                     "server": "rtmps://a.rtmps.youtube.com/live2"]])
+
+        let present = await controller.streamServiceKeyPresent()
+        XCTAssertEqual(present, false)
+        controller.disconnect()
+    }
+
+    /// A failed GetStreamServiceSettings reports nil — unavailable, not "absent".
+    func testStreamServiceKeyPresentNilWhenRequestFails() async {
+        let (controller, _) = await makeProvisioningController(
+            answering: "GetStreamServiceSettings", ok: false)
+
+        let present = await controller.streamServiceKeyPresent()
+        XCTAssertNil(present, "request failure must report nil (unavailable), never false")
+        controller.disconnect()
+    }
+
+    /// sceneNames() returns the fetched list as a value, in OBS's own order.
+    func testSceneNamesReturnsList() async {
+        let (controller, _) = await makeProvisioningController(
+            answering: "GetSceneList",
+            responseData: ["currentProgramSceneName": "Scene",
+                           "scenes": [["sceneName": "Scene"], ["sceneName": "LiveAstro"]]])
+
+        let names = await controller.sceneNames()
+        XCTAssertEqual(names, ["Scene", "LiveAstro"])
+        controller.disconnect()
+    }
 }

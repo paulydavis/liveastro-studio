@@ -26,6 +26,12 @@ struct MainView: View {
             case .help:  AnyView(HelpView())
             }
         }
+        .onAppear {
+            // Wires BroadcastDeps.openBroadcastWindow (AppModel can't touch
+            // SwiftUI's openWindow action itself) to the same path the Detach
+            // button uses below.
+            model.openBroadcastWindowHandler = { openWindow(id: "broadcast") }
+        }
     }
 
     private var detachedPlaceholder: some View {

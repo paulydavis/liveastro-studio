@@ -100,6 +100,15 @@ final class AppModel {
     /// (`$model.broadcast.obsHost`); the reference itself is never rebound.
     var broadcast: BroadcastController!
 
+    /// Set by `MainView` (the only View with `@Environment(\.openWindow)` in
+    /// scope) so `BroadcastDeps.openBroadcastWindow` can request the
+    /// "broadcast" window — the same `openWindow(id: "broadcast")` path the
+    /// Detach button uses — without `AppModel` touching SwiftUI's
+    /// window-opening API directly. Nil until `MainView` wires it; the T5
+    /// pre-flight capture stage already tolerates a slow-to-appear window
+    /// (bounded poll of `broadcastWindowID`).
+    var openBroadcastWindowHandler: (() -> Void)?
+
     /// Live-source orchestration cluster (T2 extraction): the frame relay, its
     /// retention policy, and the three auto-detect/configure paths. Same IUO
     /// init-order rationale as `broadcast` above — assigned exactly once early in
@@ -132,6 +141,26 @@ final class AppModel {
                     OBSLauncher.launch(log: { message in
                         MainActor.assumeIsolated { self?.log.append(message) }
                     })
+                }
+            },
+            openBroadcastWindow: { [weak self] in
+                MainActor.assumeIsolated { self?.openBroadcastWindowHandler?() }
+            },
+            broadcastWindowID: {
+                // NSWindow.windowNumber IS the CGWindowID — but it is documented
+                // to be <= 0 whenever the window has no window device (never yet
+                // ordered in, or released after close). Final review F-1: an
+                // invalid id yields nil — the capture stage's bounded poll keeps
+                // waiting — instead of trapping in UInt32.init, and a stale
+                // deviceless window can no longer shadow the freshly opened one.
+                MainActor.assumeIsolated {
+                    NSApp.windows
+                        .filter { $0.title == "LiveAstro Broadcast" }
+                        .compactMap { window in
+                            window.windowNumber > 0
+                                ? UInt32(exactly: window.windowNumber) : nil
+                        }
+                        .first
                 }
             }))
 

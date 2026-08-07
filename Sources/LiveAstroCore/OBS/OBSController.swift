@@ -1,6 +1,18 @@
 import Foundation
 import Combine
 
+/// One source in an OBS scene, as reported by GetSceneItemList (preflight
+/// spec §3 — the provisioning primitives' read model).
+public struct OBSSceneItem: Equatable {
+    public let inputName: String
+    public let inputKind: String
+
+    public init(inputName: String, inputKind: String) {
+        self.inputName = inputName
+        self.inputKind = inputKind
+    }
+}
+
 /// High-level, UI-facing controller over `OBSClient`.
 ///
 /// Owns the connection lifecycle and a small observable state machine
@@ -29,6 +41,14 @@ public final class OBSController: ObservableObject {
     @Published public private(set) var isRecording = false
     @Published public private(set) var sceneNames: [String] = []
     @Published public private(set) var currentScene: String?
+
+    /// Why the most recent connect attempt failed (nil before any attempt and
+    /// after a success). Additive T5 surface: goLive's preflight distinguishes
+    /// "OBS unreachable" (the `.obsRunning` link) from "reachable but the
+    /// password was refused" (the `.connected` link, `.authFailed`). Cleared
+    /// at every connect start; set only by the failing attempt's own epoch —
+    /// the same staleness rule as every other connect landing.
+    public private(set) var lastConnectFailure: OBSClient.OBSError?
 
     /// Diagnostic log sink. Every swallowed error and lifecycle note is emitted here.
     public var onLog: ((String) -> Void)?
@@ -118,6 +138,12 @@ public final class OBSController: ObservableObject {
         // the epoch, so every consumer of the old client goes stale.
         teardown()
 
+        // This attempt owns the outcome — cleared BEFORE any early return, so
+        // a prior attempt's `.authFailed` cannot survive an invalid-URL failure
+        // and misdiagnose it (final review M-1: the property's contract is
+        // "cleared at every connect start", including this one).
+        lastConnectFailure = nil
+
         guard let url = URL(string: "ws://\(host):\(port)") else {
             log("connect: invalid host/port \(host):\(port)")
             state = .disconnected
@@ -165,6 +191,7 @@ public final class OBSController: ObservableObject {
         } catch {
             log("connect failed: \(error)")
             guard epoch == connectionEpoch else { return false }   // superseded: touch nothing
+            lastConnectFailure = error as? OBSClient.OBSError
             self.client = nil
             state = .disconnected
             return false
@@ -301,6 +328,60 @@ public final class OBSController: ObservableObject {
     @discardableResult
     public func setRecording(_ on: Bool) async -> Bool {
         await requestData(on ? "StartRecord" : "StopRecord", nil) != nil
+    }
+
+    // MARK: - Provisioning primitives (preflight spec §3 — additive only; this
+    // controller deliberately has NO remove/delete/rename request anywhere).
+
+    public func sceneItemList(scene: String) async -> [OBSSceneItem]? {
+        guard let data = await requestData("GetSceneItemList", ["sceneName": scene]),
+              let items = data["sceneItems"] as? [[String: Any]] else { return nil }
+        return items.compactMap { item in
+            guard let name = item["sourceName"] as? String else { return nil }
+            return OBSSceneItem(inputName: name,
+                                inputKind: item["inputKind"] as? String ?? "")
+        }
+    }
+
+    public func inputSettings(inputName: String) async -> [String: Any]? {
+        guard let data = await requestData("GetInputSettings", ["inputName": inputName])
+        else { return nil }
+        return data["inputSettings"] as? [String: Any] ?? [:]
+    }
+
+    public func setInputSettings(inputName: String, settings: [String: Any]) async -> Bool {
+        await requestData("SetInputSettings",
+                          ["inputName": inputName, "inputSettings": settings,
+                           "overlay": true]) != nil
+    }
+
+    public func createInput(scene: String, inputName: String,
+                            inputKind: String, settings: [String: Any]) async -> Bool {
+        await requestData("CreateInput",
+                          ["sceneName": scene, "inputName": inputName,
+                           "inputKind": inputKind, "inputSettings": settings]) != nil
+    }
+
+    public func createScene(_ name: String) async -> Bool {
+        await requestData("CreateScene", ["sceneName": name]) != nil
+    }
+
+    /// Fetch the scene names as a value (the same GetSceneList `refreshScenes`
+    /// issues, in OBS's own order), without touching the published state.
+    public func sceneNames() async -> [String]? {
+        guard let data = await requestData("GetSceneList", nil),
+              let scenes = data["scenes"] as? [[String: Any]] else { return nil }
+        return scenes.compactMap { $0["sceneName"] as? String }
+    }
+
+    /// Presence-only stream-key check (spec §3). The key value never reaches a
+    /// log, a published property, or a thrown error — only this Bool leaves.
+    public func streamServiceKeyPresent() async -> Bool? {
+        guard let data = await requestData("GetStreamServiceSettings", nil),
+              let settings = data["streamServiceSettings"] as? [String: Any]
+        else { return nil }
+        let key = settings["key"] as? String ?? ""
+        return !key.isEmpty
     }
 
     // MARK: - Broadcast operations
