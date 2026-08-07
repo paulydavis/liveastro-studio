@@ -1972,6 +1972,32 @@ final class BroadcastControllerTests: XCTestCase {
                        "the token value must never reach any log")
     }
 
+    /// Live-smoke finding 2: an account-linked YouTube service (empty key,
+    /// RefreshToken in the profile) passes .streamService, but obs-websocket's
+    /// StartStream can still fail instantly if no broadcast was created in
+    /// OBS's YouTube dock first — a YouTube/OBS constraint, not something this
+    /// app's preflight can verify in advance. When that StartStream fails, the
+    /// .streaming remedy must explain the account-link-specific cause instead
+    /// of the generic "check your stream key" text (which is wrong here — no
+    /// key is configured on this path at all).
+    func testAccountLinkedStartStreamFailureExplainsBroadcastRequirement() async throws {
+        let h = await makeHarness()
+        h.server.streamKey = ""
+        h.controller.obsRootOverride = try writeLinkedOBSRootFixture()
+        h.server.streamReactsToRequests = false   // StartStream accepted, no effect
+
+        h.controller.goLive()
+        await waitUntil { self.linkFailed(h.controller, .streaming) }
+        await settle()
+
+        guard case let .failed(reason, remedy) = h.controller.preflight[.streaming] else {
+            return XCTFail("streaming must be .failed — got \(h.controller.preflight[.streaming])")
+        }
+        XCTAssertFalse(reason.isEmpty)
+        XCTAssertTrue(remedy.contains("broadcast"), remedy)
+        XCTAssertTrue(remedy.contains("stream key"), remedy)
+    }
+
     /// Resume semantics: after the stream-key halt, fixing OBS and clicking
     /// Go Live again keeps the green links (no capture re-provisioning) and
     /// completes the chain.

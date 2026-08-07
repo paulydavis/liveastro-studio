@@ -107,6 +107,11 @@ LiveAstro guarantees only its own "LiveAstro Stack" source; everything else in y
 2. Set **Stack scene** and **Scope scene** under Scene Automation so LiveAstro switches between them automatically on a stall/resume.
 3. Switch scenes manually in OBS any time — LiveAstro treats that as an operator override until the next stall/resume boundary.
 
+**YouTube: stream key vs account link**
+- **Stream key** (OBS → Settings → Stream, pasted from YouTube Studio → Go Live): one-button automation — Go Live works every time with no extra steps in OBS.
+- **Account link** (OBS's YouTube dock, signed in via OAuth): gives you the live chat dock and a fresh broadcast per session, but you must create the broadcast in OBS's YouTube dock *before* clicking Go Live each session — otherwise streaming fails to start.
+- If Go Live fails with an account-linked service, check the YouTube dock for an existing broadcast first; pasting a permanent stream key avoids the per-session step entirely.
+
 ---
 
 ## Display Adjustments

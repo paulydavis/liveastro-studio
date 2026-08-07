@@ -646,6 +646,16 @@ public final class BroadcastController {
     /// re-reads the file once (regenerated-password case, spec §3).
     private var discoveredPasswordFromConfig = false
 
+    /// Live-smoke finding 2 (2026-08-06): true when the CURRENT attempt's
+    /// `.streamService` link went `.ok` via account-link detection rather than
+    /// a configured stream key. A YouTube/OBS constraint means StartStream can
+    /// still fail instantly on this basis unless a broadcast was already
+    /// created in OBS's YouTube dock — the `.streaming` failure landing uses
+    /// this to pick the remedy that actually applies (the generic "check your
+    /// stream key" text is wrong here: no key is configured on this path at
+    /// all). Reset at chain entry; set by `streamServiceStage`.
+    private var streamServiceViaAccountLink = false
+
     /// Whether any link is `.failed` — a HALTED chain. goLive's entry keeps a
     /// halted chain's green links (resume semantics) and resets anything else:
     /// a fresh chain trivially, and links left half-checked (`.checking`/`.ok`)
@@ -822,6 +832,7 @@ public final class BroadcastController {
         guard present else {
             if OBSLocalConfig.activeProfileHasLinkedAccount(obsRoot: obsRootOverride) {
                 preflight.set(.streamService, .ok)
+                streamServiceViaAccountLink = true
                 deps.log("OBS: stream service account-linked")
                 return true
             }
@@ -831,6 +842,7 @@ public final class BroadcastController {
             return false
         }
         preflight.set(.streamService, .ok)
+        streamServiceViaAccountLink = false
         return true
     }
 
@@ -842,6 +854,10 @@ public final class BroadcastController {
         // when the reconcile confirmed both outputs inactive.
         guard broadcastState == .idle || broadcastState == .unknown else { return }
         let origin = broadcastState
+        // Live-smoke finding 2: reset at chain entry — the current attempt's
+        // streamServiceStage (which always runs, resume or fresh) recomputes
+        // this before any `.streaming` failure landing can read it.
+        streamServiceViaAccountLink = false
         // T5 preflight entry (synchronous, before the generation bump): a
         // HALTED chain — some link `.failed` — RESUMES: its green links stay
         // and the failed link re-runs (the stages re-verify idempotently).
@@ -1006,9 +1022,16 @@ public final class BroadcastController {
                 // .stopUnconfirmed; sessionDidEnd's .stopping branch leaves the
                 // cleanup alone) and run the confirmed stop in a fresh
                 // unstructured task that no UI cancellation reaches.
+                // Live-smoke finding 2: an account-linked YouTube service has
+                // no key to "check" — the generic remedy is actively wrong on
+                // that path. StartStream failing instantly there is usually
+                // the YouTube/OBS constraint that a broadcast must already
+                // exist in OBS's YouTube dock; explain that instead.
                 preflight.set(.streaming, .failed(
                     reason: "OBS started but the stream didn't go live",
-                    remedy: "Check OBS → Settings → Stream (YouTube server + key), then Go Live again"))
+                    remedy: streamServiceViaAccountLink
+                        ? "Account-linked YouTube needs a broadcast created in OBS's YouTube dock each session — or paste your permanent stream key (YouTube Studio → Go Live) into OBS → Settings → Stream for one-button Go Live."
+                        : "Check OBS → Settings → Stream (YouTube server + key), then Go Live again"))
                 broadcastGeneration += 1
                 let cleanupGen = broadcastGeneration
                 broadcastState = .stopping
