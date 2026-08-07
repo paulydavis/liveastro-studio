@@ -45,6 +45,17 @@ final class AppModel {
 
     var fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
     var neutralizeBackground = false
+
+    // Session completion draft (bound to the Setup "Session end" group; assembled
+    // into SessionSettings by currentSettings() and restored by loadSettings()).
+    // These are the LIVE values the completion tick reads via
+    // currentSettings().completionSettings — without them the tick would only ever
+    // see SessionSettings defaults (planned stop unreachable in production).
+    var idleSafeguardEnabled = true
+    var idleSafeguardMinutes = 15
+    var plannedStopEnabled = false
+    var plannedStopHour = 3
+    var plannedStopMinute = 0
     var rejectionEnabled = true
     var rejectionStrength: RejectionStrength = .medium
     var frameWeightingEnabled = true
@@ -261,7 +272,24 @@ final class AppModel {
             processorBackend: processorBackend,
             displayAdjustments: displayAdjustments,
             relayRetentionDays: liveSource.relayRetentionDays,
-            demosaic: demosaic)
+            demosaic: demosaic,
+            idleSafeguardEnabled: idleSafeguardEnabled,
+            idleSafeguardMinutes: idleSafeguardMinutes,
+            plannedStopEnabled: plannedStopEnabled,
+            plannedStopHour: plannedStopHour,
+            plannedStopMinute: plannedStopMinute)
+    }
+
+    /// The live completion subset (idle safeguard + planned stop) read from the
+    /// draft properties — the same values `currentSettings().completionSettings`
+    /// assembles, exposed cheaply for the Live-tab armed status without building a
+    /// whole SessionSettings each render.
+    var completionSettings: CompletionSettings {
+        CompletionSettings(idleSafeguardEnabled: idleSafeguardEnabled,
+                           idleSafeguardMinutes: idleSafeguardMinutes,
+                           plannedStopEnabled: plannedStopEnabled,
+                           plannedStopHour: plannedStopHour,
+                           plannedStopMinute: plannedStopMinute)
     }
 
     func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
@@ -284,6 +312,11 @@ final class AppModel {
         demosaic = s.demosaic
         processorBackend = s.processorBackend
         displayAdjustments = s.displayAdjustments
+        idleSafeguardEnabled = s.idleSafeguardEnabled
+        idleSafeguardMinutes = s.idleSafeguardMinutes
+        plannedStopEnabled = s.plannedStopEnabled
+        plannedStopHour = s.plannedStopHour
+        plannedStopMinute = s.plannedStopMinute
     }
 
     private var lastAdjustmentRender = Date.distantPast

@@ -171,6 +171,20 @@ struct BroadcastView: View {
                     Text(equipmentLine)
                         .font(.system(size: BroadcastLayout.equipmentSize * scale, weight: .medium, design: .rounded))
                         .foregroundStyle(.tertiary)
+                    // Session-end armed status — operator-facing only. Shown in the
+                    // embedded Live tab (configuresWindow == false), never in the
+                    // OBS-captured detached window, so it can't burn into the
+                    // broadcast. Refreshes every 30 s so the countdown ticks.
+                    if !configuresWindow, model.isRunning {
+                        let cs = model.completionSettings
+                        if cs.plannedStopEnabled || cs.idleSafeguardEnabled {
+                            TimelineView(.periodic(from: .now, by: 30)) { context in
+                                Text(completionStatusText(cs, now: context.date))
+                                    .font(.system(size: BroadcastLayout.equipmentSize * scale, weight: .medium, design: .rounded))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
                 }
                 Spacer()
                 TimelineView(.periodic(from: .now, by: 1)) { _ in
@@ -193,6 +207,31 @@ struct BroadcastView: View {
             parts.append(model.locationLabel + bortle)
         }
         return parts.joined(separator: "  ·  ")
+    }
+
+    /// Renders the armed session-end triggers, e.g. "Auto-stop 3:00 AM · idle-safe
+    /// 15 min". When the planned stop is under an hour away, its segment switches to
+    /// a live countdown ("Auto-stop in 24 min"). Uses the same next-occurrence
+    /// deadline the driver fires on (crosses midnight).
+    private func completionStatusText(_ cs: CompletionSettings, now: Date) -> String {
+        var parts: [String] = []
+        if cs.plannedStopEnabled {
+            let deadline = SessionCompletionMonitor.plannedStopDeadline(
+                after: now, hour: cs.plannedStopHour, minute: cs.plannedStopMinute)
+            let remaining = deadline.timeIntervalSince(now)
+            if remaining < 3600 {
+                let mins = max(0, Int((remaining / 60).rounded()))
+                parts.append("Auto-stop in \(mins) min")
+            } else {
+                let f = DateFormatter()
+                f.dateFormat = "h:mm a"
+                parts.append("Auto-stop \(f.string(from: deadline))")
+            }
+        }
+        if cs.idleSafeguardEnabled {
+            parts.append("idle-safe \(cs.idleSafeguardMinutes) min")
+        }
+        return parts.joined(separator: " · ")
     }
 
     private var elapsedLine: String {
