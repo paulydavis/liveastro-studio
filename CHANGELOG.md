@@ -2,9 +2,15 @@
 
 ## Unreleased
 
+## 3.2.0 — 2026-08-08
+
 - Session end: idle safeguard writes the master mid-session (never lose a stack to
   a quit) and keeps stacking; optional auto-stop at a set clock time runs a full
-  End Session; macOS notifications when either fires.
+  End Session; macOS notifications when either fires. The idle safeguard applies to
+  native stacking only (where the app owns the master) — in external-stacker mode
+  it is disabled in Setup and no longer advertised on the Live tab. The Live tab
+  shows a floored auto-stop countdown ("Auto-stop in N min") that switches to a
+  clock time an hour out.
 - Relicensed under the **MIT License**. Replaced the demosaic path with a
   clean-room implementation of Malvar–He–Cutler (ICASSP 2004), removing the
   previous GPL-derived RCD code so the project carries no copyleft dependency.
