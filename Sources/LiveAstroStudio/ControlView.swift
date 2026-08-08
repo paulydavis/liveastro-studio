@@ -393,10 +393,16 @@ struct ControlView: View {
                         helpToggle("Idle safeguard — save master if capture stalls",
                                    isOn: $model.idleSafeguardEnabled,
                                    help: "Writes master.fit and keeps stacking; a cloud gap resumes normally.")
+                            .disabled(model.sourceMode != .nativeStack)
+                        if model.sourceMode != .nativeStack {
+                            Text("Native stacking only — external stackers own their own master.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         if model.idleSafeguardEnabled {
                             Stepper("After \(model.idleSafeguardMinutes) min idle",
                                     value: $model.idleSafeguardMinutes, in: 5...120, step: 5)
                                 .help("How long capture may stall before a master snapshot is written. Stacking continues; a resumed feed re-arms the safeguard.")
+                                .disabled(model.sourceMode != .nativeStack)
                         }
                         helpToggle("Auto-stop at a set time", isOn: $model.plannedStopEnabled,
                                    help: "Runs a full End Session at this time (writes master + replay, ends an owned broadcast). Does not quit the app.")
