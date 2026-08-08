@@ -216,8 +216,11 @@ struct BroadcastView: View {
     private func completionStatusText(_ cs: CompletionSettings, now: Date) -> String {
         var parts: [String] = []
         if cs.plannedStopEnabled {
+            // Anchor on the same armed-at timestamp the driver uses (never earlier
+            // than session start), so the displayed countdown and the tick that
+            // actually fires agree on the deadline.
             let deadline = SessionCompletionMonitor.plannedStopDeadline(
-                after: now, hour: cs.plannedStopHour, minute: cs.plannedStopMinute)
+                after: model.plannedStopAnchor, hour: cs.plannedStopHour, minute: cs.plannedStopMinute)
             let remaining = deadline.timeIntervalSince(now)
             if remaining < 3600 {
                 let mins = max(0, Int((remaining / 60).rounded()))

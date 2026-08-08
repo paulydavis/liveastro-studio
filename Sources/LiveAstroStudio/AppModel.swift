@@ -53,9 +53,32 @@ final class AppModel {
     // see SessionSettings defaults (planned stop unreachable in production).
     var idleSafeguardEnabled = true
     var idleSafeguardMinutes = 15
-    var plannedStopEnabled = false
-    var plannedStopHour = 3
-    var plannedStopMinute = 0
+    var plannedStopEnabled = false {
+        didSet {
+            // Arm/disarm on the enable flip. The armed-at timestamp anchors the
+            // planned-stop deadline (both the tick driver and the Live-tab display),
+            // so a mid-session enable at 11:30 PM with a 10 PM stop resolves to 10 PM
+            // the NEXT day instead of firing immediately.
+            guard plannedStopEnabled != oldValue else { return }
+            plannedStopArmedAt = plannedStopEnabled ? Date() : nil
+        }
+    }
+    var plannedStopHour = 3 {
+        didSet { rearmPlannedStopIfEnabled(changed: plannedStopHour != oldValue) }
+    }
+    var plannedStopMinute = 0 {
+        didSet { rearmPlannedStopIfEnabled(changed: plannedStopMinute != oldValue) }
+    }
+    /// When planned-stop was last enabled or its time last changed — the anchor for
+    /// the planned-stop deadline. nil while disabled. loadSettings() assigns the
+    /// draft on launch, so this becomes launch time (deadline = next occurrence
+    /// after launch, which is the intended behavior).
+    var plannedStopArmedAt: Date?
+    /// Re-arm (reset armed-at to now) when the stop time changes while enabled.
+    private func rearmPlannedStopIfEnabled(changed: Bool) {
+        guard changed, plannedStopEnabled else { return }
+        plannedStopArmedAt = Date()
+    }
     var rejectionEnabled = true
     var rejectionStrength: RejectionStrength = .medium
     var frameWeightingEnabled = true
@@ -290,6 +313,15 @@ final class AppModel {
                            plannedStopEnabled: plannedStopEnabled,
                            plannedStopHour: plannedStopHour,
                            plannedStopMinute: plannedStopMinute)
+    }
+
+    /// The planned-stop deadline anchor: the armed-at timestamp, but never earlier
+    /// than session start (handles arm-before-then-start-after-the-time edge without
+    /// an immediate fire on start). Used by BOTH the completion tick driver and the
+    /// Live-tab countdown so display and driver agree on the deadline.
+    var plannedStopAnchor: Date {
+        let floor = sessionStart ?? Date()
+        return max(plannedStopArmedAt ?? floor, floor)
     }
 
     func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
@@ -569,15 +601,21 @@ final class AppModel {
                 try? await Task.sleep(nanoseconds: 30_000_000_000)   // 30 s
                 guard let self, self.isRunning, !Task.isCancelled else { return }
                 let action = self.completionDriver.step(
-                    now: Date(), sessionStart: self.sessionStart ?? Date(),
+                    now: Date(), plannedStopAnchor: self.plannedStopAnchor,
                     lastAcceptedFrame: self.lastAcceptedFrame,
                     settings: self.currentSettings().completionSettings)
                 switch action {
                 case .safeguard:
+                    // Idle safeguard is native-only (writeMasterSnapshot() can only
+                    // snapshot a native stack). In watcher/mirror mode the external
+                    // stacker owns its master, so skip and leave the fired flag set —
+                    // don't retry a pointless snapshot every 30 s. The UI gate is the
+                    // primary fix; this is belt-and-suspenders.
+                    if self.sourceMode != .nativeStack { break }
                     // Idle capture: persist a master snapshot but keep running. If
-                    // the snapshot could not be written (non-native pipeline or a
-                    // failed write), clear the flag so it retries on the next tick
-                    // rather than being silently consumed.
+                    // the snapshot could not be written (a failed write), clear the
+                    // flag so it retries on the next tick rather than being silently
+                    // consumed.
                     if self.pipeline?.writeMasterSnapshot() == true {
                         self.notifier.notifySafeguard()
                     } else {

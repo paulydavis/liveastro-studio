@@ -16,7 +16,9 @@ final class SessionNotifier {
         post(title: "Capture idle", body: "No new frames — master saved. Session still running.")
     }
     func notifyPlannedStopEnd() {
-        post(title: "Session complete", body: "Planned stop reached — master + replay written.")
+        // Posted BEFORE endSession()'s async finalization (which can fail/retry), so
+        // it must not claim the master/replay are already written — say we're ending.
+        post(title: "Session ending", body: "Planned stop reached — ending session.")
     }
     private func post(title: String, body: String) {
         let content = UNMutableNotificationContent()
