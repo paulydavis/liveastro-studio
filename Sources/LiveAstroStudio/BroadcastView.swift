@@ -176,10 +176,9 @@ struct BroadcastView: View {
                     // OBS-captured detached window, so it can't burn into the
                     // broadcast. Refreshes every 30 s so the countdown ticks.
                     if !configuresWindow, model.isRunning {
-                        let cs = model.completionSettings
-                        if cs.plannedStopEnabled || cs.idleSafeguardEnabled {
-                            TimelineView(.periodic(from: .now, by: 30)) { context in
-                                Text(completionStatusText(cs, now: context.date))
+                        TimelineView(.periodic(from: .now, by: 30)) { context in
+                            if let text = completionStatusText(now: context.date) {
+                                Text(text)
                                     .font(.system(size: BroadcastLayout.equipmentSize * scale, weight: .medium, design: .rounded))
                                     .foregroundStyle(.tertiary)
                             }
@@ -213,28 +212,22 @@ struct BroadcastView: View {
     /// 15 min". When the planned stop is under an hour away, its segment switches to
     /// a live countdown ("Auto-stop in 24 min"). Uses the same next-occurrence
     /// deadline the driver fires on (crosses midnight).
-    private func completionStatusText(_ cs: CompletionSettings, now: Date) -> String {
-        var parts: [String] = []
-        if cs.plannedStopEnabled {
-            // Anchor on the same armed-at timestamp the driver uses (never earlier
-            // than session start), so the displayed countdown and the tick that
-            // actually fires agree on the deadline.
-            let deadline = SessionCompletionMonitor.plannedStopDeadline(
+    private func completionStatusText(now: Date) -> String? {
+        let cs = model.completionSettings
+        // Same armed-at anchor the driver fires on, so the displayed countdown and
+        // the tick agree. idle-safe is gated to native mode inside CompletionStatus.
+        let deadline = cs.plannedStopEnabled
+            ? SessionCompletionMonitor.plannedStopDeadline(
                 after: model.plannedStopAnchor, hour: cs.plannedStopHour, minute: cs.plannedStopMinute)
-            let remaining = deadline.timeIntervalSince(now)
-            if remaining < 3600 {
-                let mins = max(0, Int((remaining / 60).rounded()))
-                parts.append("Auto-stop in \(mins) min")
-            } else {
-                let f = DateFormatter()
-                f.dateFormat = "h:mm a"
-                parts.append("Auto-stop \(f.string(from: deadline))")
-            }
-        }
-        if cs.idleSafeguardEnabled {
-            parts.append("idle-safe \(cs.idleSafeguardMinutes) min")
-        }
-        return parts.joined(separator: " · ")
+            : nil
+        return CompletionStatus.line(
+            plannedStopEnabled: cs.plannedStopEnabled,
+            plannedDeadline: deadline,
+            idleSafeguardEnabled: cs.idleSafeguardEnabled,
+            idleSafeguardMinutes: cs.idleSafeguardMinutes,
+            isNativeStacking: model.sourceMode == .nativeStack,
+            now: now,
+            clockString: { d in let f = DateFormatter(); f.dateFormat = "h:mm a"; return f.string(from: d) })
     }
 
     private var elapsedLine: String {
