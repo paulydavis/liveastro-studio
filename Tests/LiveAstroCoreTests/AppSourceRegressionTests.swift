@@ -177,4 +177,27 @@ final class AppSourceRegressionTests: XCTestCase {
             "Configure helpers must also guard direct/internal calls before creating a relay."
         )
     }
+
+    /// Pins the P2#1 fix (session-completion post-merge review): the planned-stop
+    /// deadline must anchor on the shared armed-at anchor, NOT sessionStart — and
+    /// BOTH the driver tick and the Live-tab countdown must use the SAME anchor, or
+    /// they diverge and the stop can fire immediately on a mid-session enable.
+    func testPlannedStopUsesSharedArmedAtAnchorInDriverAndDisplay() throws {
+        let appModel = try String(contentsOf: root.appendingPathComponent("Sources/LiveAstroStudio/AppModel.swift"), encoding: .utf8)
+        let broadcast = try String(contentsOf: root.appendingPathComponent("Sources/LiveAstroStudio/BroadcastView.swift"), encoding: .utf8)
+
+        XCTAssertTrue(appModel.contains("var plannedStopArmedAt"),
+            "AppModel must track when planned-stop was armed, so a mid-session enable anchors on the enable time, not sessionStart.")
+        XCTAssertTrue(appModel.contains("var plannedStopAnchor"),
+            "AppModel must expose one shared plannedStopAnchor so the driver and the display agree.")
+        XCTAssertTrue(appModel.contains("plannedStopAnchor: self.plannedStopAnchor")
+                      || appModel.contains("plannedStopAnchor: plannedStopAnchor"),
+            "The driver tick must feed the shared plannedStopAnchor into step(), not sessionStart.")
+        XCTAssertFalse(appModel.contains("plannedStopAnchor: self.sessionStart")
+                       || appModel.contains("plannedStopAnchor: sessionStart"),
+            "Regression: the tick must NOT anchor the planned stop on sessionStart (fires immediately on a mid-session enable).")
+        XCTAssertTrue(broadcast.contains("model.plannedStopAnchor"),
+            "The Live-tab countdown must use the SAME shared anchor as the driver, or display and firing disagree.")
+    }
+
 }
