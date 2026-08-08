@@ -25,7 +25,10 @@ public enum CompletionStatus {
         if plannedStopEnabled, let deadline = plannedDeadline {
             let remaining = deadline.timeIntervalSince(now)
             if remaining < 3600 {
-                parts.append("Auto-stop in \(max(0, Int((remaining / 60).rounded()))) min")
+                // Floor, not round: this is a countdown, so N is full minutes
+                // remaining. Rounding would show "60 min" for [3570,3600) — a
+                // nonsense value inside the under-an-hour branch.
+                parts.append("Auto-stop in \(max(0, Int(remaining / 60))) min")
             } else {
                 parts.append("Auto-stop \(clockString(deadline))")
             }

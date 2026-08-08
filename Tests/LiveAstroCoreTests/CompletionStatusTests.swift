@@ -46,6 +46,36 @@ final class CompletionStatusTests: XCTestCase {
             "Auto-stop in 24 min")
     }
 
+    func testCountdownFloorsNotRounds() {
+        // 3599s remaining → 59 min (floor), never "60 min" inside the <1h branch.
+        let deadline = now.addingTimeInterval(3599)
+        XCTAssertEqual(CompletionStatus.line(
+            plannedStopEnabled: true, plannedDeadline: deadline,
+            idleSafeguardEnabled: false, idleSafeguardMinutes: 15,
+            isNativeStacking: true, now: now, clockString: clock),
+            "Auto-stop in 59 min")
+    }
+
+    func testExactlyOneHourShowsClock() {
+        // 3600s remaining is the branch boundary: >= 3600 → clock time, not countdown.
+        let deadline = now.addingTimeInterval(3600)
+        XCTAssertEqual(CompletionStatus.line(
+            plannedStopEnabled: true, plannedDeadline: deadline,
+            idleSafeguardEnabled: false, idleSafeguardMinutes: 15,
+            isNativeStacking: true, now: now, clockString: clock),
+            "Auto-stop 3:00 AM")
+    }
+
+    func testNegativeRemainingClampsToZero() {
+        // Deadline already passed (tick lag before endSession fires) → "0 min", not negative.
+        let deadline = now.addingTimeInterval(-120)
+        XCTAssertEqual(CompletionStatus.line(
+            plannedStopEnabled: true, plannedDeadline: deadline,
+            idleSafeguardEnabled: false, idleSafeguardMinutes: 15,
+            isNativeStacking: true, now: now, clockString: clock),
+            "Auto-stop in 0 min")
+    }
+
     func testBothNativeJoined() {
         let deadline = now.addingTimeInterval(3 * 3600)
         XCTAssertEqual(CompletionStatus.line(
