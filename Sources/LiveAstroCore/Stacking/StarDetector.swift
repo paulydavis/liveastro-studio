@@ -96,7 +96,44 @@ public enum StarDetector {
         var sig = sigGrid            // sigGrid is already computed above (per-cell 1.4826·MAD)
         sig.sort()
         let backgroundSigma = sig.isEmpty ? Float(1e-6) : sig[sig.count / 2]
-        return (Array(stars.prefix(maxStars)), backgroundSigma)
+        return (spatiallyDistributed(stars, width: width, height: height, maxStars: maxStars),
+                backgroundSigma)
+    }
+
+    /// Pick up to `maxStars` from the flux-sorted `stars` so they span the whole frame
+    /// instead of clustering where the brightest sources happen to be. Bins into an 8×8
+    /// grid and takes the brightest-per-cell in rounds (round 0 = brightest in each cell,
+    /// round 1 = next, …) until the budget fills. Same count as the old `prefix(maxStars)`
+    /// (so the O(n³) triangle matcher is unchanged), but the registration fit is now
+    /// constrained by stars in the CORNERS too — the old brightest-N-globally selection
+    /// left the rotation under-determined at the edges on star-poor fields, so a tiny
+    /// rotation error smeared corner stars tangentially while the center stayed round
+    /// (2026-08-16 M 63, 26MP). Fewer than `maxStars` detected → returned as-is.
+    static func spatiallyDistributed(_ stars: [Star], width: Int, height: Int,
+                                     maxStars: Int) -> [Star] {
+        guard stars.count > maxStars, width > 0, height > 0 else {
+            return Array(stars.prefix(maxStars))
+        }
+        let g = 8
+        var buckets = [[Star]](repeating: [], count: g * g)
+        for s in stars {   // stars is already flux-desc, so each bucket stays flux-desc
+            let cx = min(g - 1, max(0, Int(s.x) * g / width))
+            let cy = min(g - 1, max(0, Int(s.y) * g / height))
+            buckets[cy * g + cx].append(s)
+        }
+        var out: [Star] = []
+        out.reserveCapacity(maxStars)
+        var round = 0
+        while out.count < maxStars {
+            var addedThisRound = false
+            for b in 0..<buckets.count where round < buckets[b].count {
+                out.append(buckets[b][round]); addedThisRound = true
+                if out.count == maxStars { break }
+            }
+            if !addedThisRound { break }   // every bucket exhausted
+            round += 1
+        }
+        return out
     }
 
     public static func detect(luminance: [Float], width: Int, height: Int,
