@@ -134,6 +134,13 @@ public final class SessionPipeline {
     var drainPrimaryTimeout: DispatchTimeInterval = .seconds(10)
     var drainGraceTimeout: DispatchTimeInterval = .seconds(5)
     var importActiveReadTimeout: DispatchTimeInterval = .seconds(60)
+    /// Per-read dead-share cap: how many consecutive `importActiveReadTimeout` windows a
+    /// SINGLE in-flight read may span with no begin/end event before it is treated as a hung
+    /// share and cancelled. A slow-but-live read (a 50 MB sub over WiFi — 2026-08-16 ASI2600
+    /// regression) resets this the instant its endFrameRead, or the next read's begin, ticks
+    /// activity; only a genuinely wedged read exhausts it. 5 × 60 s = 5 min in production.
+    /// Internal so tests can shrink it.
+    var importDeadReadWindowLimit = 5
 
     /// Watcher mode: monitors a folder for new Siril stacks and processes each update.
     public init(watchFolder: URL, profile: SessionProfile, rootDirectory: URL,
@@ -585,6 +592,7 @@ public final class SessionPipeline {
     private func drainFiniteImportOrThrow() throws {
         guard let task = consumeTask else { return }
         var last = importActivitySnapshot
+        var deadReadWindows = 0
         while true {
             if consumeDone.wait(timeout: .now() + drainPrimaryTimeout) == .success {
                 consumeTask = nil
@@ -593,9 +601,14 @@ public final class SessionPipeline {
             let now = importActivitySnapshot
             if now.progress != last.progress || now.activity != last.activity {
                 last = now
+                deadReadWindows = 0
                 continue   // progressing/starting or finishing reads — keep draining
             }
             if now.activeReads > 0 {
+                // A read is genuinely in flight: slow, not stalled (a 50 MB sub over a network
+                // share slower than one window — 2026-08-16 ASI2600 regression). Keep draining
+                // while it stays active; only a read that spans importDeadReadWindowLimit
+                // windows with NO begin/end event is treated as a hung share and cancelled.
                 if consumeDone.wait(timeout: .now() + importActiveReadTimeout) == .success {
                     consumeTask = nil
                     return
@@ -603,10 +616,18 @@ public final class SessionPipeline {
                 let afterActiveRead = importActivitySnapshot
                 if afterActiveRead.progress != now.progress || afterActiveRead.activity != now.activity {
                     last = afterActiveRead
+                    deadReadWindows = 0
                     continue
                 }
+                if afterActiveRead.activeReads > 0 {
+                    deadReadWindows += 1
+                    if deadReadWindows < importDeadReadWindowLimit {
+                        last = afterActiveRead
+                        continue   // still reading, within the dead-share cap — keep waiting
+                    }
+                }
             }
-            break                                                     // a full window, no progress
+            break                          // no active read + no progress, OR read wedged past the cap
         }
         onLog?("Import stalled with no progress — cancelling remaining frames and finalizing completed frames.")
         cancelImport()

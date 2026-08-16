@@ -63,6 +63,60 @@ final class SessionPipelineShutdownTests: XCTestCase {
         func stop() { cont.finish() }
     }
 
+    /// A finite source whose SECOND read spans MULTIPLE active-read windows before
+    /// yielding — the ASI2600-over-WiFi case: a 50 MB sub read from a slow network share
+    /// legitimately takes longer than one `importActiveReadTimeout` window. It emits
+    /// `beginFrameRead` and holds the read (polling a stop flag) so `activeFrameReads`
+    /// stays > 0 the whole time. If the drain cancels it (calls `stop()`), frame 2 is
+    /// never delivered — so the stacked count distinguishes "kept waiting" (2) from
+    /// "cancelled the live read as a stall" (1).
+    final class SlowSecondReadFiniteSource: FrameSource, FrameSourceActivityReporting {
+        let frames: AsyncStream<RawFrame>
+        private let cont: AsyncStream<RawFrame>.Continuation
+        private let seed: RawFrame
+        private let readDelay: TimeInterval
+        var onActivity: ((FrameSourceActivity) -> Void)?
+        var isFinite: Bool { true }
+        var totalCount: Int? { 2 }
+        private let lock = NSLock()
+        private var stopped = false
+
+        init(seed: RawFrame, readDelay: TimeInterval) {
+            self.seed = seed
+            self.readDelay = readDelay
+            var c: AsyncStream<RawFrame>.Continuation!
+            frames = AsyncStream { c = $0 }
+            cont = c
+        }
+
+        func start() throws {
+            Task.detached { [weak self] in
+                guard let self else { return }
+                // Frame 1 (seed): a fast read that seeds the reference.
+                self.onActivity?(.beginFrameRead("seed.fit"))
+                self.cont.yield(self.seed)
+                self.onActivity?(.endFrameRead("seed.fit"))
+                // Frame 2: a read that legitimately spans several active-read windows.
+                self.onActivity?(.beginFrameRead("slow2.fit"))
+                let deadline = Date().addingTimeInterval(self.readDelay)
+                while Date() < deadline {
+                    if self.lock.withLock({ self.stopped }) {
+                        self.cont.finish()   // cancelled mid-read: never deliver frame 2
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                }
+                let f2 = RawFrame(image: self.seed.image, bayerPattern: nil, bottomUp: false,
+                                  timestamp: Date(timeIntervalSince1970: 1), sourceName: "slow2.fit")
+                self.cont.yield(f2)
+                self.onActivity?(.endFrameRead("slow2.fit"))
+                self.cont.finish()
+            }
+        }
+
+        func stop() { lock.withLock { stopped = true }; cont.finish() }
+    }
+
     /// A ≥15-star seed frame so the engine accepts it and fires onUpdate (our block point).
     private func seedFrame() -> RawFrame {
         let w = 256, h = 256
@@ -131,6 +185,40 @@ final class SessionPipelineShutdownTests: XCTestCase {
         try pipeline.start()
         XCTAssertNoThrow(try pipeline.end(),
                          "a finite import actively reading its first sub must not be cancelled merely because no frame has finalized yet")
+    }
+
+    /// Regression (ASI2600-over-WiFi, 2026-08-16): a single 50 MB sub read from a slow SMB
+    /// share exceeds one `importActiveReadTimeout` window. The stall-watchdog used to grant
+    /// exactly one window and then cancel — killing the import after the seed and finalizing
+    /// with 1 frame. A read that is genuinely in flight (activeReads > 0) is slow, not stalled,
+    /// and must be allowed to complete. Both subs must stack.
+    func testFiniteImportToleratesReadSpanningMultipleActiveWindows() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "Slow Share", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        // readDelay (450ms) spans ~3 active-read windows (150ms each), well past the single
+        // window the old code tolerated, but under the dead-share cap (5 × 150ms = 750ms).
+        // readDelay (500ms) spans ~2 active-read windows (300ms each) — comfortably past the
+        // single window the old code tolerated, comfortably under the dead-share cap
+        // (5 × 300ms = 1.5s). Margins are wide so scheduling jitter can't flip the outcome.
+        let source = SlowSecondReadFiniteSource(seed: seedFrame(), readDelay: 0.5)
+        let pipeline = SessionPipeline(nativeSource: source,
+                                       engine: engine, profile: profile, rootDirectory: sessions)
+        pipeline.drainPrimaryTimeout = .milliseconds(150)
+        pipeline.drainGraceTimeout = .milliseconds(150)
+        pipeline.importActiveReadTimeout = .milliseconds(300)
+
+        try pipeline.start()
+        XCTAssertNoThrow(try pipeline.end())
+        XCTAssertEqual(engine.stackFrameCount, 2,
+                       "a sub read spanning multiple active-read windows must not be cancelled as a stall — both subs must stack")
     }
 
     // MARK: - review10 items 4+5 fixtures
