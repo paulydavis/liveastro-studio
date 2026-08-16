@@ -76,6 +76,7 @@ final class SessionPipelineReseedContractTests: XCTestCase {
         let pipeline = SessionPipeline(nativeSource: source, engine: engine,
                                        profile: profile(), rootDirectory: root)
         pipeline.drainPrimaryTimeout = .milliseconds(100)
+        pipeline.importPrimaryTimeout = .milliseconds(100)   // finite drain uses this window
         pipeline.drainGraceTimeout = .milliseconds(100)
 
         try pipeline.start()

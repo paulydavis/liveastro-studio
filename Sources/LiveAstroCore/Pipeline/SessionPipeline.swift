@@ -134,6 +134,15 @@ public final class SessionPipeline {
     var drainPrimaryTimeout: DispatchTimeInterval = .seconds(10)
     var drainGraceTimeout: DispatchTimeInterval = .seconds(5)
     var importActiveReadTimeout: DispatchTimeInterval = .seconds(60)
+    /// Primary "no progress since the last finalized frame" window for the FINITE import
+    /// drain — distinct from the live path's responsive `drainPrimaryTimeout` (10 s). A
+    /// batch import legitimately has slow frames: a single 26MP sub can take ~12 s+ end to
+    /// end (register + warp + rejection + the full-res snapshot encode), and at the tail —
+    /// when the parallel pool drains to one frame processing alone with no sibling finalize
+    /// to tick progress — a 10 s window cancelled a healthy import and threw shutdownTimeout
+    /// (2026-08-16 ASI2600). 120 s tolerates a slow frame (even on modest hardware) while a
+    /// genuinely wedged consumer is still caught. Internal so tests can shrink it.
+    var importPrimaryTimeout: DispatchTimeInterval = .seconds(120)
     /// Per-read dead-share cap: how many consecutive `importActiveReadTimeout` windows a
     /// SINGLE in-flight read may span with no begin/end event before it is treated as a hung
     /// share and cancelled. A slow-but-live read (a 50 MB sub over WiFi — 2026-08-16 ASI2600
@@ -594,7 +603,7 @@ public final class SessionPipeline {
         var last = importActivitySnapshot
         var deadReadWindows = 0
         while true {
-            if consumeDone.wait(timeout: .now() + drainPrimaryTimeout) == .success {
+            if consumeDone.wait(timeout: .now() + importPrimaryTimeout) == .success {
                 consumeTask = nil
                 return
             }

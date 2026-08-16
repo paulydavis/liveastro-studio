@@ -117,6 +117,37 @@ final class SessionPipelineShutdownTests: XCTestCase {
         func stop() { lock.withLock { stopped = true }; cont.finish() }
     }
 
+    /// A finite source that yields two frames with a gap of NO activity between them (no
+    /// read events, activeReads stays 0) — models the tail of a 26MP import where the last
+    /// frame's CPU-bound processing (register + warp + full-res snapshot) takes longer than
+    /// the live drain's 10s window with no sibling frame to tick progress. The import is
+    /// healthy, just slow; it must finalize, not be cancelled as a stall (2026-08-16).
+    final class GapNoActivityFiniteSource: FrameSource {
+        let frames: AsyncStream<RawFrame>
+        private let cont: AsyncStream<RawFrame>.Continuation
+        private let seed: RawFrame
+        private let gap: TimeInterval
+        var isFinite: Bool { true }
+        var totalCount: Int? { 2 }
+        init(seed: RawFrame, gap: TimeInterval) {
+            self.seed = seed; self.gap = gap
+            var c: AsyncStream<RawFrame>.Continuation!
+            frames = AsyncStream { c = $0 }; cont = c
+        }
+        func start() throws {
+            Task.detached { [weak self] in
+                guard let self else { return }
+                self.cont.yield(self.seed)   // frame 1 — no FrameSourceActivity emitted at all
+                try? await Task.sleep(nanoseconds: UInt64(self.gap * 1_000_000_000))
+                let f2 = RawFrame(image: self.seed.image, bayerPattern: nil, bottomUp: false,
+                                  timestamp: Date(timeIntervalSince1970: 1), sourceName: "f2.fit")
+                self.cont.yield(f2)
+                self.cont.finish()
+            }
+        }
+        func stop() { cont.finish() }
+    }
+
     /// A ≥15-star seed frame so the engine accepts it and fires onUpdate (our block point).
     private func seedFrame() -> RawFrame {
         let w = 256, h = 256
@@ -179,6 +210,7 @@ final class SessionPipelineShutdownTests: XCTestCase {
         let pipeline = SessionPipeline(nativeSource: SlowFirstFrameFiniteSource(frame: seedFrame()),
                                        engine: StackEngine(), profile: profile, rootDirectory: sessions)
         pipeline.drainPrimaryTimeout = .milliseconds(100)
+        pipeline.importPrimaryTimeout = .milliseconds(100)
         pipeline.drainGraceTimeout = .milliseconds(100)
         pipeline.importActiveReadTimeout = .seconds(2)
 
@@ -212,6 +244,7 @@ final class SessionPipelineShutdownTests: XCTestCase {
         let pipeline = SessionPipeline(nativeSource: source,
                                        engine: engine, profile: profile, rootDirectory: sessions)
         pipeline.drainPrimaryTimeout = .milliseconds(150)
+        pipeline.importPrimaryTimeout = .milliseconds(150)
         pipeline.drainGraceTimeout = .milliseconds(150)
         pipeline.importActiveReadTimeout = .milliseconds(300)
 
@@ -219,6 +252,38 @@ final class SessionPipelineShutdownTests: XCTestCase {
         XCTAssertNoThrow(try pipeline.end())
         XCTAssertEqual(engine.stackFrameCount, 2,
                        "a sub read spanning multiple active-read windows must not be cancelled as a stall — both subs must stack")
+    }
+
+    /// Regression (ASI2600, 2026-08-16): a healthy finite import whose frames finalize with a
+    /// gap longer than the live drain window (`drainPrimaryTimeout`) but shorter than the
+    /// import window (`importPrimaryTimeout`) must COMPLETE, not throw shutdownTimeout. This
+    /// is the import tail: the last 26MP frame processes alone (no read activity, no sibling
+    /// finalize) for longer than 10s. The finite drain must use the generous import window.
+    func testFiniteImportToleratesProcessingGapLongerThanLiveWindow() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "Slow Tail", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        // gap (400ms) > live window (100ms) but < import window (1500ms) → old code (finite
+        // drain on drainPrimaryTimeout) cancelled after the seed; new code waits it out.
+        let source = GapNoActivityFiniteSource(seed: seedFrame(), gap: 0.4)
+        let pipeline = SessionPipeline(nativeSource: source,
+                                       engine: engine, profile: profile, rootDirectory: sessions)
+        pipeline.drainPrimaryTimeout = .milliseconds(100)     // live window — deliberately tiny
+        pipeline.importActiveReadTimeout = .milliseconds(100)
+        pipeline.importPrimaryTimeout = .milliseconds(1500)   // import window — tolerates the gap
+        pipeline.drainGraceTimeout = .milliseconds(100)
+
+        try pipeline.start()
+        XCTAssertNoThrow(try pipeline.end())
+        XCTAssertEqual(engine.stackFrameCount, 2,
+                       "a healthy import with a processing gap > live window must finalize both frames, not cancel")
     }
 
     // MARK: - review10 items 4+5 fixtures
