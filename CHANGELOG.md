@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+## 3.2.1 — 2026-08-16
+
+Native import now works on full-size (26 MP) subs from an ASIAIR / ASI2600MC Air —
+the first real-hardware test of that path, which surfaced a cluster of issues that
+only appear on large frames or a network share (every prior test used 8 MP Seestar
+subs on local disk).
+
+- **Import no longer stalls after the first frame** on 26 MP subs with the quality
+  features on. Three causes, all fixed: the background sky-match sorted every pixel
+  in every tile (now subsampled — negligible change to the result); the outlier
+  rejection paid per-pixel overhead in its inner loop (now bound to raw buffers,
+  identical output); and the import's stall-watchdog was too impatient for a large
+  frame's processing time (a batch import now tolerates slow-but-progressing frames
+  while still catching a genuine hang). A full 60×180 s M 63 set now stacks 60/60
+  with rejection, frame weighting, sky-match, and transparency all enabled.
+- **Import from a network share (SMB) no longer cancels mid-read** — a slow 50 MB
+  sub read over WiFi is treated as slow, not stalled.
+- **Rounder stars in the corners of wide, star-poor fields.** Registration picked the
+  brightest stars globally, which clustered on bright regions and left the fit
+  under-constrained at the frame edges (slight corner smearing over a long session).
+  It now spreads the same star budget across the whole frame.
+
 ## 3.2.0 — 2026-08-08
 
 - Session end: idle safeguard writes the master mid-session (never lose a stack to
