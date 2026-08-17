@@ -578,6 +578,7 @@ final class SessionPipelineShutdownTests: XCTestCase {
         let wedged = DispatchSemaphore(value: 0)
         pipeline.onUpdate = { _, _ in wedged.wait() }
         pipeline.drainPrimaryTimeout = .milliseconds(200)
+        pipeline.importPrimaryTimeout = .milliseconds(200)   // finite drain uses this window (else waits 120s)
         pipeline.drainGraceTimeout = .milliseconds(200)
         try pipeline.start()
         Thread.sleep(forTimeInterval: 0.3)
