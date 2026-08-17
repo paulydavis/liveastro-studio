@@ -231,6 +231,7 @@ final class SessionPipelineShutdownTests: XCTestCase {
         pipeline.importPrimaryTimeout = .milliseconds(100)
         pipeline.drainGraceTimeout = .milliseconds(100)
         pipeline.importActiveReadTimeout = .seconds(2)
+        pipeline.rendersReplay = false   // this test exercises the drain, not the replay render
 
         try pipeline.start()
         XCTAssertNoThrow(try pipeline.end(),
@@ -265,6 +266,7 @@ final class SessionPipelineShutdownTests: XCTestCase {
         pipeline.importPrimaryTimeout = .milliseconds(150)
         pipeline.drainGraceTimeout = .milliseconds(150)
         pipeline.importActiveReadTimeout = .milliseconds(300)
+        pipeline.rendersReplay = false   // this test exercises the drain, not the replay render
 
         try pipeline.start()
         XCTAssertNoThrow(try pipeline.end())
@@ -297,6 +299,7 @@ final class SessionPipelineShutdownTests: XCTestCase {
         pipeline.importActiveReadTimeout = .milliseconds(100)
         pipeline.importPrimaryTimeout = .milliseconds(1500)   // import window — tolerates the gap
         pipeline.drainGraceTimeout = .milliseconds(100)
+        pipeline.rendersReplay = false   // this test exercises the drain, not the replay render
 
         try pipeline.start()
         XCTAssertNoThrow(try pipeline.end())

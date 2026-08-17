@@ -143,6 +143,12 @@ public final class SessionPipeline {
     /// (2026-08-16 ASI2600). 120 s tolerates a slow frame (even on modest hardware) while a
     /// genuinely wedged consumer is still caught. Internal so tests can shrink it.
     var importPrimaryTimeout: DispatchTimeInterval = .seconds(120)
+    /// Test seam: when false, end() finalizes the session (master + manifest) but skips the
+    /// AVFoundation replay render and returns the session directory instead of replay.mp4.
+    /// Drain/watchdog unit tests set this — the replay writer's setup/teardown is a fixed
+    /// multi-second cost unrelated to what they exercise (2026-08-17 suite-speed note).
+    /// Production leaves it true.
+    var rendersReplay = true
     /// Per-read dead-share cap: how many consecutive `importActiveReadTimeout` windows a
     /// SINGLE in-flight read may span with no begin/end event before it is treated as a hung
     /// share and cancelled. A slow-but-live read (a 50 MB sub over WiFi — 2026-08-16 ASI2600
@@ -774,6 +780,7 @@ public final class SessionPipeline {
             }
             // Commit point: master.fit is durable (native mode), so stamping end_time is now honest.
             try session.endSession(finalization: finalization)
+            guard rendersReplay else { return dir }   // test seam: skip the AVFoundation render
             return try ReplayService.regenerate(sessionDirectory: dir,
                                                 replaySettings: replaySettings,
                                                 maxKeyframes: maxKeyframes)
