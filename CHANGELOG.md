@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 3.2.2 — 2026-08-16
+
+Follow-up review fixes to the 3.2.1 registration and import-watchdog work:
+
+- **Registration star selection is now balanced across the whole frame in every
+  prefix.** 3.2.1 spread the star budget over the frame, but the alignment matcher
+  only uses the first ~20 stars, and those were filled top-to-bottom — still biased
+  to one region. They're now chosen in a dispersed order so the matcher always sees
+  stars from every quadrant. Reduces corner star smearing further on wide, star-poor
+  fields.
+- **Network-share dead-read timeout matches its documented bound** (~5 min, not ~15).
+  Internal only — a genuinely stuck read on a disconnected share is now abandoned
+  when expected.
+
 ## 3.2.1 — 2026-08-16
 
 Native import now works on full-size (26 MP) subs from an ASIAIR / ASI2600MC Air —
