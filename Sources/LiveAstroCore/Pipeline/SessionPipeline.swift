@@ -601,39 +601,39 @@ public final class SessionPipeline {
     private func drainFiniteImportOrThrow() throws {
         guard let task = consumeTask else { return }
         var last = importActivitySnapshot
-        var deadReadWindows = 0
-        while true {
+        outer: while true {
             if consumeDone.wait(timeout: .now() + importPrimaryTimeout) == .success {
                 consumeTask = nil
                 return
             }
-            let now = importActivitySnapshot
+            var now = importActivitySnapshot
             if now.progress != last.progress || now.activity != last.activity {
                 last = now
-                deadReadWindows = 0
                 continue   // progressing/starting or finishing reads — keep draining
             }
+            // A full import-primary window passed with no finalized frame and no read event.
+            // If a read is genuinely in flight it's slow, not stalled (a 50 MB sub over a
+            // network share — 2026-08-16 ASI2600): grant it up to importDeadReadWindowLimit
+            // ACTIVE-READ windows to progress before the share is treated as dead. The
+            // dead-read patience is exactly limit × importActiveReadTimeout — it must NOT
+            // re-charge importPrimaryTimeout each cycle (2026-08-17 review: the prior
+            // `continue` looped back through the 120 s primary wait, inflating the cap to
+            // limit × (primary + active) ≈ 15 min instead of the documented ~5 min).
             if now.activeReads > 0 {
-                // A read is genuinely in flight: slow, not stalled (a 50 MB sub over a network
-                // share slower than one window — 2026-08-16 ASI2600 regression). Keep draining
-                // while it stays active; only a read that spans importDeadReadWindowLimit
-                // windows with NO begin/end event is treated as a hung share and cancelled.
-                if consumeDone.wait(timeout: .now() + importActiveReadTimeout) == .success {
-                    consumeTask = nil
-                    return
-                }
-                let afterActiveRead = importActivitySnapshot
-                if afterActiveRead.progress != now.progress || afterActiveRead.activity != now.activity {
-                    last = afterActiveRead
-                    deadReadWindows = 0
-                    continue
-                }
-                if afterActiveRead.activeReads > 0 {
-                    deadReadWindows += 1
-                    if deadReadWindows < importDeadReadWindowLimit {
-                        last = afterActiveRead
-                        continue   // still reading, within the dead-share cap — keep waiting
+                var deadReadWindows = 0
+                while deadReadWindows < importDeadReadWindowLimit {
+                    if consumeDone.wait(timeout: .now() + importActiveReadTimeout) == .success {
+                        consumeTask = nil
+                        return
                     }
+                    let after = importActivitySnapshot
+                    if after.progress != now.progress || after.activity != now.activity {
+                        last = after
+                        continue outer   // progressed — resume the primary-window watch
+                    }
+                    if after.activeReads == 0 { break }   // read ended with no progress → real stall
+                    deadReadWindows += 1
+                    now = after
                 }
             }
             break                          // no active read + no progress, OR read wedged past the cap

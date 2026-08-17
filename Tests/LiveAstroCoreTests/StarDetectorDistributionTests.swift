@@ -30,6 +30,33 @@ final class StarDetectorDistributionTests: XCTestCase {
         }
     }
 
+    func testFirst20SpanAllQuadrantsWhenEveryBucketOccupied() {
+        // One star in each of the 8×8 grid cells over a 2000×2000 frame. The triangle
+        // matcher only uses the first maxTriangleStars (20), so a row-major fill would put
+        // them all in the top rows. A prefix-balanced (Bayer) order must spread the first 20
+        // across all four quadrants.
+        let W = 2000, H = 2000, g = 8
+        var stars: [Star] = []
+        var flux = 1000.0
+        for cy in 0..<g { for cx in 0..<g {
+            let x = (Double(cx) + 0.5) * Double(W) / Double(g)
+            let y = (Double(cy) + 0.5) * Double(H) / Double(g)
+            stars.append(Star(x: x, y: y, flux: flux)); flux -= 1.0
+        } }
+        let picked = StarDetector.spatiallyDistributed(stars, width: W, height: H, maxStars: 60)
+        let first20 = picked.prefix(20)
+        func quad(_ s: Star) -> Int { (s.x < Double(W)/2 ? 0 : 1) + (s.y < Double(H)/2 ? 0 : 2) }
+        let quadrants = Set(first20.map(quad))
+        XCTAssertEqual(quadrants, Set([0, 1, 2, 3]),
+                       "the first 20 stars (the triangle-matcher budget) must cover all four quadrants, not cluster in one region")
+    }
+
+    func testDispersedBucketOrderIsAPermutationOfAllCells() {
+        let order = StarDetector.dispersedBucketOrder(8)
+        XCTAssertEqual(Set(order), Set(0..<64))
+        XCTAssertEqual(order.count, 64)
+    }
+
     func testFewerThanBudgetReturnedWhole() {
         var stars: [Star] = []
         for i in 0..<5 {

@@ -121,12 +121,18 @@ public enum StarDetector {
             let cy = min(g - 1, max(0, Int(s.y) * g / height))
             buckets[cy * g + cx].append(s)
         }
+        // Visit buckets in a prefix-balanced (ordered-dither / Bayer) sequence rather than
+        // row-major. The triangle matcher uses only the FIRST maxTriangleStars (20) of the
+        // returned list, so a row-major fill would put the first 20 in the top grid rows —
+        // spatially biased, undoing the corner-coverage fix (2026-08-17 review). A Bayer
+        // order makes every prefix span all quadrants.
+        let order = Self.dispersedBucketOrder(g)
         var out: [Star] = []
         out.reserveCapacity(maxStars)
         var round = 0
         while out.count < maxStars {
             var addedThisRound = false
-            for b in 0..<buckets.count where round < buckets[b].count {
+            for b in order where round < buckets[b].count {
                 out.append(buckets[b][round]); addedThisRound = true
                 if out.count == maxStars { break }
             }
@@ -134,6 +140,27 @@ public enum StarDetector {
             round += 1
         }
         return out
+    }
+
+    /// Bucket visitation order for a `g×g` grid (g a power of two) whose every prefix is
+    /// spatially spread — the recursive Bayer / ordered-dither threshold matrix, returned as
+    /// bucket indices (`cy*g+cx`) sorted by ascending Bayer rank. Used by
+    /// `spatiallyDistributed` so the first stars picked already cover all quadrants.
+    static func dispersedBucketOrder(_ g: Int) -> [Int] {
+        var m = [[0]]
+        var n = 1
+        while n < g {
+            var nm = [[Int]](repeating: [Int](repeating: 0, count: n * 2), count: n * 2)
+            for y in 0..<n { for x in 0..<n {
+                let base = 4 * m[y][x]
+                nm[y][x] = base;      nm[y][x + n]     = base + 2
+                nm[y + n][x] = base + 3; nm[y + n][x + n] = base + 1
+            } }
+            m = nm; n *= 2
+        }
+        var rank = [Int](repeating: 0, count: g * g)
+        for y in 0..<g { for x in 0..<g { rank[y * g + x] = m[y][x] } }
+        return (0..<g * g).sorted { rank[$0] < rank[$1] }
     }
 
     public static func detect(luminance: [Float], width: Int, height: Int,

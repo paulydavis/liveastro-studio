@@ -148,6 +148,24 @@ final class SessionPipelineShutdownTests: XCTestCase {
         func stop() { cont.finish() }
     }
 
+    /// A finite source that emits ONE beginFrameRead and then hangs — a read that stays
+    /// active but never progresses (a dead SMB read mid-syscall). The drain must declare it
+    /// wedged after importPrimaryTimeout + importDeadReadWindowLimit × importActiveReadTimeout,
+    /// NOT limit × (primary + active) (2026-08-17 review).
+    final class HungReadFiniteSource: FrameSource, FrameSourceActivityReporting {
+        let frames: AsyncStream<RawFrame>
+        private let cont: AsyncStream<RawFrame>.Continuation
+        var onActivity: ((FrameSourceActivity) -> Void)?
+        var isFinite: Bool { true }
+        var totalCount: Int? { 1 }
+        init() {
+            var c: AsyncStream<RawFrame>.Continuation!
+            frames = AsyncStream { c = $0 }; cont = c
+        }
+        func start() throws { onActivity?(.beginFrameRead("hung")) }   // starts, never ends/yields
+        func stop() { cont.finish() }                                  // cancel unblocks the consumer
+    }
+
     /// A ≥15-star seed frame so the engine accepts it and fires onUpdate (our block point).
     private func seedFrame() -> RawFrame {
         let w = 256, h = 256
@@ -284,6 +302,40 @@ final class SessionPipelineShutdownTests: XCTestCase {
         XCTAssertNoThrow(try pipeline.end())
         XCTAssertEqual(engine.stackFrameCount, 2,
                        "a healthy import with a processing gap > live window must finalize both frames, not cancel")
+    }
+
+    /// Regression (2026-08-17 review): a genuinely dead active read must be declared wedged
+    /// after ≈ importPrimaryTimeout + importDeadReadWindowLimit × importActiveReadTimeout —
+    /// NOT limit × (primary + active). The prior loop re-charged the primary window each
+    /// dead-read cycle, inflating a documented ~5 min cap to ~15 min.
+    func testDeadReadCapIsLimitTimesActiveWindowNotTimesPrimary() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "Dead Read", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let pipeline = SessionPipeline(nativeSource: HungReadFiniteSource(),
+                                       engine: StackEngine(), profile: profile, rootDirectory: sessions)
+        pipeline.importPrimaryTimeout = .milliseconds(200)
+        pipeline.importActiveReadTimeout = .milliseconds(50)
+        pipeline.importDeadReadWindowLimit = 3
+        pipeline.drainGraceTimeout = .milliseconds(100)
+        pipeline.drainPrimaryTimeout = .milliseconds(50)
+
+        try pipeline.start()
+        let t = Date()
+        _ = try? pipeline.end()            // returns/throws after cancelling the hung read
+        let elapsed = Date().timeIntervalSince(t)
+        // Expected ≈ 200 (primary) + 3×50 (dead-read) + 100 (grace) = 450 ms.
+        // The pre-fix multiplied form would be 3×(200+50) + 100 = 850 ms.
+        XCTAssertLessThan(elapsed, 0.65,
+                          "dead-read cap must be primary + limit×active, not limit×(primary+active)")
+        XCTAssertGreaterThan(elapsed, 0.30,
+                             "must still wait the primary window + the dead-read windows before giving up")
     }
 
     // MARK: - review10 items 4+5 fixtures
