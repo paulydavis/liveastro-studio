@@ -249,7 +249,13 @@ public final class SessionPipeline {
             guard let mean = engine.currentStack() else { return }
             guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
             do {
-                let cg = try displayCGImage(from: mean)
+                // Import path: render the preview/snapshot from a 2.5K downsample so the
+                // per-pixel neutralize + stretch don't run on all 26MP every frame (~6× the
+                // import bottleneck). `mean` stays full-res for the manifest record + stats;
+                // master.fit is finalized full-res separately. (Live keeps full-res display
+                // for zoom; its snapshot is capped in SnapshotRecorder.)
+                let displaySource = mean.downsampled(maxLongEdge: SnapshotRecorder.maxSnapshotLongEdge)
+                let cg = try displayCGImage(from: displaySource)
                 let record = try recorder.save(
                     cgImage: cg, linear: mean, sourceFile: sourceName,
                     index: index, timestamp: timestamp,

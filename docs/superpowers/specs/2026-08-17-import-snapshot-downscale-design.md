@@ -1,100 +1,88 @@
 # Import Snapshot Downscale — Design
 
-**Date:** 2026-08-17 · **Status:** approved (design), pending spec review
-**Goal:** Cut per-frame snapshot cost so native import (and live) isn't dominated by full-res PNG encoding.
+**Date:** 2026-08-17 · **Status:** implemented
+**Goal:** Cut per-frame preview/snapshot cost so native import isn't dominated by full-res
+display rendering.
 
 ## Problem
 
-For every accepted frame, `SessionPipeline` calls `displayCGImage(from: mean)` (a full-res
-26 MP post-stretch image) and `SnapshotRecorder.save(...)` encodes it to `snapshots/%04d.png`
-(~63 MB) and `latest.png`. On a 26 MP ASI2600 frame that PNG encode is ~7 s — the dominant
-cost of a batch import (a 60-sub M 63 import runs ~13 min, of which ~7 min is snapshot
-encoding).
+For every accepted frame, `SessionPipeline.finalizeCommitted` (import path) calls
+`displayCGImage(from: mean)` on the full-res 26 MP stacked float image, then
+`SnapshotRecorder.save(...)` encodes the result to `snapshots/%04d.png` + `latest.png`. A
+60-sub 26 MP M 63 import ran ~13 s/frame (~13 min total).
 
-Those snapshots feed only two things:
-- The **replay video**, rendered by `ReplayGenerator` at a fixed **1920×1080** — it downscales
-  the keyframes regardless.
-- **`latest.png`** — the on-screen / OBS preview.
+Those snapshots feed only the **1920×1080 replay** (downscaled regardless) and the on-screen
+`latest.png` preview. `master.fit` (the real deliverable) is written separately, full-res.
 
-`master.fit` (the real deliverable) is written separately at full 26 MP and is untouched.
-The manifest stats come from the `linear: AstroImage`, not the PNG. The live in-memory view
-(`AppModel.latestImage`, which supports zoom/pan) is the `displayCGImage` output, not the PNG.
+## Measurement (this drove the approach)
 
-So encoding snapshots at full 26 MP is wasted work: the replay is 1080p and the preview
-doesn't need 26 MP.
+Component costs on a 26 MP frame:
 
-## Change
+| Step | Time |
+|---|---|
+| neutralize (additive) | 2.91 s |
+| neutralize (multiplicative) | 3.37 s |
+| stretch | 0.11 s |
+| makeCGImage | 0.07 s |
+| downscale 26 MP→2.5K | 0.04 s |
+| PNG encode (2.5K) | ~0.5 s |
 
-Downscale the snapshot image to **2560 px on its long edge** (≈2.5K) inside
-`SnapshotRecorder.save`, before PNG-encoding. 2.5K is 2× the replay's 1080p (so replay output
-is byte-for-identical after its own downscale) and stays crisp as a preview on 4K/5K displays.
+The bottleneck is the **two per-pixel `neutralize` passes (~6.3 s) inside `displayCGImage`** —
+**not** the PNG encode. So capping only the snapshot output resolution (the first attempt) did
+**not** speed up import — it cut a step that was already cheap. The fix has to reduce the pixel
+count the neutralize/stretch passes run on.
 
-**Applies to both live and import** — one code path in `SnapshotRecorder`, no mode flag. Live
-is not bottlenecked (one frame per ~10–35 s cadence) but benefits from smaller/faster snapshots,
-and its on-screen quality is unchanged because the live view uses the full-res in-memory image,
-not the PNG.
+## Change (Approach B)
 
-### Approach (chosen: A)
+Downsample the stacked image to **2560 px long edge (2.5K)** *before* `displayCGImage` in the
+import path, so `neutralize` + `stretch` run on ~1/6 the pixels. `mean` stays full-res for the
+manifest record + stats; `master.fit` is finalized full-res, separately. Live keeps the
+full-res display (for zoom/pan) and caps only its snapshot output (below).
 
-Downscale in `SnapshotRecorder.save`, keeping `displayCGImage` full-res so the in-memory live
-view and its zoom/pan keep full resolution. The recorder is the single choke point that writes
-both `%04d.png` and `latest.png`, so one change covers both.
-
-(Approach B — render the display image directly at 2.5K for snapshots — would also skip building
-the 26 MP CGImage, a further ~1.5 s/frame, but needs two render paths. Deferred: the core
-stacking (~4.7 s/frame) dominates once the encode is cut, so B's extra saving is marginal.
-Revisit only if measurement shows the 26 MP CGImage build is itself a large share.)
+Measured result: **~13.4 s → ~6.7 s per frame (2×)**; a 60-sub import ~13 min → ~6.7 min.
 
 ## Components
 
-- **`SnapshotRecorder`** (`Sources/LiveAstroCore/Session/SnapshotRecorder.swift`)
-  - New internal helper `downscaled(_ image: CGImage, maxLongEdge: Int) -> CGImage`: if
-    `max(width, height) <= maxLongEdge` return the image unchanged; else draw it into a
-    `CGContext` sized to the scaled dimensions (aspect-preserving, `interpolationQuality =
-    .high`) and return the result.
-  - `save(...)` downscales `cgImage` once (long edge 2560) and encodes the result to both the
-    numbered snapshot and `latest.png`. The `linear: AstroImage` argument (stats source) and
-    the returned `SnapshotRecord.width/height` are **unchanged** — those keep reporting the
-    true stacked dimensions from `linear`, not the downscaled preview.
-  - `maxSnapshotLongEdge = 2560` as a named constant with a comment (2× the 1080p replay).
+- **`AstroImage.downsampled(maxLongEdge:)`** (`Imaging/AstroImage.swift`) — area-averaging
+  downsample (each output pixel = mean of the source pixels mapping to it; single O(pixels)
+  pass; anti-aliased). Returns `self` when already within bounds. Stats on the result are cheap
+  (existing `computeStats` is stride-sampled, O(1)).
+- **`SessionPipeline.finalizeCommitted`** (import path only) — render the preview/snapshot from
+  `mean.downsampled(maxLongEdge: SnapshotRecorder.maxSnapshotLongEdge)`; pass the full-res `mean`
+  to `recorder.save(linear:)` so the record dims/stats stay full-res. Live (`handleNative`)
+  unchanged.
+- **`SnapshotRecorder`** (`Session/SnapshotRecorder.swift`) — `maxSnapshotLongEdge = 2560`
+  constant, and a `downscaled(_:maxLongEdge:)` cap in `save`. For import the display is already
+  2.5K (no-op); for **live** this caps the full-res live snapshot at 2.5K (smaller/faster PNG,
+  live view still full-res in memory). Falls back to the original image if a context can't be
+  made — a snapshot is never lost.
 
-Nothing else changes: `SessionPipeline`, `ReplayGenerator`, `FrameSelector`, the manifest
-schema, and `master.fit` writing are all untouched.
+`ReplayGenerator`, `FrameSelector`, the manifest schema, and `master.fit` are untouched.
 
-## Data flow (unchanged except the resize)
+## Data flow (import)
 
 ```
 frame → engine.currentStack() (26 MP float mean)
-      → displayCGImage  → AppModel.latestImage   (full-res, live view + zoom)   [unchanged]
-                        → SnapshotRecorder.save
-                              → downscaled to 2560px          [NEW]
-                              → %04d.png, latest.png          (now 2.5K)
-      → recorder.save also records width/height from `linear` (full-res)        [unchanged]
-replay: FrameSelector picks keyframes → ReplayGenerator renders 1920×1080       [unchanged]
+      → mean.downsampled(2560)  [NEW] → displayCGImage (neutralize/stretch on 4.4M px, ~1s)
+      → SnapshotRecorder.save(cgImage: preview, linear: mean)   ← record dims/stats from full-res mean
+      → latest.png, %04d.png (2.5K)   → replay 1920×1080 (unchanged)
+master.fit finalized full-res, separately (unchanged)
 ```
 
 ## Error handling
 
-The downscale is a pure CoreGraphics context draw. If context creation fails (should not for
-valid dimensions), fall back to encoding the original image — a snapshot must never be lost.
-Existing `SnapshotError.encodeFailed` semantics are unchanged.
+Downsample is pure array math; `SnapshotRecorder.downscaled` falls back to the original on
+context-creation failure. `SnapshotError.encodeFailed` semantics unchanged.
 
 ## Testing
 
-- **Unit (SnapshotRecorder):** save a 6248×4176 CGImage → the written `%04d.png` decodes to
-  2560×1712 (long edge 2560, aspect preserved), and the `SnapshotRecord.width/height` still
-  report the `linear` dimensions (6248×4176).
-- **Unit (passthrough):** a 1920×1280 image is written unchanged (≤ 2560, no resize).
-- **Regression:** existing SnapshotRecorder / pipeline / replay tests stay green (replay reads
-  a 2.5K keyframe and still renders 1080p).
+- `AstroImageDownsampleTests` — caps long edge + preserves a constant field and per-channel
+  levels (small images / small cap; logic is size-agnostic).
+- `SnapshotRecorderTests` — 26 MP CGImage in → 2560 PNG out; record dims stay full-res;
+  ≤ cap passes through unchanged.
+- Import E2E (manual, real 26 MP M 63) — 60/60, replay renders, ~6.7 s/frame.
 
 ## Non-goals
 
-- Core-stacking speed (register/warp on Accelerate/Metal) — the larger remaining lever, separate pillar.
-- Changing replay resolution or making snapshot resolution configurable (YAGNI).
-- Skipping/throttling snapshots per-frame (rejected in favor of the downscale).
-
-## Expected result
-
-Snapshot encode ~7 s → ~0.5 s/frame. Per-frame import ~13 s → ~6 s; a 60-sub import ~13 min →
-~5–6 min (~2–2.5×). Replay output unchanged; preview crisp; `master.fit` full 26 MP.
+- Core-stacking speed (register/warp ~4.7 s/frame is now the dominant cost — separate Accelerate/Metal pillar).
+- Configurable snapshot resolution; changing replay resolution (YAGNI).
