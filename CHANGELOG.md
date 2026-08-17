@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 3.2.3 — 2026-08-17
+
+- **Batch import of full-size (26 MP) subs is ~2× faster** — a 60-sub import drops from
+  ~13 min to ~7 min. The per-frame on-screen preview is now rendered from a 2.5K downsample
+  of the stack instead of the full 26 MP, so the background-match and stretch passes (the
+  real bottleneck) do ~1/6 the work. The stacked master (`master.fit`) is still built at full
+  26 MP, and the live view keeps full resolution for zoom — only the preview/replay image is
+  downsized (the replay is 1080p regardless). Live snapshots are likewise capped at 2.5K.
+
 ## 3.2.2 — 2026-08-16
 
 Follow-up review fixes to the 3.2.1 registration and import-watchdog work:
