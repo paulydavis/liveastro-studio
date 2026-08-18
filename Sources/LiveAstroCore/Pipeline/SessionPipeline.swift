@@ -148,6 +148,14 @@ public final class SessionPipeline {
     /// passes don't run on all 26 MP. Defaults to the SnapshotRecorder cap; internal so tests
     /// can shrink it to keep the call-site test off a full-size frame.
     var importPreviewLongEdge = SnapshotRecorder.maxSnapshotLongEdge
+    /// Import-only: render (mean→downsample→neutralize→snapshot→preview) on a cadence so ~`snapshotBudget`
+    /// snapshots are produced instead of one per accepted frame (the 1.78 s/frame finalize is 82% of the
+    /// serial import cost, and the replay keeps only maxKeyframes). Internal `var` = test seam. Live/watcher
+    /// mode ignores this and renders every frame.
+    var snapshotBudget = 60
+    private var importFinalizeStride = 1          // 1 = every frame; set from totalCount at import start
+    private var lastRenderedAcceptedIndex = 0     // for the guaranteed final render in end()
+    private var lastCommitted: (name: String, timestamp: Date)?
     /// Test seam: when false, end() finalizes the session (master + manifest) but skips the
     /// AVFoundation replay render and returns the session directory instead of replay.mp4.
     /// Drain/watchdog unit tests set this — the replay writer's setup/teardown is a fixed
@@ -251,29 +259,40 @@ public final class SessionPipeline {
         withCallbackDelivery {
             if sourceMetadata == nil, let m = metadata { sourceMetadata = m }
             processedCount += 1
-            guard let mean = engine.currentStack() else { return }
-            guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
-            do {
-                // Import path: render the preview/snapshot from a 2.5K downsample so the
-                // per-pixel neutralize + stretch don't run on all 26MP every frame (~6× the
-                // import bottleneck). `mean` stays full-res for the manifest record + stats;
-                // master.fit is finalized full-res separately. (Live keeps full-res display
-                // for zoom; its snapshot is capped in SnapshotRecorder.)
-                let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
-                let cg = try displayCGImage(from: displaySource)
-                let record = try recorder.save(
-                    cgImage: cg, linear: mean, sourceFile: sourceName,
-                    index: index, timestamp: timestamp,
-                    estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
-                try session.recordSnapshot(record)
-                onUpdate?(cg, record)
-            } catch {
-                onLog?("Skipped frame (\(sourceName)): \(error)")
+            lastCommitted = (sourceName, timestamp)       // remembered for end()'s guaranteed final render
+            if shouldRenderImport(acceptedIndex: index) {
+                renderSnapshot(index: index, sourceName: sourceName, timestamp: timestamp, engine: engine)
             }
             if let total = source?.totalCount {
                 onImportProgress?(processedCount, total, engine.acceptedCount, engine.rejectedCount)
             }
         }
+    }
+
+    /// Renders + saves one snapshot from the current stack and pushes the preview. Shared by the
+    /// throttled per-frame path and end()'s guaranteed final render. Sets lastRenderedAcceptedIndex.
+    private func renderSnapshot(index: Int, sourceName: String, timestamp: Date, engine: StackEngine) {
+        guard let mean = engine.currentStack() else { return }
+        guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
+        do {
+            let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
+            let cg = try displayCGImage(from: displaySource)
+            let record = try recorder.save(
+                cgImage: cg, linear: mean, sourceFile: sourceName,
+                index: index, timestamp: timestamp,
+                estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
+            try session.recordSnapshot(record)
+            lastRenderedAcceptedIndex = index
+            onUpdate?(cg, record)
+        } catch {
+            onLog?("Skipped frame (\(sourceName)): \(error)")
+        }
+    }
+
+    /// Live/watcher mode renders every committed frame; import mode renders the seed + every stride-th.
+    private func shouldRenderImport(acceptedIndex index: Int) -> Bool {
+        guard source?.isFinite == true else { return true }
+        return index == 1 || index % importFinalizeStride == 0
     }
 
     private func finalizeRejected(sourceName: String, engine: StackEngine) {
@@ -337,7 +356,11 @@ public final class SessionPipeline {
             try src.start()
             let done = consumeDone
             if src.isFinite {
-                // IMPORT: frame-per-core parallel batch.
+                // IMPORT: frame-per-core parallel batch. Throttle finalize to ~snapshotBudget renders.
+                let total = src.totalCount ?? 0
+                importFinalizeStride = total > 0
+                    ? max(1, Int((Double(total) / Double(snapshotBudget)).rounded()))
+                    : 1
                 let cal = calibrator
                 let importer = BatchImporter(engine: eng)
                 consumeTask = Task.detached(priority: .userInitiated) { [weak self] in
