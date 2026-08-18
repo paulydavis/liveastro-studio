@@ -439,7 +439,10 @@ public final class SessionPipeline {
     /// engine.currentStack(). nil when there is no stack yet.
     public func renderCurrentDisplay(adjustments: DisplayAdjustments) -> CGImage? {
         displayAdjustments = adjustments
-        guard let mean = engine?.currentStack() else { return nil }
+        // Crop to the covered region like renderSnapshot/handleNative, so a slider re-render
+        // doesn't snap the preview back to the ragged full-union frame.
+        guard let (mean0, coverage) = engine?.currentStackAndCoverage() else { return nil }
+        let mean = cropToCoverage(mean0, coverage: coverage)
         return try? displayCGImage(from: mean)
     }
 
