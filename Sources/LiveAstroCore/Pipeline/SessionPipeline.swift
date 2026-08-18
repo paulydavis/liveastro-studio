@@ -359,7 +359,7 @@ public final class SessionPipeline {
                 // IMPORT: frame-per-core parallel batch. Throttle finalize to ~snapshotBudget renders.
                 let total = src.totalCount ?? 0
                 importFinalizeStride = total > 0
-                    ? max(1, Int((Double(total) / Double(snapshotBudget)).rounded()))
+                    ? max(1, Int((Double(total) / Double(max(1, snapshotBudget))).rounded()))   // max(1,·): a 0 budget must not divide-by-zero
                     : 1
                 let cal = calibrator
                 let importer = BatchImporter(engine: eng)
