@@ -43,6 +43,28 @@ final class CropToOverlapPipelineTests: XCTestCase {
         XCTAssertEqual(h, SUB_H, "No-drift: master height should equal sub height")
     }
 
+    /// Drifting subs => the display (latest.png) is cropped to the same covered region as master.fit,
+    /// not the full 256px union. (Subs are 256px < the 2560 preview cap, so no downsample confounds dims.)
+    func testDisplayCroppedToCoveredRegion() throws {
+        let (subsDir, sessionRoot) = try makeDriftingSession()
+        defer { try? FileManager.default.removeItem(at: subsDir.deletingLastPathComponent()) }
+        let master = try ImageLoader.load(url: try findMaster(in: sessionRoot))
+        let latest = try ImageLoader.load(url: try findFile("latest.png", in: sessionRoot))
+        XCTAssertLessThan(latest.width, SUB_W, "display should be cropped (got \(latest.width))")
+        XCTAssertLessThan(latest.height, SUB_H, "display should be cropped (got \(latest.height))")
+        XCTAssertEqual(latest.width, master.width, "display crop matches master crop width")
+        XCTAssertEqual(latest.height, master.height, "display crop matches master crop height")
+    }
+
+    /// Identical subs => uniform coverage => display is full frame (guard/no-op path), like master.
+    func testDisplayFullFrameWhenNoDrift() throws {
+        let (subsDir, sessionRoot) = try makeNoDriftSession()
+        defer { try? FileManager.default.removeItem(at: subsDir.deletingLastPathComponent()) }
+        let latest = try ImageLoader.load(url: try findFile("latest.png", in: sessionRoot))
+        XCTAssertEqual(latest.width, SUB_W, "no-drift display should be full width")
+        XCTAssertEqual(latest.height, SUB_H, "no-drift display should be full height")
+    }
+
     // MARK: - Session Helpers
 
     /// Builds a native session over CFA subs that each have their star pattern
@@ -236,5 +258,13 @@ final class CropToOverlapPipelineTests: XCTestCase {
         }
         throw NSError(domain: "CropToOverlapPipelineTests", code: 2,
                       userInfo: [NSLocalizedDescriptionKey: "master.fit not found under \(sessionsRoot.path)"])
+    }
+
+    private func findFile(_ name: String, in root: URL) throws -> URL {
+        let fm = FileManager.default
+        let en = fm.enumerator(at: root, includingPropertiesForKeys: nil)!
+        for case let url as URL in en where url.lastPathComponent == name { return url }
+        throw NSError(domain: "CropToOverlapPipelineTests", code: 3,
+                      userInfo: [NSLocalizedDescriptionKey: "\(name) not found under \(root.path)"])
     }
 }

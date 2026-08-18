@@ -272,7 +272,8 @@ public final class SessionPipeline {
     /// Renders + saves one snapshot from the current stack and pushes the preview. Shared by the
     /// throttled per-frame path and end()'s guaranteed final render. Sets lastRenderedAcceptedIndex.
     private func renderSnapshot(index: Int, sourceName: String, timestamp: Date, engine: StackEngine) {
-        guard let mean = engine.currentStack() else { return }
+        guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }
+        let mean = cropToCoverage(mean0, coverage: coverage)   // display shows the covered region (like master.fit)
         guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
         do {
             let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
@@ -457,7 +458,8 @@ public final class SessionPipeline {
             processedCount += 1
             switch outcome {
             case .becameReference, .stacked:
-                guard let mean = engine.currentStack() else { return }
+                guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }
+                let mean = cropToCoverage(mean0, coverage: coverage)   // display shows the covered region (like master.fit)
                 guard let recorder else {
                     onLog?("recorder missing — frame dropped (\(frame.sourceName))")
                     return
