@@ -272,7 +272,8 @@ public final class SessionPipeline {
     /// Renders + saves one snapshot from the current stack and pushes the preview. Shared by the
     /// throttled per-frame path and end()'s guaranteed final render. Sets lastRenderedAcceptedIndex.
     private func renderSnapshot(index: Int, sourceName: String, timestamp: Date, engine: StackEngine) {
-        guard let mean = engine.currentStack() else { return }
+        guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }
+        let mean = cropToCoverage(mean0, coverage: coverage)   // display shows the covered region (like master.fit)
         guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
         do {
             let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
@@ -438,7 +439,10 @@ public final class SessionPipeline {
     /// engine.currentStack(). nil when there is no stack yet.
     public func renderCurrentDisplay(adjustments: DisplayAdjustments) -> CGImage? {
         displayAdjustments = adjustments
-        guard let mean = engine?.currentStack() else { return nil }
+        // Crop to the covered region like renderSnapshot/handleNative, so a slider re-render
+        // doesn't snap the preview back to the ragged full-union frame.
+        guard let (mean0, coverage) = engine?.currentStackAndCoverage() else { return nil }
+        let mean = cropToCoverage(mean0, coverage: coverage)
         return try? displayCGImage(from: mean)
     }
 
@@ -457,7 +461,8 @@ public final class SessionPipeline {
             processedCount += 1
             switch outcome {
             case .becameReference, .stacked:
-                guard let mean = engine.currentStack() else { return }
+                guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }
+                let mean = cropToCoverage(mean0, coverage: coverage)   // display shows the covered region (like master.fit)
                 guard let recorder else {
                     onLog?("recorder missing — frame dropped (\(frame.sourceName))")
                     return
@@ -532,7 +537,7 @@ public final class SessionPipeline {
     /// Crop the master to its covered region (a copy). Returns the image
     /// unchanged when coverage is unavailable, the rect is nil, the rect is the
     /// full frame, or the crop would remove more than ~40% of the area.
-    private func cropMaster(_ image: AstroImage, coverage: [Float]?) -> AstroImage {
+    private func cropToCoverage(_ image: AstroImage, coverage: [Float]?) -> AstroImage {
         guard let cov = coverage,
               let rect = CoverageCrop.rect(coverage: cov, width: image.width, height: image.height)
         else { return image }
@@ -554,7 +559,7 @@ public final class SessionPipeline {
 
     /// Write `master.fit` from the CURRENT live stack WITHOUT ending the session
     /// (idle safeguard, spec §2). Native mode only. Mirrors the master write inside
-    /// `end()` — cropMaster → additive-only neutralize (when the flag is set) →
+    /// `end()` — cropToCoverage → additive-only neutralize (when the flag is set) →
     /// FITSWriter.float32 — but sources the image from the LIVE stack
     /// (`engine.currentStack()`), not the finalized state. The swap is atomic via
     /// FileReplace so a prior good master survives a failed write. Does NOT stamp
@@ -572,7 +577,7 @@ public final class SessionPipeline {
             return false
         }
         let frameCount = snap.frameCount                              // STACKCNT source (same read as pixels)
-        let master = cropMaster(snap.image, coverage: snap.coverage)   // crop BEFORE balance
+        let master = cropToCoverage(snap.image, coverage: snap.coverage)   // crop BEFORE balance
         let balanced = neutralizeBackground
             ? AutoStretch.neutralizeBackgroundAdditive(master)
             : master
@@ -788,7 +793,7 @@ public final class SessionPipeline {
                     guard let master0 = final.image else {
                         throw StackEngine.FinalizationError.invariantBreach
                     }
-                    let master = cropMaster(master0, coverage: final.coverage)   // crop BEFORE balance
+                    let master = cropToCoverage(master0, coverage: final.coverage)   // crop BEFORE balance
                     let balanced = neutralizeBackground
                         ? AutoStretch.neutralizeBackgroundAdditive(master)
                         : master
