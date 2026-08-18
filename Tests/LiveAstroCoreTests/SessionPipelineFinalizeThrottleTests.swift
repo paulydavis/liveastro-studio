@@ -72,4 +72,37 @@ final class SessionPipelineFinalizeThrottleTests: XCTestCase {
         let (_, snaps) = try run(count: 20, budget: 5)   // 20 % 4 == 0 → last already rendered
         XCTAssertEqual(snaps, 6, "no duplicate final render when the last accepted frame was already rendered")
     }
+
+    /// Lifecycle regression: the guaranteed final render in end() calls onUpdate. If a client's
+    /// onUpdate re-enters end(), the existing reentrancy contract requires .reentrantEnd — end()
+    /// must NOT nest-finalize (which would double-write master.fit past the sealed manifest). The
+    /// final render must therefore run inside callback-delivery marking, exactly like the
+    /// per-frame path. Before the fix, the final render skipped that marking, so the reentrant
+    /// end() slipped past the guard.
+    func testFinalRenderReentrantEndThrows() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        let profile = SessionProfile(targetName: "T", subExposureSeconds: 20)
+        let pipeline = SessionPipeline(nativeSource: NFrameFiniteSource(starFrame(), count: 21),
+                                       engine: StackEngine(), profile: profile, rootDirectory: sandbox)
+        pipeline.snapshotBudget = 5      // stride 4 → frame 21 is off-cadence → end() does the FINAL render
+        pipeline.rendersReplay = false
+
+        var sawFinalRender = false
+        var reentrantError: Error?
+        pipeline.onUpdate = { [weak pipeline] _, record in
+            guard record.index == 21 else { return }   // only the guaranteed final render (index == acceptedCount)
+            sawFinalRender = true
+            do { _ = try pipeline?.end() } catch { reentrantError = error }   // re-enter end() from the callback
+        }
+
+        try pipeline.start()
+        let dir = try pipeline.end()                    // outer end() must still succeed
+
+        XCTAssertTrue(sawFinalRender, "the guaranteed final render (index 21) should have fired onUpdate")
+        XCTAssertEqual(reentrantError as? SessionPipelineError, .reentrantEnd,
+                       "reentrant end() from the final render's onUpdate must throw .reentrantEnd, not nest-finalize")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("master.fit").path),
+                      "outer end() completes and writes master.fit once after the guarded reentrant attempt")
+    }
 }
