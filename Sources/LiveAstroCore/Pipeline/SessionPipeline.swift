@@ -532,7 +532,7 @@ public final class SessionPipeline {
     /// Crop the master to its covered region (a copy). Returns the image
     /// unchanged when coverage is unavailable, the rect is nil, the rect is the
     /// full frame, or the crop would remove more than ~40% of the area.
-    private func cropMaster(_ image: AstroImage, coverage: [Float]?) -> AstroImage {
+    private func cropToCoverage(_ image: AstroImage, coverage: [Float]?) -> AstroImage {
         guard let cov = coverage,
               let rect = CoverageCrop.rect(coverage: cov, width: image.width, height: image.height)
         else { return image }
@@ -554,7 +554,7 @@ public final class SessionPipeline {
 
     /// Write `master.fit` from the CURRENT live stack WITHOUT ending the session
     /// (idle safeguard, spec §2). Native mode only. Mirrors the master write inside
-    /// `end()` — cropMaster → additive-only neutralize (when the flag is set) →
+    /// `end()` — cropToCoverage → additive-only neutralize (when the flag is set) →
     /// FITSWriter.float32 — but sources the image from the LIVE stack
     /// (`engine.currentStack()`), not the finalized state. The swap is atomic via
     /// FileReplace so a prior good master survives a failed write. Does NOT stamp
@@ -572,7 +572,7 @@ public final class SessionPipeline {
             return false
         }
         let frameCount = snap.frameCount                              // STACKCNT source (same read as pixels)
-        let master = cropMaster(snap.image, coverage: snap.coverage)   // crop BEFORE balance
+        let master = cropToCoverage(snap.image, coverage: snap.coverage)   // crop BEFORE balance
         let balanced = neutralizeBackground
             ? AutoStretch.neutralizeBackgroundAdditive(master)
             : master
@@ -788,7 +788,7 @@ public final class SessionPipeline {
                     guard let master0 = final.image else {
                         throw StackEngine.FinalizationError.invariantBreach
                     }
-                    let master = cropMaster(master0, coverage: final.coverage)   // crop BEFORE balance
+                    let master = cropToCoverage(master0, coverage: final.coverage)   // crop BEFORE balance
                     let balanced = neutralizeBackground
                         ? AutoStretch.neutralizeBackgroundAdditive(master)
                         : master

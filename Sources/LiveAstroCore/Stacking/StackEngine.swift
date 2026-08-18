@@ -201,6 +201,17 @@ public final class StackEngine {
         lock.withLock { accumulator?.coverage() }
     }
 
+    /// One-lock read of the current mean AND coverage together, so a consumer (the display
+    /// crop) computes its rect from a coverage map consistent with the mean — no frame can
+    /// commit between two separate `currentStack()` / `currentCoverage()` reads. Nil when
+    /// there is no active stack. (Same atomic pattern as `masterSnapshotState`.)
+    public func currentStackAndCoverage() -> (image: AstroImage, coverage: [Float]?)? {
+        lock.withLock {
+            guard let accumulator else { return nil }
+            return (accumulator.mean(), accumulator.coverage())
+        }
+    }
+
     /// One-lock read of the live stack for the idle-safeguard master snapshot
     /// (`SessionPipeline.writeMasterSnapshot`). Returns image, coverage, and frameCount
     /// from a SINGLE lock acquisition so a frame commit or `reseed()` landing between
