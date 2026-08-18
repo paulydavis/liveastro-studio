@@ -27,4 +27,32 @@ final class StarCatalogTests: XCTestCase {
             XCTAssertEqual(error as? StarCatalog.CatalogError, .truncated)
         }
     }
+
+    private func cat(_ s: [CatalogStar]) -> StarCatalog { try! StarCatalog(data: StarCatalog.encode(s)) }
+
+    func testQueryReturnsWithinRadiusExcludesOutside() {
+        let c = cat([CatalogStar(ra: 100, dec: 10, mag: 5),    // center
+                     CatalogStar(ra: 100.5, dec: 10, mag: 6),  // ~0.49° away → inside 1°
+                     CatalogStar(ra: 105, dec: 10, mag: 7)])   // ~4.9° away → outside 1°
+        let got = c.stars(nearRA: 100, dec: 10, radiusDegrees: 1.0)
+        XCTAssertEqual(Set(got.map { $0.mag }), [5, 6])
+    }
+
+    func testQueryHandlesRA0Seam() {
+        // stars straddling the 0h seam must both be found (dot-product, not RA subtraction)
+        let c = cat([CatalogStar(ra: 359.7, dec: 0, mag: 5),
+                     CatalogStar(ra: 0.3, dec: 0, mag: 6),
+                     CatalogStar(ra: 180, dec: 0, mag: 7)])   // opposite side → excluded
+        let got = c.stars(nearRA: 0.0, dec: 0.0, radiusDegrees: 1.0)
+        XCTAssertEqual(Set(got.map { $0.mag }), [5, 6])
+    }
+
+    func testQueryNearPole() {
+        // near the pole RA converges; two stars at dec 89.5 with very different RA are both close
+        let c = cat([CatalogStar(ra: 0, dec: 89.6, mag: 5),
+                     CatalogStar(ra: 180, dec: 89.6, mag: 6),  // ~0.8° away over the pole
+                     CatalogStar(ra: 90, dec: 80, mag: 7)])    // ~9.6° away → excluded
+        let got = c.stars(nearRA: 90, dec: 90, radiusDegrees: 1.0)
+        XCTAssertEqual(Set(got.map { $0.mag }), [5, 6])
+    }
 }

@@ -47,4 +47,27 @@ public struct StarCatalog {
         }
         self.stars = out
     }
+
+    /// All catalog stars within `radiusDegrees` angular separation of (ra, dec). Uses a
+    /// declination-band prefilter (`|dec − center| ≤ radius`) over the dec-sorted array, then
+    /// unit-vector dot-product for the exact separation — correct across the RA 0/360 seam and
+    /// at the poles (no RA-subtraction wrap bug).
+    public func stars(nearRA ra: Double, dec: Double, radiusDegrees: Double) -> [CatalogStar] {
+        let d2r = Double.pi / 180
+        let cosR = cos(radiusDegrees * d2r)
+        // center unit vector
+        let cr = ra * d2r, cd = dec * d2r
+        let cx = cos(cd) * cos(cr), cy = cos(cd) * sin(cr), cz = sin(cd)
+        // dec band: stars are dec-sorted, so only scan those within radius in declination.
+        let loDec = Float(dec - radiusDegrees), hiDec = Float(dec + radiusDegrees)
+        var out: [CatalogStar] = []
+        for s in stars {
+            if s.dec < loDec { continue }
+            if s.dec > hiDec { break }            // sorted → past the band, stop
+            let sr = Double(s.ra) * d2r, sd = Double(s.dec) * d2r
+            let dot = cos(sd) * cos(sr) * cx + cos(sd) * sin(sr) * cy + sin(sd) * cz
+            if dot >= cosR { out.append(s) }
+        }
+        return out
+    }
 }
