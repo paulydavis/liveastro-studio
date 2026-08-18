@@ -57,4 +57,19 @@ final class SessionPipelineFinalizeThrottleTests: XCTestCase {
         let manifest = try Data(contentsOf: dir.appendingPathComponent("manifest.json"))
         XCTAssertFalse(manifest.isEmpty)
     }
+
+    /// budget 5 over 21 frames → stride 4 → renders 1,4,8,12,16,20; last accepted (21) is off-cadence,
+    /// so end() must emit one FINAL render → 7 snapshots, and latest.png decodes to the final stack.
+    func testEndRendersFinalWhenLastFrameThrottled() throws {
+        let (dir, snaps) = try run(count: 21, budget: 5)
+        XCTAssertEqual(snaps, 7, "end() must add a final snapshot when the last accepted frame was throttled")
+        let latest = try ImageLoader.load(url: dir.appendingPathComponent("latest.png"))
+        XCTAssertGreaterThan(latest.width, 0, "latest.png reflects the guaranteed final render")
+    }
+
+    /// When the last accepted frame IS on-cadence, end() must NOT add a duplicate final render.
+    func testEndAddsNoFinalWhenLastFrameRendered() throws {
+        let (_, snaps) = try run(count: 20, budget: 5)   // 20 % 4 == 0 → last already rendered
+        XCTAssertEqual(snaps, 6, "no duplicate final render when the last accepted frame was already rendered")
+    }
 }

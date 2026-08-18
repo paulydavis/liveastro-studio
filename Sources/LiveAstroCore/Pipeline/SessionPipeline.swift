@@ -727,6 +727,11 @@ public final class SessionPipeline {
                     // cancel + grace → shutdownTimeout instead of pinning end() forever.
                     try drainFiniteImportOrThrow()
                     source?.stop()
+                    // Guaranteed final snapshot: the last accepted frame may have been throttled, so
+                    // render once from the completed stack → latest.png + last replay keyframe show full depth.
+                    if let eng = engine, lastRenderedAcceptedIndex < eng.acceptedCount, let lc = lastCommitted {
+                        renderSnapshot(index: eng.acceptedCount, sourceName: lc.name, timestamp: lc.timestamp, engine: eng)
+                    }
                 } else {
                     // Live source: the stream never ends by itself — stop it first, then drain.
                     // Cold1 M1: the source's own bounded stop (FolderFrameSource → inner
