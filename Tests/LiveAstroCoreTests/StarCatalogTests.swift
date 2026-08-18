@@ -55,4 +55,16 @@ final class StarCatalogTests: XCTestCase {
         let got = c.stars(nearRA: 90, dec: 90, radiusDegrees: 1.0)
         XCTAssertEqual(Set(got.map { $0.mag }), [5, 6])
     }
+
+    /// The real bundled catalog loads and is queryable. Skipped until brightstars.bin is generated
+    /// (placeholder has count 0), so the suite stays green pre-data.
+    func testBundledCatalogLoadsAndQueries() throws {
+        guard let cat = StarCatalog.bundled(), cat.count > 0 else {
+            throw XCTSkip("brightstars.bin not generated yet (or empty placeholder)")
+        }
+        XCTAssertGreaterThan(cat.count, 10_000, "expected a substantial Gaia DR3 bright subset")
+        // a dense region (galactic plane, ~Cygnus) should return some bright stars
+        let got = cat.stars(nearRA: 305.0, dec: 40.0, radiusDegrees: 3.0)
+        XCTAssertFalse(got.isEmpty, "expected catalog stars in a dense region")
+    }
 }

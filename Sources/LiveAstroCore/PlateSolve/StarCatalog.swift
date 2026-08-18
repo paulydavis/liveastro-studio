@@ -70,4 +70,13 @@ public struct StarCatalog {
         }
         return out
     }
+
+    /// Load the bundled Gaia DR3 bright subset. Returns nil if the resource is missing or malformed,
+    /// so callers degrade gracefully before the catalog is generated.
+    public static func bundled() -> StarCatalog? {
+        guard let url = Bundle.module.url(forResource: "brightstars", withExtension: "bin"),
+              let data = try? Data(contentsOf: url),
+              let cat = try? StarCatalog(data: data) else { return nil }
+        return cat
+    }
 }
