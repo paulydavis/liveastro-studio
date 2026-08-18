@@ -729,8 +729,15 @@ public final class SessionPipeline {
                     source?.stop()
                     // Guaranteed final snapshot: the last accepted frame may have been throttled, so
                     // render once from the completed stack → latest.png + last replay keyframe show full depth.
+                    // Wrapped in withCallbackDelivery so this render's onUpdate marks the current thread as a
+                    // delivery context: a client that re-enters end() from that callback hits the .reentrantEnd
+                    // guard (line ~710) instead of nest-finalizing (double master write past the sealed manifest).
+                    // The consumer task is already drained here, so this only sets the reentrancy marker — no
+                    // mutual-exclusion contention and no deadlock (deliveryLock is not held by end()).
                     if let eng = engine, lastRenderedAcceptedIndex < eng.acceptedCount, let lc = lastCommitted {
-                        renderSnapshot(index: eng.acceptedCount, sourceName: lc.name, timestamp: lc.timestamp, engine: eng)
+                        withCallbackDelivery {
+                            renderSnapshot(index: eng.acceptedCount, sourceName: lc.name, timestamp: lc.timestamp, engine: eng)
+                        }
                     }
                 } else {
                     // Live source: the stream never ends by itself — stop it first, then drain.
