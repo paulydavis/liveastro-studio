@@ -143,6 +143,11 @@ public final class SessionPipeline {
     /// (2026-08-16 ASI2600). 120 s tolerates a slow frame (even on modest hardware) while a
     /// genuinely wedged consumer is still caught. Internal so tests can shrink it.
     var importPrimaryTimeout: DispatchTimeInterval = .seconds(120)
+    /// Long-edge cap for the import preview/snapshot render (Approach B): finalizeCommitted
+    /// downsamples the stacked image to this before displayCGImage so the neutralize/stretch
+    /// passes don't run on all 26 MP. Defaults to the SnapshotRecorder cap; internal so tests
+    /// can shrink it to keep the call-site test off a full-size frame.
+    var importPreviewLongEdge = SnapshotRecorder.maxSnapshotLongEdge
     /// Test seam: when false, end() finalizes the session (master + manifest) but skips the
     /// AVFoundation replay render and returns the session directory instead of replay.mp4.
     /// Drain/watchdog unit tests set this — the replay writer's setup/teardown is a fixed
@@ -254,7 +259,7 @@ public final class SessionPipeline {
                 // import bottleneck). `mean` stays full-res for the manifest record + stats;
                 // master.fit is finalized full-res separately. (Live keeps full-res display
                 // for zoom; its snapshot is capped in SnapshotRecorder.)
-                let displaySource = mean.downsampled(maxLongEdge: SnapshotRecorder.maxSnapshotLongEdge)
+                let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
                 let cg = try displayCGImage(from: displaySource)
                 let record = try recorder.save(
                     cgImage: cg, linear: mean, sourceFile: sourceName,
