@@ -56,8 +56,19 @@ final class StarCatalogTests: XCTestCase {
         XCTAssertEqual(Set(got.map { $0.mag }), [5, 6])
     }
 
+    /// Fail-closed contract: bundled() must NEVER return a non-nil but EMPTY catalog. Either nil
+    /// (missing/malformed/placeholder) or a substantial real catalog — so solver code that does
+    /// `if let cat = bundled()` cleanly disables plate-solve on no-data instead of silently querying
+    /// an empty catalog. With the committed placeholder (count 0), bundled() must be nil.
+    func testBundledIsNilOrSubstantialNeverEmpty() {
+        if let cat = StarCatalog.bundled() {
+            XCTAssertGreaterThan(cat.count, 0, "bundled() must return nil for an empty catalog, never a non-nil empty one")
+        }
+        // nil is the correct result for the placeholder / pre-data state.
+    }
+
     /// The real bundled catalog loads and is queryable. Skipped until brightstars.bin is generated
-    /// (placeholder has count 0), so the suite stays green pre-data.
+    /// (placeholder → bundled() is nil), so the suite stays green pre-data.
     func testBundledCatalogLoadsAndQueries() throws {
         guard let cat = StarCatalog.bundled(), cat.count > 0 else {
             throw XCTSkip("brightstars.bin not generated yet (or empty placeholder)")

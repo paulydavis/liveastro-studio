@@ -71,12 +71,15 @@ public struct StarCatalog {
         return out
     }
 
-    /// Load the bundled Gaia DR3 bright subset. Returns nil if the resource is missing or malformed,
-    /// so callers degrade gracefully before the catalog is generated.
+    /// Load the bundled Gaia DR3 bright subset. Returns nil if the resource is missing, malformed,
+    /// OR EMPTY (the pre-data placeholder has count 0). Failing closed on empty means callers get a
+    /// clean "no catalog" (`if let cat = bundled()` doesn't bind) instead of a silently-empty catalog
+    /// that would make every plate-solve query return nothing while appearing available.
     public static func bundled() -> StarCatalog? {
         guard let url = Bundle.module.url(forResource: "brightstars", withExtension: "bin"),
               let data = try? Data(contentsOf: url),
-              let cat = try? StarCatalog(data: data) else { return nil }
+              let cat = try? StarCatalog(data: data),
+              cat.count > 0 else { return nil }
         return cat
     }
 }
