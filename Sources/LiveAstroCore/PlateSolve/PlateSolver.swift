@@ -29,13 +29,22 @@ public enum PlateSolver {
         // that makes the match robust; the fit then uses all inliers, which span the field anyway.
         let frameStars = Array(stars.sorted { $0.flux > $1.flux }.prefix(catalogSelectionCap))
 
+        // The catalog query is a CIRCLE, but the frame is a RECTANGLE: a candidate farther than the
+        // frame's half-diagonal from center can never appear in-frame at ANY rotation (distance from
+        // center is rotation-invariant). Clip those out BEFORE the brightest-N selection, else bright
+        // off-frame stars (in the circular query's corners) would fill the candidate list with
+        // un-matchable targets (regression: testDropsOffFrameBrightCandidates). The 1.1× keeps a
+        // little slack for the approximate-center offset.
+        let maxReachPx = 0.5 * Double(width * width + height * height).squareRoot() * 1.1
+
         func grid(mirrored: Bool) -> [Star] {
-            let g = catStars.map { cs -> Star in
+            let g = catStars.compactMap { cs -> Star? in
                 let p = GnomonicProjection.project(ra: Double(cs.ra), dec: Double(cs.dec),
                                                    centerRA: approxCenterRA, centerDec: approxCenterDec)
                 var gx = Double(width)/2 + (p.xi * arcsecPerRad) / pixelScaleArcsec
                 let gy = Double(height)/2 - (p.eta * arcsecPerRad) / pixelScaleArcsec
                 if mirrored { gx = Double(width) - gx }
+                guard hypot(gx - Double(width)/2, gy - Double(height)/2) <= maxReachPx else { return nil }
                 return Star(x: gx, y: gy, flux: pow(10, -0.4 * Double(cs.mag)))
             }
             return Array(g.sorted { $0.flux > $1.flux }.prefix(catalogSelectionCap))

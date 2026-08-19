@@ -110,6 +110,46 @@ final class PlateSolverTests: XCTestCase {
         XCTAssertLessThan(abs(dRot), 0.2, "crowded rotation off by \(dRot)°")
     }
 
+    /// Reliability regression: the catalog query is a CIRCLE (half-diagonal + margin) but the frame
+    /// is a RECTANGLE. Catalog stars projecting beyond the frame's half-diagonal reach can never be
+    /// in-frame at any rotation. If such stars are BRIGHT they dominate the flux-sorted candidate
+    /// selection with un-matchable targets. The solver must clip candidates to the frame's max reach.
+    /// Here 50 bright stars sit in the query margin (never in-frame) among 40 fainter in-frame stars;
+    /// without clipping, the matcher's brightest-20 are all off-frame → no correspondence → nil.
+    func testDropsOffFrameBrightCandidates() {
+        let w = 1000, h = 800, scale = 2.0, cra = 40.0, cdec = -12.0, rotDeg = 20.0
+        let d2r = Double.pi / 180
+        let wcs = (cra: cra, cdec: cdec, rotDeg: rotDeg, scale: scale, parity: false)
+        var seed: UInt64 = 0x77AA55
+        func u() -> Double { seed = seed &* 6364136223846793005 &+ 1; return Double((seed >> 33) & 0xFFFF)/65535 }
+        var cs: [CatalogStar] = []
+        // 40 in-frame stars (angular radius ≤ 0.18° → well inside the ~0.356° half-diagonal), fainter.
+        for _ in 0..<40 {
+            let rho = 0.02 + u() * 0.16, az = u() * 2 * .pi
+            cs.append(CatalogStar(ra: Float(cra + rho * sin(az) / cos(cdec * d2r)),
+                                  dec: Float(cdec + rho * cos(az)), mag: Float(7.0 + u())))
+        }
+        // 50 BRIGHT stars in the query margin (0.40–0.42° → beyond 0.356° reach, inside 0.427° query).
+        for _ in 0..<50 {
+            let rho = 0.40 + u() * 0.02, az = u() * 2 * .pi
+            cs.append(CatalogStar(ra: Float(cra + rho * sin(az) / cos(cdec * d2r)),
+                                  dec: Float(cdec + rho * cos(az)), mag: Float(4.0 + u() * 0.5)))
+        }
+        let cat = try! StarCatalog(data: StarCatalog.encode(cs))
+        var raw: [Star] = []
+        for c in cat.stars {   // frame = in-bounds projections only (off-frame bright stars undetected)
+            let p = projectThroughWCS(ra: Double(c.ra), dec: Double(c.dec), w: w, h: h, wcs: wcs)
+            if p.x < 0 || p.x >= Double(w) || p.y < 0 || p.y >= Double(h) { continue }
+            raw.append(Star(x: p.x, y: p.y, flux: pow(10, -0.4 * Double(c.mag))))
+        }
+        guard let got = PlateSolver.solve(stars: raw, width: w, height: h, pixelScaleArcsec: scale,
+                                          approxCenterRA: cra, approxCenterDec: cdec, catalog: cat) else {
+            return XCTFail("solve nil — bright off-frame candidates polluted the brightest-N selection")
+        }
+        let sep = 3600 * hypot((got.centerRA - cra) * cos(cdec * d2r), got.centerDec - cdec)
+        XCTAssertLessThan(sep, 60, "center off by \(sep)\"")
+    }
+
     func testSolvesRealM63Frame() throws {
         guard ProcessInfo.processInfo.environment["LAS_SOLVE_FRAME"] != nil,
               let catalog = StarCatalog.bundled() else {
