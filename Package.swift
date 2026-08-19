@@ -8,7 +8,7 @@ let package = Package(
         .library(name: "LiveAstroCore", targets: ["LiveAstroCore"]),
     ],
     targets: [
-        .target(name: "LiveAstroCore"),
+        .target(name: "LiveAstroCore", resources: [.copy("Resources")]),
         .executableTarget(name: "LiveAstroStudio", dependencies: ["LiveAstroCore"],
                           resources: [.process("Resources")]),
         .executableTarget(name: "demo-stack", dependencies: ["LiveAstroCore"]),
