@@ -4,6 +4,11 @@ packed into the LASC binary format {magic "LASC", u32 version=1, u32 count, then
 {ra,dec,mag} float32 LE}, records sorted by ascending dec.
 Requires: pip install astroquery   (astropy is already present)
 Run: python3 Scripts/generate_star_catalog.py  ->  Sources/LiveAstroCore/Resources/brightstars.bin
+
+Attribution (Gaia DR3 ships in the product — required acknowledgement):
+  This work has made use of data from the European Space Agency (ESA) mission Gaia
+  (https://www.cosmos.esa.int/gaia), processed by the Gaia Data Processing and Analysis
+  Consortium (DPAC, https://www.cosmos.esa.int/web/gaia/dpac/consortium).
 """
 import struct, os
 from astroquery.gaia import Gaia
