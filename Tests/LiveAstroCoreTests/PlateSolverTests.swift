@@ -79,6 +79,37 @@ final class PlateSolverTests: XCTestCase {
 
     /// Real M63 sub: detect stars, near-solve, and check the recovered center against the frame's
     /// CRVAL (the ASIAIR's own plate-solve). Needs the real bundled catalog + a frame; skips otherwise.
+    /// Reliability regression: on a CROWDED field (many catalog stars in the FOV), the catalog
+    /// arrives declination-sorted, but the frame's stars come from StarDetector (flux-sorted +
+    /// spatially distributed). TriangleMatcher only uses the first ~20 of each list, so the grid
+    /// must be selected by the SAME brightest/spatial criterion — otherwise the grid's first-20 is
+    /// an arbitrary low-dec slice that won't overlap the frame's brightest, and the solve fails.
+    /// This test presents the frame in the real detector order; it fails if the solver feeds the
+    /// matcher dec-sorted catalog candidates.
+    func testSolvesCrowdedFieldWithDetectorOrderedFrame() {
+        let w = 1000, h = 800, scale = 2.0, cra = 150.0, cdec = 22.0, rotDeg = 15.0
+        let cat = syntheticCatalog(cra: cra, cdec: cdec, n: 120)   // crowds the ~0.56°×0.44° FOV (>>20 in frame)
+        let wcs = (cra: cra, cdec: cdec, rotDeg: rotDeg, scale: scale, parity: false)
+        // Frame = in-FOV catalog seen through the WCS, then presented exactly as StarDetector would:
+        // flux-sorted then spatially distributed (NOT dec order).
+        var raw: [Star] = []
+        for cs in cat.stars {
+            let p = projectThroughWCS(ra: Double(cs.ra), dec: Double(cs.dec), w: w, h: h, wcs: wcs)
+            if p.x < 0 || p.x >= Double(w) || p.y < 0 || p.y >= Double(h) { continue }
+            raw.append(Star(x: p.x + 0.12, y: p.y - 0.08, flux: pow(10, -0.4 * Double(cs.mag))))
+        }
+        raw.sort { $0.flux > $1.flux }
+        let frame = StarDetector.spatiallyDistributed(raw, width: w, height: h, maxStars: 60)
+        guard let got = PlateSolver.solve(stars: frame, width: w, height: h, pixelScaleArcsec: scale,
+                                          approxCenterRA: cra, approxCenterDec: cdec, catalog: cat) else {
+            return XCTFail("crowded-field solve returned nil — grid candidates not brightest/spatial-matched to the frame")
+        }
+        let sep = 3600 * hypot((got.centerRA - cra) * cos(cdec * .pi/180), got.centerDec - cdec)
+        XCTAssertLessThan(sep, 60, "crowded center off by \(sep)\"")
+        let dRot = ((got.rotationDegrees - rotDeg + 540).truncatingRemainder(dividingBy: 360)) - 180
+        XCTAssertLessThan(abs(dRot), 0.2, "crowded rotation off by \(dRot)°")
+    }
+
     func testSolvesRealM63Frame() throws {
         guard ProcessInfo.processInfo.environment["LAS_SOLVE_FRAME"] != nil,
               let catalog = StarCatalog.bundled() else {
