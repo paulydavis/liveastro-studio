@@ -9,14 +9,24 @@ public enum PlateSolver {
     /// TriangleMatcher uses only the first ~20, but keeping the brightest 60 gives it a comfortable
     /// margin of corresponding stars on crowded fields.
     static let catalogSelectionCap = 60
+    /// A candidate farther than the frame's half-diagonal from center can never be in-frame at any
+    /// rotation (distance from center is rotation-invariant). `frameReachFactor` = that half-diagonal
+    /// plus slack for the approximate-center (mount pointing) offset — the exact pixel-space clip.
+    static let frameReachFactor = 1.1
+    /// The catalog query is an APPROXIMATE angular circle; it reaches `frameReachFactor + querySlack`,
+    /// a guaranteed SUPERSET of the exact pixel clip (never dropping a real edge candidate the clip
+    /// would keep) despite gnomonic nonlinearity near the edge. Additive so the query always tracks
+    /// `frameReachFactor` with a fixed extra margin — no hand-tuned ratio to drift. Any value > 0
+    /// keeps query > clip.
+    static let querySlack = 0.1   // frameReachFactor(1.1) + this = 1.2 query radius
 
     public static func solve(stars: [Star], width: Int, height: Int, pixelScaleArcsec: Double,
                              approxCenterRA: Double, approxCenterDec: Double,
                              catalog: StarCatalog, minInliers: Int = 8) -> WCS? {
         guard stars.count >= minInliers, pixelScaleArcsec > 0, width > 0, height > 0 else { return nil }
-        // FOV radius (diagonal half-FOV + 20% margin), in degrees.
+        // FOV radius: frame half-diagonal × (clip reach + query slack) — a superset of the pixel clip below.
         let radiusDeg = 0.5 * (Double(width * width + height * height)).squareRoot()
-            * pixelScaleArcsec / 3600 * 1.2
+            * pixelScaleArcsec / 3600 * (frameReachFactor + querySlack)
         let catStars = catalog.stars(nearRA: approxCenterRA, dec: approxCenterDec, radiusDegrees: radiusDeg)
         guard catStars.count >= minInliers else { return nil }
 
@@ -33,9 +43,8 @@ public enum PlateSolver {
         // frame's half-diagonal from center can never appear in-frame at ANY rotation (distance from
         // center is rotation-invariant). Clip those out BEFORE the brightest-N selection, else bright
         // off-frame stars (in the circular query's corners) would fill the candidate list with
-        // un-matchable targets (regression: testDropsOffFrameBrightCandidates). The 1.1× keeps a
-        // little slack for the approximate-center offset.
-        let maxReachPx = 0.5 * Double(width * width + height * height).squareRoot() * 1.1
+        // un-matchable targets (regression: testDropsOffFrameBrightCandidates). See frameReachFactor.
+        let maxReachPx = 0.5 * Double(width * width + height * height).squareRoot() * frameReachFactor
 
         func grid(mirrored: Bool) -> [Star] {
             let g = catStars.compactMap { cs -> Star? in
