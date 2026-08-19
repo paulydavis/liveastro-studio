@@ -5,6 +5,10 @@ import Foundation
 /// (plate-solving = registering the frame against the catalog instead of the previous frame).
 public enum PlateSolver {
     static let arcsecPerRad = 206264.806247
+    /// Candidates kept after brightest-first (global flux) selection on BOTH the frame and the grid.
+    /// TriangleMatcher uses only the first ~20, but keeping the brightest 60 gives it a comfortable
+    /// margin of corresponding stars on crowded fields.
+    static let catalogSelectionCap = 60
 
     public static func solve(stars: [Star], width: Int, height: Int, pixelScaleArcsec: Double,
                              approxCenterRA: Double, approxCenterDec: Double,
@@ -16,9 +20,17 @@ public enum PlateSolver {
         let catStars = catalog.stars(nearRA: approxCenterRA, dec: approxCenterDec, radiusDegrees: radiusDeg)
         guard catStars.count >= minInliers else { return nil }
 
-        // Project catalog → a north-up pixel grid at the frame's scale. brightness→flux (brighter=lower mag).
+        // Order BOTH the frame and the grid candidates by GLOBAL brightness (rotation-invariant),
+        // so TriangleMatcher's first-maxTriangleStars pick the SAME physical stars on both source and
+        // target regardless of the frame's rotation. The catalog arrives declination-sorted and the
+        // frame stars arrive in StarDetector's spatially-distributed order — neither is rotation-
+        // invariant, so on a crowded field their first-20 wouldn't correspond and the solve fails
+        // (regression: testSolvesCrowdedFieldWithDetectorOrderedFrame). Brightest-N is the invariant
+        // that makes the match robust; the fit then uses all inliers, which span the field anyway.
+        let frameStars = Array(stars.sorted { $0.flux > $1.flux }.prefix(catalogSelectionCap))
+
         func grid(mirrored: Bool) -> [Star] {
-            catStars.map { cs in
+            let g = catStars.map { cs -> Star in
                 let p = GnomonicProjection.project(ra: Double(cs.ra), dec: Double(cs.dec),
                                                    centerRA: approxCenterRA, centerDec: approxCenterDec)
                 var gx = Double(width)/2 + (p.xi * arcsecPerRad) / pixelScaleArcsec
@@ -26,15 +38,16 @@ public enum PlateSolver {
                 if mirrored { gx = Double(width) - gx }
                 return Star(x: gx, y: gy, flux: pow(10, -0.4 * Double(cs.mag)))
             }
+            return Array(g.sorted { $0.flux > $1.flux }.prefix(catalogSelectionCap))
         }
 
         // Try both parities; keep the transform with more inliers.
         var best: (t: SimilarityTransform, inliers: Int, mirrored: Bool)?
         for mirrored in [false, true] {
             let g = grid(mirrored: mirrored)
-            let pairs = TriangleMatcher.correspondences(source: stars, target: g)
-            guard let t = TransformSolver.solve(source: stars, target: g, pairs: pairs) else { continue }
-            let n = TransformSolver.inliers(t, source: stars, target: g, pairs: pairs, tolerance: 3.0).count
+            let pairs = TriangleMatcher.correspondences(source: frameStars, target: g)
+            guard let t = TransformSolver.solve(source: frameStars, target: g, pairs: pairs) else { continue }
+            let n = TransformSolver.inliers(t, source: frameStars, target: g, pairs: pairs, tolerance: 3.0).count
             if best == nil || n > best!.inliers { best = (t, n, mirrored) }
         }
         guard let win = best, win.inliers >= minInliers else { return nil }
