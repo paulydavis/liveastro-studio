@@ -9,6 +9,24 @@ public enum PlateSolver {
     /// TriangleMatcher uses only the first ~20, but keeping the brightest 60 gives it a comfortable
     /// margin of corresponding stars on crowded fields.
     static let catalogSelectionCap = 60
+    /// Triangle-vote stars for the plate-solve match. Larger than TriangleMatcher's frame-to-frame
+    /// default (20) because plate-solving matches PARTIALLY-overlapping sets: the frame detects stars
+    /// fainter than the catalog's depth, so its brightest-N (by flux) and the catalog's brightest-N (by
+    /// magnitude) share only a fraction of stars. Measured on a real sparse-field M63 sub, that shared
+    /// count rises 9→16 going from N=20→30 — 30 clears the minInliers floor with margin where 20 didn't.
+    /// Cost is O(N^3)² per parity, ≈98M triangle-pair compares at 40 — acceptable off the hot path
+    /// (solve runs once at seed). 40 is needed, not optional: on the real M63 sub the grid is built
+    /// around the APPROXIMATE center (mount pointing, ~0.64° off true), which shifts which catalog
+    /// stars land in the brightest-N; at N=30 the brightest-30 lost enough true correspondences that
+    /// the solve returned nil, at N=40 it recovers 9 inliers and solves.
+    static let triangleStars = 40
+    /// Invariant match tolerance for the plate-solve triangle vote — TIGHTER than TriangleMatcher's
+    /// frame-to-frame default (0.02). Plate-solving matches partially-overlapping sets with many
+    /// unmatched distractor stars, so coincidental triangle collisions are rife; at 0.02 the spurious
+    /// pairs out-VOTE the real ones (283 vs ~200 on a real M63 sub) and win the greedy assignment,
+    /// leaving only 3 correct pairs. At 0.01 the coincidences fall off faster than the true matches, so
+    /// all real correspondences survive. Frame-to-frame registration (near-identical sets) keeps 0.02.
+    static let triangleTolerance = 0.01
     /// A candidate farther than the frame's half-diagonal from center can never be in-frame at any
     /// rotation (distance from center is rotation-invariant). `frameReachFactor` = that half-diagonal
     /// plus slack for the approximate-center (mount pointing) offset — the exact pixel-space clip.
@@ -63,7 +81,9 @@ public enum PlateSolver {
         var best: (t: SimilarityTransform, inliers: Int, mirrored: Bool)?
         for mirrored in [false, true] {
             let g = grid(mirrored: mirrored)
-            let pairs = TriangleMatcher.correspondences(source: frameStars, target: g)
+            let pairs = TriangleMatcher.correspondences(source: frameStars, target: g,
+                                                        maxTriangleStars: triangleStars,
+                                                        invariantTolerance: triangleTolerance)
             guard let t = TransformSolver.solve(source: frameStars, target: g, pairs: pairs) else { continue }
             let n = TransformSolver.inliers(t, source: frameStars, target: g, pairs: pairs, tolerance: 3.0).count
             if best == nil || n > best!.inliers { best = (t, n, mirrored) }
