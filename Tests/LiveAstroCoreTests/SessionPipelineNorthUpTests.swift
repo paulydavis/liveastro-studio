@@ -96,6 +96,64 @@ final class SessionPipelineNorthUpTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(b.height, a.height)
     }
 
+    /// EMPIRICAL source of truth (gated on LAS_SOLVE_FRAME + real catalog + ~/Desktop/M63-import):
+    /// on a REAL solved M63 frame, the north direction (from the header CD matrix, in frame pixels)
+    /// rotated by the solved `displayRotationRadians` must point UP (negative top-down y). Composes the
+    /// whole chain — real solve → display rotation — on real data; the sign is right iff this passes.
+    func testRealM63NorthEndsUp() throws {
+        guard ProcessInfo.processInfo.environment["LAS_SOLVE_FRAME"] != nil,
+              let catalog = StarCatalog.bundled() else {
+            throw XCTSkip("set LAS_SOLVE_FRAME + stage the real catalog")
+        }
+        let dir = URL(fileURLWithPath: (NSHomeDirectory() as NSString).appendingPathComponent("Desktop/M63-import"))
+        let subs = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension.lowercased() == "fit" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard let first = subs.first else { throw XCTSkip("no M63 frames") }
+        let data = try Data(contentsOf: first)
+        let img = try FITSReader.read(data, normalizeRowOrder: false)
+        let hdr = try FITSReader.readHeader(data).keywords
+        func kv(_ k: String) -> Double? { hdr[k].flatMap { Double($0.trimmingCharacters(in: .whitespaces)) } }
+        guard let ra = kv("RA"), let dec = kv("DEC"), let fl = kv("FOCALLEN"), let px = kv("XPIXSZ"),
+              let cd11 = kv("CD1_1"), let cd12 = kv("CD1_2"), let cd21 = kv("CD2_1"), let cd22 = kv("CD2_2")
+        else { throw XCTSkip("frame missing WCS keywords") }
+        let scale = px / fl * 206.264806
+        let n = img.width * img.height
+        var lum = [Float](repeating: 0, count: n)
+        let ch = max(1, img.channels)
+        for c in 0..<ch { let base = c * n; for i in 0..<n { lum[i] += img.pixels[base + i] } }
+        if ch > 1 { for i in 0..<n { lum[i] /= Float(ch) } }
+        let det = StarDetector.detectWithStats(luminance: lum, width: img.width, height: img.height, maxStars: 80)
+        guard let wcs = PlateSolver.solve(stars: det.stars, width: img.width, height: img.height,
+                                          pixelScaleArcsec: scale, approxCenterRA: ra, approxCenterDec: dec,
+                                          catalog: catalog) else { return XCTFail("real solve returned nil") }
+        // North direction in FRAME pixels: pixel_offset = CD^-1 · (intermediate for a 0.1° north step).
+        // Intermediate coords for a pure-north step ≈ (Δxi, Δeta) = (0, 0.1) degrees.
+        let det2 = cd11 * cd22 - cd12 * cd21
+        // CD^-1 · (0, 0.1):
+        let northVecX = (-cd12 * 0.1) / det2
+        let northVecY = ( cd11 * 0.1) / det2
+        // Rotate that vector by the display rotation (about origin) — must point up (top-down y < 0).
+        let angle = NorthUpRotation.displayRotationRadians(wcs: wcs)
+        let ry = sin(angle) * northVecX + cos(angle) * northVecY
+        XCTAssertLessThan(ry, 0, "real M63 north did not end up up (ry=\(ry), rot=\(wcs.rotationDegrees), parity=\(wcs.parity))")
+    }
+
+    /// Definitive pipeline-convention check: the WCS the PIPELINE actually solved (top-down, via
+    /// referenceSolveInput/halfResLuminance) must, through displayRotationRadians, rotate the frame's
+    /// north direction to UP. Uses the same top-down `project()` the synthetic frames were built with —
+    /// no header-CD / row-order guessing. This closes the loop the raw-frame gated test can't.
+    func testPipelineSolvedWCSPutsNorthUp() throws {
+        let pipeline = try runSolvedSession(catalogInjected: catalog())
+        let wcs = try XCTUnwrap(pipeline.currentWCS, "precondition: solved")
+        // North direction in top-down frame pixels (project() encodes the display's top-down convention).
+        let c = project(ra: CRA, dec: CDEC)
+        let north = project(ra: CRA, dec: CDEC + 0.01)
+        let nx = north.x - c.x, ny = north.y - c.y
+        let angle = NorthUpRotation.displayRotationRadians(wcs: wcs)
+        let ry = sin(angle) * nx + cos(angle) * ny
+        XCTAssertLessThan(ry, 0, "pipeline-solved north must rotate to up (ry=\(ry), rot=\(wcs.rotationDegrees))")
+    }
+
     func testNorthUpNoOpWhenUnsolved() throws {
         let pipeline = try runSolvedSession(catalogInjected: nil)   // no catalog → currentWCS nil
         XCTAssertNil(pipeline.currentWCS)

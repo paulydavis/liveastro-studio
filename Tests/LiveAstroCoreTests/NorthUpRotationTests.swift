@@ -72,6 +72,48 @@ final class NorthUpRotationTests: XCTestCase {
         return ctx.makeImage()!
     }
 
+    /// An image with a bright marker at a known offset from center; rest dark.
+    private func markerImage(_ w: Int, _ h: Int, mx: Int, my: Int) -> CGImage {
+        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        // CGContext is y-up; to place the marker at top-down row `my`, draw at y = h-1-my.
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fill(CGRect(x: mx - 6, y: (h - 1 - my) - 6, width: 12, height: 12))
+        return ctx.makeImage()!
+    }
+
+    /// Brightest-pixel centroid in TOP-DOWN coords (y down from the top).
+    private func brightestCentroid(_ cg: CGImage) -> (x: Double, y: Double) {
+        let w = cg.width, h = cg.height
+        var buf = [UInt8](repeating: 0, count: w * h * 4)
+        let ctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))   // CGImage draws right-side-up here
+        var sx = 0.0, sy = 0.0, n = 0.0
+        for y in 0..<h { for x in 0..<w {
+            if buf[(y * w + x) * 4] > 128 { sx += Double(x); sy += Double(y); n += 1 }
+        } }
+        return n > 0 ? (sx / n, sy / n) : (Double(w)/2, Double(h)/2)
+    }
+
+    /// The CoreGraphics realisation `apply` must move pixels the SAME direction the pure-math rotation
+    /// predicts — otherwise "north-up" would render upside down. A marker at the RIGHT-middle, rotated
+    /// by rotationDegrees=90, must land in the BOTTOM half of the output (per the top-down math:
+    /// offset (+d,0) → (0,+d)). If this lands top, the sign in `apply` is wrong.
+    func testApplyRotationMatchesMathDirection() {
+        let w = 200, h = 120
+        let img = markerImage(w, h, mx: 175, my: 60)   // right-middle
+        let wcs = WCS(centerRA: 0, centerDec: 0, rotationDegrees: 90, pixelScaleArcsec: 1, parity: false, inlierCount: 20)
+        let out = NorthUpRotation.apply(img, wcs: wcs, autoZoom: false)
+        let c = brightestCentroid(out)
+        XCTAssertGreaterThan(c.y, Double(out.height) / 2,
+                             "marker should rotate to the BOTTOM (top-down math); got y=\(c.y)/\(out.height) — apply sign is inverted")
+    }
+
     /// Auto-zoom: a SMALL rotation keeps the original canvas (crop-to-fill); a LARGE rotation returns the
     /// full rotated bounding box (letterbox).
     func testAutoZoomFramingDimensions() {
