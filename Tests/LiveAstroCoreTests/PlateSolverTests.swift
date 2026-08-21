@@ -70,6 +70,34 @@ final class PlateSolverTests: XCTestCase {
     func testSolvesSyntheticNormalParity()   { runSynthetic(rotDeg: 27.0, parity: false) }
     func testSolvesSyntheticMirroredParity() { runSynthetic(rotDeg: -63.0, parity: true) }
 
+    /// The triangle match locks the transform from only the brightest ~`triangleStars` stars, so its
+    /// inlier count is capped near that (≈9 on the real sparse M63 field — thin over the floor). The
+    /// refinement pass re-matches ALL detected stars against ALL in-frame catalog stars through that
+    /// transform and re-fits, lifting the inlier count well beyond the triangle cap. This field has
+    /// ~90 in-frame stars; a solve that only triangle-matched would report ≤ `triangleStars` inliers,
+    /// so an inlier count far above that proves refinement engaged.
+    func testRefinementLiftsInlierCountBeyondTriangleCap() {
+        let w = 1500, h = 1300, scale = 2.0, cra = 150.0, cdec = 22.0, rotDeg = 33.0
+        let cat = syntheticCatalog(cra: cra, cdec: cdec, n: 120)
+        let wcs = (cra: cra, cdec: cdec, rotDeg: rotDeg, scale: scale, parity: false)
+        var frame: [Star] = []
+        for cs in cat.stars {
+            let p = projectThroughWCS(ra: Double(cs.ra), dec: Double(cs.dec), w: w, h: h, wcs: wcs)
+            if p.x < 0 || p.x >= Double(w) || p.y < 0 || p.y >= Double(h) { continue }
+            frame.append(Star(x: p.x + 0.12, y: p.y - 0.08, flux: pow(10, -0.4 * Double(cs.mag))))
+        }
+        XCTAssertGreaterThan(frame.count, 60, "test needs many in-frame stars to exercise refinement")
+        guard let got = PlateSolver.solve(stars: frame, width: w, height: h, pixelScaleArcsec: scale,
+                                          approxCenterRA: cra + 0.05, approxCenterDec: cdec - 0.03,
+                                          catalog: cat, minInliers: 8) else {
+            return XCTFail("solve returned nil")
+        }
+        XCTAssertGreaterThan(got.inlierCount, PlateSolver.triangleStars + 10,
+                             "inliers \(got.inlierCount) should exceed the triangle cap \(PlateSolver.triangleStars) after refinement")
+        let sep = 3600 * hypot((got.centerRA - cra) * cos(cdec * .pi/180), got.centerDec - cdec)
+        XCTAssertLessThan(sep, 60, "center off by \(sep)\" after refinement")
+    }
+
     func testTooFewStarsReturnsNil() {
         let cat = syntheticCatalog(cra: 10, cdec: 20, n: 3)
         let stars = [Star(x: 100, y: 100, flux: 1), Star(x: 200, y: 150, flux: 1)]
@@ -161,11 +189,14 @@ final class PlateSolverTests: XCTestCase {
         guard let first = subs.first else { throw XCTSkip("no M63 frames") }
         let data = try Data(contentsOf: first)
         let img = try FITSReader.read(data, normalizeRowOrder: false)
-        // approx center + scale + CRVAL from the header
+        // Solver inputs from the header: approximate center (mount pointing RA/DEC) + pixel scale.
         let hdr = try FITSReader.readHeader(data).keywords
         func kv(_ k: String) -> Double? { hdr[k].flatMap { Double($0.trimmingCharacters(in: .whitespaces)) } }
         guard let ra = kv("RA"), let dec = kv("DEC"), let fl = kv("FOCALLEN"), let px = kv("XPIXSZ"),
-              let cra = kv("CRVAL1"), let cdec = kv("CRVAL2") else { throw XCTSkip("frame missing WCS keywords") }
+              let cra = kv("CRVAL1"), let cdec = kv("CRVAL2"),
+              let crpix1 = kv("CRPIX1"), let crpix2 = kv("CRPIX2"),
+              let cd11 = kv("CD1_1"), let cd12 = kv("CD1_2"),
+              let cd21 = kv("CD2_1"), let cd22 = kv("CD2_2") else { throw XCTSkip("frame missing WCS keywords") }
         let scale = px / fl * 206.264806
         // grayscale for detection: FITSImage is planar (channel-major); average the planes.
         let n = img.width * img.height
@@ -180,7 +211,19 @@ final class PlateSolverTests: XCTestCase {
         guard let wcs = PlateSolver.solve(stars: det.stars, width: img.width, height: img.height,
                                           pixelScaleArcsec: scale, approxCenterRA: ra, approxCenterDec: dec,
                                           catalog: catalog) else { return XCTFail("real solve returned nil") }
-        let sepArcmin = 60 * hypot((wcs.centerRA - cra) * cos(cdec * .pi/180), wcs.centerDec - cdec)
-        XCTAssertLessThan(sepArcmin, 10, "solved center \(sepArcmin)′ from CRVAL (\(cra),\(cdec))")
+        // `PlateSolver` returns the sky position of the IMAGE CENTER (pixel W/2, H/2). The ASIAIR's own
+        // solution is anchored at CRPIX (≠ image center here), so compare against the image center's
+        // true sky position derived from the header's full linear WCS: intermediate coords
+        // (CD · (imageCenter − CRPIX0)) in degrees, then gnomonic-deprojected about CRVAL. Comparing
+        // directly to CRVAL would be wrong by the CRPIX-to-center offset (~43′ on this frame).
+        let dx = Double(img.width) / 2 - (crpix1 - 1), dy = Double(img.height) / 2 - (crpix2 - 1)
+        let xi = (cd11 * dx + cd12 * dy) * .pi / 180, eta = (cd21 * dx + cd22 * dy) * .pi / 180
+        let ref = GnomonicProjection.deproject(xi: xi, eta: eta, centerRA: cra, centerDec: cdec)
+        let sepArcmin = 60 * hypot((wcs.centerRA - ref.ra) * cos(ref.dec * .pi / 180), wcs.centerDec - ref.dec)
+        XCTAssertLessThan(sepArcmin, 5, "solved center \(sepArcmin)′ from header image-center (\(ref.ra),\(ref.dec)); inliers=\(wcs.inlierCount) rot=\(wcs.rotationDegrees)")
+        // Refinement pass should lift the thin triangle-match inlier count (~9 on this sparse field)
+        // by re-matching all detected stars against the full catalog — a robustness floor well above
+        // the 8-inlier minimum.
+        XCTAssertGreaterThan(wcs.inlierCount, 18, "expected refinement to recover many inliers, got \(wcs.inlierCount)")
     }
 }
