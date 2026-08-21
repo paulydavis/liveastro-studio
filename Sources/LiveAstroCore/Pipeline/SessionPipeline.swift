@@ -75,6 +75,52 @@ public final class SessionPipeline {
     private var sourceMetadata: SourceMetadata?
     private var lastAutoReseedCount = 0
 
+    // MARK: Plate-solve (sub-project 3a)
+    //
+    // Once a reference frame is established and its FITS metadata (RA/DEC/FOCALLEN/XPIXSZ) is known,
+    // solve the reference against the star catalog OFF THE HOT PATH so 3b can orient the display
+    // north-up. Optional end-to-end: any missing precondition (no catalog, no metadata, no reference)
+    // makes it a silent no-op — the import is never affected. `plateSolveCatalog` is the injection seam
+    // (tests set a real in-memory catalog; production reads the bundled one, nil until 3c ships data).
+    private let plateSolveLock = NSLock()
+    private var solvedWCS: WCS?                 // guarded by plateSolveLock
+    private var solveAttempted = false          // guarded by plateSolveLock
+    private var solveGeneration = 0             // guarded by plateSolveLock; bumped on reseed to void stale solves
+    private let plateSolveQueue = DispatchQueue(label: "com.liveastro.platesolve")
+    var plateSolveCatalog: StarCatalog? = StarCatalog.bundled()
+
+    /// The plate-solved WCS for the current reference frame, or nil if not (yet) solved / no catalog /
+    /// missing metadata. 3b reads this to orient the display north-up. Thread-safe.
+    public var currentWCS: WCS? { plateSolveLock.withLock { solvedWCS } }
+
+    /// Attempt the reference plate-solve once per reference generation, off the hot path. Idempotent
+    /// and cheap to call from every finalize; guarded so preconditions failing (e.g. metadata not yet
+    /// captured) leave the attempt un-consumed for a later frame, while a launched solve consumes it.
+    private func attemptPlateSolveIfNeeded(engine: StackEngine) {
+        guard let catalog = plateSolveCatalog,
+              let m = sourceMetadata, let ra = m.ra, let dec = m.dec,
+              let focal = m.focalLengthMM, focal > 0,
+              let pix = m.pixelSizeUM, pix > 0,
+              let input = engine.referenceSolveInput() else { return }
+        // Claim the single attempt for this generation under the lock.
+        let gen: Int? = plateSolveLock.withLock {
+            guard !solveAttempted, solvedWCS == nil else { return nil }
+            solveAttempted = true
+            return solveGeneration
+        }
+        guard let gen else { return }
+        // ×2: reference stars are half-res, so a half-res pixel subtends 2× the sky.
+        let halfResScale = pix / focal * 206.264806 * 2
+        plateSolveQueue.async { [weak self] in
+            let wcs = PlateSolver.solve(stars: input.stars, width: input.width, height: input.height,
+                                        pixelScaleArcsec: halfResScale, approxCenterRA: ra,
+                                        approxCenterDec: dec, catalog: catalog)
+            guard let self, let wcs else { return }
+            // Store only if no reseed voided this generation while we solved.
+            self.plateSolveLock.withLock { if gen == self.solveGeneration { self.solvedWCS = wcs } }
+        }
+    }
+
     // MARK: Import progress ticks (cold1 I1)
     //
     // The finite drain's deadline is PROGRESS-AWARE (see drainFiniteImportOrThrow): the
@@ -243,6 +289,12 @@ public final class SessionPipeline {
             }
             guard source?.isFinite != true else { return .unavailableDuringImport }
             engine.reseed()
+            // Void any stored/in-flight solve so the new reference re-solves against its (fresh) stars.
+            // The generation bump discards a stale solve that lands after this point. sourceMetadata is
+            // left as-is: reseed is a same-target re-establish (center unchanged), and it's owned by the
+            // serial frame-processing path — clearing it here would race that writer. (New-target
+            // metadata re-capture is out of 3a scope.)
+            plateSolveLock.withLock { solvedWCS = nil; solveAttempted = false; solveGeneration += 1 }
             return .reseeded
         }
     }
@@ -258,6 +310,7 @@ public final class SessionPipeline {
         noteFrameProgress()   // cold1 I1: a finalized frame is drain progress
         withCallbackDelivery {
             if sourceMetadata == nil, let m = metadata { sourceMetadata = m }
+            attemptPlateSolveIfNeeded(engine: engine)
             processedCount += 1
             lastCommitted = (sourceName, timestamp)       // remembered for end()'s guaranteed final render
             if shouldRenderImport(acceptedIndex: index) {
@@ -454,6 +507,7 @@ public final class SessionPipeline {
             if sourceMetadata == nil, let m = rawFrame.metadata { sourceMetadata = m }
             let frame = calibrator?.apply(rawFrame) ?? rawFrame
             let outcome = engine.process(frame)
+            attemptPlateSolveIfNeeded(engine: engine)   // idempotent; no-op until a reference is seeded
             if engine.autoReseedCount != lastAutoReseedCount {
                 lastAutoReseedCount = engine.autoReseedCount
                 onLog?("Auto-reseeded — the reference frame didn't match; re-seeding on the next good sub. (Earlier subs that couldn't register stay rejected.)")
