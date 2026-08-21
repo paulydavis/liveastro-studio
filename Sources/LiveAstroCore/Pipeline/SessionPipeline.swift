@@ -97,6 +97,13 @@ public final class SessionPipeline {
     /// missing metadata. 3b reads this to orient the display north-up. Thread-safe.
     public var currentWCS: WCS? { plateSolveLock.withLock { solvedWCS } }
 
+    /// Void the stored/in-flight solve and re-enable solving so the NEXT reference re-solves. Called
+    /// on BOTH reseed paths — manual `reseed()` and the engine's internal auto-reseed. The generation
+    /// bump discards any in-flight solve that lands after this point.
+    private func invalidatePlateSolve() {
+        plateSolveLock.withLock { solvedWCS = nil; solveAttempted = false; solveGeneration += 1 }
+    }
+
     /// Attempt the reference plate-solve once per reference generation, off the hot path. Idempotent
     /// and cheap to call from every finalize; guarded so preconditions failing (e.g. metadata not yet
     /// captured) leave the attempt un-consumed for a later frame, while a launched solve consumes it.
@@ -307,11 +314,10 @@ public final class SessionPipeline {
             guard source?.isFinite != true else { return .unavailableDuringImport }
             engine.reseed()
             // Void any stored/in-flight solve so the new reference re-solves against its (fresh) stars.
-            // The generation bump discards a stale solve that lands after this point. sourceMetadata is
-            // left as-is: reseed is a same-target re-establish (center unchanged), and it's owned by the
-            // serial frame-processing path — clearing it here would race that writer. (New-target
-            // metadata re-capture is out of 3a scope.)
-            plateSolveLock.withLock { solvedWCS = nil; solveAttempted = false; solveGeneration += 1 }
+            // sourceMetadata is left as-is: reseed is a same-target re-establish (center unchanged), and
+            // it's owned by the serial frame-processing path — clearing it here would race that writer.
+            // (New-target metadata re-capture is out of 3a scope.)
+            invalidatePlateSolve()
             return .reseeded
         }
     }
@@ -524,11 +530,16 @@ public final class SessionPipeline {
             if sourceMetadata == nil, let m = rawFrame.metadata { sourceMetadata = m }
             let frame = calibrator?.apply(rawFrame) ?? rawFrame
             let outcome = engine.process(frame)
-            attemptPlateSolveIfNeeded(engine: engine)   // idempotent; no-op until a reference is seeded
             if engine.autoReseedCount != lastAutoReseedCount {
                 lastAutoReseedCount = engine.autoReseedCount
+                // The engine dropped its reference and will re-seed on the next good sub — void the
+                // stale WCS and re-enable solving so the NEW reference plate-solves (its center/rotation
+                // can differ). MUST run before attemptPlateSolveIfNeeded below so this frame's attempt
+                // sees the reset state (manual reseed() does the same via invalidatePlateSolve()).
+                invalidatePlateSolve()
                 onLog?("Auto-reseeded — the reference frame didn't match; re-seeding on the next good sub. (Earlier subs that couldn't register stay rejected.)")
             }
+            attemptPlateSolveIfNeeded(engine: engine)   // idempotent; no-op until a reference is seeded
             processedCount += 1
             switch outcome {
             case .becameReference, .stacked:

@@ -172,6 +172,61 @@ final class SessionPipelinePlateSolveTests: XCTestCase {
         source.stop()
     }
 
+    /// A distinct star field (tight grid in one corner) that will NOT triangle-match the catalog field,
+    /// so it fails registration and drives the engine's internal auto-reseed.
+    private func unmatchedFrame(_ name: String) -> RawFrame {
+        var px = [Float](repeating: 0.05, count: SUB * SUB)
+        for gy in 0..<4 { for gx in 0..<4 {
+            let sx = 30 + gx * 12, sy = 30 + gy * 12
+            for y in sy - 3...sy + 3 { for x in sx - 3...sx + 3 {
+                let dx = Double(x - sx), dy = Double(y - sy)
+                px[y * SUB + x] += 0.8 * Float(exp(-(dx*dx + dy*dy) / (2 * 2.0 * 2.0)))
+            } }
+        } }
+        let img = AstroImage(width: SUB, height: SUB, channels: 1, pixels: px, sourceIsLinear: true)
+        return RawFrame(image: img, bayerPattern: nil, bottomUp: false,
+                        timestamp: Date(timeIntervalSince1970: 0), sourceName: name, metadata: nil)
+    }
+
+    /// Auto-reseed regression: when the engine drops its reference internally (auto-reseed after repeated
+    /// registration failures), the stored WCS must be voided — otherwise `currentWCS` returns the OLD
+    /// field's solve for the new reference and the new reference is never solved (solveAttempted stuck).
+    func testAutoReseedVoidsStoredWCS() throws {
+        let cat = catalog()
+        let source = LiveSource()
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "PS", telescope: "T", camera: "C", mount: "M",
+                                     filter: "L", locationLabel: "L", bortle: 5, subExposureSeconds: 60, notes: "")
+        let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),   // default autoReseedThreshold 6
+                                       profile: profile, rootDirectory: sandbox, neutralizeBackground: false)
+        pipeline.plateSolveCatalog = cat
+        var log = ""
+        pipeline.onLog = { log += $0 }
+        var accepted = 0
+        pipeline.onUpdate = { _, _ in accepted += 1 }
+        try pipeline.start()
+
+        // Seed the catalog field and solve.
+        source.send(frame(cat, name: "a0.fit", dither: (0, 0), withMeta: true))
+        source.send(frame(cat, name: "a1.fit", dither: (2, 1), withMeta: false))
+        var d = Date().addingTimeInterval(10)
+        while pipeline.currentWCS == nil && Date() < d { usleep(50_000) }
+        XCTAssertNotNil(pipeline.currentWCS, "seeded reference should solve")
+
+        // Drive an auto-reseed with unmatched frames (threshold 6; send extra to be safe).
+        for i in 0..<8 { source.send(unmatchedFrame("u\(i).fit")) }
+        d = Date().addingTimeInterval(10)
+        while !log.contains("Auto-reseeded") && Date() < d { usleep(50_000) }
+        XCTAssertTrue(log.contains("Auto-reseeded"), "unmatched frames should trigger auto-reseed")
+
+        // The stored WCS must be voided by the auto-reseed (RED before the fix: it stayed = old solve).
+        d = Date().addingTimeInterval(10)
+        while pipeline.currentWCS != nil && Date() < d { usleep(50_000) }
+        XCTAssertNil(pipeline.currentWCS, "auto-reseed must void the stale WCS")
+        source.stop()
+    }
+
     /// Race regression (adversarial review Finding 1): a reseed landing in the window between claiming
     /// the solve generation and reading the reference stars must NOT produce a stale WCS tagged with the
     /// new generation, and must NOT wedge `solveAttempted` so the real new reference can never solve.
