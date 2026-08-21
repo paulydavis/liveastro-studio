@@ -24,11 +24,13 @@ public struct DisplayAdjustments: Equatable, Codable {
     public var bgScale: Double
     public var bgSmoothest: Double
     public var denoiseStrength: Double
+    /// Rotate the DISPLAY to celestial north-up (3b). Display-only; needs a plate solve to take effect.
+    public var northUp: Bool
 
     public init(blackPoint: Double = 0, midtoneStrength: Double = 0, saturation: Double = 1,
                 backgroundExtraction: Bool = false, backgroundDegree: Int = 1,
                 bgScale: Double = 3.0, bgSmoothest: Double = 0.5,
-                denoiseStrength: Double = 0) {
+                denoiseStrength: Double = 0, northUp: Bool = false) {
         self.blackPoint = blackPoint
         self.midtoneStrength = midtoneStrength
         self.saturation = saturation
@@ -37,6 +39,7 @@ public struct DisplayAdjustments: Equatable, Codable {
         self.bgScale = bgScale
         self.bgSmoothest = bgSmoothest
         self.denoiseStrength = denoiseStrength
+        self.northUp = northUp
     }
 
     public static let neutral = DisplayAdjustments()
@@ -44,7 +47,7 @@ public struct DisplayAdjustments: Equatable, Codable {
     // Custom decode so a settings blob written before the DBE fields existed
     // still decodes (missing keys → defaults). Encode stays synthesized.
     private enum CodingKeys: String, CodingKey {
-        case blackPoint, midtoneStrength, saturation, backgroundExtraction, backgroundDegree, bgScale, bgSmoothest, denoiseStrength
+        case blackPoint, midtoneStrength, saturation, backgroundExtraction, backgroundDegree, bgScale, bgSmoothest, denoiseStrength, northUp
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -56,5 +59,6 @@ public struct DisplayAdjustments: Equatable, Codable {
         bgScale = try c.decodeIfPresent(Double.self, forKey: .bgScale) ?? 3.0
         bgSmoothest = try c.decodeIfPresent(Double.self, forKey: .bgSmoothest) ?? 0.5
         denoiseStrength = try c.decodeIfPresent(Double.self, forKey: .denoiseStrength) ?? 0
+        northUp = try c.decodeIfPresent(Bool.self, forKey: .northUp) ?? false
     }
 }
