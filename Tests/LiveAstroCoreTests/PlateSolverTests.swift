@@ -70,6 +70,34 @@ final class PlateSolverTests: XCTestCase {
     func testSolvesSyntheticNormalParity()   { runSynthetic(rotDeg: 27.0, parity: false) }
     func testSolvesSyntheticMirroredParity() { runSynthetic(rotDeg: -63.0, parity: true) }
 
+    /// The triangle match locks the transform from only the brightest ~`triangleStars` stars, so its
+    /// inlier count is capped near that (≈9 on the real sparse M63 field — thin over the floor). The
+    /// refinement pass re-matches ALL detected stars against ALL in-frame catalog stars through that
+    /// transform and re-fits, lifting the inlier count well beyond the triangle cap. This field has
+    /// ~90 in-frame stars; a solve that only triangle-matched would report ≤ `triangleStars` inliers,
+    /// so an inlier count far above that proves refinement engaged.
+    func testRefinementLiftsInlierCountBeyondTriangleCap() {
+        let w = 1500, h = 1300, scale = 2.0, cra = 150.0, cdec = 22.0, rotDeg = 33.0
+        let cat = syntheticCatalog(cra: cra, cdec: cdec, n: 120)
+        let wcs = (cra: cra, cdec: cdec, rotDeg: rotDeg, scale: scale, parity: false)
+        var frame: [Star] = []
+        for cs in cat.stars {
+            let p = projectThroughWCS(ra: Double(cs.ra), dec: Double(cs.dec), w: w, h: h, wcs: wcs)
+            if p.x < 0 || p.x >= Double(w) || p.y < 0 || p.y >= Double(h) { continue }
+            frame.append(Star(x: p.x + 0.12, y: p.y - 0.08, flux: pow(10, -0.4 * Double(cs.mag))))
+        }
+        XCTAssertGreaterThan(frame.count, 60, "test needs many in-frame stars to exercise refinement")
+        guard let got = PlateSolver.solve(stars: frame, width: w, height: h, pixelScaleArcsec: scale,
+                                          approxCenterRA: cra + 0.05, approxCenterDec: cdec - 0.03,
+                                          catalog: cat, minInliers: 8) else {
+            return XCTFail("solve returned nil")
+        }
+        XCTAssertGreaterThan(got.inlierCount, PlateSolver.triangleStars + 10,
+                             "inliers \(got.inlierCount) should exceed the triangle cap \(PlateSolver.triangleStars) after refinement")
+        let sep = 3600 * hypot((got.centerRA - cra) * cos(cdec * .pi/180), got.centerDec - cdec)
+        XCTAssertLessThan(sep, 60, "center off by \(sep)\" after refinement")
+    }
+
     func testTooFewStarsReturnsNil() {
         let cat = syntheticCatalog(cra: 10, cdec: 20, n: 3)
         let stars = [Star(x: 100, y: 100, flux: 1), Star(x: 200, y: 150, flux: 1)]
@@ -193,5 +221,9 @@ final class PlateSolverTests: XCTestCase {
         let ref = GnomonicProjection.deproject(xi: xi, eta: eta, centerRA: cra, centerDec: cdec)
         let sepArcmin = 60 * hypot((wcs.centerRA - ref.ra) * cos(ref.dec * .pi / 180), wcs.centerDec - ref.dec)
         XCTAssertLessThan(sepArcmin, 5, "solved center \(sepArcmin)′ from header image-center (\(ref.ra),\(ref.dec)); inliers=\(wcs.inlierCount) rot=\(wcs.rotationDegrees)")
+        // Refinement pass should lift the thin triangle-match inlier count (~9 on this sparse field)
+        // by re-matching all detected stars against the full catalog — a robustness floor well above
+        // the 8-inlier minimum.
+        XCTAssertGreaterThan(wcs.inlierCount, 18, "expected refinement to recover many inliers, got \(wcs.inlierCount)")
     }
 }

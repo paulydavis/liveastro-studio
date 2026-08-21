@@ -27,6 +27,11 @@ public enum PlateSolver {
     /// leaving only 3 correct pairs. At 0.01 the coincidences fall off faster than the true matches, so
     /// all real correspondences survive. Frame-to-frame registration (near-identical sets) keeps 0.02.
     static let triangleTolerance = 0.01
+    /// Nearest-neighbour gate (grid pixels) for the refinement pass: a detected star mapped through the
+    /// coarse transform is accepted as a match to a catalog star only within this radius. Matches the
+    /// 3px inlier tolerance used elsewhere — tight enough to reject wrong pairings, loose enough for the
+    /// coarse transform's residual.
+    static let refineTolerancePx = 3.0
     /// A candidate farther than the frame's half-diagonal from center can never be in-frame at any
     /// rotation (distance from center is rotation-invariant). `frameReachFactor` = that half-diagonal
     /// plus slack for the approximate-center (mount pointing) offset — the exact pixel-space clip.
@@ -64,8 +69,11 @@ public enum PlateSolver {
         // un-matchable targets (regression: testDropsOffFrameBrightCandidates). See frameReachFactor.
         let maxReachPx = 0.5 * Double(width * width + height * height).squareRoot() * frameReachFactor
 
-        func grid(mirrored: Bool) -> [Star] {
-            let g = catStars.compactMap { cs -> Star? in
+        // ALL in-frame catalog stars projected to grid pixels for a parity (no brightest cap). The
+        // triangle match uses only the brightest `catalogSelectionCap` of these; the refinement pass
+        // below uses the full set to match every detected star.
+        func gridStars(mirrored: Bool) -> [Star] {
+            catStars.compactMap { cs -> Star? in
                 let p = GnomonicProjection.project(ra: Double(cs.ra), dec: Double(cs.dec),
                                                    centerRA: approxCenterRA, centerDec: approxCenterDec)
                 var gx = Double(width)/2 + (p.xi * arcsecPerRad) / pixelScaleArcsec
@@ -74,13 +82,12 @@ public enum PlateSolver {
                 guard hypot(gx - Double(width)/2, gy - Double(height)/2) <= maxReachPx else { return nil }
                 return Star(x: gx, y: gy, flux: pow(10, -0.4 * Double(cs.mag)))
             }
-            return Array(g.sorted { $0.flux > $1.flux }.prefix(catalogSelectionCap))
         }
 
         // Try both parities; keep the transform with more inliers.
         var best: (t: SimilarityTransform, inliers: Int, mirrored: Bool)?
         for mirrored in [false, true] {
-            let g = grid(mirrored: mirrored)
+            let g = Array(gridStars(mirrored: mirrored).sorted { $0.flux > $1.flux }.prefix(catalogSelectionCap))
             let pairs = TriangleMatcher.correspondences(source: frameStars, target: g,
                                                         maxTriangleStars: triangleStars,
                                                         invariantTolerance: triangleTolerance)
@@ -88,7 +95,33 @@ public enum PlateSolver {
             let n = TransformSolver.inliers(t, source: frameStars, target: g, pairs: pairs, tolerance: 3.0).count
             if best == nil || n > best!.inliers { best = (t, n, mirrored) }
         }
-        guard let win = best, win.inliers >= minInliers else { return nil }
+        guard var win = best, win.inliers >= minInliers else { return nil }
+
+        // Refinement pass (one ICP iteration seeded by the triangle-match transform). The triangle
+        // match locks the transform from only the brightest `triangleStars` stars, so its inlier count
+        // is thin on a sparse field (≈9 on the real M63 sub). Map EVERY detected star through that
+        // transform, nearest-neighbour it to the FULL in-frame catalog, and re-fit — this recovers the
+        // fainter true matches the brightest-N triangle set missed, lifting the inlier count and
+        // tightening center/rotation. Guarded both ways (`> win.inliers`) so it can only improve the
+        // solution, never regress it.
+        let fullGrid = gridStars(mirrored: win.mirrored)
+        var refinedPairs: [StarPair] = []
+        for (si, s) in stars.enumerated() {
+            let p = win.t.apply(x: s.x, y: s.y)
+            var bestJ = -1, bestD = refineTolerancePx
+            for (ti, g) in fullGrid.enumerated() {
+                let d = hypot(p.x - g.x, p.y - g.y)
+                if d < bestD { bestD = d; bestJ = ti }
+            }
+            if bestJ >= 0 { refinedPairs.append(StarPair(source: si, target: bestJ)) }
+        }
+        if refinedPairs.count > win.inliers,
+           let refined = TransformSolver.solve(source: stars, target: fullGrid, pairs: refinedPairs,
+                                               minMatches: minInliers) {
+            let rn = TransformSolver.inliers(refined, source: stars, target: fullGrid,
+                                             pairs: refinedPairs, tolerance: 3.0).count
+            if rn > win.inliers { win = (refined, rn, win.mirrored) }
+        }
 
         // Frame center → grid position → (xi,eta) → deproject → refined center.
         let gc = win.t.apply(x: Double(width)/2, y: Double(height)/2)
