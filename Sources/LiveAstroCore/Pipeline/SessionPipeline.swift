@@ -507,6 +507,12 @@ public final class SessionPipeline {
         guard let cg = AutoStretch.makeCGImage(display) else {
             throw ImageLoaderError.decodeFailed("CGImage packing")
         }
+        // North-up (3b): rotate the DISPLAY only, when toggled on AND a solve is available. Applied here
+        // so broadcast, latest.png, snapshots and replay all inherit it; master.fit stays native. No-op
+        // (return cg) when the toggle is off or nothing is solved.
+        if adj.northUp, let wcs = currentWCS {
+            return NorthUpRotation.apply(cg, wcs: wcs, autoZoom: true)
+        }
         return cg
     }
 
