@@ -88,6 +88,10 @@ public final class SessionPipeline {
     private var solveGeneration = 0             // guarded by plateSolveLock; bumped on reseed to void stale solves
     private let plateSolveQueue = DispatchQueue(label: "com.liveastro.platesolve")
     var plateSolveCatalog: StarCatalog? = StarCatalog.bundled()
+    /// Test seam: invoked inside `attemptPlateSolveIfNeeded` AFTER the generation is claimed and BEFORE
+    /// the reference stars are read, so a test can force a reseed into that exact window and prove no
+    /// stale/stuck solve results. nil (no-op) in production.
+    var onSolveClaimedForTest: (() -> Void)?
 
     /// The plate-solved WCS for the current reference frame, or nil if not (yet) solved / no catalog /
     /// missing metadata. 3b reads this to orient the display north-up. Thread-safe.
@@ -100,15 +104,28 @@ public final class SessionPipeline {
         guard let catalog = plateSolveCatalog,
               let m = sourceMetadata, let ra = m.ra, let dec = m.dec,
               let focal = m.focalLengthMM, focal > 0,
-              let pix = m.pixelSizeUM, pix > 0,
-              let input = engine.referenceSolveInput() else { return }
-        // Claim the single attempt for this generation under the lock.
+              let pix = m.pixelSizeUM, pix > 0 else { return }
+        // Claim the single attempt for the CURRENT generation BEFORE reading the reference stars. Order
+        // is load-bearing: reading the stars first and claiming second lets a reseed (main thread) slip
+        // in between and tag STALE stars with the FRESH generation — a stale solve the store guard would
+        // then wrongly accept, while also starving the real new reference (solveAttempted stuck true).
+        // Claiming first means the only interleaving is a reseed CLEARING the stars, which we read back
+        // as nil and bail. No NEW reference can appear between the claim and the read: references seed
+        // only on this same serial consumer task, so nothing but reseed runs in that window.
         let gen: Int? = plateSolveLock.withLock {
             guard !solveAttempted, solvedWCS == nil else { return nil }
             solveAttempted = true
             return solveGeneration
         }
         guard let gen else { return }
+        onSolveClaimedForTest?()   // test seam: force a reseed here to exercise the claim/read window
+        guard let input = engine.referenceSolveInput() else {
+            // A reseed cleared the reference after we claimed — release the claim (unless a reseed has
+            // already bumped past our generation, which resets solveAttempted itself) so the next
+            // reference for the live generation still solves.
+            plateSolveLock.withLock { if gen == solveGeneration { solveAttempted = false } }
+            return
+        }
         // ×2: reference stars are half-res, so a half-res pixel subtends 2× the sky.
         let halfResScale = pix / focal * 206.264806 * 2
         plateSolveQueue.async { [weak self] in

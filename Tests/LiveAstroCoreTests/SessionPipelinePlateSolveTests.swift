@@ -172,6 +172,51 @@ final class SessionPipelinePlateSolveTests: XCTestCase {
         source.stop()
     }
 
+    /// Race regression (adversarial review Finding 1): a reseed landing in the window between claiming
+    /// the solve generation and reading the reference stars must NOT produce a stale WCS tagged with the
+    /// new generation, and must NOT wedge `solveAttempted` so the real new reference can never solve.
+    /// The test fires a reseed from exactly that window via `onSolveClaimedForTest`, then feeds a fresh
+    /// reference and asserts it solves correctly (proving neither a stale store nor a stuck attempt).
+    func testReseedDuringSolveClaimDoesNotStaleOrStick() throws {
+        let cat = catalog()
+        let source = LiveSource()
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "PS", telescope: "T", camera: "C", mount: "M",
+                                     filter: "L", locationLabel: "L", bortle: 5, subExposureSeconds: 60, notes: "")
+        let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
+                                       profile: profile, rootDirectory: sandbox, neutralizeBackground: false)
+        pipeline.plateSolveCatalog = cat
+        var accepted = 0
+        pipeline.onUpdate = { _, _ in accepted += 1 }
+        // Fire a reseed the FIRST time a solve is claimed — i.e. right after the seeding frame claims the
+        // generation, before it reads the stars. One-shot so later (post-reseed) attempts run normally.
+        var firedReseed = false
+        pipeline.onSolveClaimedForTest = { [weak pipeline] in
+            if !firedReseed { firedReseed = true; _ = pipeline?.reseed() }
+        }
+        try pipeline.start()
+        func waitFrames(_ n: Int) {
+            let deadline = Date().addingTimeInterval(10)
+            while accepted < n && Date() < deadline { usleep(20_000) }
+        }
+        // Seeding frame → claims solve → hook reseeds mid-claim → this attempt must bail (stars cleared).
+        source.send(frame(cat, name: "s0.fit", dither: (0, 0), withMeta: true))
+        waitFrames(1)
+        XCTAssertTrue(firedReseed, "the claim hook should have fired on the seeding frame")
+        // Now feed a fresh reference; it must solve (not be starved by a stuck solveAttempted) and the
+        // stored WCS must be the CORRECT current-field solve, never a stale one.
+        source.send(frame(cat, name: "n0.fit", dither: (1, 1), withMeta: false))
+        source.send(frame(cat, name: "n1.fit", dither: (-1, 2), withMeta: false))
+        waitFrames(3)
+        let deadline = Date().addingTimeInterval(10)
+        while pipeline.currentWCS == nil && Date() < deadline { usleep(50_000) }
+        let wcs = try XCTUnwrap(pipeline.currentWCS, "fresh reference must solve after a mid-claim reseed")
+        let sep = 3600 * hypot((wcs.centerRA - CRA) * cos(CDEC * .pi/180), wcs.centerDec - CDEC)
+        XCTAssertLessThan(sep, 180, "must be the correct current-field solve, not stale (off \(sep)\")")
+        source.stop()
+    }
+
     func testSolvesReferenceAndExposesWCS() throws {
         guard let wcs = try runImport(catalogInjected: catalog(), withWCS: true) else {
             return XCTFail("expected a plate solve, got nil")
