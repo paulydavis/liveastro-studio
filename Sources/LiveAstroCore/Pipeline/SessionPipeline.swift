@@ -101,11 +101,18 @@ public final class SessionPipeline {
     /// when this is true (no solve → nothing to orient). Thread-safe.
     public var hasSolvedWCS: Bool { plateSolveLock.withLock { solvedWCS != nil } }
 
+    /// Fired whenever the solved-WCS state CHANGES — both edges: a solve landing (`hasSolvedWCS` →
+    /// true) and an invalidation from manual/auto reseed (→ false). The UI recomputes the North-up
+    /// toggle's availability from `hasSolvedWCS` here, since neither edge emits a display update of its
+    /// own (the solve runs off the hot path; reseed just clears state). May fire on a background queue.
+    public var onSolveStateChanged: (() -> Void)?
+
     /// Void the stored/in-flight solve and re-enable solving so the NEXT reference re-solves. Called
     /// on BOTH reseed paths — manual `reseed()` and the engine's internal auto-reseed. The generation
     /// bump discards any in-flight solve that lands after this point.
     private func invalidatePlateSolve() {
         plateSolveLock.withLock { solvedWCS = nil; solveAttempted = false; solveGeneration += 1 }
+        onSolveStateChanged?()   // negative edge: reseed/auto-reseed dropped the solve — refresh the gate
     }
 
     /// Attempt the reference plate-solve once per reference generation, off the hot path. Idempotent
@@ -145,7 +152,12 @@ public final class SessionPipeline {
                                         approxCenterDec: dec, catalog: catalog)
             guard let self, let wcs else { return }
             // Store only if no reseed voided this generation while we solved.
-            self.plateSolveLock.withLock { if gen == self.solveGeneration { self.solvedWCS = wcs } }
+            let stored = self.plateSolveLock.withLock { () -> Bool in
+                guard gen == self.solveGeneration else { return false }
+                self.solvedWCS = wcs; return true
+            }
+            // Notify OUTSIDE the lock so the UI can enable the North-up toggle the moment the solve lands.
+            if stored { self.onSolveStateChanged?() }
         }
     }
 

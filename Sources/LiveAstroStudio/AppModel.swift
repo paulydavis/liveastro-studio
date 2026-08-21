@@ -553,6 +553,7 @@ final class AppModel {
     private func wireCallbacks(to pipeline: SessionPipeline,
                                onAccepted: (@MainActor () -> Void)? = nil,
                                onAnyFrame: (() -> Void)? = nil) {
+        solveAvailable = false   // new session/pipeline: no solve yet — don't carry a stale gate over
         pipeline.onUpdate = { [weak self] image, record in
             onAnyFrame?()
             Task { @MainActor in
@@ -572,6 +573,11 @@ final class AppModel {
         }
         pipeline.onLog = { [weak self] message in
             Task { @MainActor in self?.log.append("⚠ \(message)") }
+        }
+        // Solve state changes off the hot path and emits no display update — refresh the toggle gate on
+        // BOTH edges: a solve landing (enable) and a reseed/auto-reseed invalidating it (disable).
+        pipeline.onSolveStateChanged = { [weak self] in
+            Task { @MainActor in self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false }
         }
     }
 

@@ -58,7 +58,8 @@ final class SessionPipelineNorthUpTests: XCTestCase {
     }
 
     /// Runs an import; returns the pipeline (solved if `catalogInjected` != nil) for renderCurrentDisplay.
-    private func runSolvedSession(catalogInjected: StarCatalog?) throws -> SessionPipeline {
+    private func runSolvedSession(catalogInjected: StarCatalog?,
+                                  beforeStart: (SessionPipeline) -> Void = { _ in }) throws -> SessionPipeline {
         let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let subsDir = sandbox.appendingPathComponent("subs"), sessions = sandbox.appendingPathComponent("sessions")
         try FileManager.default.createDirectory(at: subsDir, withIntermediateDirectories: true)
@@ -72,6 +73,7 @@ final class SessionPipelineNorthUpTests: XCTestCase {
         let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
                                        profile: profile, rootDirectory: sessions, neutralizeBackground: false)
         pipeline.plateSolveCatalog = catalogInjected
+        beforeStart(pipeline)
         try pipeline.start()
         _ = try pipeline.end()
         if catalogInjected != nil {
@@ -152,6 +154,30 @@ final class SessionPipelineNorthUpTests: XCTestCase {
         let angle = NorthUpRotation.displayRotationRadians(wcs: wcs)
         let ry = sin(angle) * nx + cos(angle) * ny
         XCTAssertLessThan(ry, 0, "pipeline-solved north must rotate to up (ry=\(ry), rot=\(wcs.rotationDegrees))")
+    }
+
+    /// Review finding: the app refreshed the North-up toggle's availability only in onUpdate, but the
+    /// solve completes on a background queue and emits no display update — so the toggle could stay
+    /// disabled after the solve landed (indefinitely, for a finished import). onSolveStateChanged must fire
+    /// when the solve is stored, giving the UI its refresh signal independent of frame updates.
+    func testOnSolveStateChangedFiresWhenSolveLands() throws {
+        let lock = NSLock(); var fired = false
+        _ = try runSolvedSession(catalogInjected: catalog(), beforeStart: { p in
+            p.onSolveStateChanged = { lock.withLock { fired = true } }
+        })
+        let deadline = Date().addingTimeInterval(10)
+        while !lock.withLock({ fired }) && Date() < deadline { usleep(50_000) }
+        XCTAssertTrue(lock.withLock { fired }, "onSolveStateChanged must fire when the solve lands")
+    }
+
+    /// And it must NOT fire when there's no catalog (nothing to solve) — the toggle stays disabled.
+    func testOnSolveStateChangedDoesNotFireWithoutCatalog() throws {
+        let lock = NSLock(); var fired = false
+        _ = try runSolvedSession(catalogInjected: nil, beforeStart: { p in
+            p.onSolveStateChanged = { lock.withLock { fired = true } }
+        })
+        usleep(300_000)   // let any stray async settle
+        XCTAssertFalse(lock.withLock { fired }, "no catalog → no solve → no state-change callback")
     }
 
     func testNorthUpNoOpWhenUnsolved() throws {

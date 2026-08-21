@@ -126,6 +126,36 @@ final class SessionPipelinePlateSolveTests: XCTestCase {
                         metadata: withMeta ? meta(withWCS: true) : nil)
     }
 
+    /// Negative edge (review finding): a reseed invalidates the WCS but emits no display update, so
+    /// onSolveStateChanged must fire reporting hasSolvedWCS == false — the app refreshes the North-up
+    /// toggle gate off this, so without it the gate stays stale-enabled after a reseed.
+    func testOnSolveStateChangedFiresBothEdges() throws {
+        let cat = catalog()
+        let source = LiveSource()
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "PS", telescope: "T", camera: "C", mount: "M",
+                                     filter: "L", locationLabel: "L", bortle: 5, subExposureSeconds: 60, notes: "")
+        let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
+                                       profile: profile, rootDirectory: sandbox, neutralizeBackground: false)
+        pipeline.plateSolveCatalog = cat
+        let lock = NSLock(); var edges: [Bool] = []
+        pipeline.onSolveStateChanged = { [weak pipeline] in
+            lock.withLock { edges.append(pipeline?.hasSolvedWCS ?? false) }
+        }
+        try pipeline.start()
+        source.send(frame(cat, name: "a0.fit", dither: (0, 0), withMeta: true))
+        source.send(frame(cat, name: "a1.fit", dither: (2, 1), withMeta: false))
+        var d = Date().addingTimeInterval(10)
+        while pipeline.currentWCS == nil && Date() < d { usleep(50_000) }
+        XCTAssertTrue(lock.withLock { edges.contains(true) }, "positive edge (solve landed) should fire")
+        XCTAssertEqual(pipeline.reseed(), .reseeded)
+        d = Date().addingTimeInterval(5)
+        while !lock.withLock({ edges.contains(false) }) && Date() < d { usleep(50_000) }
+        XCTAssertTrue(lock.withLock { edges.contains(false) }, "negative edge (reseed invalidation) should fire")
+        source.stop()
+    }
+
     /// Reseed voids the stored WCS and the new reference re-solves against its fresh stars.
     func testReseedVoidsThenReSolves() throws {
         let cat = catalog()
