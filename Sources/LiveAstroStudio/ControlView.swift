@@ -475,6 +475,12 @@ struct ControlView: View {
                             }
                             .help("Classic noise reduction — smooths background grain and color mottle on the displayed stack. 0 = off. master.fit is never modified.")
                         }
+                        helpToggle("North up", isOn: $model.displayAdjustments.northUp,
+                                   help: "Rotate the view so celestial north is up (display only — master.fit stays native). Needs a plate solve; enabled once the reference frame is solved.")
+                            .onChange(of: model.displayAdjustments.northUp) { _, _ in
+                                model.applyDisplayAdjustments()
+                            }
+                            .disabled(!model.solveAvailable)
                         Button("Reset") {
                             model.displayAdjustments = .neutral
                             model.applyDisplayAdjustments()

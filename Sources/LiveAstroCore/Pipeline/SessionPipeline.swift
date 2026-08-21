@@ -97,6 +97,10 @@ public final class SessionPipeline {
     /// missing metadata. 3b reads this to orient the display north-up. Thread-safe.
     public var currentWCS: WCS? { plateSolveLock.withLock { solvedWCS } }
 
+    /// True once the reference frame has been plate-solved — the UI enables the "North up" toggle only
+    /// when this is true (no solve → nothing to orient). Thread-safe.
+    public var hasSolvedWCS: Bool { plateSolveLock.withLock { solvedWCS != nil } }
+
     /// Void the stored/in-flight solve and re-enable solving so the NEXT reference re-solves. Called
     /// on BOTH reseed paths — manual `reseed()` and the engine's internal auto-reseed. The generation
     /// bump discards any in-flight solve that lands after this point.

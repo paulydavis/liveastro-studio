@@ -84,6 +84,7 @@ final class SessionPipelineNorthUpTests: XCTestCase {
     func testNorthUpRotatesDisplayWhenSolved() throws {
         let pipeline = try runSolvedSession(catalogInjected: catalog())
         XCTAssertNotNil(pipeline.currentWCS, "precondition: session solved")
+        XCTAssertTrue(pipeline.hasSolvedWCS, "hasSolvedWCS gates the toggle")
         var off = DisplayAdjustments.neutral; off.northUp = false
         var on = DisplayAdjustments.neutral; on.northUp = true
         let a = try XCTUnwrap(pipeline.renderCurrentDisplay(adjustments: off))
@@ -98,6 +99,7 @@ final class SessionPipelineNorthUpTests: XCTestCase {
     func testNorthUpNoOpWhenUnsolved() throws {
         let pipeline = try runSolvedSession(catalogInjected: nil)   // no catalog → currentWCS nil
         XCTAssertNil(pipeline.currentWCS)
+        XCTAssertFalse(pipeline.hasSolvedWCS, "no solve → toggle stays disabled")
         var off = DisplayAdjustments.neutral; off.northUp = false
         var on = DisplayAdjustments.neutral; on.northUp = true
         let a = try XCTUnwrap(pipeline.renderCurrentDisplay(adjustments: off))

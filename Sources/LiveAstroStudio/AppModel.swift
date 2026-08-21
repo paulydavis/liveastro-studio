@@ -109,6 +109,9 @@ final class AppModel {
     var replayURL: URL?
     var processorBackend: ProcessorBackend = .none
     var displayAdjustments = DisplayAdjustments.neutral
+    /// True once the reference frame has been plate-solved — gates the "North up" toggle. Refreshed on
+    /// each display update from `pipeline.hasSolvedWCS`.
+    private(set) var solveAvailable = false
     private(set) var lastSessionDirectory: URL?
     var errorMessage: String?
     var zoomPan = ZoomPanState.fit
@@ -555,6 +558,7 @@ final class AppModel {
             Task { @MainActor in
                 self?.latestImage = image
                 self?.latestRecord = record
+                self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false   // gate the North-up toggle
                 onAccepted?()
                 self?.log.append("✓ update \(record.index) — \(record.snapshotFile)")
             }
