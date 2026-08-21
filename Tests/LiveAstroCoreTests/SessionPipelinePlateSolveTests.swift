@@ -189,8 +189,10 @@ final class SessionPipelinePlateSolveTests: XCTestCase {
     }
 
     /// Auto-reseed regression: when the engine drops its reference internally (auto-reseed after repeated
-    /// registration failures), the stored WCS must be voided — otherwise `currentWCS` returns the OLD
-    /// field's solve for the new reference and the new reference is never solved (solveAttempted stuck).
+    /// registration failures), the stored WCS must be voided AND the new reference must re-solve — the
+    /// two halves of `invalidatePlateSolve()` (clear `solvedWCS`, reset `solveAttempted`). Pinning both
+    /// locally: a regression that cleared the WCS but forgot to reset `solveAttempted` would blank the
+    /// display correctly yet never re-solve, and the nil check alone wouldn't catch it.
     func testAutoReseedVoidsStoredWCS() throws {
         let cat = catalog()
         let source = LiveSource()
@@ -214,16 +216,32 @@ final class SessionPipelinePlateSolveTests: XCTestCase {
         while pipeline.currentWCS == nil && Date() < d { usleep(50_000) }
         XCTAssertNotNil(pipeline.currentWCS, "seeded reference should solve")
 
-        // Drive an auto-reseed with unmatched frames (threshold 6; send extra to be safe).
-        for i in 0..<8 { source.send(unmatchedFrame("u\(i).fit")) }
-        d = Date().addingTimeInterval(10)
-        while !log.contains("Auto-reseeded") && Date() < d { usleep(50_000) }
+        // Drive an auto-reseed with unmatched frames, ONE AT A TIME, stopping the instant it fires — so
+        // no extra unmatched frame seeds a stray reference (which would need a second reseed cycle to
+        // clear and muddy the clean re-solve below).
+        var u = 0
+        d = Date().addingTimeInterval(15)
+        while !log.contains("Auto-reseeded") && Date() < d {
+            source.send(unmatchedFrame("u\(u).fit")); u += 1
+            let step = Date().addingTimeInterval(1)        // let this frame process before the next
+            while !log.contains("Auto-reseeded") && Date() < step { usleep(30_000) }
+        }
         XCTAssertTrue(log.contains("Auto-reseeded"), "unmatched frames should trigger auto-reseed")
 
-        // The stored WCS must be voided by the auto-reseed (RED before the fix: it stayed = old solve).
+        // Half 1 — the stored WCS must be voided (RED before the fix: it stayed = old solve).
         d = Date().addingTimeInterval(10)
         while pipeline.currentWCS != nil && Date() < d { usleep(50_000) }
         XCTAssertNil(pipeline.currentWCS, "auto-reseed must void the stale WCS")
+
+        // Half 2 — the fresh catalog reference must RE-SOLVE (proves solveAttempted was reset, not just
+        // solvedWCS cleared). The reference was cleared with no stray frame, so these seed it directly.
+        source.send(frame(cat, name: "b0.fit", dither: (0, 0), withMeta: false))
+        source.send(frame(cat, name: "b1.fit", dither: (1, -1), withMeta: false))
+        d = Date().addingTimeInterval(10)
+        while pipeline.currentWCS == nil && Date() < d { usleep(50_000) }
+        let wcs = try XCTUnwrap(pipeline.currentWCS, "new reference must re-solve after auto-reseed")
+        let sep = 3600 * hypot((wcs.centerRA - CRA) * cos(CDEC * .pi/180), wcs.centerDec - CDEC)
+        XCTAssertLessThan(sep, 180, "re-solved center off by \(sep)\"")
         source.stop()
     }
 
