@@ -212,6 +212,18 @@ public final class StackEngine {
         }
     }
 
+    /// The reference frame's detected stars + dimensions for plate-solving (sub-project 3a). nil until
+    /// a reference is seeded. Coordinates are HALF-RES — star detection runs on the half-res luminance
+    /// (`halfResLuminance`), so the reported size is the full-res `referenceSize` halved (exactly `hw`,
+    /// `hh`). A consumer solving against a sky catalog must double the pixel scale to match this
+    /// half-res space (a half-res pixel subtends 2× the sky).
+    public func referenceSolveInput() -> (stars: [Star], width: Int, height: Int)? {
+        lock.withLock {
+            guard !referenceStars.isEmpty, let s = referenceSize else { return nil }
+            return (referenceStars, s.w / 2, s.h / 2)
+        }
+    }
+
     /// One-lock read of the live stack for the idle-safeguard master snapshot
     /// (`SessionPipeline.writeMasterSnapshot`). Returns image, coverage, and frameCount
     /// from a SINGLE lock acquisition so a frame commit or `reseed()` landing between
