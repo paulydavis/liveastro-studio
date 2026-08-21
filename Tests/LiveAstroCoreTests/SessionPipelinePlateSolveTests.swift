@@ -92,6 +92,86 @@ final class SessionPipelinePlateSolveTests: XCTestCase {
         return pipeline.currentWCS
     }
 
+    // MARK: live source for the reseed test
+
+    private final class LiveSource: FrameSource {
+        let frames: AsyncStream<RawFrame>
+        private let cont: AsyncStream<RawFrame>.Continuation
+        var isFinite: Bool { false }
+        var totalCount: Int? { nil }
+        init() { var c: AsyncStream<RawFrame>.Continuation!; frames = AsyncStream { c = $0 }; cont = c }
+        func start() throws {}
+        func stop() { cont.finish() }
+        func send(_ f: RawFrame) { cont.yield(f) }
+    }
+
+    /// A live RawFrame: catalog projected through the WCS (+ dither), mono, optional metadata.
+    private func frame(_ cat: StarCatalog, name: String, dither: (Double, Double), withMeta: Bool) -> RawFrame {
+        var px = [Float](repeating: 0.05, count: SUB * SUB)
+        for cs in cat.stars {
+            let p = project(ra: Double(cs.ra), dec: Double(cs.dec))
+            let sx = p.x + dither.0, sy = p.y + dither.1
+            guard sx >= 6, sx < Double(SUB) - 6, sy >= 6, sy < Double(SUB) - 6 else { continue }
+            let amp = Float(pow(10, -0.4 * (Double(cs.mag) - 5))) * 0.8
+            for y in Int(sy) - 5...Int(sy) + 5 {
+                for x in Int(sx) - 5...Int(sx) + 5 {
+                    let dx = Double(x) - sx, dy = Double(y) - sy
+                    px[y * SUB + x] += amp * Float(exp(-(dx*dx + dy*dy) / (2 * 2.0 * 2.0)))
+                }
+            }
+        }
+        let img = AstroImage(width: SUB, height: SUB, channels: 1, pixels: px, sourceIsLinear: true)
+        return RawFrame(image: img, bayerPattern: nil, bottomUp: false,
+                        timestamp: Date(timeIntervalSince1970: 0), sourceName: name,
+                        metadata: withMeta ? meta(withWCS: true) : nil)
+    }
+
+    /// Reseed voids the stored WCS and the new reference re-solves against its fresh stars.
+    func testReseedVoidsThenReSolves() throws {
+        let cat = catalog()
+        let source = LiveSource()
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "PS", telescope: "T", camera: "C", mount: "M",
+                                     filter: "L", locationLabel: "L", bortle: 5, subExposureSeconds: 60, notes: "")
+        let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
+                                       profile: profile, rootDirectory: sandbox, neutralizeBackground: false)
+        pipeline.plateSolveCatalog = cat
+        var accepted = 0
+        pipeline.onUpdate = { _, _ in accepted += 1 }
+        try pipeline.start()
+
+        func pollWCS(_ present: Bool, _ msg: String) {
+            let deadline = Date().addingTimeInterval(10)
+            while (pipeline.currentWCS != nil) != present && Date() < deadline { usleep(50_000) }
+            XCTAssertEqual(pipeline.currentWCS != nil, present, msg)
+        }
+        func waitFrames(_ n: Int) {
+            let deadline = Date().addingTimeInterval(10)
+            while accepted < n && Date() < deadline { usleep(20_000) }
+        }
+
+        // First field → seed + solve
+        source.send(frame(cat, name: "a0.fit", dither: (0, 0), withMeta: true))
+        source.send(frame(cat, name: "a1.fit", dither: (2, 1), withMeta: false))
+        waitFrames(2)
+        pollWCS(true, "first reference should solve")
+
+        // Reseed → stored WCS voided
+        XCTAssertEqual(pipeline.reseed(), .reseeded)
+        pollWCS(false, "reseed should void the stored WCS")
+
+        // New reference (same field) → re-solves
+        source.send(frame(cat, name: "b0.fit", dither: (0, 0), withMeta: false))
+        source.send(frame(cat, name: "b1.fit", dither: (-1, 2), withMeta: false))
+        waitFrames(4)
+        pollWCS(true, "new reference should re-solve after reseed")
+        let wcs = pipeline.currentWCS!
+        let sep = 3600 * hypot((wcs.centerRA - CRA) * cos(CDEC * .pi/180), wcs.centerDec - CDEC)
+        XCTAssertLessThan(sep, 180, "re-solved center off by \(sep)\"")
+        source.stop()
+    }
+
     func testSolvesReferenceAndExposesWCS() throws {
         guard let wcs = try runImport(catalogInjected: catalog(), withWCS: true) else {
             return XCTFail("expected a plate solve, got nil")
