@@ -45,7 +45,11 @@ public enum NorthUpRotation {
         }
         let outWi = max(1, Int(outW.rounded())), outHi = max(1, Int(outH.rounded()))
 
-        guard let space = cg.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
+        // Always render into an sRGB RGBX context, regardless of the input's colorspace. A grayscale
+        // display image (AutoStretch.makeCGImage's mono path → DeviceGray) paired with this RGB
+        // bitmapInfo can make CGContext fail on stricter CoreGraphics configs and silently no-op the
+        // rotation; drawing the gray image into an sRGB context converts it and always rotates.
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
               let ctx = CGContext(data: nil, width: outWi, height: outHi, bitsPerComponent: 8,
                                   bytesPerRow: 0, space: space,
                                   bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return cg }

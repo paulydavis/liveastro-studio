@@ -100,6 +100,20 @@ final class NorthUpRotationTests: XCTestCase {
         return n > 0 ? (sx / n, sy / n) : (Double(w)/2, Double(h)/2)
     }
 
+    /// A grayscale (DeviceGray) display — what AutoStretch.makeCGImage produces for a MONO session —
+    /// must still rotate. (Adversarial review: an RGB-only context silently no-ops gray inputs.)
+    func testRotatesGrayscaleImage() {
+        let g = CGContext(data: nil, width: 200, height: 120, bitsPerComponent: 8, bytesPerRow: 200,
+                          space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+        g.setFillColor(gray: 0.5, alpha: 1); g.fill(CGRect(x: 0, y: 0, width: 200, height: 120))
+        let gray = g.makeImage()!
+        XCTAssertEqual(gray.colorSpace?.model, .monochrome, "precondition: input is gray")
+        let wcs = WCS(centerRA: 0, centerDec: 0, rotationDegrees: 90, pixelScaleArcsec: 1, parity: false, inlierCount: 20)
+        let out = NorthUpRotation.apply(gray, wcs: wcs, autoZoom: false)
+        XCTAssertEqual(out.width, 120, "gray image must actually rotate (90°: 200×120 → 120×200)")
+        XCTAssertEqual(out.height, 200)
+    }
+
     /// The CoreGraphics realisation `apply` must move pixels the SAME direction the pure-math rotation
     /// predicts — otherwise "north-up" would render upside down. A marker at the RIGHT-middle, rotated
     /// by rotationDegrees=90, must land in the BOTTOM half of the output (per the top-down math:
