@@ -50,11 +50,12 @@ final class CatalogInstallerTests: XCTestCase {
     }
 
     func testCorruptPayloadRejectedAndCacheClean() async throws {
-        // Not a valid LASC blob (bad magic) — checksum disabled so it reaches the parse check.
+        // Not a valid LASC blob (bad magic). Checksum MATCHES the bad bytes, so it passes the checksum
+        // and reaches — and fails — the parse check.
         let bad = Data(repeating: 0x42, count: 4096)
         let src = tmpRoot.appendingPathComponent("bad.bin")
         try bad.write(to: src)
-        CatalogInstaller.expectedSHA256 = ""
+        CatalogInstaller.expectedSHA256 = sha256hex(bad)
         do {
             try await CatalogInstaller.download(from: src, progress: { _ in })
             XCTFail("expected invalidCatalog")
@@ -63,6 +64,19 @@ final class CatalogInstallerTests: XCTestCase {
         }
         XCTAssertFalse(CatalogInstaller.isInstalled())
         XCTAssertFalse(FileManager.default.fileExists(atPath: CatalogInstaller.cacheURL().path))
+    }
+
+    /// Fail-closed: an unconfigured (empty) checksum must NOT install an unverified file.
+    func testEmptyChecksumFailsClosed() async throws {
+        let (src, _) = try fixture()
+        CatalogInstaller.expectedSHA256 = ""   // not configured
+        do {
+            try await CatalogInstaller.download(from: src, progress: { _ in })
+            XCTFail("expected checksumNotConfigured")
+        } catch CatalogInstaller.InstallError.checksumNotConfigured {
+            // expected
+        }
+        XCTAssertFalse(CatalogInstaller.isInstalled(), "must not install without a configured checksum")
     }
 
     func testProgressReachesOne() async throws {

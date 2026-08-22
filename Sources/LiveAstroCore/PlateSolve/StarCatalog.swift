@@ -88,6 +88,6 @@ public struct StarCatalog {
     /// installed. Replaces the old bundled() — the catalog is fetched at runtime, never shipped in the
     /// app (keeps the MIT app free of the CC BY-NC Gaia data).
     public static func installed() -> StarCatalog? {
-        CatalogInstaller.isInstalled() ? load(from: CatalogInstaller.cacheURL()) : nil
+        load(from: CatalogInstaller.cacheURL())   // load() returns nil if absent/invalid — single parse
     }
 }
