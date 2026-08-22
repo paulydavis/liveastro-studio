@@ -71,6 +71,25 @@ final class DisplayAdjustmentsDBEv3Tests: XCTestCase {
     }
 }
 
+final class DisplayAdjustmentsNorthUpTests: XCTestCase {
+    func testNorthUpDefaultsOffAndRoundTrips() throws {
+        var a = DisplayAdjustments.neutral
+        XCTAssertFalse(a.northUp)                             // default OFF (3b: toggle default off)
+        a.northUp = true
+        let back = try JSONDecoder().decode(DisplayAdjustments.self,
+                                            from: JSONEncoder().encode(a))
+        XCTAssertTrue(back.northUp)
+    }
+
+    func testDecodesOldSettingsWithoutNorthUpKey() throws {
+        // A settings blob written before 3b must decode northUp as false.
+        let old = #"{"blackPoint":0.1,"midtoneStrength":-0.3,"saturation":1.5,"backgroundExtraction":true,"backgroundDegree":2,"bgScale":3.0,"bgSmoothest":0.5,"denoiseStrength":0.4}"#
+        let a = try JSONDecoder().decode(DisplayAdjustments.self, from: Data(old.utf8))
+        XCTAssertFalse(a.northUp)                             // absent -> off
+        XCTAssertEqual(a.denoiseStrength, 0.4, accuracy: 1e-9)
+    }
+}
+
 final class DisplayAdjustmentsDenoiseTests: XCTestCase {
     func testDenoiseDefaultsOffAndRoundTrips() throws {
         var a = DisplayAdjustments.neutral
