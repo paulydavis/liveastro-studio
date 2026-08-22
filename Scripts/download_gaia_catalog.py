@@ -45,7 +45,9 @@ def vizier_band(lo, hi):
             for x in t[0] if x["RA_ICRS"] is not None and x["DE_ICRS"] is not None and x["Gmag"] is not None]
 
 def fetch_band(lo, hi):
-    cache = os.path.join(CACHE, f"band_{lo:+05.1f}.csv")
+    # Cache key MUST include the magnitude limit — otherwise a re-run at a different depth silently
+    # replays a stale shallower cache (e.g. a G<=8.5 run leaving 106k stars when you asked for G<=11).
+    cache = os.path.join(CACHE, f"band_{lo:+05.1f}_g{MAG:g}.csv")
     if os.path.exists(cache):
         with open(cache) as f: return [(float(a), float(b), float(c)) for a, b, c in csv.reader(f)]
     stars = None
