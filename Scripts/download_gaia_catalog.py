@@ -16,6 +16,11 @@ import struct, os, sys, time, csv
 MAG     = float(sys.argv[1]) if len(sys.argv) > 1 else 11.0
 DEC_DEG = float(sys.argv[2]) if len(sys.argv) > 2 else 10.0   # dec tile height
 RA_DEG  = float(sys.argv[3]) if len(sys.argv) > 3 else 15.0   # RA tile width (finer → smaller queries)
+# VizieR's public server throttles bursts: ~24 rapid queries then it read-times-out. Pace ourselves
+# (a short delay per network tile) and back off exponentially on failure so a throttle window clears
+# before the next try, instead of hammering it.
+REQUEST_DELAY = 1.5    # seconds between network tiles (cache hits don't wait)
+RETRY_BASE    = 5.0    # backoff = RETRY_BASE * 2**attempt (5, 10, 20, 40s)
 HERE  = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, ".gaia_cache")
 OUT   = os.path.join(HERE, "..", "Sources", "LiveAstroCore", "Resources", "brightstars.bin")
@@ -34,7 +39,7 @@ def tiles():
 
 def vizier_tile(dlo, dhi, rlo, rhi):
     from astroquery.vizier import Vizier
-    Vizier.TIMEOUT = 300                      # a slow tile fails+retries instead of hanging forever
+    Vizier.TIMEOUT = 120                      # fail fast when throttled → back off → retry after it clears
     v = Vizier(columns=["RA_ICRS", "DE_ICRS", "Gmag"], row_limit=-1,
                column_filters={"Gmag": f"<{MAG}", "DE_ICRS": f">={dlo} & <{dhi}",
                                "RA_ICRS": f">={rlo} & <{rhi}"})
@@ -57,15 +62,19 @@ def fetch_tile(dlo, dhi, rlo, rhi):
     cache = os.path.join(CACHE, f"tile_d{dlo:+05.1f}_r{rlo:05.1f}_g{MAG:g}.csv")
     if os.path.exists(cache):
         with open(cache) as f: return [(float(a), float(b), float(c)) for a, b, c in csv.reader(f)]
+    time.sleep(REQUEST_DELAY)   # pace uncached tiles so VizieR doesn't throttle us
     stars = None
-    # VizieR first (ESA TAP has been unreliable — 500s); ESA as a single fallback attempt.
-    for src, fn, tries in (("VizieR", vizier_tile, 3), ("ESA", esa_tile, 1)):
+    # VizieR first (ESA TAP has been unreliable — 500s); ESA as a fallback. Exponential backoff on
+    # failure lets a rate-limit / read-timeout window clear before the next attempt.
+    for src, fn, tries in (("VizieR", vizier_tile, 4), ("ESA", esa_tile, 2)):
         for attempt in range(tries):
             try:
                 print(f"  tile d[{dlo:+.0f},{dhi:+.0f}) ra[{rlo:.0f},{rhi:.0f}) via {src} try {attempt+1}...", flush=True)
                 stars = fn(dlo, dhi, rlo, rhi); break
             except Exception as e:
-                print(f"    {src} failed: {type(e).__name__}: {str(e)[:90]}", flush=True); time.sleep(4)
+                back = RETRY_BASE * (2 ** attempt)
+                print(f"    {src} failed: {type(e).__name__}: {str(e)[:80]} — backoff {back:.0f}s", flush=True)
+                time.sleep(back)
         if stars is not None: break
     if stars is None:
         raise RuntimeError(f"tile d[{dlo},{dhi}) ra[{rlo},{rhi}) failed on both sources")
