@@ -156,6 +156,27 @@ final class SessionPipelinePlateSolveTests: XCTestCase {
         source.stop()
     }
 
+    /// After a catalog download (3c), reloadCatalog() swaps in the newly-installed catalog live — a
+    /// pipeline created with nothing installed picks it up without a restart.
+    func testReloadCatalogPicksUpInstalledCatalog() throws {
+        let cacheDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        CatalogInstaller.cacheDirectoryOverride = cacheDir
+        defer { CatalogInstaller.cacheDirectoryOverride = nil }
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "PS", telescope: "T", camera: "C", mount: "M",
+                                     filter: "L", locationLabel: "L", bortle: 5, subExposureSeconds: 60, notes: "")
+        let pipeline = SessionPipeline(nativeSource: LiveSource(), engine: StackEngine(),
+                                       profile: profile, rootDirectory: sandbox, neutralizeBackground: false)
+        XCTAssertNil(pipeline.plateSolveCatalog, "nothing installed at init → nil")
+        // Stage a catalog into the cache, then reload.
+        try FileManager.default.createDirectory(at: CatalogInstaller.cacheURL().deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try StarCatalog.encode(catalog().stars).write(to: CatalogInstaller.cacheURL())
+        pipeline.reloadCatalog()
+        XCTAssertNotNil(pipeline.plateSolveCatalog, "reloadCatalog picks up the installed catalog")
+    }
+
     /// Reseed voids the stored WCS and the new reference re-solves against its fresh stars.
     func testReseedVoidsThenReSolves() throws {
         let cat = catalog()

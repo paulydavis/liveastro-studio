@@ -87,7 +87,13 @@ public final class SessionPipeline {
     private var solveAttempted = false          // guarded by plateSolveLock
     private var solveGeneration = 0             // guarded by plateSolveLock; bumped on reseed to void stale solves
     private let plateSolveQueue = DispatchQueue(label: "com.liveastro.platesolve")
-    var plateSolveCatalog: StarCatalog? = StarCatalog.installed()
+    private var _plateSolveCatalog: StarCatalog? = StarCatalog.installed()   // guarded by plateSolveLock
+    /// The catalog plate-solving uses (the injection seam for tests; `installed()` in production).
+    /// Lock-guarded because `reloadCatalog()` may swap it from the UI thread while the frame path reads it.
+    var plateSolveCatalog: StarCatalog? {
+        get { plateSolveLock.withLock { _plateSolveCatalog } }
+        set { plateSolveLock.withLock { _plateSolveCatalog = newValue } }
+    }
     /// Test seam: invoked inside `attemptPlateSolveIfNeeded` AFTER the generation is claimed and BEFORE
     /// the reference stars are read, so a test can force a reseed into that exact window and prove no
     /// stale/stuck solve results. nil (no-op) in production.
@@ -113,6 +119,15 @@ public final class SessionPipeline {
     private func invalidatePlateSolve() {
         plateSolveLock.withLock { solvedWCS = nil; solveAttempted = false; solveGeneration += 1 }
         onSolveStateChanged?()   // negative edge: reseed/auto-reseed dropped the solve — refresh the gate
+    }
+
+    /// Re-read the installed catalog (call after a catalog download completes) and void any prior solve
+    /// state, so the current reference re-solves against the freshly-available catalog with no app
+    /// restart. A no-op-safe: if nothing is installed, plateSolveCatalog becomes nil and plate-solve
+    /// stays the usual no-op.
+    public func reloadCatalog() {
+        plateSolveCatalog = StarCatalog.installed()
+        invalidatePlateSolve()
     }
 
     /// Attempt the reference plate-solve once per reference generation, off the hot path. Idempotent
