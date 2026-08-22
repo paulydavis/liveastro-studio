@@ -475,12 +475,32 @@ struct ControlView: View {
                             }
                             .help("Classic noise reduction — smooths background grain and color mottle on the displayed stack. 0 = off. master.fit is never modified.")
                         }
-                        helpToggle("North up", isOn: $model.displayAdjustments.northUp,
-                                   help: "Rotate the view so celestial north is up (display only — master.fit stays native). Needs a plate solve; enabled once the reference frame is solved.")
-                            .onChange(of: model.displayAdjustments.northUp) { _, _ in
-                                model.applyDisplayAdjustments()
+                        switch model.catalogState {
+                        case .installed:
+                            helpToggle("North up", isOn: $model.displayAdjustments.northUp,
+                                       help: "Rotate the view so celestial north is up (display only — master.fit stays native). Needs a plate solve; enabled once the reference frame is solved.")
+                                .onChange(of: model.displayAdjustments.northUp) { _, _ in
+                                    model.applyDisplayAdjustments()
+                                }
+                                .disabled(!model.solveAvailable)
+                        case .notInstalled:
+                            Button("Download star catalog (~32 MB) — enables North up") {
+                                model.downloadCatalog()
                             }
-                            .disabled(!model.solveAvailable)
+                            .help("Downloads the Gaia bright-star catalog used to plate-solve and orient the view north-up. One-time, cached locally.")
+                        case .downloading(let p):
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Downloading star catalog…").font(.caption)
+                                ProgressView(value: p)
+                            }
+                        case .failed(let msg):
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(msg).font(.caption).foregroundStyle(.red)
+                                Button("Retry download") { model.downloadCatalog() }
+                            }
+                        }
+                        Text("Star catalog: Gaia DR3 (ESA/DPAC)")
+                            .font(.caption2).foregroundStyle(.secondary)
                         Button("Reset") {
                             model.displayAdjustments = .neutral
                             model.applyDisplayAdjustments()

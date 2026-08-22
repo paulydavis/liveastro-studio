@@ -112,6 +112,11 @@ final class AppModel {
     /// True once the reference frame has been plate-solved — gates the "North up" toggle. Refreshed on
     /// each display update from `pipeline.hasSolvedWCS`.
     private(set) var solveAvailable = false
+
+    /// Whether the (download-on-demand) star catalog needed for plate-solving / north-up is present.
+    enum CatalogState: Equatable { case notInstalled, downloading(Double), installed, failed(String) }
+    private(set) var catalogState: CatalogState = CatalogInstaller.isInstalled() ? .installed : .notInstalled
+
     private(set) var lastSessionDirectory: URL?
     var errorMessage: String?
     var zoomPan = ZoomPanState.fit
@@ -355,6 +360,38 @@ final class AppModel {
     }
 
     private var lastAdjustmentRender = Date.distantPast
+
+    /// Download the star catalog on demand (3c). The download itself runs off-main (CatalogInstaller
+    /// .download is nonisolated), so the UI never blocks; progress streams into `catalogState`, and on
+    /// success it's applied to the live pipeline via reloadCatalog() so North-up can enable without a
+    /// restart. Callable from `.notInstalled` or `.failed` (retry); a no-op while already downloading.
+    func downloadCatalog() {
+        if case .downloading = catalogState { return }
+        catalogState = .downloading(0)
+        Task { [weak self] in
+            do {
+                try await CatalogInstaller.download(progress: { p in
+                    Task { @MainActor [weak self] in
+                        if case .downloading = self?.catalogState { self?.catalogState = .downloading(p) }
+                    }
+                })
+                self?.catalogState = .installed
+                self?.pipeline?.reloadCatalog()
+                self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false
+            } catch {
+                self?.catalogState = .failed(Self.catalogErrorText(error))
+            }
+        }
+    }
+
+    private static func catalogErrorText(_ error: Error) -> String {
+        switch error {
+        case CatalogInstaller.InstallError.checksumMismatch: return "Catalog failed verification — try again."
+        case CatalogInstaller.InstallError.invalidCatalog:   return "Downloaded file wasn't a valid catalog."
+        case CatalogInstaller.InstallError.http(let code):   return "Download failed (HTTP \(code))."
+        default: return "Download failed — check your connection and try again."
+        }
+    }
 
     /// Called when a slider changes: persist, push adjustments to the pipeline so
     /// the next frame's snapshot matches, and re-render the current stack off-main
