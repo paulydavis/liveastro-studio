@@ -19,11 +19,13 @@ python3 Scripts/download_gaia_catalog.py            # default depth G<=11
 ```
 - Writes `Sources/LiveAstroCore/Resources/brightstars.bin` (a transient output — this dir is being
   removed from the package; the file is what you upload, not something you commit).
-- **Resumable:** each declination band caches to `Scripts/.gaia_cache/band_<lo>_g<mag>.csv`, so a re-run
-  skips completed bands. The mag is in the cache key, so switching depth never replays a stale cache.
-- **G≤11 is ~2.7M stars (~32 MB).** Dense galactic-plane bands can exceed VizieR's per-query row limit;
-  if a band fails on both ESA and VizieR, split the generator into finer dec×RA tiles (ask, or lower
-  `band_deg`: `python3 Scripts/download_gaia_catalog.py 11 5`).
+- **Resumable:** every dec×RA tile caches to `Scripts/.gaia_cache/tile_d<dec>_r<ra>_g<mag>.csv`, so a
+  re-run skips completed tiles. The mag is in the cache key, so switching depth never replays a stale
+  cache.
+- **G≤11 is ~2.7M stars (~32 MB).** The generator queries in small dec×RA tiles (default 10°×15°) so
+  no single request hits VizieR's row limit or times out on a dense galactic-plane strip. VizieR is
+  primary, ESA is the fallback. If dense tiles still fail, tile finer:
+  `python3 Scripts/download_gaia_catalog.py 11 5 10` (mag, dec°, ra°).
 
 Requires `pip install astroquery`. Attribution: Gaia DR3, ESA/DPAC.
 
