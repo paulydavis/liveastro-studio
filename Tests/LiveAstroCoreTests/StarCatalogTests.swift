@@ -56,26 +56,34 @@ final class StarCatalogTests: XCTestCase {
         XCTAssertEqual(Set(got.map { $0.mag }), [5, 6])
     }
 
-    /// Fail-closed contract: bundled() must NEVER return a non-nil but EMPTY catalog. Either nil
-    /// (missing/malformed/placeholder) or a substantial real catalog — so solver code that does
-    /// `if let cat = bundled()` cleanly disables plate-solve on no-data instead of silently querying
-    /// an empty catalog. With the committed placeholder (count 0), bundled() must be nil.
-    func testBundledIsNilOrSubstantialNeverEmpty() {
-        if let cat = StarCatalog.bundled() {
-            XCTAssertGreaterThan(cat.count, 0, "bundled() must return nil for an empty catalog, never a non-nil empty one")
-        }
-        // nil is the correct result for the placeholder / pre-data state.
+    /// Fail-closed contract: installed() must NEVER return a non-nil but EMPTY catalog. Either nil
+    /// (not downloaded / malformed / empty) or a real catalog — so solver code that does
+    /// `if let cat = installed()` cleanly disables plate-solve on no-data. No cached file → nil; an
+    /// empty (count-0) cached file → still nil.
+    func testInstalledIsNilWhenAbsentOrEmpty() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        CatalogInstaller.cacheDirectoryOverride = tmp
+        defer { CatalogInstaller.cacheDirectoryOverride = nil }
+        XCTAssertNil(StarCatalog.installed(), "no cache → installed() nil")
+        // stage an EMPTY catalog (valid LASC header, count 0) → still nil, never a non-nil empty one
+        try FileManager.default.createDirectory(at: CatalogInstaller.cacheURL().deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try StarCatalog.encode([]).write(to: CatalogInstaller.cacheURL())
+        XCTAssertNil(StarCatalog.installed(), "empty cached catalog → installed() nil")
     }
 
-    /// The real bundled catalog loads and is queryable. Skipped until brightstars.bin is generated
-    /// (placeholder → bundled() is nil), so the suite stays green pre-data.
-    func testBundledCatalogLoadsAndQueries() throws {
-        guard let cat = StarCatalog.bundled(), cat.count > 0 else {
-            throw XCTSkip("brightstars.bin not generated yet (or empty placeholder)")
-        }
-        XCTAssertGreaterThan(cat.count, 10_000, "expected a substantial Gaia DR3 bright subset")
-        // a dense region (galactic plane, ~Cygnus) should return some bright stars
-        let got = cat.stars(nearRA: 305.0, dec: 40.0, radiusDegrees: 3.0)
-        XCTAssertFalse(got.isEmpty, "expected catalog stars in a dense region")
+    /// A catalog staged into the cache loads via installed() and is queryable.
+    func testInstalledLoadsAndQueriesStagedCatalog() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        CatalogInstaller.cacheDirectoryOverride = tmp
+        defer { CatalogInstaller.cacheDirectoryOverride = nil }
+        let stars = [CatalogStar(ra: 305.0, dec: 40.0, mag: 6), CatalogStar(ra: 305.4, dec: 40.3, mag: 7),
+                     CatalogStar(ra: 120.0, dec: -10.0, mag: 5)]
+        try FileManager.default.createDirectory(at: CatalogInstaller.cacheURL().deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try StarCatalog.encode(stars).write(to: CatalogInstaller.cacheURL())
+        let cat = try XCTUnwrap(StarCatalog.installed())
+        XCTAssertEqual(cat.count, 3)
+        XCTAssertFalse(cat.stars(nearRA: 305.0, dec: 40.0, radiusDegrees: 3.0).isEmpty)
     }
 }

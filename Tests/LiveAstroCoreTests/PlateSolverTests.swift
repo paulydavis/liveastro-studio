@@ -180,7 +180,7 @@ final class PlateSolverTests: XCTestCase {
 
     func testSolvesRealM63Frame() throws {
         guard ProcessInfo.processInfo.environment["LAS_SOLVE_FRAME"] != nil,
-              let catalog = StarCatalog.bundled() else {
+              let catalog = StarCatalog.installed() else {
             throw XCTSkip("set LAS_SOLVE_FRAME + generate the real catalog to run the real-frame solve")
         }
         let dir = URL(fileURLWithPath: (NSHomeDirectory() as NSString).appendingPathComponent("Desktop/M63-import"))

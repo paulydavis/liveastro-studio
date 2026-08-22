@@ -104,7 +104,7 @@ final class SessionPipelineNorthUpTests: XCTestCase {
     /// whole chain — real solve → display rotation — on real data; the sign is right iff this passes.
     func testRealM63NorthEndsUp() throws {
         guard ProcessInfo.processInfo.environment["LAS_SOLVE_FRAME"] != nil,
-              let catalog = StarCatalog.bundled() else {
+              let catalog = StarCatalog.installed() else {
             throw XCTSkip("set LAS_SOLVE_FRAME + stage the real catalog")
         }
         let dir = URL(fileURLWithPath: (NSHomeDirectory() as NSString).appendingPathComponent("Desktop/M63-import"))

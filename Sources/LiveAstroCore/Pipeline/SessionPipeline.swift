@@ -87,7 +87,7 @@ public final class SessionPipeline {
     private var solveAttempted = false          // guarded by plateSolveLock
     private var solveGeneration = 0             // guarded by plateSolveLock; bumped on reseed to void stale solves
     private let plateSolveQueue = DispatchQueue(label: "com.liveastro.platesolve")
-    var plateSolveCatalog: StarCatalog? = StarCatalog.bundled()
+    var plateSolveCatalog: StarCatalog? = StarCatalog.installed()
     /// Test seam: invoked inside `attemptPlateSolveIfNeeded` AFTER the generation is claimed and BEFORE
     /// the reference stars are read, so a test can force a reseed into that exact window and prove no
     /// stale/stuck solve results. nil (no-op) in production.

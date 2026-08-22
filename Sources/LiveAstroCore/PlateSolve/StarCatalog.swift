@@ -75,11 +75,19 @@ public struct StarCatalog {
     /// OR EMPTY (the pre-data placeholder has count 0). Failing closed on empty means callers get a
     /// clean "no catalog" (`if let cat = bundled()` doesn't bind) instead of a silently-empty catalog
     /// that would make every plate-solve query return nothing while appearing available.
-    public static func bundled() -> StarCatalog? {
-        guard let url = Bundle.module.url(forResource: "brightstars", withExtension: "bin"),
-              let data = try? Data(contentsOf: url),
-              let cat = try? StarCatalog(data: data),
-              cat.count > 0 else { return nil }
+    /// Load a catalog from a file on disk. nil (never a non-nil empty one) when the file is
+    /// missing, unreadable, malformed, or empty — the same fail-closed contract `bundled()` had, so
+    /// callers that do `if let cat = ...` cleanly disable plate-solve on no-data.
+    public static func load(from url: URL) -> StarCatalog? {
+        guard let data = try? Data(contentsOf: url),
+              let cat = try? StarCatalog(data: data), cat.count > 0 else { return nil }
         return cat
+    }
+
+    /// The catalog downloaded on demand into the local cache (sub-project 3c), or nil if not yet
+    /// installed. Replaces the old bundled() — the catalog is fetched at runtime, never shipped in the
+    /// app (keeps the MIT app free of the CC BY-NC Gaia data).
+    public static func installed() -> StarCatalog? {
+        CatalogInstaller.isInstalled() ? load(from: CatalogInstaller.cacheURL()) : nil
     }
 }
