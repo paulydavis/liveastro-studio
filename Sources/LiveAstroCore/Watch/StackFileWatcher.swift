@@ -326,6 +326,22 @@ public final class StackFileWatcher {
     /// writes in scan().
     internal var digestComputations: Int { onQueueSync { _digestComputations } }
 
+    // Liveness heartbeat (M8 all-nighter stall diagnosis). The live watcher once quietly stopped
+    // detecting new files ~2h in, with no evidence of WHERE the pipeline stalled. A periodic heartbeat
+    // through onLog turns the next long session into a diagnosis: if the log stops advancing, the
+    // WATCHER died; if it keeps advancing (polls climbing) while `emitted` flatlines, detection
+    // desynced; if `emitted` climbs but the app stops stacking, the CONSUMER stalled. Queue-confined
+    // like all scan state; the counters feed only this log line.
+    /// Heartbeat cadence (default 60 s). Instance-settable (pre-start) so tests can force a heartbeat
+    /// on every poll without waiting a wall-clock minute.
+    internal var heartbeatIntervalNanos: UInt64 = 60_000_000_000
+    private var _polls = 0
+    private var _emitted = 0
+    private var _lastHeartbeatNanos: UInt64 = 0
+    /// Test-visible poll/emit counters (queue-synchronized snapshot).
+    internal var pollCount: Int { onQueueSync { _polls } }
+    internal var emittedCount: Int { onQueueSync { _emitted } }
+
     /// Monotonic now, in nanoseconds (review8 finding 1). DispatchTime rides
     /// CLOCK_UPTIME_RAW — never wall-adjusted, never goes backwards — which is
     /// what the digest-stability gate's separation requirement needs (Date/
@@ -539,6 +555,8 @@ public final class StackFileWatcher {
         // A queued/debounced scan may outlive stop(). The atomic flag also covers a stop whose
         // queue-confined teardown is waiting behind this scan.
         guard state == .running, !stopRequested.isSet else { return }
+        _polls += 1
+        emitHeartbeatIfDue()
         let fm = FileManager.default
 
         var isDirectory: ObjCBool = false
@@ -617,6 +635,16 @@ public final class StackFileWatcher {
             nowNanos: nowNanos)))
         afterObservationBatchForTesting?()
         execute(effects)
+    }
+
+    /// Heartbeat through onLog every `heartbeatIntervalNanos`, at the top of a scan on the watcher
+    /// queue. See the counter declarations: a log that stops advancing means the watcher died; polls
+    /// climbing while `emitted` flatlines means detection desynced.
+    private func emitHeartbeatIfDue() {
+        let now = monotonicNowNanos()
+        guard now &- _lastHeartbeatNanos >= heartbeatIntervalNanos else { return }
+        _lastHeartbeatNanos = now
+        onLog?("watcher alive: \(_polls) polls, \(reducer.state.generation.files.count) tracked, \(_emitted) emitted")
     }
 
     private func isTrackedFileName(_ name: String) -> Bool {
@@ -751,6 +779,7 @@ public final class StackFileWatcher {
                     url: intent.candidate.url,
                     fileSize: intent.candidate.byteCount,
                     identity: intent.candidate.identity.withDigest(intent.candidate.digest)))
+                _emitted += 1
                 let followupEffects = reducer.reduce(.emissionFinished(EmissionResult(
                     intent: intent,
                     outcome: .yielded)))

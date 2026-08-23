@@ -54,6 +54,50 @@ final class StackFileWatcherTests: XCTestCase {
         XCTAssertTrue(got, "expected one update for a complete FITS write")
     }
 
+    /// Guards against a COUNT-related stall of the live watcher (investigated after the M8 all-nighter
+    /// stalled ~762 frames in): native-relay style (.immutableAfterPublish, Light_ prefix), a large
+    /// batch of subs arriving incrementally, every one must be emitted. (Confirms the stall was NOT a
+    /// reducer/scan-at-scale bug on local storage — 1500 files emit in ~1.5s.)
+    func testStressManyFilesDoesNotStall() async throws {
+        let N = 1500
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.05, pollInterval: 0.05,
+                                   fileNamePrefix: "Light_", digestPolicy: .immutableAfterPublish)
+        let collector = collect(watcher)
+        try watcher.start()
+        // Incremental arrival, like a relay dropping subs over time (staggered writes).
+        for i in 0..<N {
+            try makeFITS(Float(i % 97) / 100 + 0.01)
+                .write(to: tmp.appendingPathComponent(String(format: "Light_%04d.fit", i)))
+            if i % 50 == 0 { try? await Task.sleep(nanoseconds: 30_000_000) }
+        }
+        let got = await collector.waitForCount(N, timeout: 180)
+        let count = await collector.items.count
+        XCTAssertTrue(got, "only \(count)/\(N) emitted — possible count-related stall")
+    }
+
+    final class LogSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _lines: [String] = []
+        func add(_ s: String) { lock.withLock { _lines.append(s) } }
+        var lines: [String] { lock.withLock { _lines } }
+    }
+
+    /// The liveness heartbeat (M8 stall diagnosis) logs through onLog and its poll/emit counters
+    /// advance — so a long session's log shows whether the watcher is still scanning + emitting.
+    func testHeartbeatLogsAndCountersAdvance() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.1, pollInterval: 0.1)
+        watcher.heartbeatIntervalNanos = 0   // force a heartbeat on every poll
+        let logs = LogSink()
+        watcher.onLog = { logs.add($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        _ = await collector.waitForCount(1, timeout: 5)
+        XCTAssertGreaterThanOrEqual(watcher.emittedCount, 1, "emit counter tracks yields")
+        XCTAssertGreaterThan(watcher.pollCount, 0, "poll counter advances")
+        XCTAssertTrue(logs.lines.contains { $0.hasPrefix("watcher alive:") }, "heartbeat logs through onLog")
+    }
+
     func testIgnoresPartialFITSUntilComplete() async throws {
         watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.3)
         let collector = collect(watcher)
