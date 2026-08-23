@@ -1,8 +1,5 @@
 import Foundation
 
-/// A block-level element of a limited markdown subset. Inline markup
-/// (**bold**, *italic*, `code`) is preserved verbatim inside each block's
-/// text — the renderer is responsible for interpreting it.
 /// One list entry: its own text plus up to one level of nested sub-bullets (empty when flat).
 /// `ExpressibleByStringLiteral` so a flat list can still be written `["a", "b"]` — the literal
 /// becomes a `ListItem` with no sub-items.
@@ -16,6 +13,9 @@ public struct ListItem: Equatable, ExpressibleByStringLiteral {
     public init(stringLiteral value: String) { self.init(value) }
 }
 
+/// A block-level element of a limited markdown subset. Inline markup
+/// (**bold**, *italic*, `code`) is preserved verbatim inside each block's
+/// text — the renderer is responsible for interpreting it.
 public enum MarkdownBlock: Equatable {
     case heading(level: Int, text: String)
     case paragraph(String)
