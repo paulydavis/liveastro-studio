@@ -12,7 +12,16 @@ If BOTH sources time out, they've throttled you: stop, wait ~30-60 min for the c
 resumes from cached bands). Gaia DR3 is ESA/DPAC, CC BY-NC 3.0 IGO — see NOTICE. Requires astroquery.
 Usage: python3 Scripts/download_gaia_catalog.py [mag_limit] [band_deg]
 """
-import struct, os, sys, time, csv
+import struct, os, sys, time, csv, signal
+
+class _AttemptTimeout(Exception): pass
+def _on_alarm(signum, frame): raise _AttemptTimeout("attempt exceeded cap")
+signal.signal(signal.SIGALRM, _on_alarm)
+# Per-attempt hard cap. ESA's async service has NO client timeout — a queued/stuck job blocks forever
+# (a real band once sat 56 min). Cap each attempt so a slow/hung job is abandoned and retried (a fresh
+# job usually dodges the slow queue) instead of hanging the whole run.
+ESA_CAP    = 1200   # 20 min per ESA attempt
+VIZIER_CAP = 150    # VizieR throttles under load — fail fast so ESA carries the band
 
 # Default G<=11: enough catalog stars per field to clear the solver's inlier floor even in sparse
 # high-galactic-latitude fields (G<=8.5 gave only ~7 in-frame stars on a real M63 sub). ~2.7M stars.
@@ -54,12 +63,16 @@ def fetch_band(lo, hi):
     stars = None
     # ESA async primary (handles big bands server-side); VizieR fallback. Exponential backoff on
     # failure lets a rate-limit / read-timeout window clear before the next attempt.
-    for src, fn, tries in (("ESA", esa_band, 3), ("VizieR", vizier_band, 2)):
+    for src, fn, tries, cap in (("ESA", esa_band, 3, ESA_CAP), ("VizieR", vizier_band, 2, VIZIER_CAP)):
         for attempt in range(tries):
             try:
-                print(f"  band [{lo:+.0f},{hi:+.0f}) via {src} try {attempt+1}...", flush=True)
-                stars = fn(lo, hi); break
+                print(f"  band [{lo:+.0f},{hi:+.0f}) via {src} try {attempt+1} (cap {cap}s)...", flush=True)
+                signal.alarm(cap)
+                stars = fn(lo, hi)
+                signal.alarm(0)
+                break
             except Exception as e:
+                signal.alarm(0)
                 back = RETRY_BASE * (2 ** attempt)
                 print(f"    {src} failed: {type(e).__name__}: {str(e)[:70]} — backoff {back:.0f}s", flush=True)
                 time.sleep(back)
