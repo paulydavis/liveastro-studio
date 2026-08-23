@@ -21,6 +21,32 @@ final class MarkdownBlocksTests: XCTestCase {
                        [.paragraph("a"), .rule, .paragraph("b")])
     }
 
+    func testCodeBlock() {
+        let md = """
+        Run this:
+
+        ```bash
+        mkdir -p /tmp/demo
+        swift run demo-stack /tmp/demo
+        ```
+
+        Done.
+        """
+        XCTAssertEqual(MarkdownBlocks.parse(md), [
+            .paragraph("Run this:"),
+            .codeBlock("mkdir -p /tmp/demo\nswift run demo-stack /tmp/demo"),
+            .paragraph("Done."),
+        ])
+    }
+
+    func testCodeBlockPreservesIndentationAndUnterminatedFence() {
+        // Indentation inside the fence is preserved verbatim (prose lines are trimmed; code is not).
+        XCTAssertEqual(MarkdownBlocks.parse("```\n  indented\n    more\n```"),
+                       [.codeBlock("  indented\n    more")])
+        // An unterminated fence collects to EOF rather than dropping the content.
+        XCTAssertEqual(MarkdownBlocks.parse("```\nx\ny"), [.codeBlock("x\ny")])
+    }
+
     func testTable() {
         let md = """
         | Mode | What |

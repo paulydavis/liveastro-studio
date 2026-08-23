@@ -11,6 +11,9 @@ public enum MarkdownBlock: Equatable {
     case table(headers: [String], rows: [[String]])
     case quote(String)
     case rule
+    /// Fenced code block (``` … ```). The joined RAW lines — indentation preserved, no inline markdown
+    /// interpretation — so a command or snippet renders verbatim in a monospace box.
+    case codeBlock(String)
 }
 
 /// Parses the block structure of the markdown subset used by Help.md.
@@ -39,6 +42,21 @@ public enum MarkdownBlocks {
             let line = lines[i].trimmingCharacters(in: .whitespaces)
 
             if line.isEmpty { flushAll(); i += 1; continue }
+
+            // Fenced code block: collect the RAW lines (indentation preserved, no inline markdown) up
+            // to the closing fence. An unterminated fence collects to EOF rather than dropping content.
+            if line.hasPrefix("```") {
+                flushAll()
+                var code: [String] = []
+                var j = i + 1
+                while j < lines.count, !lines[j].trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                    code.append(lines[j])
+                    j += 1
+                }
+                blocks.append(.codeBlock(code.joined(separator: "\n")))
+                i = j < lines.count ? j + 1 : j    // step past the closing fence when present
+                continue
+            }
 
             if line == "---" { flushAll(); blocks.append(.rule); i += 1; continue }
 

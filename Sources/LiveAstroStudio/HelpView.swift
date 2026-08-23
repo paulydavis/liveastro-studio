@@ -86,6 +86,16 @@ struct HelpView: View {
             .background(Color.secondary.opacity(0.08))
             .clipShape(RoundedRectangle(cornerRadius: 4))
 
+        case let .codeBlock(code):
+            // Verbatim monospace — no inline() so backticks/asterisks in a command stay literal.
+            Text(code)
+                .font(.system(.callout, design: .monospaced))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(Color.secondary.opacity(0.10))
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+
         case .rule:
             Divider().padding(.vertical, 4)
         }
