@@ -1,6 +1,6 @@
 import Foundation
 
-/// A bright-star catalog (Gaia DR3, G ≤ 8.5) loaded from the compact `brightstars.bin` resource.
+/// A bright-star catalog (Tycho-2, ~2.5M stars to V≈11.5) loaded from the compact `brightstars.bin`.
 /// Little-endian: magic "LASC" + UInt32 version + UInt32 count, then count × {ra,dec,mag} Float32.
 /// Records are stored sorted by ascending declination (enables the dec-band query in Task 2).
 public struct StarCatalog {

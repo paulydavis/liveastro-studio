@@ -1,56 +1,46 @@
-# Star catalog — generate, host, and wire the download-on-demand asset
+# Star catalog — build, host, and wire the download-on-demand asset
 
-LiveAstro Studio plate-solves (and orients north-up) against a Gaia DR3 bright-star catalog that is
-**downloaded on demand**, not bundled — so the MIT app ships free of the CC BY-NC Gaia data. This doc
-is the one-time operator procedure to produce the catalog, host it, and point the app at it.
+LiveAstro Studio plate-solves (and orients north-up) against a bright-star catalog that is
+**downloaded on demand**, not bundled — so the MIT app ships without a 30 MB data blob.
 
 The app fetches it via `CatalogInstaller` (`Sources/LiveAstroCore/PlateSolve/CatalogInstaller.swift`),
-verifies its SHA-256 + that it parses, and caches it in `~/Library/Application Support/LiveAstroStudio/
-catalog/brightstars.bin`. Until `CatalogInstaller.remoteURL`/`expectedSHA256` point at a real asset, the
-app just shows the "Download star catalog" button and fails cleanly on click.
+verifies its SHA-256 (**required** — an empty `expectedSHA256` fails closed rather than installing an
+unverified file) and that it parses, and caches it in `~/Library/Application Support/LiveAstroStudio/
+catalog/brightstars.bin`.
 
-## 1. Generate the catalog (`.bin`)
+## Current catalog: Tycho-2 (shipped)
 
-Runs on a network that can reach ESA/CDS/VizieR (the dev sandbox is ESA-blocked; VizieR works):
+**Tycho-2** (CDS I/259; Høg et al. 2000) — ~2.5M stars complete to V≈11.5, all-sky, ICRS. The classic
+astrometric / plate-solving catalog, **freely redistributable** (ESA Hipparcos mission). Served as 20
+static `.gz` files from the CDS archive (`cdsarc`), which is **separate infrastructure from the
+throttled TAP/query engine** — so it downloads fast and reliably.
+
 ```bash
 cd ~/liveastro-studio
 export SSL_CERT_FILE="$(python3 -c 'import certifi; print(certifi.where())')"
-python3 Scripts/download_gaia_catalog.py            # default depth G<=11
+python3 Scripts/build_tycho2_catalog.py     # → Sources/LiveAstroCore/Resources/brightstars.bin (~30 MB)
 ```
-- Writes `Sources/LiveAstroCore/Resources/brightstars.bin` (a transient output — this dir is being
-  removed from the package; the file is what you upload, not something you commit).
-- **Resumable:** every dec×RA tile caches to `Scripts/.gaia_cache/tile_d<dec>_r<ra>_g<mag>.csv`, so a
-  re-run skips completed tiles. The mag is in the cache key, so switching depth never replays a stale
-  cache.
-- **G≤11 is ~2.7M stars (~32 MB).** The generator queries in small dec×RA tiles (default 10°×15°) so
-  no single request hits VizieR's row limit or times out on a dense galactic-plane strip. VizieR is
-  primary, ESA is the fallback. If dense tiles still fail, tile finer:
-  `python3 Scripts/download_gaia_catalog.py 11 5 10` (mag, dec°, ra°).
+- Downloads the 20 `tyc2.dat.NN.gz` files to `Scripts/.tycho2_cache/` (skip-existing → resumable),
+  parses mean RA/Dec + VT (fallback BT) mag, writes the dec-sorted LASC binary.
+- The output `Sources/LiveAstroCore/Resources/brightstars.bin` is a **transient artifact** — it's what
+  you upload, not something you commit (the `Resources` dir was removed from the package).
 
-Requires `pip install astroquery`. Attribution: Gaia DR3, ESA/DPAC.
+### As shipped (catalog-v1)
+- 2,539,913 stars, 30,478,968 bytes.
+- SHA-256 `360c949de295d09a1c849e76d353ab667be6afddac814f94a72e4177a9610d22`.
+- Hosted: https://github.com/paulydavis/liveastro-studio/releases/download/catalog-v1/brightstars.bin
+- Wired into `CatalogInstaller.remoteURL` + `expectedSHA256`.
 
-## 2. Host it on GitHub Releases
+## Alternative: Gaia DR3 (deeper, but painful to fetch)
 
-```bash
-shasum -a 256 Sources/LiveAstroCore/Resources/brightstars.bin   # note the hash
+`Scripts/download_gaia_catalog.py` builds a G≤11 Gaia DR3 subset (~2.7M) via ESA/VizieR TAP. It works
+but the query services throttle/queue heavily (dense bands ran ~1 hr each; regional VizieR mirrors
+don't replicate Gaia DR3). Kept for reference; **Tycho-2 is the shipped choice** — comparable density
+for plate-solving, faster/reliable to obtain, and unrestricted. Note Gaia DR3 is CC BY-NC 3.0 IGO
+(download-on-demand only, never bundle).
 
-gh release create catalog-v1 \
-  Sources/LiveAstroCore/Resources/brightstars.bin \
-  --repo paulydavis/liveastro-studio \
-  --title "Star catalog v1 (Gaia DR3 G<=11)" \
-  --notes "Gaia DR3 bright-star subset (G<=11) for native plate-solving. ESA/DPAC."
-```
-GitHub then serves the asset (no auth needed on a public repo, up to 2 GB) at:
-```
-https://github.com/paulydavis/liveastro-studio/releases/download/catalog-v1/brightstars.bin
-```
+## Publish a new catalog
 
-## 3. Wire the URL + hash into the app
-
-In `CatalogInstaller.swift`:
-```swift
-public static var remoteURL = URL(string: "https://github.com/paulydavis/liveastro-studio/releases/download/catalog-v1/brightstars.bin")!
-public static var expectedSHA256 = "<the shasum -a 256 output>"
-```
-Rebuild. The "Download star catalog" button now fetches, verifies against the hash, and enables
-north-up. To publish a new catalog, upload a new release asset (e.g. `catalog-v2`) and bump both values.
+1. Build the `.bin` (above), then `shasum -a 256 Sources/LiveAstroCore/Resources/brightstars.bin`.
+2. `gh release create catalog-vN <bin> --repo paulydavis/liveastro-studio --title "..." --notes "..."`
+3. Set `CatalogInstaller.remoteURL` (…/catalog-vN/brightstars.bin) + `expectedSHA256` to the new hash; rebuild.

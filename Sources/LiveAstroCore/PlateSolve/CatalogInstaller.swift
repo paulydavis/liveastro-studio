@@ -1,20 +1,19 @@
 import Foundation
 import CryptoKit
 
-/// Downloads the Gaia bright-star catalog (~32 MB) on demand and caches it locally, so plate-solving
-/// works in the shipped app WITHOUT bundling the CC BY-NC Gaia data (sub-project 3c).
+/// Downloads the Tycho-2 bright-star catalog (~30 MB) on demand and caches it locally, so plate-solving
+/// works in the shipped app without bundling a 30 MB asset (sub-project 3c).
 ///
 /// Integrity is enforced: the download is verified against `expectedSHA256` (which is REQUIRED — an
 /// empty value fails closed rather than silently accepting an unverified file) AND must parse as a
 /// non-empty catalog, and it's written atomically. So the cache only ever holds a complete, verified
 /// catalog — never a partial one, and never a wrong-but-parseable one.
 public enum CatalogInstaller {
-    /// GitHub Release asset URL for the pre-built G<=11 catalog. PLACEHOLDER until the asset is uploaded
-    /// (see docs/CATALOG.md).
+    /// GitHub Release asset URL for the pre-built Tycho-2 catalog (see docs/CATALOG.md).
     public static var remoteURL = URL(string: "https://github.com/paulydavis/liveastro-studio/releases/download/catalog-v1/brightstars.bin")!
     /// Lowercase hex SHA-256 of the release asset (see docs/CATALOG.md). REQUIRED: an empty value makes
     /// `download` throw `.checksumNotConfigured` rather than install an unverified file.
-    public static var expectedSHA256 = ""
+    public static var expectedSHA256 = "360c949de295d09a1c849e76d353ab667be6afddac814f94a72e4177a9610d22"
 
     /// Test seam: when set, the cache lives here instead of Application Support.
     public static var cacheDirectoryOverride: URL?
