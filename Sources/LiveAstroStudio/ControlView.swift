@@ -713,6 +713,8 @@ struct ControlView: View {
                                     }
 
                                     if latestMasterURL != nil {
+                                        Button("Open master.fit") { openMaster() }
+                                            .help("Open master.fit in your default FITS app (e.g. Siril) for further processing.")
                                         Button("Reveal master.fit") { revealMaster() }
                                             .help("Show the native stacking master in Finder.")
                                     } else if model.lastSessionDirectory != nil {
@@ -916,6 +918,11 @@ struct ControlView: View {
         guard let url = model.watchFolder else { return }
         NSWorkspace.shared.open(url)
         model.log.append("Opened watch folder")
+    }
+
+    private func openMaster() {
+        guard let url = latestMasterURL else { return }
+        NSWorkspace.shared.open(url)   // opens in the user's default FITS app (Siril if configured)
     }
 
     private func revealMaster() {
