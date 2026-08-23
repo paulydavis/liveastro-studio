@@ -20,7 +20,7 @@ signal.signal(signal.SIGALRM, _on_alarm)
 # Per-attempt hard cap. ESA's async service has NO client timeout — a queued/stuck job blocks forever
 # (a real band once sat 56 min). Cap each attempt so a slow/hung job is abandoned and retried (a fresh
 # job usually dodges the slow queue) instead of hanging the whole run.
-ESA_CAP    = 1200   # 20 min per ESA attempt
+ESA_CAP    = 4500   # 75 min per ESA attempt — dense bands legitimately run ~1hr on ESA's slow queue
 VIZIER_CAP = 150    # VizieR throttles under load — fail fast so ESA carries the band
 
 # Default G<=11: enough catalog stars per field to clear the solver's inlier floor even in sparse
