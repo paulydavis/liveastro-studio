@@ -12,14 +12,23 @@ public enum PlateSolver {
     /// 3px inlier tolerance used elsewhere — tight enough to reject wrong pairings, loose enough for the
     /// coarse transform's residual.
     static let refineTolerancePx = 3.0
-    /// A candidate farther than the frame's half-diagonal from center can never be in-frame at any
-    /// rotation (distance from center is rotation-invariant). `frameReachFactor` = that half-diagonal
-    /// plus slack for the approximate-center (mount pointing) offset — the exact pixel-space clip.
-    static let frameReachFactor = 1.1
-    /// The catalog query is an APPROXIMATE angular circle; it reaches `frameReachFactor + querySlack`,
-    /// a guaranteed SUPERSET of the exact pixel clip (never dropping a real edge candidate the clip
-    /// would keep) despite gnomonic nonlinearity near the edge.
-    static let querySlack = 0.1   // frameReachFactor(1.1) + this = 1.2 query radius
+    /// Pixel-space clip reach. A catalog candidate farther than `pointingErrorReach × half-diagonal`
+    /// from the APPROXIMATE center is dropped before the vote (distance from center is rotation-
+    /// invariant, so it can't be in-frame). `pointingErrorReach − 1` is the approx-center (mount
+    /// pointing) error for which edge stars are still admitted, as a fraction of the half-diagonal.
+    /// 1.1 is a MEASURED balance, not an upper bound on tolerable pointing error: a real M63 sub solved
+    /// with its mount pointing 0.13× off (edge stars beyond 1.1× were clipped, but field redundancy
+    /// carried the solve), whereas widening to 1.25× admitted enough extra edge/off-frame distractors to
+    /// BREAK that same real solve. So the reach trades pointing-error headroom against distractor load;
+    /// 1.1 holds up on real dense fields.
+    static let pointingErrorReach = 1.1
+    /// Tiny ANGULAR margin on the catalog query ONLY, so the angular query circle is a strict SUPERSET
+    /// of the pixel-space clip. Gnomonic projection stretches pixel distance slightly beyond the angular
+    /// distance near the edge, so a star at the clip radius subtends slightly LESS angle — a hair of
+    /// margin guarantees the query fetches every star the clip would keep. Superset-safety, NOT reach
+    /// (kept separate from `pointingErrorReach` so the two concerns aren't conflated — the old code
+    /// queried to 1.2× but clipped at 1.1×, fetching a 1.1–1.2× shell it always discarded).
+    static let queryGnomonicMargin = 0.02
 
     // --- Robust known-scale near-solve (rotation-vote) tuning ---
     /// Brightest stars from each side used for the rotation + translation vote.
@@ -42,9 +51,10 @@ public enum PlateSolver {
                              approxCenterRA: Double, approxCenterDec: Double,
                              catalog: StarCatalog, minInliers: Int = 8) -> WCS? {
         guard stars.count >= minInliers, pixelScaleArcsec > 0, width > 0, height > 0 else { return nil }
-        // FOV radius: frame half-diagonal × (clip reach + query slack) — a superset of the pixel clip below.
+        // Angular query radius = the pixel clip reach (below) + a small gnomonic superset margin, so the
+        // query never drops a candidate the clip would keep.
         let radiusDeg = 0.5 * (Double(width * width + height * height)).squareRoot()
-            * pixelScaleArcsec / 3600 * (frameReachFactor + querySlack)
+            * pixelScaleArcsec / 3600 * (pointingErrorReach + queryGnomonicMargin)
         let catStars = catalog.stars(nearRA: approxCenterRA, dec: approxCenterDec, radiusDegrees: radiusDeg)
         guard catStars.count >= minInliers else { return nil }
 
@@ -53,10 +63,12 @@ public enum PlateSolver {
         let frameStars = Array(stars.sorted { $0.flux > $1.flux }.prefix(catalogSelectionCap))
 
         // The catalog query is a CIRCLE, but the frame is a RECTANGLE: a candidate farther than the
-        // frame's half-diagonal from center can never appear in-frame at ANY rotation (distance from
-        // center is rotation-invariant). Clip those out before selection, else bright off-frame stars
-        // (in the circular query's corners) fill the candidate list with un-matchable targets.
-        let maxReachPx = 0.5 * Double(width * width + height * height).squareRoot() * frameReachFactor
+        // frame's half-diagonal (× pointing-error reach) from center can never appear in-frame at ANY
+        // rotation (distance from center is rotation-invariant). Clip those out before selection, else
+        // bright off-frame stars (in the circular query's corners) fill the list with un-matchable
+        // targets. Reaches `pointingErrorReach × half-diagonal` to keep genuine in-frame edge stars when
+        // the approximate center is off by up to (pointingErrorReach − 1) × half-diagonal.
+        let maxReachPx = 0.5 * Double(width * width + height * height).squareRoot() * pointingErrorReach
 
         // ALL in-frame catalog stars projected to grid pixels for a parity (no brightest cap). The
         // rotation vote uses the brightest `catalogSelectionCap` of these; the refinement pass below

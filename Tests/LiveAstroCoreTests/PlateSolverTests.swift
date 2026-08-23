@@ -104,6 +104,32 @@ final class PlateSolverTests: XCTestCase {
         XCTAssertEqual(got.parity, true, "parity mismatch")
     }
 
+    /// Regression for the supported approx-center (mount pointing) error boundary. The approximate
+    /// center is offset from the true center by ~0.2× the half-diagonal — beyond the OLD 1.1× clip's
+    /// 0.1× tolerance (which would drop genuine in-frame edge stars 1.1–1.2× from the offset center),
+    /// within the current `pointingErrorReach` (0.25×). The pixel clip must keep those edge stars for
+    /// the solve to hold up on off-center fields.
+    func testSolvesWithLargeApproxCenterOffset() {
+        let w = 1000, h = 800, scale = 2.0, cra = 150.0, cdec = 30.0, rotDeg = 40.0
+        let cat = syntheticCatalog(cra: cra, cdec: cdec, n: 60)
+        let wcs = (cra: cra, cdec: cdec, rotDeg: rotDeg, scale: scale, parity: false)
+        var frame: [Star] = []
+        for cs in cat.stars {
+            let p = projectThroughWCS(ra: Double(cs.ra), dec: Double(cs.dec), w: w, h: h, wcs: wcs)
+            if p.x < 0 || p.x >= Double(w) || p.y < 0 || p.y >= Double(h) { continue }
+            frame.append(Star(x: p.x + 0.1, y: p.y - 0.1, flux: pow(10, -0.4 * Double(cs.mag))))
+        }
+        // half-diagonal ≈ 0.356°; offset the approx center by ~0.2× that (beyond the old 0.1× reach).
+        let halfDiagDeg = 0.5 * (Double(w*w + h*h)).squareRoot() * scale / 3600
+        guard let got = PlateSolver.solve(stars: frame, width: w, height: h, pixelScaleArcsec: scale,
+                                          approxCenterRA: cra, approxCenterDec: cdec + 0.2 * halfDiagDeg,
+                                          catalog: cat, minInliers: 8) else {
+            return XCTFail("solve returned nil with a 0.2× half-diagonal center offset")
+        }
+        let sep = 3600 * hypot((got.centerRA - cra) * cos(cdec * .pi/180), got.centerDec - cdec)
+        XCTAssertLessThan(sep, 60, "center off by \(sep)\" with a large approx-center offset")
+    }
+
     /// The coarse rotation-vote fits the transform from only the brightest `voteStars` stars, so its
     /// inlier count is thin before refinement. The refinement pass re-matches ALL detected stars against
     /// ALL in-frame catalog stars through that transform and re-fits, lifting the inlier count well
