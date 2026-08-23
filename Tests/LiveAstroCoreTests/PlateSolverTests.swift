@@ -70,13 +70,46 @@ final class PlateSolverTests: XCTestCase {
     func testSolvesSyntheticNormalParity()   { runSynthetic(rotDeg: 27.0, parity: false) }
     func testSolvesSyntheticMirroredParity() { runSynthetic(rotDeg: -63.0, parity: true) }
 
-    /// The triangle match locks the transform from only the brightest ~`triangleStars` stars, so its
-    /// inlier count is capped near that (≈9 on the real sparse M63 field — thin over the floor). The
-    /// refinement pass re-matches ALL detected stars against ALL in-frame catalog stars through that
-    /// transform and re-fits, lifting the inlier count well beyond the triangle cap. This field has
-    /// ~90 in-frame stars; a solve that only triangle-matched would report ≤ `triangleStars` inliers,
-    /// so an inlier count far above that proves refinement engaged.
-    func testRefinementLiftsInlierCountBeyondTriangleCap() {
+    /// Regression (real M63 + Tycho-2, 2026-08-22): a catalog far DEEPER than the frame's detections,
+    /// where the frame's flux ordering does NOT track the catalog's magnitude ordering (as when bright
+    /// catalog stars saturate a long sub, scrambling their measured flux). The old scale-invariant
+    /// triangle match relied on brightest-N-by-flux (frame) overlapping brightest-N-by-mag (catalog) and
+    /// returned nil here; the rotation-vote + full-grid NN must solve it: the vote finds the rotation
+    /// from the length-matched baselines of whatever stars DO overlap, then NN against the full catalog
+    /// recovers the rest.
+    func testSolvesDeepCatalogWithScrambledFrameFlux() {
+        let w = 1400, h = 1100, scale = 2.0, cra = 200.0, cdec = 40.0, rotDeg = -95.0
+        let cat = syntheticCatalog(cra: cra, cdec: cdec, n: 300)   // deep field
+        let wcs = (cra: cra, cdec: cdec, rotDeg: rotDeg, scale: scale, parity: true)
+        var frame: [Star] = []
+        for cs in cat.stars {
+            let p = projectThroughWCS(ra: Double(cs.ra), dec: Double(cs.dec), w: w, h: h, wcs: wcs)
+            if p.x < 0 || p.x >= Double(w) || p.y < 0 || p.y >= Double(h) { continue }
+            // Flux tracks magnitude, but the bright end is CLAMPED (all stars brighter than the
+            // saturation limit read the same capped flux) — scrambling the brightest-by-flux order the
+            // way a saturating sub does, which is what defeated the old brightest-N triangle match.
+            let flux = pow(10, -0.4 * max(Double(cs.mag), 6.2))
+            frame.append(Star(x: p.x + 0.1, y: p.y - 0.1, flux: flux))
+        }
+        XCTAssertGreaterThan(frame.count, 60, "need a deep in-frame set to exercise the regression")
+        guard let got = PlateSolver.solve(stars: frame, width: w, height: h, pixelScaleArcsec: scale,
+                                          approxCenterRA: cra + 0.04, approxCenterDec: cdec - 0.02,
+                                          catalog: cat, minInliers: 8) else {
+            return XCTFail("solve returned nil on a deep catalog with scrambled frame flux")
+        }
+        let sep = 3600 * hypot((got.centerRA - cra) * cos(cdec * .pi/180), got.centerDec - cdec)
+        XCTAssertLessThan(sep, 60, "center off by \(sep)\"")
+        let dRot = ((got.rotationDegrees - rotDeg + 540).truncatingRemainder(dividingBy: 360)) - 180
+        XCTAssertLessThan(abs(dRot), 0.3, "rotation off by \(dRot)°")
+        XCTAssertEqual(got.parity, true, "parity mismatch")
+    }
+
+    /// The coarse rotation-vote fits the transform from only the brightest `voteStars` stars, so its
+    /// inlier count is thin before refinement. The refinement pass re-matches ALL detected stars against
+    /// ALL in-frame catalog stars through that transform and re-fits, lifting the inlier count well
+    /// beyond the vote subset. This field has ~90 in-frame stars, so an inlier count far above a
+    /// brightest-N match proves refinement engaged.
+    func testRefinementLiftsInlierCount() {
         let w = 1500, h = 1300, scale = 2.0, cra = 150.0, cdec = 22.0, rotDeg = 33.0
         let cat = syntheticCatalog(cra: cra, cdec: cdec, n: 120)
         let wcs = (cra: cra, cdec: cdec, rotDeg: rotDeg, scale: scale, parity: false)
@@ -92,8 +125,8 @@ final class PlateSolverTests: XCTestCase {
                                           catalog: cat, minInliers: 8) else {
             return XCTFail("solve returned nil")
         }
-        XCTAssertGreaterThan(got.inlierCount, PlateSolver.triangleStars + 10,
-                             "inliers \(got.inlierCount) should exceed the triangle cap \(PlateSolver.triangleStars) after refinement")
+        XCTAssertGreaterThan(got.inlierCount, 50,
+                             "inliers \(got.inlierCount) should far exceed a brightest-N-only match after refinement")
         let sep = 3600 * hypot((got.centerRA - cra) * cos(cdec * .pi/180), got.centerDec - cdec)
         XCTAssertLessThan(sep, 60, "center off by \(sep)\" after refinement")
     }
