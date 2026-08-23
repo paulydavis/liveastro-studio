@@ -47,6 +47,34 @@ final class MarkdownBlocksTests: XCTestCase {
         XCTAssertEqual(MarkdownBlocks.parse("```\nx\ny"), [.codeBlock("x\ny")])
     }
 
+    func testNestedSubBulletsUnderNumberedItemKeepContinuousNumbering() {
+        // The Help.md Quick Start shape: indented sub-bullets under a numbered item must NOT reset the
+        // counter — one numberedList, item 2 carries its sub-items, item 3 stays "3".
+        let md = """
+        1. First
+        2. Choose a source:
+           - Seestar
+           - ASIAIR
+        3. Third
+        """
+        XCTAssertEqual(MarkdownBlocks.parse(md), [
+            .numberedList([
+                "First",
+                ListItem("Choose a source:", subItems: ["Seestar", "ASIAIR"]),
+                "Third",
+            ])
+        ])
+    }
+
+    func testNestedSubBulletsUnderBulletItem() {
+        XCTAssertEqual(MarkdownBlocks.parse("- Parent\n  - childA\n  - childB\n- Sibling"), [
+            .bulletList([
+                ListItem("Parent", subItems: ["childA", "childB"]),
+                "Sibling",
+            ])
+        ])
+    }
+
     func testTable() {
         let md = """
         | Mode | What |

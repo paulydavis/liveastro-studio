@@ -38,20 +38,14 @@ struct HelpView: View {
         case let .bulletList(items):
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text("•")
-                        Text(inline(item)).fixedSize(horizontal: false, vertical: true)
-                    }
+                    listRow(marker: "•", item: item)
                 }
             }
 
         case let .numberedList(items):
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(items.enumerated()), id: \.offset) { idx, item in
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text("\(idx + 1).").monospacedDigit()
-                        Text(inline(item)).fixedSize(horizontal: false, vertical: true)
-                    }
+                    listRow(marker: "\(idx + 1).", item: item)
                 }
             }
 
@@ -98,6 +92,24 @@ struct HelpView: View {
 
         case .rule:
             Divider().padding(.vertical, 4)
+        }
+    }
+
+    /// One list entry: its marker + text, then any nested sub-bullets indented beneath it.
+    @ViewBuilder
+    private func listRow(marker: String, item: ListItem) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(marker).monospacedDigit()
+                Text(inline(item.text)).fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(Array(item.subItems.enumerated()), id: \.offset) { _, sub in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("◦")
+                    Text(inline(sub)).fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.leading, 18)
+            }
         }
     }
 
