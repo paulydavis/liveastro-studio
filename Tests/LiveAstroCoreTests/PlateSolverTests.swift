@@ -104,11 +104,12 @@ final class PlateSolverTests: XCTestCase {
         XCTAssertEqual(got.parity, true, "parity mismatch")
     }
 
-    /// Regression for the supported approx-center (mount pointing) error boundary. The approximate
-    /// center is offset from the true center by ~0.2× the half-diagonal — beyond the OLD 1.1× clip's
-    /// 0.1× tolerance (which would drop genuine in-frame edge stars 1.1–1.2× from the offset center),
-    /// within the current `pointingErrorReach` (0.25×). The pixel clip must keep those edge stars for
-    /// the solve to hold up on off-center fields.
+    /// Off-center regression: the approximate center (mount pointing) is offset from the true center by
+    /// ~0.2× the half-diagonal. That's beyond `pointingErrorReach`'s 0.1× reach, so the far-edge stars
+    /// (1.1–1.2× from the offset center) ARE clipped — the solve must still succeed on the REDUNDANCY of
+    /// the remaining in-frame stars. This guards that a realistic pointing error doesn't break the solve,
+    /// and that the grid is built around the approximate center (a bug centering it elsewhere would fail
+    /// here even though the un-offset synthetic cases pass).
     func testSolvesWithLargeApproxCenterOffset() {
         let w = 1000, h = 800, scale = 2.0, cra = 150.0, cdec = 30.0, rotDeg = 40.0
         let cat = syntheticCatalog(cra: cra, cdec: cdec, n: 60)
@@ -119,7 +120,8 @@ final class PlateSolverTests: XCTestCase {
             if p.x < 0 || p.x >= Double(w) || p.y < 0 || p.y >= Double(h) { continue }
             frame.append(Star(x: p.x + 0.1, y: p.y - 0.1, flux: pow(10, -0.4 * Double(cs.mag))))
         }
-        // half-diagonal ≈ 0.356°; offset the approx center by ~0.2× that (beyond the old 0.1× reach).
+        // half-diagonal ≈ 0.356°; offset the approx center by ~0.2× that — past the 1.1× clip, so the
+        // far-edge stars are dropped and the solve leans on the remaining in-frame stars' redundancy.
         let halfDiagDeg = 0.5 * (Double(w*w + h*h)).squareRoot() * scale / 3600
         guard let got = PlateSolver.solve(stars: frame, width: w, height: h, pixelScaleArcsec: scale,
                                           approxCenterRA: cra, approxCenterDec: cdec + 0.2 * halfDiagDeg,
