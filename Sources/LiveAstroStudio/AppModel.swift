@@ -533,97 +533,45 @@ final class AppModel {
     /// A session begun on an EMPTY folder can't be matched yet — that's logged and left
     /// uncalibrated (resolve-on-first-sub is a documented follow-up). Not CI-testable
     /// (FileManager + pipeline); the pure matcher/scaler/library are unit-tested.
-    func resolveCalibration(watchFolder: URL, prefix: String?) -> (Calibrator?, [String]) {
-        var messages: [String] = []
-        let library = calibrationLibrary.all()
-        let meta = representativeMetadata(in: watchFolder, prefix: prefix)
-
-        var darkImage: AstroImage?
-        var biasImage: AstroImage?
-
-        if let meta, !library.isEmpty {
-            let result = CalibrationMatcher.match(light: meta, library: library,
-                            options: .init(scaleEnabled: scaleDarksAcrossExposures))
-            messages.append(contentsOf: result.warnings.map { "Calibration: \($0)" })
-            if let b = result.bias {
-                biasImage = calibrationLibrary.master(for: b)
-                if biasImage == nil { messages.append("Calibration: matched a bias but its master file could not be loaded.") }
-            }
-            switch result.dark {
-            case .exact(let f):
-                // Only claim a match once the master actually loads.
-                if let img = calibrationLibrary.master(for: f) {
-                    darkImage = img
-                    messages.append("Calibration: matched \(describe(f)).")
-                } else {
-                    messages.append("Calibration: matched \(describe(f)) but its master file could not be loaded — continuing without a dark.")
-                }
-            case .scaled(let base, let biasF, let factor):
-                // Require both masters loaded AND the scale to succeed (dims can mismatch).
-                if let d = calibrationLibrary.master(for: base),
-                   let bi = calibrationLibrary.master(for: biasF),
-                   let scaled = DarkScaler.scale(dark: d, bias: bi, factor: factor) {
-                    darkImage = scaled
-                    messages.append("Calibration: scaled \(describe(base)) to this exposure.")
-                } else {
-                    messages.append("Calibration: could not scale \(describe(base)) (missing master or size mismatch) — continuing without a dark.")
-                }
-            case .none(let reason):
-                messages.append("Calibration: \(reason)")
-            }
-        } else if meta == nil {
-            messages.append("Calibration: no sub present yet to read camera settings — darks not auto-matched this session.")
+    func resolveCalibration(watchFolder: URL, prefix: String?)
+        -> (calibrator: Calibrator?, messages: [String], foundMetadata: Bool) {
+        // Peek a representative sub already in the folder. If none (empty-folder live
+        // start), report foundMetadata: false so the caller attaches the first-sub
+        // provider instead — calibration then resolves as the first sub lands.
+        guard let meta = representativeMetadata(in: watchFolder, prefix: prefix) else {
+            calibrationStatus = statusLine(dark: false, flat: false)
+            return (nil, ["Calibration: no subs yet — matching from the first sub as it arrives."], false)
         }
-
-        // Legacy explicit dark selection as a fallback when the library had no match.
-        if darkImage == nil, let p = calibration.darkPath {
-            do {
-                darkImage = try MasterBuilder.load(URL(fileURLWithPath: p))
-                messages.append("Calibration: using selected dark file.")
-            } catch {
-                messages.append("Calibration: selected dark could not be read — \(error.localizedDescription).")
-            }
-        }
-
-        // Session flat: build fresh from the chosen flats folder (offset = dark-flats else bias).
-        var flatImage: AstroImage?
-        if let flatsFolder = sessionFlatsFolder {
-            var offset = biasImage
-            if let dfFolder = sessionDarkFlatsFolder {
-                let dfURLs = CalibrationLibrary.fitsFiles(in: dfFolder)
-                if dfURLs.isEmpty {
-                    messages.append("Calibration: no dark-flats in that folder — using bias as the flat offset.")
-                } else {
-                    do { offset = try MasterBuilder.combine(fitsURLs: dfURLs, kind: .bias, bias: nil) }
-                    catch { messages.append("Calibration: dark-flats build failed — \(error.localizedDescription); using bias instead.") }
-                }
-            }
-            let urls = CalibrationLibrary.fitsFiles(in: flatsFolder)
-            if urls.isEmpty {
-                messages.append("Calibration: no flats found in the flats folder — continuing without a flat.")
-            } else {
-                do {
-                    flatImage = try MasterBuilder.combine(fitsURLs: urls, kind: .flat, bias: offset)
-                    messages.append("Calibration: built master flat from \(urls.count) flats\(offset != nil ? " (offset subtracted)" : "").")
-                } catch {
-                    messages.append("Calibration: flat build failed — \(error.localizedDescription); continuing without a flat.")
-                }
-            }
-        } else if let p = calibration.flatPath {
-            do {
-                // Normalize legacy/external master flats to median 1 (idempotent) so a
-                // non-normalized file can't over/under-correct — matches the session-flat path.
-                flatImage = MasterBuilder.normalizedFlat(try MasterBuilder.load(URL(fileURLWithPath: p)))
-                messages.append("Calibration: using selected flat file.")
-            } catch {
-                messages.append("Calibration: selected flat could not be read — \(error.localizedDescription).")
-            }
-        }
-
-        calibrationStatus = statusLine(dark: darkImage != nil, flat: flatImage != nil)
-        guard darkImage != nil || flatImage != nil else { return (nil, messages) }
-        return (Calibrator(dark: darkImage, flat: flatImage), messages)
+        let r = CalibrationResolver.resolve(
+            metadata: meta, library: calibrationLibrary, scaleEnabled: scaleDarksAcrossExposures,
+            flatsFolder: sessionFlatsFolder, darkFlatsFolder: sessionDarkFlatsFolder,
+            legacyDarkPath: calibration.darkPath, legacyFlatPath: calibration.flatPath)
+        calibrationStatus = statusLine(dark: r.hasDark, flat: r.hasFlat)
+        return (r.calibrator, r.messages, true)
     }
+
+    /// First-sub calibrator provider for empty-folder starts: the pipeline calls this
+    /// with the first frame's header on the consume task; it resolves calibration and
+    /// hops to the main actor to log + update the status line.
+    private func makeCalibratorProvider() -> ((SourceMetadata) -> Calibrator?) {
+        let library = calibrationLibrary
+        let scale = scaleDarksAcrossExposures
+        let flats = sessionFlatsFolder, darkFlats = sessionDarkFlatsFolder
+        let legacyDark = calibration.darkPath, legacyFlat = calibration.flatPath
+        return { [weak self] meta in
+            let r = CalibrationResolver.resolve(
+                metadata: meta, library: library, scaleEnabled: scale,
+                flatsFolder: flats, darkFlatsFolder: darkFlats,
+                legacyDarkPath: legacyDark, legacyFlatPath: legacyFlat)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                r.messages.forEach { self.log.append($0) }
+                self.calibrationStatus = self.statusLine(dark: r.hasDark, flat: r.hasFlat)
+            }
+            return r.calibrator
+        }
+    }
+
 
     private func representativeMetadata(in folder: URL, prefix: String?) -> SourceMetadata? {
         var files = CalibrationLibrary.fitsFiles(in: folder)
@@ -638,13 +586,6 @@ final class AppModel {
         return nil
     }
 
-    private func describe(_ f: MasterFrame) -> String {
-        var parts: [String] = []
-        if let e = f.exposureSeconds { parts.append("\(Int(e))s") }
-        if let t = f.setTempC { parts.append("\(Int(t))°C") }
-        if let g = f.gain { parts.append("gain \(Int(g))") }
-        return "\(f.camera) dark" + (parts.isEmpty ? "" : " (\(parts.joined(separator: ", ")))")
-    }
 
     private func statusLine(dark: Bool, flat: Bool) -> String {
         switch (dark, flat) {
@@ -754,13 +695,15 @@ final class AppModel {
             let source = FolderFrameSource(folder: folder, mode: .live,
                                             fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
             let engine = makeStackEngine()
-            let (calibrator, calMessages) = resolveCalibration(
+            let cal = resolveCalibration(
                 watchFolder: folder, prefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
-            calMessages.forEach { log.append($0) }
+            cal.messages.forEach { log.append($0) }
             CalibrationStore.save(calibration, to: .standard)
+            // Empty folder at Start → resolve calibration from the first sub that lands.
+            let provider = cal.foundMetadata ? nil : makeCalibratorProvider()
             p = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
                 rootDirectory: root, neutralizeBackground: neutralizeBackground,
-                               calibrator: calibrator)
+                calibrator: cal.calibrator, calibratorProvider: provider)
         }
         p.displayAdjustments = displayAdjustments
 

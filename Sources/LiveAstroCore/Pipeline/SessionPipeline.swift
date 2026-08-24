@@ -221,6 +221,14 @@ public final class SessionPipeline {
     private let maxKeyframes: Int
     private let neutralizeBackground: Bool
     private let calibrator: Calibrator?
+    /// Native-only fallback: resolves a Calibrator from the FIRST frame's header
+    /// metadata when no explicit `calibrator` was supplied — e.g. a live session
+    /// started on an empty folder, where the lights' camera/gain/exposure aren't
+    /// known until the first sub lands. Called at most once, on the serial consume
+    /// task inside handleNative, so its state needs no extra locking.
+    private let calibratorProvider: ((SourceMetadata) -> Calibrator?)?
+    private var providerCalibrator: Calibrator?
+    private var providerAttempted = false
     /// Injectable for the master-snapshot atomic swap (FileReplace). Tests substitute a
     /// FileManager whose replace/move throws to prove a prior good master survives a
     /// failed write. Production uses `.default`.
@@ -296,6 +304,7 @@ public final class SessionPipeline {
         self.maxKeyframes = maxKeyframes
         self.neutralizeBackground = neutralizeBackground
         self.calibrator = nil
+        self.calibratorProvider = nil
     }
 
     /// Native stacking mode: pulls raw frames from a FrameSource, stacks them with StackEngine,
@@ -303,7 +312,8 @@ public final class SessionPipeline {
     public init(nativeSource: FrameSource, engine: StackEngine, profile: SessionProfile,
                 rootDirectory: URL, replaySettings: ReplaySettings = .init(),
                 maxKeyframes: Int = FrameSelector.defaultMaxKeyframes,
-                neutralizeBackground: Bool = false, calibrator: Calibrator? = nil) {
+                neutralizeBackground: Bool = false, calibrator: Calibrator? = nil,
+                calibratorProvider: ((SourceMetadata) -> Calibrator?)? = nil) {
         self.watcher = nil
         self.source = nativeSource
         self.engine = engine
@@ -313,6 +323,7 @@ public final class SessionPipeline {
         self.maxKeyframes = maxKeyframes
         self.neutralizeBackground = neutralizeBackground
         self.calibrator = calibrator
+        self.calibratorProvider = calibratorProvider
     }
 
     /// Review10 item 5: a RUNNING pipeline dropped without end() must not leak its live
@@ -564,8 +575,17 @@ public final class SessionPipeline {
     private func handleNative(_ rawFrame: RawFrame, engine: StackEngine) {
         withCallbackDelivery {
             if cancelled.isSet { return }
-            if sourceMetadata == nil, let m = rawFrame.metadata { sourceMetadata = m }
-            let frame = calibrator?.apply(rawFrame) ?? rawFrame
+            if sourceMetadata == nil, let m = rawFrame.metadata {
+                sourceMetadata = m
+                // No explicit calibrator (empty-folder live start): resolve one now from
+                // this first frame's header. Once only; serial consume task → no lock.
+                if calibrator == nil, !providerAttempted, let provider = calibratorProvider {
+                    providerAttempted = true
+                    providerCalibrator = provider(m)
+                    providerCalibrator?.onLog = { [weak self] in self?.onLog?($0) }
+                }
+            }
+            let frame = (calibrator ?? providerCalibrator)?.apply(rawFrame) ?? rawFrame
             let outcome = engine.process(frame)
             if engine.autoReseedCount != lastAutoReseedCount {
                 lastAutoReseedCount = engine.autoReseedCount
