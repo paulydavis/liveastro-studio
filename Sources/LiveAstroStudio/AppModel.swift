@@ -185,6 +185,17 @@ final class AppModel {
     private var pipeline: SessionPipeline?
     private var demoTask: Task<Void, Never>?
 
+    /// Snapshot of the user's real session metadata, captured when a Try-Demo
+    /// session overrides these fields with demo values ("Demo Nebula", 30 s,
+    /// "Demo Stack Generator", …). Restored when the demo session ends so a later
+    /// real session — and the persisted settings — never inherit demo branding.
+    /// nil whenever no demo override is active.
+    private struct DemoMetadataSnapshot {
+        var targetName, telescope, camera, mount, filter, locationLabel: String
+        var bortleText, subExposureText, notes: String
+    }
+    private var metadataBeforeDemo: DemoMetadataSnapshot?
+
     // MARK: - Session completion (spec §2)
 
     /// Per-session completion state (idle safeguard + planned stop flags, re-arm).
@@ -347,7 +358,29 @@ final class AppModel {
         return max(plannedStopArmedAt ?? floor, floor)
     }
 
-    func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
+    func saveSettings() {
+        var settings = currentSettings()
+        // While a Try-Demo override is active, never persist its transient branding.
+        // Any saveSettings during a demo (start, display-adjust, end) keeps the
+        // user's real target name and exposure on disk — so a crash or force-quit
+        // mid-demo can't leave "Demo Nebula"/30 s in saved settings.
+        if let snap = metadataBeforeDemo {
+            settings.targetName = snap.targetName
+            settings.subExposureSeconds = Double(snap.subExposureText) ?? settings.subExposureSeconds
+        }
+        SessionSettingsStore.save(settings, to: .standard)
+    }
+
+    /// Restore the user's real metadata captured before a Try-Demo session, so the
+    /// demo leaves no residue in the fields (or, via saveSettings, on disk). No-op
+    /// when no demo override is active.
+    private func restoreMetadataAfterDemoIfNeeded() {
+        guard let snap = metadataBeforeDemo else { return }
+        targetName = snap.targetName; telescope = snap.telescope; camera = snap.camera
+        mount = snap.mount; filter = snap.filter; locationLabel = snap.locationLabel
+        bortleText = snap.bortleText; subExposureText = snap.subExposureText; notes = snap.notes
+        metadataBeforeDemo = nil
+    }
 
     func loadSettings() {
         let s = SessionSettingsStore.load(.standard)
@@ -560,6 +593,13 @@ final class AppModel {
         }
 
         demoTask?.cancel()
+        // Snapshot the user's real metadata so ending the demo restores it — the
+        // demo must leave no "Demo Nebula"/30 s branding on a later real session
+        // or in saved settings (see metadataBeforeDemo, saveSettings, endSession).
+        metadataBeforeDemo = DemoMetadataSnapshot(
+            targetName: targetName, telescope: telescope, camera: camera, mount: mount,
+            filter: filter, locationLabel: locationLabel, bortleText: bortleText,
+            subExposureText: subExposureText, notes: notes)
         sourceMode = .stackerOutput
         watchFolder = folder
         fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
@@ -695,6 +735,7 @@ final class AppModel {
     }
 
     func endSession() {
+        restoreMetadataAfterDemoIfNeeded()   // undo demo branding before it can be persisted
         saveSettings()
         completionTick?.cancel()
         completionTick = nil
