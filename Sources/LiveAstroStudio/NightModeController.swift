@@ -30,12 +30,36 @@ final class NightModeController {
     /// Night Shift / power events that quietly reset the gamma table at the scope.
     private static let reapplyInterval: TimeInterval = 2.0
 
+    /// A single stable C callback so register and remove pass the *identical* pointer
+    /// (two inline closure literals are not guaranteed to compare equal). The context
+    /// pointer is the owning controller, resolved unretained.
+    private static let reconfigurationCallback: CGDisplayReconfigurationCallBack = { _, flags, userInfo in
+        // Ignore the "begin" phase — the display is mid-change and would wipe our
+        // write. Re-apply once it settles (any non-begin callback).
+        guard !flags.contains(.beginConfigurationFlag), let userInfo else { return }
+        Unmanaged<NightModeController>.fromOpaque(userInfo)
+            .takeUnretainedValue().reapplyIfActive()
+    }
+
     init() {
         // Restore normal color the instant a normal quit begins (belt-and-suspenders;
         // process-exit revert would clear it regardless, but this is immediate).
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleAppWillTerminate),
             name: NSApplication.willTerminateNotification, object: nil)
+    }
+
+    deinit {
+        // The reconfiguration callback holds an unretained pointer to self; it MUST be
+        // removed before self is freed or a later display change dereferences freed
+        // memory. Also tear down the timer/observer and clear any active tint.
+        if reconfigureRegistered {
+            CGDisplayRemoveReconfigurationCallback(
+                Self.reconfigurationCallback, Unmanaged.passUnretained(self).toOpaque())
+        }
+        reapplyTimer?.invalidate()
+        NotificationCenter.default.removeObserver(self)
+        if isActive { CGDisplayRestoreColorSyncSettings() }
     }
 
     /// Turn the tint on at `level`, or update the level if already on.
@@ -90,14 +114,8 @@ final class NightModeController {
     private func registerReconfigurationCallbackIfNeeded() {
         guard !reconfigureRegistered else { return }
         reconfigureRegistered = true
-        let ctx = Unmanaged.passUnretained(self).toOpaque()
-        CGDisplayRegisterReconfigurationCallback({ _, flags, userInfo in
-            // Ignore the "begin" phase — the display is mid-change and would wipe our
-            // write. Re-apply once it settles (any non-begin callback).
-            guard !flags.contains(.beginConfigurationFlag), let userInfo else { return }
-            Unmanaged<NightModeController>.fromOpaque(userInfo)
-                .takeUnretainedValue().reapplyIfActive()
-        }, ctx)
+        CGDisplayRegisterReconfigurationCallback(
+            Self.reconfigurationCallback, Unmanaged.passUnretained(self).toOpaque())
     }
 
     @objc private func handleAppWillTerminate() {
