@@ -543,16 +543,28 @@ final class AppModel {
             let result = CalibrationMatcher.match(light: meta, library: library,
                             options: .init(scaleEnabled: scaleDarksAcrossExposures))
             messages.append(contentsOf: result.warnings.map { "Calibration: \($0)" })
-            if let b = result.bias { biasImage = calibrationLibrary.master(for: b) }
+            if let b = result.bias {
+                biasImage = calibrationLibrary.master(for: b)
+                if biasImage == nil { messages.append("Calibration: matched a bias but its master file could not be loaded.") }
+            }
             switch result.dark {
             case .exact(let f):
-                darkImage = calibrationLibrary.master(for: f)
-                messages.append("Calibration: matched \(describe(f)).")
+                // Only claim a match once the master actually loads.
+                if let img = calibrationLibrary.master(for: f) {
+                    darkImage = img
+                    messages.append("Calibration: matched \(describe(f)).")
+                } else {
+                    messages.append("Calibration: matched \(describe(f)) but its master file could not be loaded — continuing without a dark.")
+                }
             case .scaled(let base, let biasF, let factor):
+                // Require both masters loaded AND the scale to succeed (dims can mismatch).
                 if let d = calibrationLibrary.master(for: base),
-                   let bi = calibrationLibrary.master(for: biasF) {
-                    darkImage = DarkScaler.scale(dark: d, bias: bi, factor: factor)
+                   let bi = calibrationLibrary.master(for: biasF),
+                   let scaled = DarkScaler.scale(dark: d, bias: bi, factor: factor) {
+                    darkImage = scaled
                     messages.append("Calibration: scaled \(describe(base)) to this exposure.")
+                } else {
+                    messages.append("Calibration: could not scale \(describe(base)) (missing master or size mismatch) — continuing without a dark.")
                 }
             case .none(let reason):
                 messages.append("Calibration: \(reason)")
