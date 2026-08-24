@@ -421,6 +421,25 @@ struct ControlView: View {
                     // Observes the OBSController (Combine ObservableObject) so its
                     // @Published state/scene/record changes re-render this section.
                     OBSSection(model: model)
+                    Section("Night vision") {
+                        helpToggle("Red screen", isOn: $model.nightVisionOn,
+                                   help: "Tints the whole Mac display red to protect your dark adaptation at the scope — affects every app, not just LiveAstro. Clears when you quit.")
+                            .onChange(of: model.nightVisionOn) { _, _ in model.applyNightVision() }
+                        if model.nightVisionOn {
+                            HStack {
+                                Text("Brightness").frame(width: 90, alignment: .leading)
+                                Slider(value: $model.nightVisionLevel, in: 1...100)
+                                    .onChange(of: model.nightVisionLevel) { _, _ in
+                                        if model.nightVisionOn { model.applyNightVision() }
+                                    }
+                                Text("\(Int(model.nightVisionLevel))%")
+                                    .frame(width: 48, alignment: .trailing).monospacedDigit()
+                            }
+                            .help("Lower = dimmer and deeper red. Your keyboard brightness keys still work on top.")
+                        }
+                        Text("A screenshot still looks normal — macOS captures the image before the display tint is applied.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
                     Section("Display Adjustments") {
                         VStack(alignment: .leading) {
                             Text("Black point")
