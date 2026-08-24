@@ -649,7 +649,12 @@ final class AppModel {
         case (true, true):  return "Calibrating with dark + flat ✓"
         case (true, false): return "Calibrating with dark ✓"
         case (false, true): return "Calibrating with flat ✓"
-        case (false, false): return "No calibration applied"
+        case (false, false):
+            // Gentle, actionable — a raw stack looks noisy without calibration, and that's
+            // often mistaken for the app rather than missing darks/flats.
+            return libraryEntries.isEmpty
+                ? "No calibration — add darks/bias to the library for a cleaner stack"
+                : "No calibration applied"
         }
     }
 

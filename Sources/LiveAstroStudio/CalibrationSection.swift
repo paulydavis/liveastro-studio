@@ -58,6 +58,8 @@ struct CalibrationSection: View {
                       help: "Optional raw dark-flats — subtracted from the flats when the master flat is built.")
             Text("Flats aren't stored in the library — they're built fresh each session from the folders above.")
                 .font(.caption2).foregroundStyle(.secondary)
+            Text("The Live view is a real-time preview; the finished image is master.fit — open it in Siril or PixInsight for the final result.")
+                .font(.caption2).foregroundStyle(.secondary)
         }
         .onAppear { model.refreshLibraryEntries() }
     }
