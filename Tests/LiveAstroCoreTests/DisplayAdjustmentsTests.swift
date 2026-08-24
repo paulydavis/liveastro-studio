@@ -32,6 +32,16 @@ final class DisplayAdjustmentsTests: XCTestCase {
         XCTAssertEqual(DisplayAdjustments(), n)
     }
 
+    func testLiveDefaultIsNeutralPlusDBE() {
+        // liveDefault (fresh-install / Reset target) has DBE on; neutral (identity)
+        // stays off. They differ only by backgroundExtraction.
+        XCTAssertTrue(DisplayAdjustments.liveDefault.backgroundExtraction)
+        XCTAssertFalse(DisplayAdjustments.neutral.backgroundExtraction)
+        var expected = DisplayAdjustments.neutral
+        expected.backgroundExtraction = true
+        XCTAssertEqual(DisplayAdjustments.liveDefault, expected)
+    }
+
     func testDBERoundTrip() throws {
         let a = DisplayAdjustments(blackPoint: 0.05, midtoneStrength: 0.2, saturation: 1.3,
                                    backgroundExtraction: true, backgroundDegree: 2)

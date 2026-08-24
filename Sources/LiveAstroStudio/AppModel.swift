@@ -124,7 +124,7 @@ final class AppModel {
     var log: [String] = []
     var replayURL: URL?
     var processorBackend: ProcessorBackend = .none
-    var displayAdjustments = DisplayAdjustments.neutral
+    var displayAdjustments = DisplayAdjustments.liveDefault
 
     /// Red night-vision tint of the *whole Mac display* (not just the astro image).
     /// In-memory only — defaults off each launch so the app never opens unexpectedly red.
@@ -424,7 +424,9 @@ final class AppModel {
         liveSource.relayRetentionDays = s.relayRetentionDays
         demosaic = s.demosaic
         processorBackend = s.processorBackend
-        displayAdjustments = s.displayAdjustments
+        // Fresh install (no saved settings) starts with the recommended DBE-on look;
+        // a returning user keeps whatever they last had.
+        displayAdjustments = SessionSettingsStore.exists(.standard) ? s.displayAdjustments : .liveDefault
         idleSafeguardEnabled = s.idleSafeguardEnabled
         idleSafeguardMinutes = s.idleSafeguardMinutes
         plannedStopEnabled = s.plannedStopEnabled

@@ -136,4 +136,8 @@ public enum SessionSettingsStore {
     public static func save(_ s: SessionSettings, to d: UserDefaults) {
         if let data = try? JSONEncoder().encode(s) { d.set(data, forKey: key) }
     }
+
+    /// True once the user has saved settings at least once — lets the app apply a
+    /// first-run default (e.g. DBE-on display) without overriding a returning user.
+    public static func exists(_ d: UserDefaults) -> Bool { d.data(forKey: key) != nil }
 }

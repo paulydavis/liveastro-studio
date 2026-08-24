@@ -520,10 +520,10 @@ struct ControlView: View {
                         Text("Star catalog: Gaia DR3 (ESA/DPAC)")
                             .font(.caption2).foregroundStyle(.secondary)
                         Button("Reset") {
-                            model.displayAdjustments = .neutral
+                            model.displayAdjustments = .liveDefault
                             model.applyDisplayAdjustments()
                         }
-                        .help("Back to the neutral auto-stretch look.")
+                        .help("Back to the recommended look (auto-stretch with background flattening on).")
                     }
                     Section {
                         ScrollView {
