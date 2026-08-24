@@ -546,9 +546,12 @@ struct ControlView: View {
                     }
                 }
                 .formStyle(.grouped)
+                // Force a permanent legacy scrollbar on the backing NSScrollView — a
+                // zero-size probe inside the scroll content reaches up to it. This is
+                // what actually keeps the bar visible; .scrollIndicators(.visible) alone
+                // doesn't override the macOS overlay auto-hide.
+                .background(AlwaysVisibleScroller())
             }
-            // Keep the Setup scrollbar always visible (not the auto-hiding overlay) so
-            // it's an easy, permanent grab target instead of a thin fade-in slider.
             .scrollIndicators(.visible)
 
             Divider()
