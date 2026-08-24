@@ -109,6 +109,21 @@ final class AppModel {
     var replayURL: URL?
     var processorBackend: ProcessorBackend = .none
     var displayAdjustments = DisplayAdjustments.neutral
+
+    /// Red night-vision tint of the *whole Mac display* (not just the astro image).
+    /// In-memory only — defaults off each launch so the app never opens unexpectedly red.
+    var nightVisionOn = false
+    /// Tint brightness 1...100 (Double for the slider); lower is dimmer.
+    var nightVisionLevel = Double(NightVision.defaultLevel)
+    private let nightMode = NightModeController()
+
+    /// Apply the current night-vision on/off + level to the display. Called from the
+    /// control-panel toggle and slider.
+    func applyNightVision() {
+        if nightVisionOn { nightMode.enable(level: Int(nightVisionLevel)) }
+        else { nightMode.disable() }
+    }
+
     /// True once the reference frame has been plate-solved — gates the "North up" toggle. Refreshed on
     /// each display update from `pipeline.hasSolvedWCS`.
     private(set) var solveAvailable = false
