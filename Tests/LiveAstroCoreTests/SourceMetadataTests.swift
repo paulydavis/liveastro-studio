@@ -28,6 +28,26 @@ final class SourceMetadataTests: XCTestCase {
         XCTAssertEqual(m.siteLon ?? 0, -97.6027, accuracy: 1e-4)
     }
 
+    func testParsesBinningAndSetTemp() {
+        // XBINNING is an integer; SET-TEMP the cooler set-point, distinct from CCD-TEMP.
+        let m = SourceMetadata(fitsKeywords: [
+            "XBINNING": "2", "SET-TEMP": "-10.0", "CCD-TEMP": "-9.6", "GAIN": "100",
+        ])
+        XCTAssertEqual(m.binning, 2)
+        XCTAssertEqual(m.setTempC ?? 0, -10.0, accuracy: 1e-6)
+        XCTAssertEqual(m.ccdTempC ?? 0, -9.6, accuracy: 1e-6)
+    }
+
+    func testBinningRoundsFloatFormattedValue() {
+        // Some writers emit "2.0" for XBINNING; it must land as Int 2.
+        XCTAssertEqual(SourceMetadata(fitsKeywords: ["XBINNING": "2.0"]).binning, 2)
+    }
+
+    func testBinningAndSetTempNilWhenAbsent() {
+        let m = SourceMetadata(fitsKeywords: ["OBJECT": "M31"])
+        XCTAssertNil(m.binning); XCTAssertNil(m.setTempC)
+    }
+
     func testStripsQuotesAndWhitespace() {
         let m = SourceMetadata(fitsKeywords: ["OBJECT": "'NGC 6960 '", "RA": " 314.5 "])
         XCTAssertEqual(m.object, "NGC 6960")   // quotes stripped, trailing space trimmed

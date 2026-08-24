@@ -1,6 +1,6 @@
 import Foundation
 
-public enum MasterKind { case dark, flat, bias }
+public enum MasterKind: String, Codable { case dark, flat, bias }
 
 /// Builds master calibration frames by mean-combining raw FITS frames.
 /// Masters are canonical TOP-DOWN AstroImages (read with normalizeRowOrder: true),
