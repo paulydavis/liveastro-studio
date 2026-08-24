@@ -373,8 +373,7 @@ struct ControlView: View {
                     }
                     if model.sourceMode == .nativeStack {
                         Section("Calibration") {
-                            CalibrationSection(selection: $model.calibration,
-                                               onLog: { model.log.append($0) })
+                            CalibrationSection(model: model)
                         }
                     }
                     Section("Session Profile") {

@@ -86,6 +86,22 @@ final class AppModel {
     var scaleNormalizationEnabled = true
     var demosaic: DemosaicMethod = .malvar
     var calibration = CalibrationStore.load(.standard)
+
+    /// Reusable master darks/bias, matched to a session by camera + settings.
+    let calibrationLibrary = CalibrationLibrary()
+    /// Per-session flat frames (shot fresh each night) — a folder of raw flats built now.
+    var sessionFlatsFolder: URL?
+    /// Optional per-session dark-flats folder (offset subtracted when building the flat).
+    var sessionDarkFlatsFolder: URL?
+    /// Scale a library dark across exposures using bias when no exact-exposure dark exists.
+    var scaleDarksAcrossExposures = true
+    /// Latest auto-match status line, shown in the Calibration section.
+    var calibrationStatus = ""
+    /// Observable mirror of the on-disk library, for the Calibration list UI.
+    var libraryEntries: [MasterFrame] = []
+    /// True while a master is building/rebuilding (disables the add buttons).
+    var calibrationBusy = false
+
     var watchFolder: URL?
     var sourceMode: SourceMode = .stackerOutput {
         didSet {
@@ -506,6 +522,182 @@ final class AppModel {
                                          subSeconds: profile.subExposureSeconds)
     }
 
+    /// Resolve the session's calibration by reading a representative sub already in
+    /// the watch folder, auto-matching a master dark/bias from the library (scaling
+    /// by exposure when needed), and building the session flat. Returns the Calibrator
+    /// (nil if nothing applies) plus log lines.
+    ///
+    /// Peek-at-Start: real captures (ASIAIR/Seestar/NINA) have subs present at Start.
+    /// A session begun on an EMPTY folder can't be matched yet — that's logged and left
+    /// uncalibrated (resolve-on-first-sub is a documented follow-up). Not CI-testable
+    /// (FileManager + pipeline); the pure matcher/scaler/library are unit-tested.
+    func resolveCalibration(watchFolder: URL, prefix: String?) -> (Calibrator?, [String]) {
+        var messages: [String] = []
+        let library = calibrationLibrary.all()
+        let meta = representativeMetadata(in: watchFolder, prefix: prefix)
+
+        var darkImage: AstroImage?
+        var biasImage: AstroImage?
+
+        if let meta, !library.isEmpty {
+            let result = CalibrationMatcher.match(light: meta, library: library,
+                            options: .init(scaleEnabled: scaleDarksAcrossExposures))
+            messages.append(contentsOf: result.warnings.map { "Calibration: \($0)" })
+            if let b = result.bias { biasImage = calibrationLibrary.master(for: b) }
+            switch result.dark {
+            case .exact(let f):
+                darkImage = calibrationLibrary.master(for: f)
+                messages.append("Calibration: matched \(describe(f)).")
+            case .scaled(let base, let biasF, let factor):
+                if let d = calibrationLibrary.master(for: base),
+                   let bi = calibrationLibrary.master(for: biasF) {
+                    darkImage = DarkScaler.scale(dark: d, bias: bi, factor: factor)
+                    messages.append("Calibration: scaled \(describe(base)) to this exposure.")
+                }
+            case .none(let reason):
+                messages.append("Calibration: \(reason)")
+            }
+        } else if meta == nil {
+            messages.append("Calibration: no sub present yet to read camera settings — darks not auto-matched this session.")
+        }
+
+        // Legacy explicit dark selection as a fallback when the library had no match.
+        if darkImage == nil, let p = calibration.darkPath {
+            darkImage = try? MasterBuilder.load(URL(fileURLWithPath: p))
+            if darkImage != nil { messages.append("Calibration: using selected dark file.") }
+        }
+
+        // Session flat: build fresh from the chosen flats folder (offset = dark-flats or bias).
+        var flatImage: AstroImage?
+        if let flatsFolder = sessionFlatsFolder {
+            let offset = darkFlatOffset() ?? biasImage
+            let urls = CalibrationLibrary.fitsFiles(in: flatsFolder)
+            if urls.isEmpty {
+                messages.append("Calibration: no flats found in the flats folder.")
+            } else if let flat = try? MasterBuilder.combine(fitsURLs: urls, kind: .flat, bias: offset) {
+                flatImage = flat
+                messages.append("Calibration: built master flat from \(urls.count) flats\(offset != nil ? " (offset subtracted)" : "").")
+            }
+        } else if let p = calibration.flatPath {
+            flatImage = try? MasterBuilder.load(URL(fileURLWithPath: p))
+            if flatImage != nil { messages.append("Calibration: using selected flat file.") }
+        }
+
+        calibrationStatus = statusLine(dark: darkImage != nil, flat: flatImage != nil)
+        guard darkImage != nil || flatImage != nil else { return (nil, messages) }
+        return (Calibrator(dark: darkImage, flat: flatImage), messages)
+    }
+
+    private func darkFlatOffset() -> AstroImage? {
+        guard let folder = sessionDarkFlatsFolder else { return nil }
+        let urls = CalibrationLibrary.fitsFiles(in: folder)
+        guard !urls.isEmpty else { return nil }
+        return try? MasterBuilder.combine(fitsURLs: urls, kind: .bias, bias: nil)
+    }
+
+    private func representativeMetadata(in folder: URL, prefix: String?) -> SourceMetadata? {
+        var files = CalibrationLibrary.fitsFiles(in: folder)
+        if let prefix, !prefix.isEmpty { files = files.filter { $0.lastPathComponent.hasPrefix(prefix) } }
+        for url in files.sorted(by: { $0.lastPathComponent > $1.lastPathComponent }) {   // newest first
+            guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
+            defer { try? fh.close() }
+            guard let head = try? fh.read(upToCount: 256 * 1024),   // header only, not pixels
+                  let header = try? FITSReader.readHeader(head) else { continue }
+            return SourceMetadata(fitsKeywords: header.keywords)
+        }
+        return nil
+    }
+
+    private func describe(_ f: MasterFrame) -> String {
+        var parts: [String] = []
+        if let e = f.exposureSeconds { parts.append("\(Int(e))s") }
+        if let t = f.setTempC { parts.append("\(Int(t))°C") }
+        if let g = f.gain { parts.append("gain \(Int(g))") }
+        return "\(f.camera) dark" + (parts.isEmpty ? "" : " (\(parts.joined(separator: ", ")))")
+    }
+
+    private func statusLine(dark: Bool, flat: Bool) -> String {
+        switch (dark, flat) {
+        case (true, true):  return "Calibrating with dark + flat ✓"
+        case (true, false): return "Calibrating with dark ✓"
+        case (false, true): return "Calibrating with flat ✓"
+        case (false, false): return "No calibration applied"
+        }
+    }
+
+    // MARK: - Calibration library management
+
+    func refreshLibraryEntries() { libraryEntries = calibrationLibrary.all() }
+
+    /// Build a master (dark or bias) from a folder of raw frames, keyed automatically
+    /// from the first frame's FITS header, and add it to the library. Off the main thread.
+    func addMasterFromFolder(_ folder: URL, kind: MasterKind) {
+        let urls = CalibrationLibrary.fitsFiles(in: folder)
+        guard !urls.isEmpty else { log.append("Calibration: no FITS frames in that folder."); return }
+        calibrationBusy = true
+        log.append("Calibration: building \(kind.rawValue) master from \(urls.count) frames…")
+        let lib = calibrationLibrary
+        Task.detached { [weak self] in
+            // Swift 6: rebind weak self to a strong immutable up front — nested
+            // @Sendable closures may not reference a captured weak *var*.
+            guard let self else { return }
+            var meta = SourceMetadata()
+            if let fh = try? FileHandle(forReadingFrom: urls[0]) {
+                if let head = try? fh.read(upToCount: 256 * 1024),
+                   let header = try? FITSReader.readHeader(head) {
+                    meta = SourceMetadata(fitsKeywords: header.keywords)
+                }
+                try? fh.close()
+            }
+            do {
+                let frame = try lib.add(kind: kind, camera: meta.instrument ?? "Camera",
+                    gain: meta.gain, exposureSeconds: kind == .bias ? nil : meta.exposureSeconds,
+                    setTempC: meta.setTempC ?? meta.ccdTempC, binning: meta.binning, fitsURLs: urls)
+                await MainActor.run {
+                    self.calibrationBusy = false
+                    self.refreshLibraryEntries()
+                    self.log.append("Calibration: added \(frame.camera) \(kind.rawValue).")
+                }
+            } catch {
+                await MainActor.run {
+                    self.calibrationBusy = false
+                    self.log.append("Calibration: build failed — \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func removeMaster(_ id: UUID) {
+        try? calibrationLibrary.remove(id: id)
+        refreshLibraryEntries()
+    }
+
+    func rebuildMaster(_ id: UUID) {
+        calibrationBusy = true
+        let lib = calibrationLibrary
+        Task.detached { [weak self] in
+            guard let self else { return }   // Swift 6: strong immutable for nested closures
+            let message: String
+            do { try lib.rebuild(id: id); message = "Calibration: rebuilt master." }
+            catch { message = "Calibration: rebuild failed — \(error.localizedDescription)" }
+            await MainActor.run {
+                self.calibrationBusy = false
+                self.refreshLibraryEntries()
+                self.log.append(message)
+            }
+        }
+    }
+
+    /// A one-line description of a library entry for the list UI.
+    func summary(of f: MasterFrame) -> String {
+        var parts: [String] = [f.camera, f.kind.rawValue]
+        if let e = f.exposureSeconds { parts.append("\(Int(e))s") }
+        if let g = f.gain { parts.append("gain \(Int(g))") }
+        if let t = f.setTempC { parts.append("\(Int(t))°C") }
+        if let b = f.binning { parts.append("bin\(b)") }
+        return parts.joined(separator: " · ") + " · ×\(f.frameCount)"
+    }
+
     /// Starts a live session watching `watchFolder`.
     /// Not unit-testable: needs FileManager, a live pipeline, and a real watch
     /// folder — the end-to-end test covers this path.
@@ -527,10 +719,9 @@ final class AppModel {
             let source = FolderFrameSource(folder: folder, mode: .live,
                                             fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
             let engine = makeStackEngine()
-            let (calibrator, calWarnings) = CalibrationLoader.makeCalibrator(
-                dark: calibration.darkPath.map { URL(fileURLWithPath: $0) },
-                flat: calibration.flatPath.map { URL(fileURLWithPath: $0) })
-            calWarnings.forEach { log.append("⚠ \($0)") }
+            let (calibrator, calMessages) = resolveCalibration(
+                watchFolder: folder, prefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
+            calMessages.forEach { log.append($0) }
             CalibrationStore.save(calibration, to: .standard)
             p = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
                 rootDirectory: root, neutralizeBackground: neutralizeBackground,

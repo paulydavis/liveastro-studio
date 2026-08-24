@@ -34,7 +34,7 @@ public struct MasterFrame: Codable, Equatable, Identifiable {
 ///
 /// Layout: `<baseDir>/index.json` (array of MasterFrame) + one `master-<id>.fit`
 /// per entry. Default baseDir is Application Support; a test seam overrides it.
-public final class CalibrationLibrary {
+public final class CalibrationLibrary: Sendable {
     public enum LibraryError: Error, Equatable { case noSourceFolder, noFramesInSource }
 
     private let baseDir: URL
@@ -116,7 +116,7 @@ public final class CalibrationLibrary {
         try enc.encode(frames).write(to: indexURL, options: .atomic)
     }
 
-    static func fitsFiles(in folder: URL) -> [URL] {
+    public static func fitsFiles(in folder: URL) -> [URL] {
         let exts: Set<String> = ["fit", "fits"]
         let items = (try? FileManager.default.contentsOfDirectory(
             at: folder, includingPropertiesForKeys: nil)) ?? []
