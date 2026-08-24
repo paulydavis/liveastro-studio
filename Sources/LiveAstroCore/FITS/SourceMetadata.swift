@@ -14,7 +14,9 @@ public struct SourceMetadata: Equatable {
     public var exposureSeconds: Double?
     public var dateObs: String?     // ISO-ish string, verbatim
     public var gain: Double?
-    public var ccdTempC: Double?
+    public var ccdTempC: Double?     // CCD-TEMP: actual sensor temperature
+    public var setTempC: Double?     // SET-TEMP: cooler set-point (preferred for dark matching)
+    public var binning: Int?         // XBINNING
     public var siteLat: Double?
     public var siteLon: Double?
 
@@ -43,6 +45,8 @@ public struct SourceMetadata: Equatable {
         dateObs = clean("DATE-OBS")
         gain = num("GAIN")
         ccdTempC = num("CCD-TEMP")
+        setTempC = num("SET-TEMP")
+        binning = num("XBINNING").map { Int($0.rounded()) }
         siteLat = num("SITELAT")
         siteLon = num("SITELONG")
     }
