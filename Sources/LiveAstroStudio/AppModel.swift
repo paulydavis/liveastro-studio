@@ -563,36 +563,52 @@ final class AppModel {
 
         // Legacy explicit dark selection as a fallback when the library had no match.
         if darkImage == nil, let p = calibration.darkPath {
-            darkImage = try? MasterBuilder.load(URL(fileURLWithPath: p))
-            if darkImage != nil { messages.append("Calibration: using selected dark file.") }
+            do {
+                darkImage = try MasterBuilder.load(URL(fileURLWithPath: p))
+                messages.append("Calibration: using selected dark file.")
+            } catch {
+                messages.append("Calibration: selected dark could not be read — \(error.localizedDescription).")
+            }
         }
 
-        // Session flat: build fresh from the chosen flats folder (offset = dark-flats or bias).
+        // Session flat: build fresh from the chosen flats folder (offset = dark-flats else bias).
         var flatImage: AstroImage?
         if let flatsFolder = sessionFlatsFolder {
-            let offset = darkFlatOffset() ?? biasImage
+            var offset = biasImage
+            if let dfFolder = sessionDarkFlatsFolder {
+                let dfURLs = CalibrationLibrary.fitsFiles(in: dfFolder)
+                if dfURLs.isEmpty {
+                    messages.append("Calibration: no dark-flats in that folder — using bias as the flat offset.")
+                } else {
+                    do { offset = try MasterBuilder.combine(fitsURLs: dfURLs, kind: .bias, bias: nil) }
+                    catch { messages.append("Calibration: dark-flats build failed — \(error.localizedDescription); using bias instead.") }
+                }
+            }
             let urls = CalibrationLibrary.fitsFiles(in: flatsFolder)
             if urls.isEmpty {
-                messages.append("Calibration: no flats found in the flats folder.")
-            } else if let flat = try? MasterBuilder.combine(fitsURLs: urls, kind: .flat, bias: offset) {
-                flatImage = flat
-                messages.append("Calibration: built master flat from \(urls.count) flats\(offset != nil ? " (offset subtracted)" : "").")
+                messages.append("Calibration: no flats found in the flats folder — continuing without a flat.")
+            } else {
+                do {
+                    flatImage = try MasterBuilder.combine(fitsURLs: urls, kind: .flat, bias: offset)
+                    messages.append("Calibration: built master flat from \(urls.count) flats\(offset != nil ? " (offset subtracted)" : "").")
+                } catch {
+                    messages.append("Calibration: flat build failed — \(error.localizedDescription); continuing without a flat.")
+                }
             }
         } else if let p = calibration.flatPath {
-            flatImage = try? MasterBuilder.load(URL(fileURLWithPath: p))
-            if flatImage != nil { messages.append("Calibration: using selected flat file.") }
+            do {
+                // Normalize legacy/external master flats to median 1 (idempotent) so a
+                // non-normalized file can't over/under-correct — matches the session-flat path.
+                flatImage = MasterBuilder.normalizedFlat(try MasterBuilder.load(URL(fileURLWithPath: p)))
+                messages.append("Calibration: using selected flat file.")
+            } catch {
+                messages.append("Calibration: selected flat could not be read — \(error.localizedDescription).")
+            }
         }
 
         calibrationStatus = statusLine(dark: darkImage != nil, flat: flatImage != nil)
         guard darkImage != nil || flatImage != nil else { return (nil, messages) }
         return (Calibrator(dark: darkImage, flat: flatImage), messages)
-    }
-
-    private func darkFlatOffset() -> AstroImage? {
-        guard let folder = sessionDarkFlatsFolder else { return nil }
-        let urls = CalibrationLibrary.fitsFiles(in: folder)
-        guard !urls.isEmpty else { return nil }
-        return try? MasterBuilder.combine(fitsURLs: urls, kind: .bias, bias: nil)
     }
 
     private func representativeMetadata(in folder: URL, prefix: String?) -> SourceMetadata? {
@@ -818,7 +834,12 @@ final class AppModel {
         log.append("Try Demo — writing sample stack updates to \(folder.path)")
 
         startSession()
-        guard isRunning else { return }
+        guard isRunning else {
+            // Session didn't start (e.g. an import is running) — undo the demo override
+            // so it doesn't leave "Demo Nebula"/DemoInput branding armed on the real fields.
+            restoreMetadataAfterDemoIfNeeded()
+            return
+        }
 
         let args = ["demo-stack", folder.path, "--interval", "3", "--count", "30"]
         demoTask = Task.detached { [weak self] in
