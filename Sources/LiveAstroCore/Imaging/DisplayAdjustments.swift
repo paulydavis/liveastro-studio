@@ -44,6 +44,13 @@ public struct DisplayAdjustments: Equatable, Codable {
 
     public static let neutral = DisplayAdjustments()
 
+    /// The recommended starting look for the live display: neutral plus DBE on, so a
+    /// light-pollution gradient is flattened out of the box. Display-only (master.fit
+    /// is never touched) and one toggle to disable. Used as the fresh-install default
+    /// and the Reset target — NOT as `neutral`, which stays the pure identity for
+    /// tests/goldens/serialization.
+    public static let liveDefault = DisplayAdjustments(backgroundExtraction: true)
+
     // Custom decode so a settings blob written before the DBE fields existed
     // still decodes (missing keys → defaults). Encode stays synthesized.
     private enum CodingKeys: String, CodingKey {
