@@ -547,6 +547,9 @@ struct ControlView: View {
                 }
                 .formStyle(.grouped)
             }
+            // Keep the Setup scrollbar always visible (not the auto-hiding overlay) so
+            // it's an easy, permanent grab target instead of a thin fade-in slider.
+            .scrollIndicators(.visible)
 
             Divider()
 
