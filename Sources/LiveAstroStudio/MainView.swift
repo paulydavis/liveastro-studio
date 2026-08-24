@@ -12,6 +12,14 @@ struct MainView: View {
                     ForEach(AppModel.MainTab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 300)
                 Spacer()
+                Button {
+                    model.nightVisionOn.toggle()
+                    model.applyNightVision()
+                } label: {
+                    Image(systemName: model.nightVisionOn ? "moon.fill" : "moon")
+                        .foregroundStyle(model.nightVisionOn ? Color.red : Color.primary)
+                }
+                .help("Red night-vision screen tint (whole display) — for dark-adapted viewing at the scope. Fine-tune brightness under Setup ▸ Night vision.")
                 if model.selectedTab == .live {
                     Button { openWindow(id: "broadcast"); model.isDetached = true } label: {
                         Image(systemName: "rectangle.portrait.and.arrow.right")
