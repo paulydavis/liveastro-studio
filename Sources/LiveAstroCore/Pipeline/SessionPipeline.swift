@@ -34,6 +34,9 @@ public final class SessionPipeline {
     /// May be delivered synchronously on the frame-consumer task — same reentrancy rule as
     /// `onUpdate`: end() from inside throws `.reentrantEnd`.
     public var onLog: ((String) -> Void)?
+    /// Fired when a live folder watcher's detection stalls (a hung read froze its queue).
+    /// The app surfaces it as a prominent alert + notification.
+    public var onStall: (() -> Void)?
     /// Called for every frame the stack engine rejects (native mode only). Delivered on
     /// the frame-consumer task — same reentrancy rule as `onUpdate`.
     public var onRejected: ((RejectionReason, String) -> Void)?
@@ -466,6 +469,7 @@ public final class SessionPipeline {
             // Forward folder-disappearance log events from the watcher inside a live FolderFrameSource.
             if let folderSrc = src as? FolderFrameSource {
                 folderSrc.onLog = { [weak self] msg in self?.onLog?(msg) }
+                folderSrc.onStall = { [weak self] in self?.onStall?() }
             }
             if let activitySource = src as? FrameSourceActivityReporting {
                 activitySource.onActivity = { [weak self] activity in

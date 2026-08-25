@@ -852,6 +852,17 @@ final class AppModel {
         pipeline.onLog = { [weak self] message in
             Task { @MainActor in self?.log.append("⚠ \(message)") }
         }
+        // Watcher detection stalled (a hung folder read froze the poll queue) — make it loud:
+        // a system notification for an away/asleep operator, plus a visible error so it can't
+        // be missed. The loud "Watcher STALLED" line is already in the log via onLog above.
+        pipeline.onStall = { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.notifier.notifyStall()
+                self.errorMessage = "Capture detection stalled — new subs aren't being detected. "
+                    + "End and restart the session (a folder read appears to be hung)."
+            }
+        }
         // Solve state changes off the hot path and emits no display update — refresh the toggle gate on
         // BOTH edges: a solve landing (enable) and a reseed/auto-reseed invalidating it (disable).
         pipeline.onSolveStateChanged = { [weak self] in

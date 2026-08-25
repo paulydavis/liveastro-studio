@@ -212,6 +212,27 @@ public final class StackFileWatcher {
     private var continuation: AsyncStream<StackUpdate>.Continuation!
     private var source: DispatchSourceFileSystemObject?
     private var pollTimer: DispatchSourceTimer?
+
+    // --- Stall watchdog (M8) ---
+    // The digest read runs on `queue` with O_NONBLOCK cleared, so a hung read (dead network
+    // share / iCloud fileprovider) freezes the serial queue and the poll timer can't fire —
+    // detection silently stops (confirmed by testBlockedContentReadFreezesDetection). The
+    // watcher can't cleanly unblock a hung read() on its own confined queue, but it CAN detect
+    // the freeze from a SEPARATE queue (never touching the frozen one) and make it loud, turning
+    // a silent all-nighter data loss into a visible, actionable event.
+    private let watchdogQueue = DispatchQueue(label: "liveastro.watcher.watchdog")
+    private var watchdogTimer: DispatchSourceTimer?
+    private let livenessLock = NSLock()
+    private var lastProgressNanos: UInt64 = 0        // updated at the top of every scan tick
+    private let stallLock = NSLock()
+    private var stallReported = false
+    /// Fired ONCE (until scans resume) when detection has been frozen past the threshold.
+    /// Called on the watchdog queue. The app surfaces it as a visible "detection stalled" alert.
+    public var onStall: (() -> Void)?
+    /// How long detection may be frozen before the watchdog reports a stall. Generous by
+    /// default so a slow-but-completing scan never false-positives; test-settable.
+    internal var stallThresholdNanos: UInt64 = 30_000_000_000
+    internal var watchdogIntervalNanos: UInt64 = 5_000_000_000
     private var debounceWork: DispatchWorkItem?
     private var folderFD: Int32 = -1
 
@@ -362,6 +383,11 @@ public final class StackFileWatcher {
     /// The reducer is the sole semantic state owner once scan integration is complete.
     private var reducer: WatcherReducer
 
+    /// Test seam (watcher-stall diagnosis): invoked on the serial queue right before a file's
+    /// content digest is read. A test can block here to simulate a hung read (dead network
+    /// share / iCloud fileprovider) and prove it freezes the poll loop. nil in production.
+    internal var beforeContentReadForTesting: (() -> Void)?
+
     /// Deterministic integration seam: tests may replace the watched folder after a complete
     /// observation batch has reduced, but before its ordered effects execute.
     internal var afterObservationBatchForTesting: (() -> Void)?
@@ -426,6 +452,7 @@ public final class StackFileWatcher {
         debounceWork?.cancel()
         source?.cancel()
         pollTimer?.cancel()
+        watchdogTimer?.cancel()
         continuation.finish()
     }
 
@@ -447,7 +474,40 @@ public final class StackFileWatcher {
             timer.resume()
             pollTimer = timer
             state = .running
+            startWatchdog()
         }
+    }
+
+    /// Start the stall watchdog on its own queue. It only reads a lock-guarded timestamp and
+    /// the atomic stop flag — never the (potentially frozen) watcher queue — so a hung scan
+    /// can't freeze the watchdog too.
+    private func startWatchdog() {
+        livenessLock.withLock { lastProgressNanos = monotonicNowNanos() }
+        let interval = Double(watchdogIntervalNanos) / 1_000_000_000
+        let wd = DispatchSource.makeTimerSource(queue: watchdogQueue)
+        wd.schedule(deadline: .now() + interval, repeating: interval)
+        wd.setEventHandler { [weak self] in self?.watchdogTick() }
+        wd.resume()
+        watchdogTimer = wd
+    }
+
+    private func watchdogTick() {
+        guard !stopRequested.isSet else { return }
+        let last = livenessLock.withLock { lastProgressNanos }
+        let now = monotonicNowNanos()
+        guard last != 0, now > last, now - last >= stallThresholdNanos else {
+            stallLock.withLock { stallReported = false }   // healthy → re-arm the one-shot
+            return
+        }
+        let fire = stallLock.withLock { () -> Bool in
+            if stallReported { return false }
+            stallReported = true
+            return true
+        }
+        guard fire else { return }
+        onLog?("⚠️ Watcher STALLED — folder detection has been frozen for ~\((now - last) / 1_000_000_000)s "
+             + "(likely a hung read on \(folder.path)). New subs are NOT being detected — End and restart the session.")
+        onStall?()
     }
 
     /// Open the folder fd and arm the DispatchSource.
@@ -540,6 +600,7 @@ public final class StackFileWatcher {
         // The fd is closed by the source's cancel handler, never here (see armSource()).
         cancelSource()
         pollTimer?.cancel(); pollTimer = nil
+        watchdogTimer?.cancel(); watchdogTimer = nil
         continuation.finish()
     }
 
@@ -557,6 +618,9 @@ public final class StackFileWatcher {
         guard state == .running, !stopRequested.isSet else { return }
         _polls += 1
         emitHeartbeatIfDue()
+        // Liveness for the stall watchdog: a scan that blocks (hung read) never reaches the
+        // NEXT tick, so this timestamp goes stale and the watchdog (separate queue) fires.
+        livenessLock.withLock { lastProgressNanos = monotonicNowNanos() }
         let fm = FileManager.default
 
         var isDirectory: ObjCBool = false
@@ -708,6 +772,7 @@ public final class StackFileWatcher {
                 }
             }
 
+            beforeContentReadForTesting?()   // seam: make the digest read block, to prove a hung read freezes the queue
             _digestComputations += 1
             let stopFlag = stopRequested
             guard let digest = FileIdentity.contentDigest(
