@@ -171,6 +171,30 @@ a blocker, so when it finally reads it is high-water-dropped (lost frame). Requi
 numbered capture writes strictly increasing names, so it does not arise in normal use. Revisit if
 option (B)/(C) reworks the cap.
 
+## Option A applied + re-reviewed (2026-08-25)
+
+Implemented **Option A** (watchdog visibility): the watchdog now also fires `onStall` when
+`outstandingReadMirror >= maxInFlightReads` and no read has dispatched/completed for the stall
+threshold — i.e. every read slot is stuck. This restores the operator alert for the dead-mount case
+and makes the branch **strictly ≥ `main`**. New test `testAllReadSlotsStuckFiresStall`; the existing
+one-slow-read test confirms a single stuck read (slots free) does not alarm.
+
+A focused adversarial re-review of the Option-A delta found **no Critical or Important defect** —
+lock discipline clean (all mirror writes serial-queue-confined under `livenessLock`, all reads on the
+watchdog queue, no nesting with `stallLock`), no mirror drift, correct fire on all-stuck, one-shot
+re-arm intact. Two Theoretical/Minor notes:
+- **Accepted (not fixed):** a false positive is only reachable if a backlog bursts 8 dispatches and
+  all 8 reads each take >30 s with no staggered completion — a near-dead share where "End and
+  restart" is the right advice; real 50 MB subs read in <1 s, so real inputs don't reach a *false*
+  alarm. Recorded here so it isn't re-derived.
+- **Fixed:** `stampReadProgress()` was moved *behind* the generation guard in
+  `integrateCompletedRead`, so a stale old-generation completion no longer restamps the reader-liveness
+  clock (only current-generation progress counts) — removes a bounded window where a post-swap
+  all-stuck stall could be briefly masked.
+
+**Remaining open (Paul's call): Option C (interruptible reads)** — would remove the fd/thread leak
+entirely and drop the watchdog dependency. Deferred as a reviewed fast-follow.
+
 ## Out of scope
 
 - Moving `enumerateDirectory`/`open`/`fstat` off the serial queue (they don't materialize; residual hang stays watchdog-covered).

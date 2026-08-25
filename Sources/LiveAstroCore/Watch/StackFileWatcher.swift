@@ -937,12 +937,16 @@ public final class StackFileWatcher {
     private func integrateCompletedRead(name: String, observation: FileObservation,
                                         generation: FolderGeneration) {
         guard state == .running, !stopRequested.isSet else { return }
-        stampReadProgress()   // a read returned — the reader queue is alive (stale or not)
         // Stale read from a superseded generation (folder swapped while it was in flight): drop it
         // and DO NOT clear inFlightReads[name] — a fresh read for the same name may already be in
         // flight under the current generation, and clearing here would wipe its live marker (letting
         // a redundant third read dispatch). Only the current generation's completion frees the slot.
         guard generation == reducer.state.generation.id else { return }
+        // A CURRENT-generation read returned: the reader queue is progressing the generation we care
+        // about. A stale old-generation completion is intentionally NOT counted (guard above) — its
+        // return doesn't mean current-generation detection is advancing, so letting it restamp could
+        // briefly mask an all-slots-stuck stall in the new generation.
+        stampReadProgress()
         inFlightReads[name] = nil   // this generation's read completed → free its slot
         syncOutstandingMirror()
         let now = monotonicNowNanos()
