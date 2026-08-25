@@ -43,6 +43,18 @@ internal final class LogRelayBox: @unchecked Sendable {
     func emit(_ line: String) { current?(line) }
 }
 
+/// Lock-guarded relay for a `() -> Void` callback (mirrors LogRelayBox) — lets a sink
+/// assigned AFTER start() still reach the inner watcher (used for the stall alert).
+internal final class CallbackRelayBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sink: (() -> Void)?
+    var current: (() -> Void)? {
+        get { lock.withLock { sink } }
+        set { lock.withLock { sink = newValue } }
+    }
+    func fire() { current?() }
+}
+
 internal final class ActivityRelayBox: @unchecked Sendable {
     private let lock = NSLock()
     private var sink: ((FrameSourceActivity) -> Void)?
@@ -80,6 +92,11 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
             liveWatcherLog?.current = onLog   // cold2 M2: reaches the inner watcher too
         }
     }
+    /// Live mode: forwarded to the inner watcher's stall watchdog so a frozen-detection
+    /// stall surfaces as a prominent app alert, not just a log line.
+    public var onStall: (() -> Void)? {
+        didSet { liveWatcherStall?.current = onStall }
+    }
     public var onActivity: ((FrameSourceActivity) -> Void)? {
         didSet { importActivity?.current = onActivity }
     }
@@ -93,6 +110,8 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
     /// start() — SessionPipeline wires it in startSources — never reached the watcher.
     /// The didSet above keeps this relay current instead.
     private let liveWatcherLog: LogRelayBox?
+    /// Live mode only: relay the inner watcher's stall watchdog fires through.
+    private let liveWatcherStall: CallbackRelayBox?
     /// Live mode only: continuation of the LIGHT update buffer (never RawFrames).
     private let liveUpdateContinuation: AsyncStream<StackUpdate>.Continuation?
     /// Live mode only: the pull-time decoder behind `frames`.
@@ -160,6 +179,7 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
             self.liveUpdateContinuation = nil
             self.livePull = nil
             self.liveWatcherLog = nil
+            self.liveWatcherStall = nil
             let logBox = LogRelayBox()
             self.importLog = logBox
             let activityBox = ActivityRelayBox()
@@ -196,6 +216,7 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
             self.importLog = nil
             self.importActivity = nil
             self.liveWatcherLog = LogRelayBox()   // cold2 M2
+            self.liveWatcherStall = CallbackRelayBox()
             var cont: AsyncStream<StackUpdate>.Continuation!
             // AsyncStream's init runs this closure synchronously; cont is non-nil here.
             let updates = AsyncStream<StackUpdate> { cont = $0 }
@@ -259,6 +280,9 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
             let watcherLog = liveWatcherLog!
             watcherLog.current = onLog
             w.onLog = { watcherLog.emit($0) }
+            let watcherStall = liveWatcherStall!
+            watcherStall.current = onStall
+            w.onStall = { watcherStall.fire() }
             do {
                 try w.start()   // I/O — the lock is NOT held here
             } catch {

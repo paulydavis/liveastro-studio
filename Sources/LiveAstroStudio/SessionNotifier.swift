@@ -15,6 +15,10 @@ final class SessionNotifier {
     func notifySafeguard() {
         post(title: "Capture idle", body: "No new frames — master saved. Session still running.")
     }
+    func notifyStall() {
+        post(title: "Capture detection stalled",
+             body: "New subs aren't being detected (a folder read is hung) — End and restart the session.")
+    }
     func notifyPlannedStopEnd() {
         // Posted BEFORE endSession()'s async finalization (which can fail/retry), so
         // it must not claim the master/replay are already written — say we're ending.
