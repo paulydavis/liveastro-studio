@@ -998,14 +998,16 @@ struct WatcherReducer {
             return false
 
         case .pendingRead(let identity):
-            // The content read is in flight. Hold the file not-ready so it keeps its ordering
-            // slot as the blocker. Never disturb a terminal state (a settled/emitted file does
-            // not take the read path, so it should never carry a pendingRead placeholder).
+            // A content read is in flight. For a brand-new/observing file, hold it not-ready so it
+            // keeps its ordering slot as the blocker. For a file that ALREADY has digest progress
+            // (.digestPending / .ready) — a stability re-read in flight — PRESERVE that progress:
+            // resetting it to .observing would wipe the stability gate and the file could never
+            // emit. Terminal/settled states are likewise never disturbed.
             switch existing {
-            case .droppedOutOfOrder, .writtenOff, .settled:
-                break
-            default:
+            case .observing, nil:
                 state.generation.files[observation.name] = .observing(stat: identity)
+            case .digestPending, .ready, .settled, .droppedOutOfOrder, .writtenOff:
+                break
             }
             return false
 

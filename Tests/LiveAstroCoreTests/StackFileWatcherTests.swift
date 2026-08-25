@@ -59,11 +59,13 @@ final class StackFileWatcherTests: XCTestCase {
         func fireOnce() -> Bool { lock.lock(); defer { lock.unlock() }; if fired { return false }; fired = true; return true }
     }
 
-    /// ROOT-CAUSE PROOF (M8 stall): the content digest is read on the serial poll queue with
-    /// O_NONBLOCK cleared, so a hung read (dead network share / iCloud fileprovider) freezes the
-    /// queue → the poll timer can't fire → detection silently stops. Block the first content read
-    /// and show that NOTHING new is detected until it's released.
-    func testBlockedContentReadFreezesDetection() async throws {
+    /// M8 stall FIXED AT THE SOURCE: content reads now run on a concurrent reader queue, not the
+    /// serial poll queue, so a hung read (dead share / iCloud fileprovider) no longer freezes
+    /// detection. Block ONE file's read and prove (a) the serial queue stays alive — polls keep
+    /// advancing and the stall watchdog does NOT fire — and (b) BOTH subs still emit once the read
+    /// is released, in revision order: the in-flight file holds its ordering slot, so no frame is
+    /// lost to the slow read.
+    func testBlockedContentReadDoesNotFreezeDetection() async throws {
         watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.05, pollInterval: 0.05,
                                    fileNamePrefix: "Light_", digestPolicy: .immutableAfterPublish)
         let collector = collect(watcher)
@@ -72,30 +74,33 @@ final class StackFileWatcherTests: XCTestCase {
         let reachedRead = DispatchSemaphore(value: 0)
         let once = OnceFlag()
         watcher.beforeContentReadForTesting = {
-            if once.fireOnce() { reachedRead.signal(); blocking.wait() }   // freeze the serial queue
+            // Runs on the READER queue now — hanging here must NOT freeze the serial poll queue.
+            if once.fireOnce() { reachedRead.signal(); blocking.wait() }
         }
-        // The watchdog (separate queue) must notice the freeze quickly.
-        watcher.stallThresholdNanos = 300_000_000    // 0.3 s
+        // If detection froze, the watchdog would fire. Assert it does NOT.
+        watcher.stallThresholdNanos = 400_000_000    // 0.4 s
         watcher.watchdogIntervalNanos = 100_000_000  // 0.1 s
-        let stalled = expectation(description: "watchdog reports the stall")
-        watcher.onStall = { stalled.fulfill() }
+        let noStall = expectation(description: "watchdog must NOT fire — the serial queue stays alive")
+        noStall.isInverted = true
+        watcher.onStall = { noStall.fulfill() }
 
         try watcher.start()
         try makeFITS(0.5).write(to: tmp.appendingPathComponent("Light_0001.fit"))
-        XCTAssertEqual(reachedRead.wait(timeout: .now() + 5), .success, "watcher should reach the content read")
-
-        // While the read is blocked, drop a SECOND file. Detection is frozen → neither emits.
         try makeFITS(0.6).write(to: tmp.appendingPathComponent("Light_0002.fit"))
-        let sawWhileBlocked = await collector.waitForCount(1, timeout: 1.5)
-        XCTAssertFalse(sawWhileBlocked, "a hung read freezes the serial queue → detection stops (the M8 stall)")
+        XCTAssertEqual(reachedRead.wait(timeout: .now() + 5), .success, "a content read should start")
 
-        // THE FIX: the watchdog (separate queue) detects the freeze and reports it loudly,
-        // so a silent all-nighter stall becomes a visible, actionable event.
-        await fulfillment(of: [stalled], timeout: 3)
+        // While one read hangs, scans must keep running and the watchdog must stay quiet.
+        let pollsBefore = watcher.pollCount
+        await fulfillment(of: [noStall], timeout: 1.0)   // ~10 watchdog ticks with no stall reported
+        XCTAssertGreaterThan(watcher.pollCount, pollsBefore,
+                             "the serial queue keeps polling while a read is blocked")
+        // The hung file must not be re-dispatched on every poll (inFlightReads dedupes).
+        XCTAssertLessThanOrEqual(watcher.digestComputations, 4,
+                                 "a pending read is not re-dispatched each poll")
 
-        blocking.signal()   // release → detection resumes
-        let resumed = await collector.waitForCount(1, timeout: 5)
-        XCTAssertTrue(resumed, "detection resumes once the read unblocks")
+        blocking.signal()   // release the hung read
+        let both = await collector.waitForCount(2, timeout: 8)
+        XCTAssertTrue(both, "both subs emit once the read unblocks — no frame lost to the slow read")
     }
 
     /// Guards against a COUNT-related stall of the live watcher (investigated after the M8 all-nighter
@@ -517,6 +522,10 @@ final class StackFileWatcherTests: XCTestCase {
         let w = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
                                  fileNamePrefix: prefix, digestPolicy: policy)
         w.monotonicNowNanos = { clock.now() }
+        // These tests choreograph exact reducer state through synchronous scanNow() calls, so the
+        // content read must complete within the scan (the async reader queue would not have finished
+        // by the time scanNow() returns). The real-I/O tests cover the async transport.
+        w.synchronousContentReadsForTesting = true
         return w
     }
 
@@ -1085,6 +1094,7 @@ final class StackFileWatcherTests: XCTestCase {
         async throws {
         watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
                                    digestPolicy: .immutableAfterPublish)
+        watcher.synchronousContentReadsForTesting = true   // scanNow() choreography needs inline reads
         let collector = collect(watcher)
         try watcher.start()
 
@@ -1247,6 +1257,7 @@ final class StackFileWatcherTests: XCTestCase {
             let w = StackFileWatcher(folder: folder, quietPeriod: bad, pollInterval: bad,
                                      digestPolicy: .mutableStackerOutput)
             w.monotonicNowNanos = { clock.now() }
+            w.synchronousContentReadsForTesting = true   // scanNow() choreography needs inline reads
             defer { w.stop() }
             let collector = collect(w)
             try w.start()                  // pre-fix: NaN/∞ pollInterval crashed timer math
