@@ -54,6 +54,50 @@ final class StackFileWatcherTests: XCTestCase {
         XCTAssertTrue(got, "expected one update for a complete FITS write")
     }
 
+    final class OnceFlag: @unchecked Sendable {
+        private let lock = NSLock(); private var fired = false
+        func fireOnce() -> Bool { lock.lock(); defer { lock.unlock() }; if fired { return false }; fired = true; return true }
+    }
+
+    /// ROOT-CAUSE PROOF (M8 stall): the content digest is read on the serial poll queue with
+    /// O_NONBLOCK cleared, so a hung read (dead network share / iCloud fileprovider) freezes the
+    /// queue → the poll timer can't fire → detection silently stops. Block the first content read
+    /// and show that NOTHING new is detected until it's released.
+    func testBlockedContentReadFreezesDetection() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.05, pollInterval: 0.05,
+                                   fileNamePrefix: "Light_", digestPolicy: .immutableAfterPublish)
+        let collector = collect(watcher)
+
+        let blocking = DispatchSemaphore(value: 0)
+        let reachedRead = DispatchSemaphore(value: 0)
+        let once = OnceFlag()
+        watcher.beforeContentReadForTesting = {
+            if once.fireOnce() { reachedRead.signal(); blocking.wait() }   // freeze the serial queue
+        }
+        // The watchdog (separate queue) must notice the freeze quickly.
+        watcher.stallThresholdNanos = 300_000_000    // 0.3 s
+        watcher.watchdogIntervalNanos = 100_000_000  // 0.1 s
+        let stalled = expectation(description: "watchdog reports the stall")
+        watcher.onStall = { stalled.fulfill() }
+
+        try watcher.start()
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("Light_0001.fit"))
+        XCTAssertEqual(reachedRead.wait(timeout: .now() + 5), .success, "watcher should reach the content read")
+
+        // While the read is blocked, drop a SECOND file. Detection is frozen → neither emits.
+        try makeFITS(0.6).write(to: tmp.appendingPathComponent("Light_0002.fit"))
+        let sawWhileBlocked = await collector.waitForCount(1, timeout: 1.5)
+        XCTAssertFalse(sawWhileBlocked, "a hung read freezes the serial queue → detection stops (the M8 stall)")
+
+        // THE FIX: the watchdog (separate queue) detects the freeze and reports it loudly,
+        // so a silent all-nighter stall becomes a visible, actionable event.
+        await fulfillment(of: [stalled], timeout: 3)
+
+        blocking.signal()   // release → detection resumes
+        let resumed = await collector.waitForCount(1, timeout: 5)
+        XCTAssertTrue(resumed, "detection resumes once the read unblocks")
+    }
+
     /// Guards against a COUNT-related stall of the live watcher (investigated after the M8 all-nighter
     /// stalled ~762 frames in): native-relay style (.immutableAfterPublish, Light_ prefix), a large
     /// batch of subs arriving incrementally, every one must be emitted. (Confirms the stall was NOT a
