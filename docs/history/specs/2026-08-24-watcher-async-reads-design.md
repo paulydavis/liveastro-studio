@@ -104,6 +104,73 @@ Per `adversarial-cold-review`: dispatch ≥2 parallel refutation subagents with 
 
 PROVEN-Critical/Important findings → fix + regression test before merge to main.
 
+## Adversarial cold-review findings (2026-08-25) — OPEN DECISION before merge
+
+Two independent cold-review agents (concurrency lens + resource-lifetime lens) converged on ONE
+Critical. The branch is **not yet a strict improvement over `main`** until it's resolved.
+
+### CRITICAL — hung reads have no timeout/cancellation → silent halt + fd/thread leak
+
+A dispatched content read that hangs forever (dead SMB, offline iCloud mount) is never aborted:
+`shouldAbort` is only polled *between* 64 KB chunks, never during a `read()` wedged on the first
+chunk. Consequences:
+
+1. **Silent detection halt (concurrency lens).** Each hung read permanently holds an
+   `inFlightReads` slot. After `maxInFlightReads` (8) simultaneous hangs, every new file hits the
+   cap and is omitted **forever**. And the stall watchdog can't see it: `scan()` runs on the serial
+   queue and keeps stamping `lastProgressNanos`, so `onStall` never fires. `main` *alerts* on a
+   stall (the whole serial queue freezes → watchdog fires); this branch can stop detecting
+   **silently** — a regression for the ≥8-stuck / dead-mount case. Under `.immutableAfterPublish`
+   there is no write-off machinery, so the slot is never reclaimed even in principle.
+2. **fd/thread leak across swaps (resource lens).** `inFlightReads.removeAll()` on every generation
+   swap (folder drop/return or atomic replace) and on teardown empties the map **without stopping
+   the still-live hung tasks**. Each task keeps its fd (closeOnDealloc, never deallocated) and its
+   `readerQueue` worker thread, while the cap — keyed on the now-empty map — happily dispatches 8
+   more. Over an overnight flapping mount: `8 × swaps` leaked fds/threads → fd or thread-pool
+   exhaustion.
+
+**Note on Paul's actual regime:** the branch is a genuine win for the *slow* iCloud read (the
+suspected M8 cause) — materializing reads run concurrently off the serial queue and detection
+continues. The Critical bites the *permanently-dead-mount* / *flapping-network-mount* case, which is
+less likely on his local+iCloud Desktop but must be handled for "do it properly."
+
+**Options (needs Paul's call — different complexity/robustness):**
+- **(A) Watchdog visibility + Finding-2 (minimal, makes branch ≥ main).** Add a read-completion
+  liveness signal: the watchdog also fires `onStall` when reads are outstanding but none have
+  completed for the stall threshold. Restores the operator alert for the dead-mount case (matching
+  `main`), and the alert practically bounds the leak (operator restarts). Leaves the fd leak
+  technically present but operator-bounded. ~20 lines of lock-guarded watchdog code.
+- **(B) Deadline-based slot reclamation.** Give each read a wall-clock deadline; on expiry, evict
+  its `inFlightReads` slot (detection continues) and back off re-dispatching that file. Bounds
+  concurrent slot use; the abandoned task still leaks its fd/thread until it errors out. Medium.
+- **(C) Interruptible reads (gold standard, removes the leak entirely).** Rewrite the digest read
+  to a non-blocking fd + `poll()` with a per-chunk deadline (or close the fd from a watchdog to
+  force `read()` to return). A hung read then returns an error → task completes → fd/thread/slot all
+  freed → `.invalid` → retried with backoff → self-heals when the mount returns. No leak, no silent
+  halt, no watchdog dependency. Largest change (touches `FileIdentity.contentDigest`), needs its own
+  review pass.
+
+Recommendation: **(A) now** (small, makes the branch strictly better than `main` and re-armed the
+operator alert), with **(C)** as a fast-follow if overnight dead-mount robustness is a priority.
+Whichever is chosen, the new code gets its own adversarial re-review before merge.
+
+### Applied now: Finding 2 (Minor/theoretical) — FIXED
+
+`integrateCompletedRead` cleared `inFlightReads[name]` unconditionally *before* the generation
+guard, so a stale read completing after a folder swap could wipe a fresh read's live marker
+(→ a redundant third dispatch; a possible duplicate emit only in the narrow classic-mutable +
+swap-window case). Fixed by moving the clear behind the state/generation guards — only the current
+generation's completion frees the slot.
+
+### Recorded, not yet fixed: Finding 3 (theoretical) — cap can drop a late lower revision
+
+If a *lower* revision becomes stat-stable only after `maxInFlightReads` higher revisions already
+occupy the slots (or already emitted), the omitted lower file is never presented to the reducer as
+a blocker, so when it finally reads it is high-water-dropped (lost frame). Requires out-of-order
+*stabilization* (filesystem enumeration reordering, or a producer finalizing a lower index later) —
+numbered capture writes strictly increasing names, so it does not arise in normal use. Revisit if
+option (B)/(C) reworks the cap.
+
 ## Out of scope
 
 - Moving `enumerateDirectory`/`open`/`fstat` off the serial queue (they don't materialize; residual hang stays watchdog-covered).

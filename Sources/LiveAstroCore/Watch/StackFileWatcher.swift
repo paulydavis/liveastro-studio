@@ -900,9 +900,13 @@ public final class StackFileWatcher {
     /// omission, and a one-entry batch cannot charge the ordering ledgers.
     private func integrateCompletedRead(name: String, observation: FileObservation,
                                         generation: FolderGeneration) {
-        inFlightReads[name] = nil   // no longer outstanding, whatever the outcome
         guard state == .running, !stopRequested.isSet else { return }
-        guard generation == reducer.state.generation.id else { return }   // folder replaced → stale
+        // Stale read from a superseded generation (folder swapped while it was in flight): drop it
+        // and DO NOT clear inFlightReads[name] — a fresh read for the same name may already be in
+        // flight under the current generation, and clearing here would wipe its live marker (letting
+        // a redundant third read dispatch). Only the current generation's completion frees the slot.
+        guard generation == reducer.state.generation.id else { return }
+        inFlightReads[name] = nil   // this generation's read completed → free its slot
         let now = monotonicNowNanos()
         livenessLock.withLock { lastProgressNanos = now }   // completions are progress
         var entry = observation
