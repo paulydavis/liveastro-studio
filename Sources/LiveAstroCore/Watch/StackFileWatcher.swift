@@ -224,6 +224,13 @@ public final class StackFileWatcher {
     private var watchdogTimer: DispatchSourceTimer?
     private let livenessLock = NSLock()
     private var lastProgressNanos: UInt64 = 0        // updated at the top of every scan tick
+    // Reader-queue liveness (all under livenessLock): the scan tick above proves the SERIAL queue is
+    // alive, but content reads run on the reader queue where the scan-tick can't see them. If every
+    // read slot is occupied by a hung read (dead share / offline iCloud) with no completions, new
+    // files are omitted at the cap and detection halts — silently, because scans keep ticking. These
+    // let the watchdog also alarm on that "all read slots stuck" case.
+    private var lastReadProgressNanos: UInt64 = 0    // last read dispatch-start or completion; 0 = none yet
+    private var outstandingReadMirror: Int = 0       // lock-visible mirror of inFlightReads.count
     private let stallLock = NSLock()
     private var stallReported = false
     /// Fired ONCE (until scans resume) when detection has been frozen past the threshold.
@@ -539,9 +546,18 @@ public final class StackFileWatcher {
 
     private func watchdogTick() {
         guard !stopRequested.isSet else { return }
-        let last = livenessLock.withLock { lastProgressNanos }
         let now = monotonicNowNanos()
-        guard last != 0, now > last, now - last >= stallThresholdNanos else {
+        let (scanLast, readLast, outstanding) = livenessLock.withLock {
+            (lastProgressNanos, lastReadProgressNanos, outstandingReadMirror)
+        }
+        // Two independent stalls, both meaning "new subs are no longer being detected":
+        // (1) the serial poll queue itself froze (scan tick stale) — e.g. a hung readdir/open;
+        // (2) EVERY content-read slot is occupied by a stuck read with no completions — detection
+        //     halts at the cap while the poll queue keeps ticking, so (1) alone can't see it.
+        let queueFrozen = scanLast != 0 && now > scanLast && now &- scanLast >= stallThresholdNanos
+        let readsStuck = outstanding >= Self.maxInFlightReads
+            && readLast != 0 && now > readLast && now &- readLast >= stallThresholdNanos
+        guard queueFrozen || readsStuck else {
             stallLock.withLock { stallReported = false }   // healthy → re-arm the one-shot
             return
         }
@@ -551,8 +567,10 @@ public final class StackFileWatcher {
             return true
         }
         guard fire else { return }
-        onLog?("⚠️ Watcher STALLED — folder detection has been frozen for ~\((now - last) / 1_000_000_000)s "
-             + "(likely a hung read on \(folder.path)). New subs are NOT being detected — End and restart the session.")
+        let detail = queueFrozen
+            ? "folder detection has been frozen for ~\((now &- scanLast) / 1_000_000_000)s (likely a hung read on the poll queue)"
+            : "all \(outstanding) content-read slots have been stuck for ~\((now &- readLast) / 1_000_000_000)s (dead share / offline iCloud)"
+        onLog?("⚠️ Watcher STALLED — \(detail). New subs are NOT being detected — End and restart the session.")
         onStall?()
     }
 
@@ -647,6 +665,7 @@ public final class StackFileWatcher {
         // promptly, closing their own descriptors; their integration hop then no-ops on .stopped.
         // Clear the map so no phantom placeholder survives a restart.
         inFlightReads.removeAll()
+        syncOutstandingMirror()
         // The fd is closed by the source's cancel handler, never here (see armSource()).
         cancelSource()
         pollTimer?.cancel(); pollTimer = nil
@@ -850,6 +869,11 @@ public final class StackFileWatcher {
                                      identity: FileIdentity, isFITS: Bool,
                                      handle: FileHandle, generation: FolderGeneration) {
         inFlightReads[name] = identity
+        // A read starting is reader-queue progress; keep the watchdog clock fresh while we're still
+        // able to dispatch. It only goes stale once the cap is full of hung reads (no more dispatches
+        // AND no completions) — exactly the "all read slots stuck" halt the watchdog must catch.
+        stampReadProgress()
+        syncOutstandingMirror()
         _digestComputations += 1
         let stopFlag = stopRequested
         let seam = beforeContentReadForTesting   // capture on the serial queue; run it on the reader queue
@@ -898,15 +922,29 @@ public final class StackFileWatcher {
     /// batch. Guards: a stale generation (folder replaced mid-read) or a stop drops the result. This
     /// one-entry batch is safe by the reducer contract — the reducer never infers absence from
     /// omission, and a one-entry batch cannot charge the ordering ledgers.
+    /// Refresh the watchdog's lock-visible mirror of how many reads are outstanding. Serial-queue
+    /// confined (every `inFlightReads` mutation is followed by this).
+    private func syncOutstandingMirror() {
+        livenessLock.withLock { outstandingReadMirror = inFlightReads.count }
+    }
+    /// Restamp the reader-queue liveness clock — a read just started or completed, so the reader
+    /// queue is demonstrably making progress and the watchdog should not count it as stuck.
+    private func stampReadProgress() {
+        let now = monotonicNowNanos()
+        livenessLock.withLock { lastReadProgressNanos = now }
+    }
+
     private func integrateCompletedRead(name: String, observation: FileObservation,
                                         generation: FolderGeneration) {
         guard state == .running, !stopRequested.isSet else { return }
+        stampReadProgress()   // a read returned — the reader queue is alive (stale or not)
         // Stale read from a superseded generation (folder swapped while it was in flight): drop it
         // and DO NOT clear inFlightReads[name] — a fresh read for the same name may already be in
         // flight under the current generation, and clearing here would wipe its live marker (letting
         // a redundant third read dispatch). Only the current generation's completion frees the slot.
         guard generation == reducer.state.generation.id else { return }
         inFlightReads[name] = nil   // this generation's read completed → free its slot
+        syncOutstandingMirror()
         let now = monotonicNowNanos()
         livenessLock.withLock { lastProgressNanos = now }   // completions are progress
         var entry = observation
@@ -978,6 +1016,7 @@ public final class StackFileWatcher {
         // integrateCompletedRead. Clearing here stops a re-scan from re-presenting a phantom
         // in-flight file that may not exist in the new folder. (The read task still closes its own fd.)
         inFlightReads.removeAll()
+        syncOutstandingMirror()
     }
 
     /// Mid-tick replacement handling shared by the top-of-scan and pre-yield identity checks.

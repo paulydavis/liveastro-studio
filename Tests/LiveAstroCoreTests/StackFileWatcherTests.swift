@@ -103,6 +103,33 @@ final class StackFileWatcherTests: XCTestCase {
         XCTAssertTrue(both, "both subs emit once the read unblocks — no frame lost to the slow read")
     }
 
+    /// The other half of the M8 fix: a SINGLE slow read no longer freezes the queue (above), but if
+    /// EVERY read slot is occupied by a stuck read (a truly dead share / offline iCloud), new files
+    /// are omitted at the cap and detection halts — silently, since the poll queue keeps ticking. The
+    /// watchdog must alarm on that "all read slots stuck" condition too, so it stays as visible as the
+    /// old whole-queue freeze. Block every read, flood past the cap, and require onStall to fire.
+    func testAllReadSlotsStuckFiresStall() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.05, pollInterval: 0.05,
+                                   fileNamePrefix: "Light_", digestPolicy: .immutableAfterPublish)
+        let collector = collect(watcher)
+        let blocking = DispatchSemaphore(value: 0)
+        watcher.beforeContentReadForTesting = { blocking.wait() }   // EVERY read hangs on the reader queue
+        defer { for _ in 0..<128 { blocking.signal() } }            // release all reads so teardown completes
+        watcher.stallThresholdNanos = 400_000_000    // 0.4 s
+        watcher.watchdogIntervalNanos = 100_000_000  // 0.1 s
+        let stalled = expectation(description: "watchdog reports the all-slots-stuck stall")
+        watcher.onStall = { stalled.fulfill() }
+
+        try watcher.start()
+        // More files than the in-flight cap, so every read slot fills with a hung read.
+        for i in 1...16 {
+            try makeFITS(Float(i) * 0.05)
+                .write(to: tmp.appendingPathComponent(String(format: "Light_%04d.fit", i)))
+        }
+        await fulfillment(of: [stalled], timeout: 5)
+        _ = collector
+    }
+
     /// Guards against a COUNT-related stall of the live watcher (investigated after the M8 all-nighter
     /// stalled ~762 frames in): native-relay style (.immutableAfterPublish, Light_ prefix), a large
     /// batch of subs arriving incrementally, every one must be emitted. (Confirms the stall was NOT a
