@@ -674,10 +674,12 @@ final class AppModel {
 
     /// A one-line description of a library entry for the list UI.
     func summary(of f: MasterFrame) -> String {
+        // Int(_:) traps on a finite-but-huge Double (corrupt index value); Int(exactly:) is safe.
+        func intStr(_ v: Double) -> String { Int(exactly: v.rounded()).map(String.init) ?? String(format: "%.2g", v) }
         var parts: [String] = [f.camera, f.kind.rawValue]
-        if let e = f.exposureSeconds { parts.append("\(Int(e))s") }
-        if let g = f.gain { parts.append("gain \(Int(g))") }
-        if let t = f.setTempC { parts.append("\(Int(t))°C") }
+        if let e = f.exposureSeconds { parts.append("\(intStr(e))s") }
+        if let g = f.gain { parts.append("gain \(intStr(g))") }
+        if let t = f.setTempC { parts.append("\(intStr(t))°C") }
         if let b = f.binning { parts.append("bin\(b)") }
         return parts.joined(separator: " · ") + " · ×\(f.frameCount)"
     }

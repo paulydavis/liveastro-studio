@@ -112,6 +112,20 @@ public enum CalibrationMatcher {
                             light: light).first
     }
 
+    /// All library biases matching the light (camera/gain/binning + temp tolerance when both carry a
+    /// set-point), best-first. Exposed so the resolver can pick a bias whose loaded SHAPE fits a
+    /// specific dark, rather than discarding a valid dark over a shape-mismatched bias.
+    public static func matchingBiases(light: SourceMetadata, library: [MasterFrame],
+                                      options: Options = Options()) -> [MasterFrame] {
+        let lightTemp = light.setTempC
+        let tempOK: (MasterFrame) -> Bool = { f in
+            guard let lt = lightTemp, let ft = f.setTempC else { return true }
+            return abs(ft - lt) <= options.tempToleranceC
+        }
+        return rankedBySpecificity(library.filter { $0.kind == .bias && keyMatches($0, light) && tempOK($0) },
+                                   light: light)
+    }
+
     /// How many of gain/binning/temp are BOTH specified on the master AND on the light (i.e. actually
     /// verified to agree, not wildcard-passed). Higher = more trustworthy match.
     private static func specificity(_ f: MasterFrame, _ light: SourceMetadata) -> Int {

@@ -74,6 +74,21 @@ final class MasterBuilderTests: XCTestCase {
         XCTAssertTrue(applied.offsetApplied)
     }
 
+    /// With `expected` dimensions, a stray wrong-size frame that sorts first must NOT hijack the
+    /// reference and discard the valid same-size frames.
+    func testExpectedDimensionsIgnoreOddSortedFirstFrame() throws {
+        let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
+        _ = try writeConst(dir, "00_odd.fit", 0.9, w: 8, h: 8)   // sorts first, wrong size
+        _ = try writeConst(dir, "a.fit", 0.4, w: 2, h: 2)
+        _ = try writeConst(dir, "b.fit", 0.6, w: 2, h: 2)
+        let urls = [dir.appendingPathComponent("00_odd.fit"),
+                    dir.appendingPathComponent("a.fit"), dir.appendingPathComponent("b.fit")]
+        let r = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .dark, bias: nil, expected: (2, 2, 1))
+        XCTAssertEqual(r.image.width, 2); XCTAssertEqual(r.image.height, 2)
+        XCTAssertEqual(r.contributingCount, 2, "only the target-size frames contribute")
+        for p in r.image.pixels { XCTAssertEqual(p, 0.5, accuracy: 1e-5) }   // mean(0.4, 0.6)
+    }
+
     func testFlatBiasSubtractedAndNormalizedToMedianOne() throws {
         let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
         // flat frames constant 0.6; bias constant 0.1 → (0.6-0.1)=0.5 everywhere;

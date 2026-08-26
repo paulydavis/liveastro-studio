@@ -28,6 +28,14 @@ public struct MasterFrame: Codable, Equatable, Identifiable {
         self.fileName = fileName; self.sourcePath = sourcePath
     }
 
+    /// A master's on-disk name must be a plain basename inside the library — never a path that could
+    /// traverse out (`../…`, an absolute path, or embedded separators).
+    static func isSafeBasename(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".."
+            && !name.contains("/") && !name.contains("\\") && !name.contains(":")
+            && name == (name as NSString).lastPathComponent
+    }
+
     // Versioned-tolerant decode: only id/kind/camera/fileName are truly required (the record is
     // useless without them). Fields added over time (channels, frameCount, dims, createdAt) DEFAULT
     // when absent, so an older-schema index entry is SALVAGED rather than silently dropped by the
@@ -43,6 +51,13 @@ public struct MasterFrame: Codable, Equatable, Identifiable {
         kind = try c.decode(MasterKind.self, forKey: .kind)
         camera = try c.decode(String.self, forKey: .camera)
         fileName = try c.decode(String.self, forKey: .fileName)
+        // SECURITY: fileName drives load / rebuild-overwrite / remove-delete. A hostile or corrupt
+        // index with "../../evil.fit" must never let those escape the library root, so reject any
+        // non-basename here — the tolerant per-entry decode in all() then skips this record.
+        guard MasterFrame.isSafeBasename(fileName) else {
+            throw DecodingError.dataCorruptedError(forKey: .fileName, in: c,
+                debugDescription: "unsafe (path-traversing) master fileName: \(fileName)")
+        }
         gain = try c.decodeIfPresent(Double.self, forKey: .gain)
         exposureSeconds = try c.decodeIfPresent(Double.self, forKey: .exposureSeconds)
         setTempC = try c.decodeIfPresent(Double.self, forKey: .setTempC)
@@ -63,7 +78,7 @@ public struct MasterFrame: Codable, Equatable, Identifiable {
 /// Layout: `<baseDir>/index.json` (array of MasterFrame) + one `master-<id>.fit`
 /// per entry. Default baseDir is Application Support; a test seam overrides it.
 public final class CalibrationLibrary: Sendable {
-    public enum LibraryError: Error, Equatable { case noSourceFolder, noFramesInSource }
+    public enum LibraryError: Error, Equatable { case noSourceFolder, noFramesInSource, unsafeFileName }
 
     private let baseDir: URL
 
@@ -78,6 +93,16 @@ public final class CalibrationLibrary: Sendable {
     }
 
     private var indexURL: URL { baseDir.appendingPathComponent("index.json") }
+
+    /// Resolve a master's on-disk URL, GUARANTEEING it stays inside the library root. Returns nil for
+    /// an unsafe/traversing fileName — defense-in-depth beyond the decode-time `isSafeBasename` check,
+    /// so load/rebuild/remove can never touch a file outside the library.
+    private func masterURL(for fileName: String) -> URL? {
+        guard MasterFrame.isSafeBasename(fileName) else { return nil }
+        let url = baseDir.appendingPathComponent(fileName).standardizedFileURL
+        guard url.path.hasPrefix(baseDir.standardizedFileURL.path + "/") else { return nil }
+        return url
+    }
 
     /// All library entries (empty if none / unreadable). Decodes entry-by-entry and SKIPS any single
     /// malformed/legacy entry rather than failing the whole array — one bad record must not hide
@@ -130,7 +155,8 @@ public final class CalibrationLibrary: Sendable {
         guard !urls.isEmpty else { throw LibraryError.noFramesInSource }
         let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: frames[idx].kind, bias: bias)
         let master = built.image
-        try MasterBuilder.save(master, to: baseDir.appendingPathComponent(frames[idx].fileName))
+        guard let masterURL = masterURL(for: frames[idx].fileName) else { throw LibraryError.unsafeFileName }
+        try MasterBuilder.save(master, to: masterURL)
         frames[idx].width = master.width; frames[idx].height = master.height
         frames[idx].channels = master.channels; frames[idx].frameCount = built.contributingCount
         frames[idx].createdAt = Date()
@@ -142,13 +168,14 @@ public final class CalibrationLibrary: Sendable {
         var frames = all()
         guard let idx = frames.firstIndex(where: { $0.id == id }) else { return }
         let f = frames.remove(at: idx)
-        try? FileManager.default.removeItem(at: baseDir.appendingPathComponent(f.fileName))
+        if let url = masterURL(for: f.fileName) { try? FileManager.default.removeItem(at: url) }
         try writeIndex(frames)
     }
 
     /// Load an entry's master pixels (nil if the file is missing/unreadable).
     public func master(for frame: MasterFrame) -> AstroImage? {
-        try? MasterBuilder.load(baseDir.appendingPathComponent(frame.fileName))
+        guard let url = masterURL(for: frame.fileName) else { return nil }
+        return try? MasterBuilder.load(url)
     }
 
     // MARK: - Private

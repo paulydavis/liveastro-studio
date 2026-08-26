@@ -38,6 +38,18 @@ final class CalibrationResolverTests: XCTestCase {
         return dir
     }
 
+    /// Write `n` synthetic mono FITS frames of an arbitrary size (for wrong-size-master scenarios).
+    private func rawFolderSized(_ name: String, count: Int, value: Float, w: Int, h: Int) -> URL {
+        let dir = tmp.appendingPathComponent(name, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for i in 0..<count {
+            let data = FITSWriter.float32(width: w, height: h, channels: 1,
+                                          pixels: [Float](repeating: value, count: w * h))
+            try? data.write(to: dir.appendingPathComponent(String(format: "f_%02d.fit", i)))
+        }
+        return dir
+    }
+
     private func library() -> CalibrationLibrary {
         CalibrationLibrary(baseDirectory: tmp.appendingPathComponent("lib", isDirectory: true))
     }
@@ -133,6 +145,22 @@ final class CalibrationResolverTests: XCTestCase {
                             setTempC: -10, binning: 1, width: 4, height: 4, channels: 1,
                             frameCount: 1, createdAt: Date(), fileName: "m.fit", sourcePath: nil)
         _ = CalibrationResolver.describe(f)   // must return, not fatalError
+    }
+
+    /// When the light carries no dimensions, a wrong-size bias must not sink a valid scaled dark —
+    /// scaling falls back to a bias whose shape matches the dark, rather than excluding the dark.
+    func testScaledDarkUsesShapeCompatibleBiasWhenLightDimsUnknown() throws {
+        let lib = library()
+        _ = try lib.add(kind: .dark, camera: "ASI2600", gain: 100, exposureSeconds: 120,   // 4×4, needs scaling to 180
+                    setTempC: -10, binning: 1, fitsURLs: filesIn(rawFolder("d", count: 2, value: 0.2)))
+        _ = try lib.add(kind: .bias, camera: "ASI2600", gain: 100, exposureSeconds: nil,     // 8×8 wrong size, index-first
+                    setTempC: -10, binning: 1, fitsURLs: filesIn(rawFolderSized("bwrong", count: 2, value: 0.1, w: 8, h: 8)))
+        _ = try lib.add(kind: .bias, camera: "ASI2600", gain: 100, exposureSeconds: nil,     // 4×4 compatible
+                    setTempC: -10, binning: 1, fitsURLs: filesIn(rawFolder("bok", count: 2, value: 0.1)))
+        // light() carries no width/height/channels → bias can't be pre-validated against the light.
+        let r = CalibrationResolver.resolve(metadata: light(exp: 180), library: lib, scaleEnabled: true,
+                    flatsFolder: nil, darkFlatsFolder: nil, legacyDarkPath: nil, legacyFlatPath: nil)
+        XCTAssertTrue(r.hasDark, "scaling must fall back to a shape-compatible bias, not discard the valid dark")
     }
 
     func testNoDarkForDifferentCamera() throws {

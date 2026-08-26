@@ -36,26 +36,33 @@ public enum MasterBuilder {
     ///   and normalizes to median 1. The `bias` input may be a bias master or a matched dark-flat
     ///   master; both occupy the same flat-offset role. A dimension-mismatched offset is skipped
     ///   and reported via `offsetApplied == false`.
-    /// - The first successfully-read frame sets the reference dimensions; later frames of a
-    ///   different size (or unreadable frames) are skipped and excluded from `contributingCount`.
-    ///   Throws if no frames are readable.
-    public static func combineDetailed(fitsURLs: [URL], kind: MasterKind,
-                                       bias: AstroImage?) throws -> BuildResult {
+    /// - `expected`: when given, ONLY frames of exactly these dimensions contribute (the reference is
+    ///   fixed up front). Session calibration passes the light's target size so a stray wrong-size
+    ///   frame that happens to sort first can't hijack the reference and discard the valid frames.
+    ///   When nil, the first successfully-read frame sets the reference (later mismatches skipped).
+    /// - Unreadable/mismatched frames are excluded from `contributingCount`. Throws if none contribute.
+    public static func combineDetailed(fitsURLs: [URL], kind: MasterKind, bias: AstroImage?,
+                                       expected: (width: Int, height: Int, channels: Int)? = nil) throws -> BuildResult {
         guard !fitsURLs.isEmpty else { throw BuildError.noFrames }
 
         var sum: [Double] = []
         var refW = 0, refH = 0, refC = 0
         var count = 0
         var offsetApplied = false
+        if let e = expected {
+            guard e.width > 0, e.height > 0, e.channels > 0 else { throw BuildError.noValidFrames }
+            refW = e.width; refH = e.height; refC = e.channels
+            sum = [Double](repeating: 0, count: refW * refH * refC)
+        }
 
         for url in fitsURLs {
             guard let data = try? Data(contentsOf: url),
                   let img = try? FITSReader.read(data, normalizeRowOrder: true) else { continue }
-            if count == 0 {
+            if expected == nil, count == 0 {
                 refW = img.width; refH = img.height; refC = img.channels
                 sum = [Double](repeating: 0, count: refW * refH * refC)
             } else if img.width != refW || img.height != refH || img.channels != refC {
-                continue    // dimension mismatch → skip
+                continue    // doesn't match the reference (expected, or first-readable) → skip
             }
             // For flats, subtract the selected bias/dark-flat per-frame when its
             // dimensions match; otherwise fall through WITHOUT subtracting (recorded below).
