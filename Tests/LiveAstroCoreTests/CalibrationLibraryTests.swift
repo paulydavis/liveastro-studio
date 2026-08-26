@@ -31,6 +31,20 @@ final class CalibrationLibraryTests: XCTestCase {
         CalibrationLibrary(baseDirectory: tmp.appendingPathComponent("lib", isDirectory: true))
     }
 
+    /// One malformed/legacy entry in the index must not hide every good master — all() skips it.
+    func testTolerantDecodeSkipsMalformedEntry() throws {
+        let l = lib()
+        _ = try l.add(kind: .dark, camera: "ASI2600", gain: 100, exposureSeconds: 180,
+                      setTempC: -10, binning: 1, fitsURLs: writeRaws(2, value: 0.2))
+        XCTAssertEqual(l.all().count, 1)
+        // Append a malformed entry to the on-disk JSON array.
+        let indexURL = tmp.appendingPathComponent("lib/index.json")
+        var arr = try JSONSerialization.jsonObject(with: Data(contentsOf: indexURL)) as! [Any]
+        arr.append(["totally": "not a master frame"])
+        try JSONSerialization.data(withJSONObject: arr).write(to: indexURL)
+        XCTAssertEqual(l.all().count, 1, "the good master must survive a single malformed entry")
+    }
+
     func testAddBuildsMasterAndIndexes() throws {
         let urls = writeRaws(3, value: 0.2)
         let l = lib()

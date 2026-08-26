@@ -52,7 +52,10 @@ public enum CalibrationMatcher {
             guard let lt = lightTemp, let ft = frame.setTempC else { return true }
             return abs(ft - lt) <= options.tempToleranceC
         }
-        let candidates = darks.filter(tempOK)
+        // Prefer the MOST specific match: a dark that agrees on gain/binning/temp beats a legacy
+        // wildcard (gain/binning/temp all nil) that matches only by camera+exposure. Without this a
+        // stale under-specified entry with earlier index order could win over the correct dark.
+        let candidates = rankedBySpecificity(darks.filter(tempOK), light: light)
         if candidates.isEmpty {
             return Result(dark: .none(reason: "No dark within \(fmt(options.tempToleranceC)) °C of the lights' temperature."),
                           bias: bias, warnings: warnings)
@@ -102,7 +105,25 @@ public enum CalibrationMatcher {
     }
 
     private static func firstMatchingBias(light: SourceMetadata, library: [MasterFrame]) -> MasterFrame? {
-        library.first { $0.kind == .bias && keyMatches($0, light) }
+        rankedBySpecificity(library.filter { $0.kind == .bias && keyMatches($0, light) }, light: light).first
+    }
+
+    /// How many of gain/binning/temp are BOTH specified on the master AND on the light (i.e. actually
+    /// verified to agree, not wildcard-passed). Higher = more trustworthy match.
+    private static func specificity(_ f: MasterFrame, _ light: SourceMetadata) -> Int {
+        var s = 0
+        if light.gain != nil, f.gain != nil { s += 1 }
+        if light.binning != nil, f.binning != nil { s += 1 }
+        if light.setTempC != nil, f.setTempC != nil { s += 1 }
+        return s
+    }
+
+    /// Stable sort by specificity descending — ties keep the original (index) order.
+    private static func rankedBySpecificity(_ frames: [MasterFrame], light: SourceMetadata) -> [MasterFrame] {
+        frames.enumerated().sorted { a, b in
+            let sa = specificity(a.element, light), sb = specificity(b.element, light)
+            return sa != sb ? sa > sb : a.offset < b.offset
+        }.map(\.element)
     }
 
     private static func sameCamera(_ a: String, _ b: String) -> Bool {
@@ -115,6 +136,9 @@ public enum CalibrationMatcher {
     }
 
     private static func fmt(_ v: Double) -> String {
-        v == v.rounded() ? String(Int(v)) : String(format: "%.2g", v)
+        // Int(_:) traps on a finite-but-huge Double (e.g. a corrupt EXPTIME=1e100); Int(exactly:)
+        // returns nil out of range → fall back to a float format instead of crashing.
+        if v == v.rounded(), let i = Int(exactly: v) { return String(i) }
+        return String(format: "%.2g", v)
     }
 }

@@ -51,11 +51,22 @@ public final class CalibrationLibrary: Sendable {
 
     private var indexURL: URL { baseDir.appendingPathComponent("index.json") }
 
-    /// All library entries (empty if none / unreadable).
+    /// All library entries (empty if none / unreadable). Decodes entry-by-entry and SKIPS any single
+    /// malformed/legacy entry rather than failing the whole array — one bad record must not hide
+    /// every good master.
     public func all() -> [MasterFrame] {
-        guard let data = try? Data(contentsOf: indexURL),
-              let frames = try? JSONDecoder().decode([MasterFrame].self, from: data) else { return [] }
-        return frames
+        guard let data = try? Data(contentsOf: indexURL) else { return [] }
+        // Fast path: a fully-valid array.
+        if let frames = try? JSONDecoder().decode([MasterFrame].self, from: data) { return frames }
+        // Tolerant path: decode each element independently, dropping the ones that fail.
+        struct Tolerant: Decodable {
+            let frame: MasterFrame?
+            init(from decoder: Decoder) throws {
+                frame = try? decoder.singleValueContainer().decode(MasterFrame.self)
+            }
+        }
+        guard let wrapped = try? JSONDecoder().decode([Tolerant].self, from: data) else { return [] }
+        return wrapped.compactMap(\.frame)
     }
 
     /// Build a master from `fitsURLs` and add it to the library. `bias` is only

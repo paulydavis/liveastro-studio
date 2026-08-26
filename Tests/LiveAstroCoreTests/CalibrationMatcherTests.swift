@@ -92,6 +92,15 @@ final class CalibrationMatcherTests: XCTestCase {
                        "uncooled light (CCD-TEMP only) must not be rejected on temperature")
     }
 
+    /// A fully-specified dark (gain/binning/temp all agree) must win over a legacy wildcard dark
+    /// (those fields nil, matches only by camera+exposure) even when the wildcard has earlier index.
+    func testFullySpecifiedDarkBeatsLegacyWildcard() {
+        let wild = master(.dark, gain: nil, exp: 180, temp: nil, binning: nil)     // legacy, earlier index
+        let specific = master(.dark, gain: 100, exp: 180, temp: -10, binning: 1)   // fully specified
+        let r = CalibrationMatcher.match(light: light(), library: [wild, specific])
+        XCTAssertEqual(r.dark, .exact(specific), "the fully-specified dark must beat the legacy wildcard")
+    }
+
     /// When the lights have no recorded exposure and multiple darks match, the matcher must NOT
     /// silently pick the first (insertion order) — that's an arbitrary, likely-wrong calibration.
     func testNilExposureWithMultipleDarksIsAmbiguousNoMatch() {
