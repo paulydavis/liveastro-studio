@@ -27,6 +27,34 @@ public struct MasterFrame: Codable, Equatable, Identifiable {
         self.frameCount = frameCount; self.createdAt = createdAt
         self.fileName = fileName; self.sourcePath = sourcePath
     }
+
+    // Versioned-tolerant decode: only id/kind/camera/fileName are truly required (the record is
+    // useless without them). Fields added over time (channels, frameCount, dims, createdAt) DEFAULT
+    // when absent, so an older-schema index entry is SALVAGED rather than silently dropped by the
+    // per-entry tolerant decode in `all()` (which would then be pruned on the next write). Encoding
+    // stays auto-synthesized (always writes the current, complete schema).
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, camera, gain, exposureSeconds, setTempC, binning
+        case width, height, channels, frameCount, createdAt, fileName, sourcePath
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        kind = try c.decode(MasterKind.self, forKey: .kind)
+        camera = try c.decode(String.self, forKey: .camera)
+        fileName = try c.decode(String.self, forKey: .fileName)
+        gain = try c.decodeIfPresent(Double.self, forKey: .gain)
+        exposureSeconds = try c.decodeIfPresent(Double.self, forKey: .exposureSeconds)
+        setTempC = try c.decodeIfPresent(Double.self, forKey: .setTempC)
+        binning = try c.decodeIfPresent(Int.self, forKey: .binning)
+        sourcePath = try c.decodeIfPresent(String.self, forKey: .sourcePath)
+        width = try c.decodeIfPresent(Int.self, forKey: .width) ?? 0
+        height = try c.decodeIfPresent(Int.self, forKey: .height) ?? 0
+        channels = try c.decodeIfPresent(Int.self, forKey: .channels) ?? 1
+        frameCount = try c.decodeIfPresent(Int.self, forKey: .frameCount) ?? 0
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt)
+            ?? Date(timeIntervalSinceReferenceDate: 0)
+    }
 }
 
 /// On-disk library of reusable master darks/bias. Masters build once per camera+

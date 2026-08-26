@@ -42,4 +42,18 @@ final class DarkScalerTests: XCTestCase {
     func testNilOnDimensionMismatch() {
         XCTAssertNil(DarkScaler.scale(dark: img([0.1, 0.2]), bias: img([0.1]), factor: 1.0))
     }
+
+    /// A corrupt exposure yields a non-finite factor (Float(1e100)=+Inf); scaling must refuse rather
+    /// than emit a non-finite dark that would black out every calibrated frame.
+    func testRejectsNonFiniteOrNonPositiveFactor() {
+        let dark = img([0.10, 0.30]); let bias = img([0.05, 0.05])
+        XCTAssertNil(DarkScaler.scale(dark: dark, bias: bias, factor: .infinity))
+        XCTAssertNil(DarkScaler.scale(dark: dark, bias: bias, factor: .nan))
+        XCTAssertNil(DarkScaler.scale(dark: dark, bias: bias, factor: 0))
+        XCTAssertNil(DarkScaler.scale(dark: dark, bias: bias, factor: -1))
+        XCTAssertNil(DarkScaler.scale(dark: dark, bias: bias, factor: 1e100))   // Float overflow → +Inf
+        let ok = DarkScaler.scale(dark: dark, bias: bias, factor: 1.5)
+        XCTAssertNotNil(ok)
+        XCTAssertTrue(ok!.pixels.allSatisfy { $0.isFinite }, "valid results are always finite")
+    }
 }

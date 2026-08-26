@@ -94,6 +94,18 @@ final class SourceMetadataTests: XCTestCase {
         XCTAssertEqual(SourceMetadata(fitsKeywords: ["NAXIS1": "100", "NAXIS2": "100", "NAXIS3": "3"]).channels, 3)
     }
 
+    /// Implausible finite magnitudes (corrupt cards) are rejected before they reach calibration —
+    /// e.g. EXPTIME=1e100 must not flow into dark scaling and produce a non-finite dark.
+    func testImplausibleMetadataMagnitudesRejected() {
+        let m = SourceMetadata(fitsKeywords: ["EXPTIME": "1e100", "GAIN": "1e50", "SET-TEMP": "1e30", "CCD-TEMP": "-500"])
+        XCTAssertNil(m.exposureSeconds)   // above the 24 h ceiling
+        XCTAssertNil(m.gain)
+        XCTAssertNil(m.setTempC)
+        XCTAssertNil(m.ccdTempC)          // below absolute zero
+        let ok = SourceMetadata(fitsKeywords: ["EXPTIME": "180", "GAIN": "100", "SET-TEMP": "-10"])
+        XCTAssertEqual(ok.exposureSeconds, 180); XCTAssertEqual(ok.gain, 100); XCTAssertEqual(ok.setTempC, -10)
+    }
+
     /// Fortran-style FITS D/d exponents (1.8D+02) are valid FITS but Swift's Double(_:) returns nil.
     /// They must parse, else exposure silently goes nil and calibration matching turns ambiguous.
     func testFortranStyleDExponentParses() {
