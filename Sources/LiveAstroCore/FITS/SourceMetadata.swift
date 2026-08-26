@@ -19,6 +19,7 @@ public struct SourceMetadata: Equatable {
     public var binning: Int?         // XBINNING
     public var width: Int?           // NAXIS1 — sensor width, for validating a master matches these lights
     public var height: Int?          // NAXIS2 — sensor height
+    public var channels: Int?        // NAXIS3 (else 1 for a 2-D frame) — validated against the master
     public var siteLat: Double?
     public var siteLon: Double?
 
@@ -44,6 +45,15 @@ public struct SourceMetadata: Equatable {
             guard let v = Double(normalized), v.isFinite else { return nil }
             return v
         }
+        // Convert a numeric card to a bounded Int. num() rejects NaN/Inf, but a FINITE but huge
+        // value (e.g. XBINNING = 1e100) still TRAPS Int(_:) — so require the rounded value to sit
+        // within [min, max] (both Int-representable) before converting. Rejects out-of-range as nil.
+        func intCard(_ key: String, min: Int = 1, max: Int) -> Int? {
+            guard let v = num(key) else { return nil }
+            let r = v.rounded()
+            guard r >= Double(min), r <= Double(max) else { return nil }
+            return Int(r)
+        }
 
         object = clean("OBJECT")
         ra = num("RA"); dec = num("DEC")
@@ -57,10 +67,12 @@ public struct SourceMetadata: Equatable {
         gain = num("GAIN")
         ccdTempC = num("CCD-TEMP")
         setTempC = num("SET-TEMP")
-        // num() already guarantees finite; require a positive binning factor (0/negative is invalid).
-        binning = num("XBINNING").flatMap { $0 >= 1 ? Int($0.rounded()) : nil }
-        width = num("NAXIS1").flatMap { $0 >= 1 ? Int($0.rounded()) : nil }
-        height = num("NAXIS2").flatMap { $0 >= 1 ? Int($0.rounded()) : nil }
+        binning = intCard("XBINNING", max: 64)            // practical binning ceiling
+        width = intCard("NAXIS1", max: 1_000_000)         // sensor axis lengths (bounded so huge
+        height = intCard("NAXIS2", max: 1_000_000)        // finite values can't trap Int(_:))
+        // Channels: NAXIS3 for a 3-plane cube (RGB), else 1 for a 2-D image. Used to validate a
+        // master's channel count matches these lights (a same-size wrong-channel dark is unusable).
+        channels = intCard("NAXIS3", max: 4) ?? ((width != nil && height != nil) ? 1 : nil)
         siteLat = num("SITELAT")
         siteLon = num("SITELONG")
     }

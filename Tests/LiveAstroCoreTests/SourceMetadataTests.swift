@@ -79,6 +79,21 @@ final class SourceMetadataTests: XCTestCase {
         XCTAssertNil(SourceMetadata(fitsKeywords: ["XBINNING": "-1"]).binning)
     }
 
+    /// A FINITE but astronomically large value passes isFinite yet traps Int(_:). It must be
+    /// rejected by the bounded parser, not crash. (Double("1e100")!.isFinite == true.)
+    func testHugeFiniteNumericsDoNotTrapIntConversion() {
+        let m = SourceMetadata(fitsKeywords: ["XBINNING": "1e100", "NAXIS1": "1e300", "NAXIS2": "9e99", "NAXIS3": "1e40"])
+        XCTAssertNil(m.binning)
+        XCTAssertNil(m.width)
+        XCTAssertNil(m.height)
+        XCTAssertNil(m.channels)
+        // In-range values still parse; a 2-D frame reports 1 channel.
+        let ok = SourceMetadata(fitsKeywords: ["NAXIS1": "6248", "NAXIS2": "4176", "XBINNING": "2"])
+        XCTAssertEqual(ok.width, 6248); XCTAssertEqual(ok.height, 4176)
+        XCTAssertEqual(ok.binning, 2); XCTAssertEqual(ok.channels, 1)
+        XCTAssertEqual(SourceMetadata(fitsKeywords: ["NAXIS1": "100", "NAXIS2": "100", "NAXIS3": "3"]).channels, 3)
+    }
+
     /// Fortran-style FITS D/d exponents (1.8D+02) are valid FITS but Swift's Double(_:) returns nil.
     /// They must parse, else exposure silently goes nil and calibration matching turns ambiguous.
     func testFortranStyleDExponentParses() {
