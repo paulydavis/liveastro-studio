@@ -66,4 +66,25 @@ final class SourceMetadataTests: XCTestCase {
         XCTAssertEqual(m, SourceMetadata(fitsKeywords: [:]))
         XCTAssertNil(m.object); XCTAssertNil(m.ra)
     }
+
+    /// Non-finite numeric cards must NOT crash. XBINNING = NaN previously reached
+    /// Int(Double.nan.rounded()), which traps — a malformed header could kill the app.
+    func testNonFiniteNumericsAreRejectedNotTrapped() {
+        let m = SourceMetadata(fitsKeywords: ["XBINNING": "nan", "EXPTIME": "inf", "GAIN": "NaN"])
+        XCTAssertNil(m.binning)
+        XCTAssertNil(m.exposureSeconds)
+        XCTAssertNil(m.gain)
+        // Nonpositive binning is invalid → rejected (not 0).
+        XCTAssertNil(SourceMetadata(fitsKeywords: ["XBINNING": "0"]).binning)
+        XCTAssertNil(SourceMetadata(fitsKeywords: ["XBINNING": "-1"]).binning)
+    }
+
+    /// Fortran-style FITS D/d exponents (1.8D+02) are valid FITS but Swift's Double(_:) returns nil.
+    /// They must parse, else exposure silently goes nil and calibration matching turns ambiguous.
+    func testFortranStyleDExponentParses() {
+        let m = SourceMetadata(fitsKeywords: ["EXPTIME": "1.8D+02", "GAIN": "1.0d2", "FOCALLEN": "6.72D2"])
+        XCTAssertEqual(m.exposureSeconds ?? 0, 180, accuracy: 1e-9)
+        XCTAssertEqual(m.gain ?? 0, 100, accuracy: 1e-9)
+        XCTAssertEqual(m.focalLengthMM ?? 0, 672, accuracy: 1e-9)
+    }
 }
