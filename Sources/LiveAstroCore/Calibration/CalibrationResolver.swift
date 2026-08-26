@@ -24,32 +24,45 @@ public enum CalibrationResolver {
         var biasImage: AstroImage?
 
         if !entries.isEmpty {
-            let result = CalibrationMatcher.match(light: metadata, library: entries,
-                            options: .init(scaleEnabled: scaleEnabled))
-            messages.append(contentsOf: result.warnings.map { "Calibration: \($0)" })
-            if let b = result.bias {
+            // Bias is resolved once, from the full library, independent of the dark retry below.
+            let firstMatch = CalibrationMatcher.match(light: metadata, library: entries,
+                                options: .init(scaleEnabled: scaleEnabled))
+            messages.append(contentsOf: firstMatch.warnings.map { "Calibration: \($0)" })
+            if let b = firstMatch.bias {
                 biasImage = library.master(for: b)
                 if biasImage == nil { messages.append("Calibration: matched a bias but its master file could not be loaded.") }
             }
-            switch result.dark {
-            case .exact(let f):
-                if let img = library.master(for: f) {
-                    darkImage = img
-                    messages.append("Calibration: matched \(describe(f)).")
-                } else {
-                    messages.append("Calibration: matched \(describe(f)) but its master file could not be loaded — continuing without a dark.")
+
+            // Try matched darks in preference order. A master that is missing/corrupt on disk, or the
+            // wrong SIZE for these lights, must not block an otherwise-valid alternative — exclude it
+            // and re-match. Terminates: each failed candidate is excluded, shrinking the set.
+            var excluded = Set<UUID>()
+            darkLoop: while darkImage == nil {
+                let usable = entries.filter { !excluded.contains($0.id) }
+                switch CalibrationMatcher.match(light: metadata, library: usable,
+                                                options: .init(scaleEnabled: scaleEnabled)).dark {
+                case .exact(let f):
+                    if let img = library.master(for: f), dimensionsOK(img, metadata) {
+                        darkImage = img
+                        messages.append("Calibration: matched \(describe(f)).")
+                    } else {
+                        excluded.insert(f.id)
+                        messages.append("Calibration: \(describe(f)) is unusable (missing/corrupt or wrong size) — trying another dark.")
+                    }
+                case .scaled(let base, let biasF, let factor):
+                    if let d = library.master(for: base), dimensionsOK(d, metadata),
+                       let bi = library.master(for: biasF),
+                       let scaled = DarkScaler.scale(dark: d, bias: bi, factor: factor) {
+                        darkImage = scaled
+                        messages.append("Calibration: scaled \(describe(base)) to this exposure.")
+                    } else {
+                        excluded.insert(base.id)
+                        messages.append("Calibration: could not use \(describe(base)) (missing/corrupt or wrong size) — trying another dark.")
+                    }
+                case .none(let reason):
+                    messages.append("Calibration: \(reason)")
+                    break darkLoop
                 }
-            case .scaled(let base, let biasF, let factor):
-                if let d = library.master(for: base),
-                   let bi = library.master(for: biasF),
-                   let scaled = DarkScaler.scale(dark: d, bias: bi, factor: factor) {
-                    darkImage = scaled
-                    messages.append("Calibration: scaled \(describe(base)) to this exposure.")
-                } else {
-                    messages.append("Calibration: could not scale \(describe(base)) (missing master or size mismatch) — continuing without a dark.")
-                }
-            case .none(let reason):
-                messages.append("Calibration: \(reason)")
             }
         }
 
@@ -106,6 +119,14 @@ public enum CalibrationResolver {
         let cal = (darkImage != nil || flatImage != nil) ? Calibrator(dark: darkImage, flat: flatImage) : nil
         return Resolution(calibrator: cal, messages: messages,
                           hasDark: darkImage != nil, hasFlat: flatImage != nil)
+    }
+
+    /// A loaded master must match the lights' sensor dimensions when they're known. When the light
+    /// header carries no NAXIS1/2 we can't validate here — accept and let the Calibrator skip a truly
+    /// mismatched master at apply time (it already guards dimensions per-frame).
+    private static func dimensionsOK(_ img: AstroImage, _ light: SourceMetadata) -> Bool {
+        guard let w = light.width, let h = light.height else { return true }
+        return img.width == w && img.height == h
     }
 
     static func describe(_ f: MasterFrame) -> String {

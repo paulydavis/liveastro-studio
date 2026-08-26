@@ -17,6 +17,8 @@ public struct SourceMetadata: Equatable {
     public var ccdTempC: Double?     // CCD-TEMP: actual sensor temperature
     public var setTempC: Double?     // SET-TEMP: cooler set-point (preferred for dark matching)
     public var binning: Int?         // XBINNING
+    public var width: Int?           // NAXIS1 — sensor width, for validating a master matches these lights
+    public var height: Int?          // NAXIS2 — sensor height
     public var siteLat: Double?
     public var siteLon: Double?
 
@@ -57,6 +59,8 @@ public struct SourceMetadata: Equatable {
         setTempC = num("SET-TEMP")
         // num() already guarantees finite; require a positive binning factor (0/negative is invalid).
         binning = num("XBINNING").flatMap { $0 >= 1 ? Int($0.rounded()) : nil }
+        width = num("NAXIS1").flatMap { $0 >= 1 ? Int($0.rounded()) : nil }
+        height = num("NAXIS2").flatMap { $0 >= 1 ? Int($0.rounded()) : nil }
         siteLat = num("SITELAT")
         siteLon = num("SITELONG")
     }
