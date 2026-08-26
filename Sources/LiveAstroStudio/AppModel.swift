@@ -628,7 +628,10 @@ final class AppModel {
             do {
                 let frame = try lib.add(kind: kind, camera: meta.instrument ?? "Camera",
                     gain: meta.gain, exposureSeconds: kind == .bias ? nil : meta.exposureSeconds,
-                    setTempC: meta.setTempC ?? meta.ccdTempC, binning: meta.binning, fitsURLs: urls)
+                    // Store only the controlled SET-TEMP as the master's setpoint. CCD-TEMP (actual,
+                    // uncontrolled) must not masquerade as a setpoint — that made uncooled darks carry
+                    // a spurious temperature that then false-rejected uncooled lights.
+                    setTempC: meta.setTempC, binning: meta.binning, fitsURLs: urls)
                 await MainActor.run {
                     self.calibrationBusy = false
                     self.refreshLibraryEntries()
