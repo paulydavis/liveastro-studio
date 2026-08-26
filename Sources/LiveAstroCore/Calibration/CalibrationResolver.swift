@@ -24,13 +24,22 @@ public enum CalibrationResolver {
         var biasImage: AstroImage?
 
         if !entries.isEmpty {
-            // Bias is resolved once, from the full library, independent of the dark retry below.
             let firstMatch = CalibrationMatcher.match(light: metadata, library: entries,
                                 options: .init(scaleEnabled: scaleEnabled))
             messages.append(contentsOf: firstMatch.warnings.map { "Calibration: \($0)" })
-            if let b = firstMatch.bias {
-                biasImage = library.master(for: b)
-                if biasImage == nil { messages.append("Calibration: matched a bias but its master file could not be loaded.") }
+            // Resolve a USABLE bias, retrying past any that are missing/corrupt/wrong-size — a bad
+            // first bias must not doom every scaled-dark attempt below.
+            var biasExcluded = Set<UUID>()
+            while biasImage == nil {
+                let usable = entries.filter { !biasExcluded.contains($0.id) }
+                guard let b = CalibrationMatcher.match(light: metadata, library: usable,
+                                options: .init(scaleEnabled: scaleEnabled)).bias else { break }
+                if let img = library.master(for: b), dimensionsOK(img, metadata) {
+                    biasImage = img
+                } else {
+                    biasExcluded.insert(b.id)
+                    messages.append("Calibration: a matched bias is unusable (missing/corrupt or wrong size) — trying another.")
+                }
             }
 
             // Try matched darks in preference order. A master that is missing/corrupt on disk, or the
@@ -49,9 +58,14 @@ public enum CalibrationResolver {
                         excluded.insert(f.id)
                         messages.append("Calibration: \(describe(f)) is unusable (missing/corrupt or wrong size) — trying another dark.")
                     }
-                case .scaled(let base, let biasF, let factor):
+                case .scaled(let base, _, let factor):
+                    // Scale with the already-validated bias (resolved above), not a freshly-loaded
+                    // one — so a bad first bias can't repeatedly sink an otherwise-valid scaled dark.
+                    guard let bi = biasImage else {
+                        messages.append("Calibration: no usable bias to scale the nearest dark — continuing without a dark.")
+                        break darkLoop
+                    }
                     if let d = library.master(for: base), dimensionsOK(d, metadata),
-                       let bi = library.master(for: biasF),
                        let scaled = DarkScaler.scale(dark: d, bias: bi, factor: factor) {
                         darkImage = scaled
                         messages.append("Calibration: scaled \(describe(base)) to this exposure.")
@@ -125,8 +139,12 @@ public enum CalibrationResolver {
     /// header carries no NAXIS1/2 we can't validate here — accept and let the Calibrator skip a truly
     /// mismatched master at apply time (it already guards dimensions per-frame).
     private static func dimensionsOK(_ img: AstroImage, _ light: SourceMetadata) -> Bool {
-        guard let w = light.width, let h = light.height else { return true }
-        return img.width == w && img.height == h
+        if let w = light.width, img.width != w { return false }
+        if let h = light.height, img.height != h { return false }
+        // Same-size but wrong CHANNELS is also unusable — the Calibrator skips it at apply time, so
+        // accepting it here would report hasDark=true and block retrying a valid alternative.
+        if let c = light.channels, img.channels != c { return false }
+        return true
     }
 
     static func describe(_ f: MasterFrame) -> String {
