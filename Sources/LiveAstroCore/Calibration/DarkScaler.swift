@@ -19,7 +19,9 @@ public enum DarkScaler {
         // Refuse rather than emit a non-finite dark that would black out every calibrated frame.
         guard factor.isFinite, factor > 0 else { return nil }
         let f = Float(factor)
-        guard f.isFinite else { return nil }
+        // A tiny Double (e.g. 180 / 1e100) is positive+finite but UNDERFLOWS to Float 0 — that would
+        // yield bias + (dark−bias)·0 == bias, accepted as a "scaled dark". Require strictly positive.
+        guard f.isFinite, f > 0 else { return nil }
         let n = dark.pixels.count
         var out = [Float](repeating: 0, count: n)
         dark.pixels.withUnsafeBufferPointer { D in

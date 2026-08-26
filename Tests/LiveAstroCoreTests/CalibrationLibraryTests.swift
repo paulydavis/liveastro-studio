@@ -62,6 +62,31 @@ final class CalibrationLibraryTests: XCTestCase {
         XCTAssertEqual(all.first?.frameCount, 0)   // defaulted
     }
 
+    /// SECURITY: a corrupt/hostile index entry with a path-traversing fileName ("../../evil.fit")
+    /// must be rejected at decode so load/rebuild/remove can never touch a file outside the library.
+    func testRejectsPathTraversingFileName() throws {
+        XCTAssertFalse(MasterFrame.isSafeBasename("../../evil.fit"))
+        XCTAssertFalse(MasterFrame.isSafeBasename("/etc/passwd"))
+        XCTAssertFalse(MasterFrame.isSafeBasename("a/b.fit"))
+        XCTAssertFalse(MasterFrame.isSafeBasename(".."))
+        XCTAssertTrue(MasterFrame.isSafeBasename("master-ABC.fit"))
+
+        let l = lib()
+        _ = try l.add(kind: .dark, camera: "ASI2600", gain: 100, exposureSeconds: 180,
+                      setTempC: -10, binning: 1, fitsURLs: writeRaws(2, value: 0.2))
+        let indexURL = tmp.appendingPathComponent("lib/index.json")
+        var arr = try JSONSerialization.jsonObject(with: Data(contentsOf: indexURL)) as! [[String: Any]]
+        var evil = arr[0]
+        evil["id"] = UUID().uuidString
+        evil["fileName"] = "../../evil.fit"
+        arr.append(evil)
+        try JSONSerialization.data(withJSONObject: arr).write(to: indexURL)
+
+        let all = l.all()
+        XCTAssertEqual(all.count, 1, "the traversing entry must be dropped, the safe one kept")
+        XCTAssertTrue(all.allSatisfy { MasterFrame.isSafeBasename($0.fileName) })
+    }
+
     func testAddBuildsMasterAndIndexes() throws {
         let urls = writeRaws(3, value: 0.2)
         let l = lib()

@@ -26,7 +26,12 @@ public enum CalibrationResolver {
         if !entries.isEmpty {
             let firstMatch = CalibrationMatcher.match(light: metadata, library: entries,
                                 options: .init(scaleEnabled: scaleEnabled))
-            messages.append(contentsOf: firstMatch.warnings.map { "Calibration: \($0)" })
+            // Append only the LIGHT-level warnings (temperature / camera). The scaling warning is
+            // dark-specific — the actually-chosen dark logs its own "scaled X" message below, so
+            // emitting it here could name a dark that a later retry abandons.
+            messages.append(contentsOf: firstMatch.warnings
+                .filter { !$0.contains("scaling the") }
+                .map { "Calibration: \($0)" })
             // Resolve a USABLE bias, retrying past any that are missing/corrupt/wrong-size — a bad
             // first bias must not doom every scaled-dark attempt below.
             var biasExcluded = Set<UUID>()
@@ -59,20 +64,23 @@ public enum CalibrationResolver {
                         messages.append("Calibration: \(describe(f)) is unusable (missing/corrupt or wrong size) — trying another dark.")
                     }
                 case .scaled(let base, _, let factor):
-                    // Scale with the already-validated bias (resolved above), not a freshly-loaded
-                    // one — so a bad first bias can't repeatedly sink an otherwise-valid scaled dark.
-                    guard let bi = biasImage else {
-                        messages.append("Calibration: no usable bias to scale the nearest dark — continuing without a dark.")
-                        break darkLoop
-                    }
-                    if let d = library.master(for: base), dimensionsOK(d, metadata),
-                       let scaled = DarkScaler.scale(dark: d, bias: bi, factor: factor) {
-                        darkImage = scaled
-                        messages.append("Calibration: scaled \(describe(base)) to this exposure.")
-                    } else {
+                    guard let d = library.master(for: base), dimensionsOK(d, metadata) else {
                         excluded.insert(base.id)
-                        messages.append("Calibration: could not use \(describe(base)) (missing/corrupt or wrong size) — trying another dark.")
+                        messages.append("Calibration: \(describe(base)) is unusable (missing/corrupt or wrong size) — trying another dark.")
+                        continue
                     }
+                    // Scale needs a bias matching THIS dark's shape. The light-matched bias usually
+                    // fits, but when the light carries no dimensions it might not — so fall back to any
+                    // matching bias whose loaded shape equals the dark's, rather than discarding a
+                    // valid dark over a shape-mismatched bias (retry the bias, not the dark).
+                    guard let bi = biasFitting(dark: d, light: metadata, library: library, preferred: biasImage),
+                          let scaled = DarkScaler.scale(dark: d, bias: bi, factor: factor) else {
+                        excluded.insert(base.id)
+                        messages.append("Calibration: no bias compatible with \(describe(base)) to scale it — trying another dark.")
+                        continue
+                    }
+                    darkImage = scaled
+                    messages.append("Calibration: scaled \(describe(base)) to this exposure.")
                 case .none(let reason):
                     messages.append("Calibration: \(reason)")
                     break darkLoop
@@ -97,6 +105,12 @@ public enum CalibrationResolver {
         }
 
         // Session flat: build fresh from the chosen flats folder (offset = dark-flats else bias).
+        // Build against the light's TARGET dimensions when known, so a stray wrong-size frame that
+        // sorts first can't hijack the reference dimensions and discard the valid same-size flats.
+        let targetDims: (width: Int, height: Int, channels: Int)? = {
+            if let w = metadata.width, let h = metadata.height, let c = metadata.channels { return (w, h, c) }
+            return nil
+        }()
         var flatImage: AstroImage?
         if let flatsFolder {
             var offset = biasImage
@@ -105,7 +119,7 @@ public enum CalibrationResolver {
                 if dfURLs.isEmpty {
                     messages.append("Calibration: no dark-flats in that folder — using bias as the flat offset.")
                 } else {
-                    do { offset = try MasterBuilder.combine(fitsURLs: dfURLs, kind: .bias, bias: nil) }
+                    do { offset = try MasterBuilder.combineDetailed(fitsURLs: dfURLs, kind: .bias, bias: nil, expected: targetDims).image }
                     catch { messages.append("Calibration: dark-flats build failed — \(error.localizedDescription); using bias instead.") }
                 }
             }
@@ -114,7 +128,7 @@ public enum CalibrationResolver {
                 messages.append("Calibration: no flats found in the flats folder — continuing without a flat.")
             } else {
                 do {
-                    let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .flat, bias: offset)
+                    let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .flat, bias: offset, expected: targetDims)
                     if dimensionsOK(built.image, metadata) {
                         flatImage = built.image
                         // Report the offset HONESTLY: a dimension-mismatched offset is silently skipped
@@ -161,6 +175,21 @@ public enum CalibrationResolver {
         // accepting it here would report hasDark=true and block retrying a valid alternative.
         if let c = light.channels, img.channels != c { return false }
         return true
+    }
+
+    /// A bias whose loaded shape fits `dark` (so scaling won't fail on a shape mismatch): the
+    /// already-resolved bias if it fits, else any matching library bias whose loaded shape equals
+    /// the dark's. Returns nil if none fit.
+    private static func biasFitting(dark: AstroImage, light: SourceMetadata,
+                                    library: CalibrationLibrary, preferred: AstroImage?) -> AstroImage? {
+        func fits(_ img: AstroImage) -> Bool {
+            img.width == dark.width && img.height == dark.height && img.channels == dark.channels
+        }
+        if let p = preferred, fits(p) { return p }
+        for b in CalibrationMatcher.matchingBiases(light: light, library: library.all()) {
+            if let img = library.master(for: b), fits(img) { return img }
+        }
+        return nil
     }
 
     static func describe(_ f: MasterFrame) -> String {

@@ -56,4 +56,11 @@ final class DarkScalerTests: XCTestCase {
         XCTAssertNotNil(ok)
         XCTAssertTrue(ok!.pixels.allSatisfy { $0.isFinite }, "valid results are always finite")
     }
+
+    /// A tiny positive+finite Double factor (e.g. 180 / 1e100 ≈ 1.8e-98) underflows Float to 0.0,
+    /// which would make the "scaled dark" equal the bias. It must be rejected, not accepted.
+    func testRejectsFactorThatUnderflowsFloatToZero() {
+        let dark = img([0.10, 0.30]); let bias = img([0.05, 0.05])
+        XCTAssertNil(DarkScaler.scale(dark: dark, bias: bias, factor: 1.8e-98))
+    }
 }
