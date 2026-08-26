@@ -31,8 +31,11 @@ public enum CalibrationMatcher {
                              options: Options = Options()) -> Result {
         var warnings: [String] = []
 
-        let lightTemp = light.setTempC ?? light.ccdTempC
-        if lightTemp == nil { warnings.append("Lights have no temperature — matching darks ignoring temperature.") }
+        // Only SET-TEMP is a controlled setpoint the dark library keys on. CCD-TEMP is actual sensor
+        // telemetry (uncontrolled on uncooled cameras like Seestar) and must NOT drive rejection —
+        // using it caused false "outside tolerance" mismatches for uncooled data.
+        let lightTemp = light.setTempC
+        if lightTemp == nil { warnings.append("Lights have no set-point temperature — matching darks ignoring temperature.") }
         if light.instrument == nil { warnings.append("Lights have no camera name — matching on gain/exposure only.") }
 
         let bias = firstMatchingBias(light: light, library: library)
@@ -60,9 +63,15 @@ public enum CalibrationMatcher {
            let exact = candidates.first(where: { exposureMatches($0.exposureSeconds, lightExp) }) {
             return Result(dark: .exact(exact), bias: bias, warnings: warnings)
         }
-        // A single candidate with no recorded exposure is treated as usable as-is.
-        if light.exposureSeconds == nil, let only = candidates.first {
-            return Result(dark: .exact(only), bias: bias, warnings: warnings)
+        // Unknown light exposure: usable only if it's unambiguous (exactly one matching dark).
+        // With several, picking `candidates.first` would apply an arbitrary insertion-order dark.
+        if light.exposureSeconds == nil {
+            if candidates.count == 1 {
+                return Result(dark: .exact(candidates[0]), bias: bias, warnings: warnings)
+            }
+            return Result(
+                dark: .none(reason: "Lights have no recorded exposure and \(candidates.count) darks match — can't choose one."),
+                bias: bias, warnings: warnings)
         }
 
         // Scale the nearest-exposure dark using bias.

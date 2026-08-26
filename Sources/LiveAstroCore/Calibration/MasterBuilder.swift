@@ -14,19 +14,39 @@ public enum MasterBuilder {
 
     public enum BuildError: Error, Equatable { case noFrames, noValidFrames }
 
-    /// Mean-combine `fitsURLs` into a top-down master.
-    /// - .flat: subtracts `bias` per-frame when provided, then clamps ≥ flatFloor
-    ///   and normalizes to median 1. The `bias` input may be a bias master or a
-    ///   matched dark-flat master; both occupy the same flat-offset role.
-    /// - The first successfully-read frame sets the reference dimensions; later
-    ///   frames of a different size are skipped. Throws if no frames are readable.
+    /// A built master plus honest accounting of what actually went into it: how many frames
+    /// contributed (readable + matching dimensions — NOT the input count, which may include skipped
+    /// files) and, for flats, whether the offset was truly subtracted (it is silently skipped when
+    /// the offset's dimensions don't match, so callers must not claim "offset subtracted" blindly).
+    public struct BuildResult {
+        public let image: AstroImage
+        public let contributingCount: Int
+        public let offsetApplied: Bool
+    }
+
+    /// Mean-combine `fitsURLs` into a top-down master. Facade returning just the image; use
+    /// `combineDetailed` when the contributing count or offset-applied flag is needed.
     public static func combine(fitsURLs: [URL], kind: MasterKind,
                                bias: AstroImage?) throws -> AstroImage {
+        try combineDetailed(fitsURLs: fitsURLs, kind: kind, bias: bias).image
+    }
+
+    /// Mean-combine with full accounting (see `BuildResult`).
+    /// - .flat: subtracts `bias` per-frame when its dimensions match, then clamps ≥ flatFloor
+    ///   and normalizes to median 1. The `bias` input may be a bias master or a matched dark-flat
+    ///   master; both occupy the same flat-offset role. A dimension-mismatched offset is skipped
+    ///   and reported via `offsetApplied == false`.
+    /// - The first successfully-read frame sets the reference dimensions; later frames of a
+    ///   different size (or unreadable frames) are skipped and excluded from `contributingCount`.
+    ///   Throws if no frames are readable.
+    public static func combineDetailed(fitsURLs: [URL], kind: MasterKind,
+                                       bias: AstroImage?) throws -> BuildResult {
         guard !fitsURLs.isEmpty else { throw BuildError.noFrames }
 
         var sum: [Double] = []
         var refW = 0, refH = 0, refC = 0
         var count = 0
+        var offsetApplied = false
 
         for url in fitsURLs {
             guard let data = try? Data(contentsOf: url),
@@ -38,10 +58,11 @@ public enum MasterBuilder {
                 continue    // dimension mismatch → skip
             }
             // For flats, subtract the selected bias/dark-flat per-frame when its
-            // dimensions match.
+            // dimensions match; otherwise fall through WITHOUT subtracting (recorded below).
             if kind == .flat, let bias,
                bias.width == refW && bias.height == refH && bias.channels == refC {
                 for i in 0..<sum.count { sum[i] += Double(img.pixels[i]) - Double(bias.pixels[i]) }
+                offsetApplied = true
             } else {
                 for i in 0..<sum.count { sum[i] += Double(img.pixels[i]) }
             }
@@ -53,12 +74,8 @@ public enum MasterBuilder {
         let mean = sum.map { Float($0 / Double(count)) }
         let raw = AstroImage(width: refW, height: refH, channels: refC,
                              pixels: mean, sourceIsLinear: true)
-
-        if kind == .flat {
-            return normalizedFlat(raw)
-        }
-
-        return raw
+        let image = (kind == .flat) ? normalizedFlat(raw) : raw
+        return BuildResult(image: image, contributingCount: count, offsetApplied: offsetApplied)
     }
 
     /// Clamp a flat to ≥ flatFloor and normalize it to median 1 (a dimensionless

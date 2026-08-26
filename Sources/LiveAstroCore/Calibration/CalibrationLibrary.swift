@@ -64,7 +64,8 @@ public final class CalibrationLibrary: Sendable {
     public func add(kind: MasterKind, camera: String, gain: Double?, exposureSeconds: Double?,
                     setTempC: Double?, binning: Int?, fitsURLs: [URL],
                     bias: AstroImage? = nil) throws -> MasterFrame {
-        let master = try MasterBuilder.combine(fitsURLs: fitsURLs, kind: kind, bias: bias)
+        let built = try MasterBuilder.combineDetailed(fitsURLs: fitsURLs, kind: kind, bias: bias)
+        let master = built.image
         let id = UUID()
         let fileName = "master-\(id.uuidString).fit"
         try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
@@ -72,7 +73,9 @@ public final class CalibrationLibrary: Sendable {
         let frame = MasterFrame(
             id: id, kind: kind, camera: camera, gain: gain, exposureSeconds: exposureSeconds,
             setTempC: setTempC, binning: binning, width: master.width, height: master.height,
-            channels: master.channels, frameCount: fitsURLs.count, createdAt: Date(),
+            // frameCount reflects frames that ACTUALLY contributed (readable + matching dims), not
+            // the input count — a corrupt/odd-sized file is skipped and must not inflate the ×N.
+            channels: master.channels, frameCount: built.contributingCount, createdAt: Date(),
             fileName: fileName, sourcePath: fitsURLs.first?.deletingLastPathComponent().path)
         var frames = all(); frames.append(frame); try writeIndex(frames)
         return frame
@@ -86,10 +89,11 @@ public final class CalibrationLibrary: Sendable {
         guard let src = frames[idx].sourcePath else { throw LibraryError.noSourceFolder }
         let urls = Self.fitsFiles(in: URL(fileURLWithPath: src, isDirectory: true))
         guard !urls.isEmpty else { throw LibraryError.noFramesInSource }
-        let master = try MasterBuilder.combine(fitsURLs: urls, kind: frames[idx].kind, bias: bias)
+        let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: frames[idx].kind, bias: bias)
+        let master = built.image
         try MasterBuilder.save(master, to: baseDir.appendingPathComponent(frames[idx].fileName))
         frames[idx].width = master.width; frames[idx].height = master.height
-        frames[idx].channels = master.channels; frames[idx].frameCount = urls.count
+        frames[idx].channels = master.channels; frames[idx].frameCount = built.contributingCount
         frames[idx].createdAt = Date()
         try writeIndex(frames)
     }

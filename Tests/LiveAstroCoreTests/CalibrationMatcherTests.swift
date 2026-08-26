@@ -77,4 +77,37 @@ final class CalibrationMatcherTests: XCTestCase {
         let r = CalibrationMatcher.match(light: light(camera: "Seestar"), library: [d])
         if case .none = r.dark {} else { XCTFail("expected none, got \(r.dark)") }
     }
+
+    /// Uncooled cameras (Seestar etc.) report CCD-TEMP (actual, uncontrolled) but no SET-TEMP.
+    /// CCD-TEMP is telemetry, not a dark-library setpoint, so a temperature difference must NOT
+    /// reject the dark. Only SET-TEMP is a controlled setpoint that gates the ±tolerance rule.
+    func testUncooledCcdTempIsNotUsedAsSetpoint() {
+        var l = SourceMetadata()
+        l.instrument = "Seestar"; l.gain = 100; l.exposureSeconds = 10
+        l.ccdTempC = 30; l.setTempC = nil; l.binning = 1
+        // A dark that carries a differing set-point (e.g. an older entry, or a cooled sibling):
+        let d = master(.dark, camera: "Seestar", exp: 10, temp: 35, binning: 1)
+        let r = CalibrationMatcher.match(light: l, library: [d])
+        XCTAssertEqual(r.dark, .exact(d),
+                       "uncooled light (CCD-TEMP only) must not be rejected on temperature")
+    }
+
+    /// When the lights have no recorded exposure and multiple darks match, the matcher must NOT
+    /// silently pick the first (insertion order) — that's an arbitrary, likely-wrong calibration.
+    func testNilExposureWithMultipleDarksIsAmbiguousNoMatch() {
+        let d30 = master(.dark, exp: 30); let d300 = master(.dark, exp: 300)
+        var l = light(); l.exposureSeconds = nil
+        let r = CalibrationMatcher.match(light: l, library: [d30, d300])
+        if case .none = r.dark {} else {
+            XCTFail("nil exposure + 2 darks must be ambiguous no-match, got \(r.dark)")
+        }
+    }
+
+    /// With exactly one matching dark, an unknown light exposure is unambiguous → still usable.
+    func testNilExposureWithSingleDarkStillMatches() {
+        let d = master(.dark, exp: 30)
+        var l = light(); l.exposureSeconds = nil
+        let r = CalibrationMatcher.match(light: l, library: [d])
+        XCTAssertEqual(r.dark, .exact(d))
+    }
 }

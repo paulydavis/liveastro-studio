@@ -50,6 +50,30 @@ final class MasterBuilderTests: XCTestCase {
         }
     }
 
+    /// combineDetailed reports frames that ACTUALLY contributed (not the input count) and whether
+    /// the flat offset was truly subtracted — so callers can't record ×N or claim "offset subtracted"
+    /// when a file was skipped or the offset size-mismatched.
+    func testCombineDetailedReportsContributingCountAndOffset() throws {
+        let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
+        let a = try writeConst(dir, "d1.fit", 0.4, w: 2, h: 2)
+        let b = try writeConst(dir, "d2.fit", 0.6, w: 2, h: 2)
+        let odd = try writeConst(dir, "d3.fit", 0.9, w: 4, h: 4)      // skipped (wrong size)
+        let dark = try MasterBuilder.combineDetailed(fitsURLs: [a, b, odd], kind: .dark, bias: nil)
+        XCTAssertEqual(dark.contributingCount, 2, "the odd-sized frame must not inflate the count")
+        XCTAssertFalse(dark.offsetApplied)
+
+        let f = try writeConst(dir, "f1.fit", 0.6, w: 2, h: 2)
+        let biasWrong = AstroImage(width: 4, height: 4, channels: 1,
+                                   pixels: [Float](repeating: 0.1, count: 16), sourceIsLinear: true)
+        let mismatched = try MasterBuilder.combineDetailed(fitsURLs: [f], kind: .flat, bias: biasWrong)
+        XCTAssertFalse(mismatched.offsetApplied, "a size-mismatched offset must NOT be silently applied")
+
+        let biasRight = AstroImage(width: 2, height: 2, channels: 1,
+                                   pixels: [0.1, 0.1, 0.1, 0.1], sourceIsLinear: true)
+        let applied = try MasterBuilder.combineDetailed(fitsURLs: [f], kind: .flat, bias: biasRight)
+        XCTAssertTrue(applied.offsetApplied)
+    }
+
     func testFlatBiasSubtractedAndNormalizedToMedianOne() throws {
         let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
         // flat frames constant 0.6; bias constant 0.1 → (0.6-0.1)=0.5 everywhere;

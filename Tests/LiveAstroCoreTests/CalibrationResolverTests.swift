@@ -48,6 +48,25 @@ final class CalibrationResolverTests: XCTestCase {
         XCTAssertTrue(r.messages.contains { $0.contains("matched") })
     }
 
+    /// A corrupt/unloadable top-matched master must NOT block an otherwise-valid alternative dark —
+    /// the resolver retries the next matching candidate instead of silently continuing dark-less.
+    func testRetriesNextDarkWhenChosenMasterIsCorrupt() throws {
+        let lib = library()
+        // Two equally-matching darks (same key + exposure). The matcher prefers the first.
+        let f1 = try lib.add(kind: .dark, camera: "ASI2600", gain: 100, exposureSeconds: 180,
+                    setTempC: -10, binning: 1, fitsURLs: filesIn(rawFolder("d1", count: 2, value: 0.2)))
+        _ = try lib.add(kind: .dark, camera: "ASI2600", gain: 100, exposureSeconds: 180,
+                    setTempC: -10, binning: 1, fitsURLs: filesIn(rawFolder("d2", count: 2, value: 0.3)))
+        // Corrupt the first-matched master's file on disk.
+        let libDir = tmp.appendingPathComponent("lib", isDirectory: true)
+        try Data([0x00, 0x01, 0x02]).write(to: libDir.appendingPathComponent(f1.fileName))
+
+        let r = CalibrationResolver.resolve(metadata: light(), library: lib, scaleEnabled: true,
+                    flatsFolder: nil, darkFlatsFolder: nil, legacyDarkPath: nil, legacyFlatPath: nil)
+        XCTAssertTrue(r.hasDark, "a corrupt top master must not block the valid second dark")
+        XCTAssertNotNil(r.calibrator)
+    }
+
     func testNoDarkForDifferentCamera() throws {
         let lib = library()
         try lib.add(kind: .dark, camera: "ASI2600", gain: 100, exposureSeconds: 180,

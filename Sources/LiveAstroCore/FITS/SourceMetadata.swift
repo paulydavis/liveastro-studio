@@ -17,6 +17,8 @@ public struct SourceMetadata: Equatable {
     public var ccdTempC: Double?     // CCD-TEMP: actual sensor temperature
     public var setTempC: Double?     // SET-TEMP: cooler set-point (preferred for dark matching)
     public var binning: Int?         // XBINNING
+    public var width: Int?           // NAXIS1 — sensor width, for validating a master matches these lights
+    public var height: Int?          // NAXIS2 — sensor height
     public var siteLat: Double?
     public var siteLon: Double?
 
@@ -32,7 +34,16 @@ public struct SourceMetadata: Equatable {
             s = s.trimmingCharacters(in: .whitespaces)
             return s.isEmpty ? nil : s
         }
-        func num(_ key: String) -> Double? { clean(key).flatMap { Double($0) } }
+        func num(_ key: String) -> Double? {
+            guard let s = clean(key) else { return nil }
+            // FITS permits Fortran-style D/d exponents (e.g. 1.8D+02); Swift's Double(_:) rejects
+            // them, so normalize D→E first. Then reject non-finite (NaN/±Inf) — a "nan" card must
+            // never reach Int(Double.nan.rounded()), which traps.
+            let normalized = s.replacingOccurrences(of: "D", with: "E")
+                              .replacingOccurrences(of: "d", with: "E")
+            guard let v = Double(normalized), v.isFinite else { return nil }
+            return v
+        }
 
         object = clean("OBJECT")
         ra = num("RA"); dec = num("DEC")
@@ -46,7 +57,10 @@ public struct SourceMetadata: Equatable {
         gain = num("GAIN")
         ccdTempC = num("CCD-TEMP")
         setTempC = num("SET-TEMP")
-        binning = num("XBINNING").map { Int($0.rounded()) }
+        // num() already guarantees finite; require a positive binning factor (0/negative is invalid).
+        binning = num("XBINNING").flatMap { $0 >= 1 ? Int($0.rounded()) : nil }
+        width = num("NAXIS1").flatMap { $0 >= 1 ? Int($0.rounded()) : nil }
+        height = num("NAXIS2").flatMap { $0 >= 1 ? Int($0.rounded()) : nil }
         siteLat = num("SITELAT")
         siteLon = num("SITELONG")
     }

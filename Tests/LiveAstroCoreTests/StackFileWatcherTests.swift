@@ -130,6 +130,29 @@ final class StackFileWatcherTests: XCTestCase {
         _ = collector
     }
 
+    /// The classic single-file (Siril `live_stack.fit`) producer: there is only ONE file, rewritten
+    /// in place. If its content read hangs, no new stack updates ever appear — but outstanding reads
+    /// never reach the cap (it's stuck at 1) and the poll queue keeps ticking, so the count-based and
+    /// scan-liveness stall checks both miss it. A single stuck read must alarm in single-file mode.
+    func testSingleClassicReadStuckFiresStall() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.05, pollInterval: 0.05,
+                                   digestPolicy: .mutableStackerOutput)   // classic Siril single-file
+        let collector = collect(watcher)
+        let blocking = DispatchSemaphore(value: 0)
+        let once = OnceFlag()
+        watcher.beforeContentReadForTesting = { if once.fireOnce() { blocking.wait() } }
+        defer { for _ in 0..<8 { blocking.signal() } }
+        watcher.stallThresholdNanos = 400_000_000    // 0.4 s
+        watcher.watchdogIntervalNanos = 100_000_000  // 0.1 s
+        let stalled = expectation(description: "a single stuck classic read must alarm")
+        watcher.onStall = { stalled.fulfill() }
+
+        try watcher.start()
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        await fulfillment(of: [stalled], timeout: 5)
+        _ = collector
+    }
+
     /// Guards against a COUNT-related stall of the live watcher (investigated after the M8 all-nighter
     /// stalled ~762 frames in): native-relay style (.immutableAfterPublish, Light_ prefix), a large
     /// batch of subs arriving incrementally, every one must be emitted. (Confirms the stall was NOT a
