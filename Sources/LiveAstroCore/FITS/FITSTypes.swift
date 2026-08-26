@@ -24,9 +24,24 @@ public struct FITSHeader: Equatable {
     public var width: Int { dims[0] }
     public var height: Int { dims[1] }
     public var channels: Int { dims.count == 3 ? dims[2] : 1 }
-    public var dataBytes: Int { dims.reduce(1, *) * abs(bitpix) / 8 }
-    /// Watcher completeness check: file must be at least this many bytes.
-    public var minimumFileSize: Int { headerBytes + dataBytes }
+    /// Bytes of pixel data. Overflow-SATURATES to Int.max rather than trapping, so a hostile header
+    /// (huge NAXIS) can't crash a public caller; the watcher then treats such a file as never
+    /// complete (a real file size can't reach Int.max), which is the safe outcome.
+    public var dataBytes: Int {
+        var acc = 1
+        for d in dims {
+            let (p, o) = acc.multipliedReportingOverflow(by: d)
+            if o { return Int.max }
+            acc = p
+        }
+        let (bytes, o) = acc.multipliedReportingOverflow(by: abs(bitpix))
+        return o ? Int.max : bytes / 8
+    }
+    /// Watcher completeness check: file must be at least this many bytes. Saturating add.
+    public var minimumFileSize: Int {
+        let (s, o) = headerBytes.addingReportingOverflow(dataBytes)
+        return o ? Int.max : s
+    }
 
     public var bayerPattern: String? { keywords["BAYERPAT"] }
     public var dateObs: String? { keywords["DATE-OBS"] }

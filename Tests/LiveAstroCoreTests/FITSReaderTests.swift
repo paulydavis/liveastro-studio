@@ -227,4 +227,17 @@ enum FITSTestBuilder {
         while s.count % 2880 != 0 { s += String(repeating: " ", count: 80) }
         return s.data(using: .ascii)!
     }
+
+    /// FITSHeader.dataBytes / minimumFileSize are public and were an unchecked product — a hostile
+    /// header (huge NAXIS) would trap. They must SATURATE to Int.max instead.
+    func testFITSHeaderDimensionProductSaturatesOnOverflow() {
+        let hostile = FITSHeader(bitpix: 32, dims: [Int.max, 2], bscale: 1, bzero: 0,
+                                 bottomUp: false, headerBytes: 2880)
+        XCTAssertEqual(hostile.dataBytes, Int.max)
+        XCTAssertEqual(hostile.minimumFileSize, Int.max)
+        let normal = FITSHeader(bitpix: 32, dims: [100, 100], bscale: 1, bzero: 0,
+                                bottomUp: false, headerBytes: 2880)
+        XCTAssertEqual(normal.dataBytes, 100 * 100 * 4)
+        XCTAssertEqual(normal.minimumFileSize, 2880 + 100 * 100 * 4)
+    }
 }
