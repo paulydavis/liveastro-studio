@@ -38,19 +38,21 @@ public enum CalibrationMatcher {
         if lightTemp == nil { warnings.append("Lights have no set-point temperature — matching darks ignoring temperature.") }
         if light.instrument == nil { warnings.append("Lights have no camera name — matching on gain/exposure only.") }
 
-        let bias = firstMatchingBias(light: light, library: library)
+        // Temperature tolerance — applied to BOTH darks and bias when both sides carry a set-point.
+        // (Bias specificity counts SET-TEMP, so bias must be temp-filtered too, else a wrong-temp
+        // bias could out-rank the correct one on index order.)
+        let tempOK: (MasterFrame) -> Bool = { frame in
+            guard let lt = lightTemp, let ft = frame.setTempC else { return true }
+            return abs(ft - lt) <= options.tempToleranceC
+        }
+
+        let bias = firstMatchingBias(light: light, library: library, tempOK: tempOK)
 
         // Darks matching camera + gain + binning.
         let darks = library.filter { $0.kind == .dark && keyMatches($0, light) }
         if darks.isEmpty {
             return Result(dark: .none(reason: "No dark in the library for this camera and gain."),
                           bias: bias, warnings: warnings)
-        }
-
-        // Apply temperature tolerance when the lights carry a temperature.
-        let tempOK: (MasterFrame) -> Bool = { frame in
-            guard let lt = lightTemp, let ft = frame.setTempC else { return true }
-            return abs(ft - lt) <= options.tempToleranceC
         }
         // Prefer the MOST specific match: a dark that agrees on gain/binning/temp beats a legacy
         // wildcard (gain/binning/temp all nil) that matches only by camera+exposure. Without this a
@@ -104,8 +106,10 @@ public enum CalibrationMatcher {
         return true
     }
 
-    private static func firstMatchingBias(light: SourceMetadata, library: [MasterFrame]) -> MasterFrame? {
-        rankedBySpecificity(library.filter { $0.kind == .bias && keyMatches($0, light) }, light: light).first
+    private static func firstMatchingBias(light: SourceMetadata, library: [MasterFrame],
+                                          tempOK: (MasterFrame) -> Bool) -> MasterFrame? {
+        rankedBySpecificity(library.filter { $0.kind == .bias && keyMatches($0, light) && tempOK($0) },
+                            light: light).first
     }
 
     /// How many of gain/binning/temp are BOTH specified on the master AND on the light (i.e. actually

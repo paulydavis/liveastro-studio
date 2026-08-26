@@ -54,6 +54,13 @@ public struct SourceMetadata: Equatable {
             guard r >= Double(min), r <= Double(max) else { return nil }
             return Int(r)
         }
+        // A finite value within a physically-plausible range. Rejects corrupt magnitudes (e.g.
+        // EXPTIME=1e100) at the source, before they can flow into dark scaling and produce a
+        // non-finite (blacked-out) calibrated frame.
+        func boundedNum(_ keys: [String], min: Double, max: Double) -> Double? {
+            for key in keys { if let v = num(key), v >= min, v <= max { return v } }
+            return nil
+        }
 
         object = clean("OBJECT")
         ra = num("RA"); dec = num("DEC")
@@ -62,11 +69,11 @@ public struct SourceMetadata: Equatable {
         instrument = clean("INSTRUME")
         telescope = clean("TELESCOP")
         filter = clean("FILTER")
-        exposureSeconds = num("EXPTIME") ?? num("EXPOSURE")
+        exposureSeconds = boundedNum(["EXPTIME", "EXPOSURE"], min: 0, max: 86_400)   // ≤ 24 h
         dateObs = clean("DATE-OBS")
-        gain = num("GAIN")
-        ccdTempC = num("CCD-TEMP")
-        setTempC = num("SET-TEMP")
+        gain = boundedNum(["GAIN"], min: 0, max: 1_000_000)
+        ccdTempC = boundedNum(["CCD-TEMP"], min: -273.15, max: 10_000)               // ≥ absolute zero
+        setTempC = boundedNum(["SET-TEMP"], min: -273.15, max: 10_000)
         binning = intCard("XBINNING", max: 64)            // practical binning ceiling
         width = intCard("NAXIS1", max: 1_000_000)         // sensor axis lengths (bounded so huge
         height = intCard("NAXIS2", max: 1_000_000)        // finite values can't trap Int(_:))

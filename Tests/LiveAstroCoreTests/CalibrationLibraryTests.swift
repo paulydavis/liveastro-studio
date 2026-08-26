@@ -45,6 +45,23 @@ final class CalibrationLibraryTests: XCTestCase {
         XCTAssertEqual(l.all().count, 1, "the good master must survive a single malformed entry")
     }
 
+    /// A salvageable older-schema entry (missing fields added later, e.g. channels/frameCount) must
+    /// decode with defaults, not be dropped — otherwise the next write permanently prunes it.
+    func testLenientDecodeSalvagesLegacyEntryMissingNewFields() throws {
+        let l = lib()
+        _ = try l.add(kind: .dark, camera: "ASI2600", gain: 100, exposureSeconds: 180,
+                      setTempC: -10, binning: 1, fitsURLs: writeRaws(2, value: 0.2))
+        let indexURL = tmp.appendingPathComponent("lib/index.json")
+        var arr = try JSONSerialization.jsonObject(with: Data(contentsOf: indexURL)) as! [[String: Any]]
+        arr[0].removeValue(forKey: "channels")     // simulate an older schema
+        arr[0].removeValue(forKey: "frameCount")
+        try JSONSerialization.data(withJSONObject: arr).write(to: indexURL)
+        let all = l.all()
+        XCTAssertEqual(all.count, 1, "a legacy entry missing new fields must be salvaged, not dropped")
+        XCTAssertEqual(all.first?.channels, 1)     // defaulted
+        XCTAssertEqual(all.first?.frameCount, 0)   // defaulted
+    }
+
     func testAddBuildsMasterAndIndexes() throws {
         let urls = writeRaws(3, value: 0.2)
         let l = lib()

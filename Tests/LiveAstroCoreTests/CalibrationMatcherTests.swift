@@ -72,6 +72,16 @@ final class CalibrationMatcherTests: XCTestCase {
         XCTAssertEqual(r.bias, bias)
     }
 
+    /// Bias selection must apply the same temperature tolerance as darks (both sides have a set-point)
+    /// — a wrong-temperature bias must be filtered out, not chosen by index order.
+    func testWrongTemperatureBiasNotChosenOverCorrect() {
+        let wrongTemp = master(.bias, exp: nil, temp: 20)     // far from light −10, earlier index
+        let correct = master(.bias, exp: nil, temp: -10)
+        let r = CalibrationMatcher.match(light: light(temp: -10),
+                                         library: [wrongTemp, correct, master(.dark, exp: 180)])
+        XCTAssertEqual(r.bias, correct, "a wrong-temperature bias must be filtered out, not chosen first")
+    }
+
     func testCameraMismatchNoDark() {
         let d = master(.dark, camera: "ASI2600", exp: 180)
         let r = CalibrationMatcher.match(light: light(camera: "Seestar"), library: [d])
