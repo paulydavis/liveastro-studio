@@ -102,6 +102,15 @@ final class MasterBuilderTests: XCTestCase {
         }
     }
 
+    /// The element-count guard must be OVERFLOW-safe (not just ceiling-checked) so a public caller
+    /// with hostile dimensions gets nil, not an arithmetic trap.
+    func testCheckedElementCountRejectsOverflowAndCeiling() {
+        XCTAssertNil(MasterBuilder.checkedElementCount(Int.max, 2, 1))             // multiply overflow
+        XCTAssertNil(MasterBuilder.checkedElementCount(1_000_000, 1_000_000, 4))   // exceeds 500M ceiling
+        XCTAssertNil(MasterBuilder.checkedElementCount(0, 2, 1))                   // nonpositive
+        XCTAssertEqual(MasterBuilder.checkedElementCount(6248, 4176, 1), 6248 * 4176)   // real 26 MP
+    }
+
     func testFlatBiasSubtractedAndNormalizedToMedianOne() throws {
         let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
         // flat frames constant 0.6; bias constant 0.1 → (0.6-0.1)=0.5 everywhere;

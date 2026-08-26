@@ -20,6 +20,18 @@ public enum MasterBuilder {
     /// would otherwise demand tens of terabytes.
     public static let maxPixelElements = 500_000_000
 
+    /// width·height·channels, or nil if the product OVERFLOWS Int or exceeds `maxPixelElements`.
+    /// Overflow-safe so a public caller passing hostile `expected` dimensions gets a clean throw,
+    /// not an arithmetic trap, before any allocation.
+    public static func checkedElementCount(_ width: Int, _ height: Int, _ channels: Int) -> Int? {
+        guard width > 0, height > 0, channels > 0 else { return nil }
+        let (wh, o1) = width.multipliedReportingOverflow(by: height)
+        guard !o1 else { return nil }
+        let (whc, o2) = wh.multipliedReportingOverflow(by: channels)
+        guard !o2, whc <= maxPixelElements else { return nil }
+        return whc
+    }
+
     /// A built master plus honest accounting of what actually went into it: how many frames
     /// contributed (readable + matching dimensions — NOT the input count, which may include skipped
     /// files) and, for flats, whether the offset was truly subtracted (it is silently skipped when
@@ -74,8 +86,9 @@ public enum MasterBuilder {
             // Allocate the accumulator on the FIRST contributing frame, bounded by a pixel ceiling so
             // a corrupt/hostile dimension can't demand a multi-terabyte buffer.
             if sum.isEmpty {
-                let elements = refW * refH * refC
-                guard elements > 0, elements <= maxPixelElements else { throw BuildError.frameTooLarge }
+                guard let elements = Self.checkedElementCount(refW, refH, refC) else {
+                    throw BuildError.frameTooLarge
+                }
                 sum = [Double](repeating: 0, count: elements)
             }
             // For flats, subtract the selected bias/dark-flat per-frame when its
