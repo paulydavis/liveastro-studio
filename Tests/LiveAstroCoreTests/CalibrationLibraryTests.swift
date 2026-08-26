@@ -87,6 +87,39 @@ final class CalibrationLibraryTests: XCTestCase {
         XCTAssertTrue(all.allSatisfy { MasterFrame.isSafeBasename($0.fileName) })
     }
 
+    /// A safe-basename fileName that aliases ANOTHER master's file (A's fileName set to B's file)
+    /// stays inside the library so the traversal guard passes — but it would load/overwrite/delete B
+    /// under A's identity. The canonical master-<id>.fit invariant must reject it.
+    func testRejectsAliasedFileNamePointingAtAnotherMaster() throws {
+        let l = lib()
+        let a = try l.add(kind: .dark, camera: "ASI2600", gain: 100, exposureSeconds: 180,
+                          setTempC: -10, binning: 1, fitsURLs: writeRaws(2, value: 0.2))
+        let b = try l.add(kind: .bias, camera: "ASI2600", gain: 100, exposureSeconds: nil,
+                          setTempC: -10, binning: 1, fitsURLs: writeRaws(2, value: 0.1))
+        let indexURL = tmp.appendingPathComponent("lib/index.json")
+        var arr = try JSONSerialization.jsonObject(with: Data(contentsOf: indexURL)) as! [[String: Any]]
+        for i in arr.indices where (arr[i]["id"] as? String) == a.id.uuidString {
+            arr[i]["fileName"] = b.fileName        // alias A → B's backing file
+        }
+        try JSONSerialization.data(withJSONObject: arr).write(to: indexURL)
+        let all = l.all()
+        XCTAssertEqual(all.count, 1, "the aliased entry must be rejected, the canonical one kept")
+        XCTAssertEqual(all.first?.id, b.id)
+        XCTAssertEqual(all.first?.fileName, "master-\(b.id.uuidString).fit")
+    }
+
+    /// A corrupt index that repeats an entry must not surface it twice.
+    func testDuplicateIdEntriesAreDeduped() throws {
+        let l = lib()
+        _ = try l.add(kind: .dark, camera: "ASI2600", gain: 100, exposureSeconds: 180,
+                      setTempC: -10, binning: 1, fitsURLs: writeRaws(2, value: 0.2))
+        let indexURL = tmp.appendingPathComponent("lib/index.json")
+        var arr = try JSONSerialization.jsonObject(with: Data(contentsOf: indexURL)) as! [[String: Any]]
+        arr.append(arr[0])
+        try JSONSerialization.data(withJSONObject: arr).write(to: indexURL)
+        XCTAssertEqual(l.all().count, 1, "a duplicate id must be deduped")
+    }
+
     func testAddBuildsMasterAndIndexes() throws {
         let urls = writeRaws(3, value: 0.2)
         let l = lib()

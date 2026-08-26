@@ -51,12 +51,14 @@ public struct MasterFrame: Codable, Equatable, Identifiable {
         kind = try c.decode(MasterKind.self, forKey: .kind)
         camera = try c.decode(String.self, forKey: .camera)
         fileName = try c.decode(String.self, forKey: .fileName)
-        // SECURITY: fileName drives load / rebuild-overwrite / remove-delete. A hostile or corrupt
-        // index with "../../evil.fit" must never let those escape the library root, so reject any
-        // non-basename here — the tolerant per-entry decode in all() then skips this record.
-        guard MasterFrame.isSafeBasename(fileName) else {
+        // SECURITY: fileName drives load / rebuild-overwrite / remove-delete. Require the CANONICAL
+        // name master-<id>.fit — this both blocks path traversal ("../../evil.fit") AND prevents one
+        // entry from aliasing another's master file (a corrupt index pointing A's fileName at B's
+        // file, which would load/overwrite/delete B under A's identity — all still "inside" the
+        // library). The tolerant per-entry decode in all() then skips any record that fails this.
+        guard MasterFrame.isSafeBasename(fileName), fileName == "master-\(id.uuidString).fit" else {
             throw DecodingError.dataCorruptedError(forKey: .fileName, in: c,
-                debugDescription: "unsafe (path-traversing) master fileName: \(fileName)")
+                debugDescription: "master fileName must be the canonical master-<id>.fit: \(fileName)")
         }
         gain = try c.decodeIfPresent(Double.self, forKey: .gain)
         exposureSeconds = try c.decodeIfPresent(Double.self, forKey: .exposureSeconds)
@@ -109,17 +111,25 @@ public final class CalibrationLibrary: Sendable {
     /// every good master.
     public func all() -> [MasterFrame] {
         guard let data = try? Data(contentsOf: indexURL) else { return [] }
+        let decoded: [MasterFrame]
         // Fast path: a fully-valid array.
-        if let frames = try? JSONDecoder().decode([MasterFrame].self, from: data) { return frames }
-        // Tolerant path: decode each element independently, dropping the ones that fail.
-        struct Tolerant: Decodable {
-            let frame: MasterFrame?
-            init(from decoder: Decoder) throws {
-                frame = try? decoder.singleValueContainer().decode(MasterFrame.self)
+        if let frames = try? JSONDecoder().decode([MasterFrame].self, from: data) {
+            decoded = frames
+        } else {
+            // Tolerant path: decode each element independently, dropping the ones that fail.
+            struct Tolerant: Decodable {
+                let frame: MasterFrame?
+                init(from decoder: Decoder) throws {
+                    frame = try? decoder.singleValueContainer().decode(MasterFrame.self)
+                }
             }
+            guard let wrapped = try? JSONDecoder().decode([Tolerant].self, from: data) else { return [] }
+            decoded = wrapped.compactMap(\.frame)
         }
-        guard let wrapped = try? JSONDecoder().decode([Tolerant].self, from: data) else { return [] }
-        return wrapped.compactMap(\.frame)
+        // De-duplicate by id (a corrupt index could repeat one) — keep the first occurrence. The
+        // canonical-fileName invariant already guarantees distinct ids map to distinct files.
+        var seen = Set<UUID>()
+        return decoded.filter { seen.insert($0.id).inserted }
     }
 
     /// Build a master from `fitsURLs` and add it to the library. `bias` is only

@@ -12,7 +12,13 @@ public enum MasterBuilder {
     /// prototype's clip(flat, 1.0) in ADU space.
     public static let flatFloor: Float = 1.0 / 65535
 
-    public enum BuildError: Error, Equatable { case noFrames, noValidFrames }
+    public enum BuildError: Error, Equatable { case noFrames, noValidFrames, frameTooLarge }
+
+    /// Upper bound on total elements (width·height·channels) of a master's accumulation buffer.
+    /// 500 M Doubles ≈ 4 GB — comfortably above any real sensor (a 150 MP RGB frame is ~450 M
+    /// elements) but a hard stop against a hostile/corrupt FITS header (e.g. NAXIS 1e6×1e6) that
+    /// would otherwise demand tens of terabytes.
+    public static let maxPixelElements = 500_000_000
 
     /// A built master plus honest accounting of what actually went into it: how many frames
     /// contributed (readable + matching dimensions — NOT the input count, which may include skipped
@@ -49,20 +55,28 @@ public enum MasterBuilder {
         var refW = 0, refH = 0, refC = 0
         var count = 0
         var offsetApplied = false
+        var haveRef = false
         if let e = expected {
             guard e.width > 0, e.height > 0, e.channels > 0 else { throw BuildError.noValidFrames }
-            refW = e.width; refH = e.height; refC = e.channels
-            sum = [Double](repeating: 0, count: refW * refH * refC)
+            refW = e.width; refH = e.height; refC = e.channels; haveRef = true
+            // NOTE: do NOT allocate here — a hostile `expected` size that no frame matches must not
+            // force a giant buffer. Allocation happens (bounded) only when a real frame matches.
         }
 
         for url in fitsURLs {
             guard let data = try? Data(contentsOf: url),
                   let img = try? FITSReader.read(data, normalizeRowOrder: true) else { continue }
-            if expected == nil, count == 0 {
-                refW = img.width; refH = img.height; refC = img.channels
-                sum = [Double](repeating: 0, count: refW * refH * refC)
+            if !haveRef {
+                refW = img.width; refH = img.height; refC = img.channels; haveRef = true
             } else if img.width != refW || img.height != refH || img.channels != refC {
                 continue    // doesn't match the reference (expected, or first-readable) → skip
+            }
+            // Allocate the accumulator on the FIRST contributing frame, bounded by a pixel ceiling so
+            // a corrupt/hostile dimension can't demand a multi-terabyte buffer.
+            if sum.isEmpty {
+                let elements = refW * refH * refC
+                guard elements > 0, elements <= maxPixelElements else { throw BuildError.frameTooLarge }
+                sum = [Double](repeating: 0, count: elements)
             }
             // For flats, subtract the selected bias/dark-flat per-frame when its
             // dimensions match; otherwise fall through WITHOUT subtracting (recorded below).
