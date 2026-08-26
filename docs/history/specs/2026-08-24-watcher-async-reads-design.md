@@ -143,12 +143,9 @@ less likely on his local+iCloud Desktop but must be handled for "do it properly.
 - **(B) Deadline-based slot reclamation.** Give each read a wall-clock deadline; on expiry, evict
   its `inFlightReads` slot (detection continues) and back off re-dispatching that file. Bounds
   concurrent slot use; the abandoned task still leaks its fd/thread until it errors out. Medium.
-- **(C) Interruptible reads (gold standard, removes the leak entirely).** Rewrite the digest read
-  to a non-blocking fd + `poll()` with a per-chunk deadline (or close the fd from a watchdog to
-  force `read()` to return). A hung read then returns an error → task completes → fd/thread/slot all
-  freed → `.invalid` → retried with backoff → self-heals when the mount returns. No leak, no silent
-  halt, no watchdog dependency. Largest change (touches `FileIdentity.contentDigest`), needs its own
-  review pass.
+- **(C) Interruptible reads — INFEASIBLE (see below).** Originally listed as the gold standard that
+  "removes the leak entirely." On investigation (2026-08-25) this is **not achievable on macOS** for
+  the case that matters. See the resolution section.
 
 Recommendation: **(A) now** (small, makes the branch strictly better than `main` and re-armed the
 operator alert), with **(C)** as a fast-follow if overnight dead-mount robustness is a priority.
@@ -192,8 +189,25 @@ re-arm intact. Two Theoretical/Minor notes:
   clock (only current-generation progress counts) — removes a bounded window where a post-swap
   all-stuck stall could be briefly masked.
 
-**Remaining open (Paul's call): Option C (interruptible reads)** — would remove the fd/thread leak
-entirely and drop the watchdog dependency. Deferred as a reviewed fast-follow.
+**Option C (interruptible reads) — INVESTIGATED, INFEASIBLE (2026-08-25).** The premise (force a hung
+read to return, e.g. by closing its fd from a deadline timer) does not hold for a **regular file**
+wedged on a dead mount. On BSD/macOS, `close()` from another thread removes the fd→file mapping and
+decrements the file-object refcount, but a `read()` already in progress on another thread holds its
+own reference, so the read completes/blocks on the underlying object regardless — `close()` does NOT
+interrupt it. `poll()`/`O_NONBLOCK` don't help either: regular files are always poll-ready and ignore
+non-blocking mode; the fault happens *inside* `read()` (the fileprovider/VFS faulting the bytes).
+Sockets can be unblocked via `shutdown()`, but our reads are regular files (local / SMB / NFS / iCloud
+fileprovider). So a kernel-wedged read returns only when the network/kernel layer times out (SMB
+≈ minutes) or the mount is force-unmounted — neither is user-space-controllable.
+
+**Accepted resolution: Option A is the terminal state.** True interruption is impossible, so the
+achievable envelope is: (1) a single hung read no longer freezes detection (async transport,
+merged); (2) the operator is alerted within the stall threshold when every slot is stuck (watchdog
+visibility, merged); (3) the leak is bounded by operator restart on that alert. A persistent
+outstanding-read counter (bound leaked fds to `maxInFlightReads` regardless of folder-swap count,
+without operator action) remains a possible defense-in-depth hardening, but it does NOT unwedge reads
+(nothing can) and matters only for a rapidly-flapping network mount — not the local+iCloud regime this
+app targets. Recorded here so the impossibility isn't re-derived and Option C isn't re-attempted.
 
 ## Out of scope
 
