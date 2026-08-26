@@ -83,8 +83,14 @@ public enum CalibrationResolver {
         // Legacy explicit dark selection as a fallback when the library had no match.
         if darkImage == nil, let p = legacyDarkPath {
             do {
-                darkImage = try MasterBuilder.load(URL(fileURLWithPath: p))
-                messages.append("Calibration: using selected dark file.")
+                let img = try MasterBuilder.load(URL(fileURLWithPath: p))
+                if dimensionsOK(img, metadata) {
+                    darkImage = img
+                    messages.append("Calibration: using selected dark file.")
+                } else {
+                    // Validate BEFORE reporting active — else hasDark lies and the Calibrator skips it.
+                    messages.append("Calibration: selected dark doesn't match these lights' size — skipping it.")
+                }
             } catch {
                 messages.append("Calibration: selected dark could not be read — \(error.localizedDescription).")
             }
@@ -109,12 +115,17 @@ public enum CalibrationResolver {
             } else {
                 do {
                     let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .flat, bias: offset)
-                    flatImage = built.image
-                    // Report the offset HONESTLY: a dimension-mismatched offset is silently skipped
-                    // by the builder, so don't claim "subtracted" unless it actually was.
-                    let offsetNote = built.offsetApplied ? " (offset subtracted)"
-                        : (offset != nil ? " (offset skipped — size mismatch)" : "")
-                    messages.append("Calibration: built master flat from \(built.contributingCount) flats\(offsetNote).")
+                    if dimensionsOK(built.image, metadata) {
+                        flatImage = built.image
+                        // Report the offset HONESTLY: a dimension-mismatched offset is silently skipped
+                        // by the builder, so don't claim "subtracted" unless it actually was.
+                        let offsetNote = built.offsetApplied ? " (offset subtracted)"
+                            : (offset != nil ? " (offset skipped — size mismatch)" : "")
+                        messages.append("Calibration: built master flat from \(built.contributingCount) flats\(offsetNote).")
+                    } else {
+                        // Validate the built flat's size against the lights before reporting hasFlat.
+                        messages.append("Calibration: built flat doesn't match these lights' size — skipping the flat.")
+                    }
                 } catch {
                     messages.append("Calibration: flat build failed — \(error.localizedDescription); continuing without a flat.")
                 }
@@ -123,8 +134,13 @@ public enum CalibrationResolver {
             do {
                 // Normalize legacy/external master flats (idempotent) so a non-normalized
                 // file can't over/under-correct — matches the session-flat path.
-                flatImage = MasterBuilder.normalizedFlat(try MasterBuilder.load(URL(fileURLWithPath: p)))
-                messages.append("Calibration: using selected flat file.")
+                let img = MasterBuilder.normalizedFlat(try MasterBuilder.load(URL(fileURLWithPath: p)))
+                if dimensionsOK(img, metadata) {
+                    flatImage = img
+                    messages.append("Calibration: using selected flat file.")
+                } else {
+                    messages.append("Calibration: selected flat doesn't match these lights' size — skipping it.")
+                }
             } catch {
                 messages.append("Calibration: selected flat could not be read — \(error.localizedDescription).")
             }
@@ -148,10 +164,12 @@ public enum CalibrationResolver {
     }
 
     static func describe(_ f: MasterFrame) -> String {
+        // Int(_:) traps on a finite-but-huge Double; Int(exactly:) is nil out of range → safe format.
+        func intStr(_ v: Double) -> String { Int(exactly: v.rounded()).map(String.init) ?? String(format: "%.2g", v) }
         var parts: [String] = []
-        if let e = f.exposureSeconds { parts.append("\(Int(e))s") }
-        if let t = f.setTempC { parts.append("\(Int(t))°C") }
-        if let g = f.gain { parts.append("gain \(Int(g))") }
+        if let e = f.exposureSeconds { parts.append("\(intStr(e))s") }
+        if let t = f.setTempC { parts.append("\(intStr(t))°C") }
+        if let g = f.gain { parts.append("gain \(intStr(g))") }
         return "\(f.camera) dark" + (parts.isEmpty ? "" : " (\(parts.joined(separator: ", ")))")
     }
 }

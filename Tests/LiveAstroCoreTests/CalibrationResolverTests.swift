@@ -113,6 +113,28 @@ final class CalibrationResolverTests: XCTestCase {
         XCTAssertTrue(r.hasDark, "a corrupt first bias must not block scaling with the valid second bias")
     }
 
+    /// A legacy explicitly-selected dark whose size doesn't match the lights must NOT report hasDark
+    /// (the Calibrator would skip it) — it's validated before acceptance.
+    func testLegacyDarkWrongSizeNotReportedActive() throws {
+        // Build a 4×4 dark file, then point legacyDarkPath at it with lights declared 8×8.
+        let darkURL = tmp.appendingPathComponent("legacydark.fit")
+        try MasterBuilder.save(MasterBuilder.combine(fitsURLs: filesIn(rawFolder("ld", count: 2, value: 0.2)),
+                                                     kind: .dark, bias: nil), to: darkURL)
+        var l = light(); l.width = 8; l.height = 8; l.channels = 1
+        let r = CalibrationResolver.resolve(metadata: l, library: library(), scaleEnabled: true,
+                    flatsFolder: nil, darkFlatsFolder: nil, legacyDarkPath: darkURL.path, legacyFlatPath: nil)
+        XCTAssertFalse(r.hasDark, "a wrong-size legacy dark must not be reported active")
+        XCTAssertTrue(r.messages.contains { $0.contains("doesn't match") })
+    }
+
+    /// describe()/fmt() must not trap on a corrupt finite-but-huge exposure (Int(1e100) traps).
+    func testDescribeDoesNotCrashOnHugeExposure() {
+        let f = MasterFrame(id: UUID(), kind: .dark, camera: "ASI2600", gain: 100, exposureSeconds: 1e100,
+                            setTempC: -10, binning: 1, width: 4, height: 4, channels: 1,
+                            frameCount: 1, createdAt: Date(), fileName: "m.fit", sourcePath: nil)
+        _ = CalibrationResolver.describe(f)   // must return, not fatalError
+    }
+
     func testNoDarkForDifferentCamera() throws {
         let lib = library()
         try lib.add(kind: .dark, camera: "ASI2600", gain: 100, exposureSeconds: 180,
