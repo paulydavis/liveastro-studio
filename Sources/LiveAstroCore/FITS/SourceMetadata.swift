@@ -75,8 +75,8 @@ public struct SourceMetadata: Equatable {
         ccdTempC = boundedNum(["CCD-TEMP"], min: -273.15, max: 10_000)               // ≥ absolute zero
         setTempC = boundedNum(["SET-TEMP"], min: -273.15, max: 10_000)
         binning = intCard("XBINNING", max: 64)            // practical binning ceiling
-        width = intCard("NAXIS1", max: 1_000_000)         // sensor axis lengths (bounded so huge
-        height = intCard("NAXIS2", max: 1_000_000)        // finite values can't trap Int(_:))
+        width = intCard("NAXIS1", max: 100_000)           // sensor axis lengths — far above any real
+        height = intCard("NAXIS2", max: 100_000)          // sensor (~14k), bounded vs corrupt headers
         // Channels: NAXIS3 for a 3-plane cube (RGB), else 1 for a 2-D image. Used to validate a
         // master's channel count matches these lights (a same-size wrong-channel dark is unusable).
         channels = intCard("NAXIS3", max: 4) ?? ((width != nil && height != nil) ? 1 : nil)

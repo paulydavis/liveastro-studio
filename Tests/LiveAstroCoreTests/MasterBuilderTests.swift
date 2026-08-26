@@ -89,6 +89,19 @@ final class MasterBuilderTests: XCTestCase {
         for p in r.image.pixels { XCTAssertEqual(p, 0.5, accuracy: 1e-5) }   // mean(0.4, 0.6)
     }
 
+    /// A hostile/corrupt `expected` size (e.g. 1e6×1e6 from a bad FITS header) must NOT force a
+    /// multi-terabyte allocation: the buffer is allocated only when a real frame matches, so with no
+    /// matching frame it throws noValidFrames instead of OOM-ing.
+    func testHostileExpectedDimensionsDoNotForceGiantAllocation() throws {
+        let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
+        _ = try writeConst(dir, "a.fit", 0.5, w: 2, h: 2)
+        let urls = [dir.appendingPathComponent("a.fit")]
+        XCTAssertThrowsError(try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .dark, bias: nil,
+                                                               expected: (1_000_000, 1_000_000, 1))) {
+            XCTAssertEqual($0 as? MasterBuilder.BuildError, .noValidFrames)
+        }
+    }
+
     func testFlatBiasSubtractedAndNormalizedToMedianOne() throws {
         let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
         // flat frames constant 0.6; bias constant 0.1 → (0.6-0.1)=0.5 everywhere;
