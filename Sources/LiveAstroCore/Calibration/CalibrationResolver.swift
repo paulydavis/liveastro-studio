@@ -81,8 +81,13 @@ public enum CalibrationResolver {
                 messages.append("Calibration: no flats found in the flats folder — continuing without a flat.")
             } else {
                 do {
-                    flatImage = try MasterBuilder.combine(fitsURLs: urls, kind: .flat, bias: offset)
-                    messages.append("Calibration: built master flat from \(urls.count) flats\(offset != nil ? " (offset subtracted)" : "").")
+                    let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .flat, bias: offset)
+                    flatImage = built.image
+                    // Report the offset HONESTLY: a dimension-mismatched offset is silently skipped
+                    // by the builder, so don't claim "subtracted" unless it actually was.
+                    let offsetNote = built.offsetApplied ? " (offset subtracted)"
+                        : (offset != nil ? " (offset skipped — size mismatch)" : "")
+                    messages.append("Calibration: built master flat from \(built.contributingCount) flats\(offsetNote).")
                 } catch {
                     messages.append("Calibration: flat build failed — \(error.localizedDescription); continuing without a flat.")
                 }

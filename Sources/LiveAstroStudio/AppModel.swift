@@ -617,13 +617,18 @@ final class AppModel {
             // Swift 6: rebind weak self to a strong immutable up front — nested
             // @Sendable closures may not reference a captured weak *var*.
             guard let self else { return }
+            // Key the master from the first READABLE frame's header — not urls[0], which may be the
+            // corrupt/unreadable file MasterBuilder silently skips. Keying off a skipped file would
+            // stamp the master with generic/nil camera+gain so it never matches lights later.
             var meta = SourceMetadata()
-            if let fh = try? FileHandle(forReadingFrom: urls[0]) {
+            for url in urls {
+                guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
+                defer { try? fh.close() }
                 if let head = try? fh.read(upToCount: 256 * 1024),
                    let header = try? FITSReader.readHeader(head) {
                     meta = SourceMetadata(fitsKeywords: header.keywords)
+                    break
                 }
-                try? fh.close()
             }
             do {
                 let frame = try lib.add(kind: kind, camera: meta.instrument ?? "Camera",
