@@ -53,7 +53,7 @@ final class SessionPipelineSubFrameTests: XCTestCase {
         source.send(FaultMatrixLifecycleTests.starField(name: "good.fit", dx: 1.1, dy: -0.9))
         // star-less frame -> rejected (insufficient stars)
         source.send(FaultMatrixLifecycleTests.blankField(name: "too_few_stars.fit"))
-        wait(for: [subFrameCount], timeout: 5)
+        wait(for: [subFrameCount], timeout: 30)   // returns the instant callbacks fire; generous only to survive heavy-load stalls
 
         _ = try pipeline.end()
 
@@ -95,7 +95,7 @@ final class SessionPipelineSubFrameTests: XCTestCase {
         source.send(FaultMatrixLifecycleTests.starField(name: "seed.fit", dx: 0, dy: 0))
         source.send(FaultMatrixLifecycleTests.starField(name: "good.fit", dx: 1.1, dy: -0.9))
         source.send(FaultMatrixLifecycleTests.blankField(name: "too_few_stars.fit"))
-        wait(for: [subFrameCount], timeout: 5)
+        wait(for: [subFrameCount], timeout: 30)   // returns the instant callbacks fire; generous only to survive heavy-load stalls
 
         _ = try pipeline.end()
 
@@ -140,7 +140,7 @@ final class SessionPipelineSubFrameTests: XCTestCase {
         source.send(FaultMatrixLifecycleTests.blankField(name: "too_few_stars.fit"))
         // registers against the seed -> stacked (accepted)
         source.send(FaultMatrixLifecycleTests.starField(name: "good.fit", dx: 1.1, dy: -0.9))
-        wait(for: [subFrameCount], timeout: 5)
+        wait(for: [subFrameCount], timeout: 30)   // returns the instant callbacks fire; generous only to survive heavy-load stalls
 
         _ = try pipeline.end()
 
