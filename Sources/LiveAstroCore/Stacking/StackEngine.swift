@@ -202,6 +202,10 @@ public final class StackEngine {
         lock.withLock { accumulator?.mean() }
     }
 
+    /// Read-only view of the seed threshold (RestackCoordinator reports this as the
+    /// `needed` count in `.belowSeedMinimum` — the stored `seedMinStars` stays private).
+    public var minimumSeedStars: Int { seedMinStars }
+
     /// Frames in the CURRENT stack (resets on reseed, unlike acceptedCount).
     public var stackFrameCount: Int {
         lock.withLock { accumulator?.frameCount ?? 0 }
