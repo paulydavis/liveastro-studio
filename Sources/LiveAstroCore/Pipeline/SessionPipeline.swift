@@ -619,12 +619,17 @@ public final class SessionPipeline {
             case .stacked:         subOutcome = .stacked
             case .rejected(let r): subOutcome = .rejected; rejectionReason = "\(r)"
             }
-            onSubFrame?(SubFrameRecord(
+            let subRecord = SubFrameRecord(
                 index: subOutcome == .rejected ? processedCount : engine.acceptedCount,
                 timestamp: frame.timestamp, sourceFile: frame.sourceName,
                 starCount: result.starCount, backgroundSigma: result.backgroundSigma,
                 weight: result.weight, outcome: subOutcome, rejectionReason: rejectionReason,
-                rejectedByUser: false))
+                rejectedByUser: false)
+            onSubFrame?(subRecord)
+            // Persist every sub (accepted AND rejected) on this same callback-delivery
+            // thread — the same serial context recordSnapshot runs on below, so this is
+            // race-free against AppModel's main-actor mirror (Task 8 Refinement).
+            try? session.recordSubFrame(subRecord)
             switch outcome {
             case .becameReference, .stacked:
                 guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }

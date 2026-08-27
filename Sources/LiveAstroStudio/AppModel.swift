@@ -117,6 +117,13 @@ final class AppModel {
     /// (watcher mode reads 0 — use latestRecord?.index instead).
     var acceptedCount = 0
     var rejectedCount = 0
+    /// Main-actor mirror of the per-sub quality records the pipeline persists to the
+    /// session manifest (Task 8a). Source of truth for the Stats UI and the re-stack
+    /// excluded set. Appended from `pipeline.onSubFrame`; the pipeline itself already
+    /// wrote the record to `session.subFrames` on its own callback thread, so this
+    /// handler is UI-mirror only (no manifest write here — that would race the
+    /// consume task; see Task 8 Refinement in the sub-stats plan).
+    private(set) var subFrames: [SubFrameRecord] = []
     var latestImage: CGImage?
     var latestRecord: SnapshotRecord?
     var sessionStart: Date?
@@ -719,6 +726,7 @@ final class AppModel {
 
         acceptedCount = 0
         rejectedCount = 0
+        subFrames = []
 
         // Reset per-session completion state and ask for notification permission
         // once (no-op if already granted/denied). The tick starts only on success.
@@ -878,6 +886,24 @@ final class AppModel {
         pipeline.onSolveStateChanged = { [weak self] in
             Task { @MainActor in self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false }
         }
+        // Task 8a data plane: mirror each persisted sub onto the main actor for the Stats
+        // UI. The pipeline already wrote the record to session.subFrames on its own
+        // callback thread (SessionPipeline.handleNative) — this hop is UI-mirror only.
+        pipeline.onSubFrame = { [weak self] record in
+            Task { @MainActor in self?.subFrames.append(record) }
+        }
+    }
+
+    /// Number of subs the operator has flagged for exclusion from a re-stack.
+    var flaggedCount: Int { subFrames.filter(\.rejectedByUser).count }
+
+    /// Flips the operator reject flag on the in-memory mirror for the sub with `index`.
+    /// Mirror-only: does NOT write the manifest mid-session (would race the pipeline's
+    /// consume task). Flags are persisted to the manifest at the race-free points —
+    /// session end() and re-stack (later tasks); see Task 8 Refinement.
+    func toggleReject(index: Int) {
+        guard let i = subFrames.firstIndex(where: { $0.index == index }) else { return }
+        subFrames[i].rejectedByUser.toggle()
     }
 
     /// Reseeds the stacking engine reference frame (native mode only).

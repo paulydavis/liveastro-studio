@@ -60,4 +60,43 @@ final class SessionPipelineSubFrameTests: XCTestCase {
         XCTAssertEqual(records[0].index, 1)
         XCTAssertEqual(records[1].index, 2)
     }
+
+    /// Task 8a: the pipeline persists every emitted sub (accepted AND rejected) into
+    /// `session.subFrames` on the same callback-delivery thread as the emit — completing
+    /// Task 6's emit-only hook into the data-plane write.
+    func testPipelinePersistsEverySubToSessionManifest() throws {
+        let root = try sandbox()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = root.appendingPathComponent("sessions")
+        let source = NativePipelineTests.ControlledLiveSource()
+        let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
+                                       profile: profile(), rootDirectory: sessions)
+
+        let captureLock = NSLock()
+        var captured: [SubFrameRecord] = []
+        let subFrameCount = expectation(description: "onSubFrame fired 3 times")
+        subFrameCount.expectedFulfillmentCount = 3
+        pipeline.onSubFrame = { record in
+            captureLock.withLock { captured.append(record) }
+            subFrameCount.fulfill()
+        }
+
+        try pipeline.start()
+        source.send(FaultMatrixLifecycleTests.starField(name: "seed.fit", dx: 0, dy: 0))
+        source.send(FaultMatrixLifecycleTests.starField(name: "good.fit", dx: 1.1, dy: -0.9))
+        source.send(FaultMatrixLifecycleTests.blankField(name: "too_few_stars.fit"))
+        wait(for: [subFrameCount], timeout: 5)
+
+        _ = try pipeline.end()
+
+        let records = captureLock.withLock { captured }
+        let persisted = pipeline.session.subFrames
+        XCTAssertEqual(persisted.count, 3)
+        XCTAssertEqual(persisted.map(\.sourceFile), records.map(\.sourceFile))
+        XCTAssertEqual(persisted.map(\.outcome), records.map(\.outcome))
+        XCTAssertEqual(persisted.map(\.index), records.map(\.index))
+        // Persisted set must include both accepted and rejected subs.
+        XCTAssertEqual(persisted.filter { $0.outcome == .rejected }.count, 1)
+        XCTAssertEqual(persisted.filter { $0.outcome != .rejected }.count, 2)
+    }
 }
