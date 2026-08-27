@@ -50,78 +50,9 @@ struct ControlView: View {
         return "LiveAstro v\(version)"
     }
 
-    // Session Health summary text — used by the "Copy Support Bundle" action in the
-    // pinned footer below. The Session Health GRID itself (which also renders these)
-    // moved to DiagnosticsView; that view keeps its own copy of these formatters
-    // rather than sharing them across the footer/tab boundary.
-    private var sessionStateText: String {
-        if model.liveSource.isDetecting { return "Detecting source" }
-        if model.importer.isImporting { return "Importing" }
-        if model.importer.isGeneratingReplay { return "Rendering replay" }
-        if model.isRunning { return "Running" }
-        return "Idle"
-    }
-
-    private var sourceSummaryText: String {
-        switch model.sourceMode {
-        case .nativeStack:
-            return "Native stacking"
-        case .stackerOutput:
-            return "Siril / external stacker"
-        }
-    }
-
-    private var watchFolderSummaryText: String {
-        model.watchFolder?.path ?? "(none selected)"
-    }
-
-    private var lastUpdateSummaryText: String {
-        guard let record = model.latestRecord else { return model.integrationCaption }
-        return "#\(record.index) · \(record.snapshotFile)"
-    }
-
-    private var framesSummaryText: String {
-        "accepted \(model.acceptedCount) · rejected \(model.rejectedCount)"
-    }
-
-    private var lastRejectionSummaryText: String {
-        guard let line = model.log.last(where: { $0.hasPrefix("✗ rejected ") }) else {
-            return "(none)"
-        }
-        let prefix = "✗ rejected "
-        if line.hasPrefix(prefix) {
-            return String(line.dropFirst(prefix.count))
-        }
-        return line
-    }
-
-    private var obsSummaryText: String {
-        switch model.broadcast.broadcastState {
-        case .idle:
-            return "idle"
-        case .unknown:
-            return "not checked"
-        case .connecting:
-            return "connecting"
-        case .live:
-            if let h = model.broadcast.streamHealth {
-                return "live · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% congestion"
-            }
-            return "live"
-        case .endingSession:
-            return "ending session"
-        case .stopping:
-            return "stopping"
-        case .stopUnconfirmed:
-            return "may still be live"
-        }
-    }
-
-    private var outputsSummaryText: String {
-        if model.replayURL != nil { return "replay ready" }
-        if model.lastSessionDirectory != nil { return "session folder ready" }
-        return "no finished session yet"
-    }
+    // Session Health summary text (sessionStateText, sourceSummaryText, etc.) used by
+    // the "Copy Support Bundle" action below now lives on AppModel — shared with
+    // DiagnosticsView's Session Health grid.
 
     var body: some View {
         @Bindable var model = model
@@ -179,10 +110,10 @@ struct ControlView: View {
                 } label: { Label("Start ASIAIR", systemImage: "camera.aperture") }
                 .help("Auto-detect the ASIAIR's Autorun/Light folder, relay its subs, and begin native stacking — one tap.")
                 .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
-                Button("Live from Folder / NINA…") { pickNativeWatchFolderLive() }
+                Button("Live from Folder / NINA…") { model.pickNativeWatchFolderLive() }
                     .help("Live-stack subs from any folder your rig writes to, including NINA or another FITS capture app.")
                     .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
-                Button("Stack Previous Shoot…") { pickImportFolder() }
+                Button("Stack Previous Shoot…") { model.pickImportFolder() }
                     .disabled(model.isRunning || model.importer.isImporting)
                     .help("Select a folder of previously captured FITS light frames to stack offline, with progress tracking and Cancel support.")
             }
@@ -210,7 +141,7 @@ struct ControlView: View {
                     HStack(spacing: 10) {
                         Button("End Broadcast", role: .destructive) { model.broadcast.endBroadcast() }
                         if let h = model.broadcast.streamHealth {
-                            Text("● LIVE · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
+                            Text("● LIVE · \(model.formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
                                 .foregroundStyle(.red).font(.caption)
                         }
                     }
@@ -225,7 +156,7 @@ struct ControlView: View {
                         Button("End Broadcast", role: .destructive) { model.broadcast.endBroadcast() }
                             .help("Stop the stream now instead of waiting for the replay to finish rendering.")
                         if let h = model.broadcast.streamHealth {
-                            Text("● LIVE · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
+                            Text("● LIVE · \(model.formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
                                 .foregroundStyle(.red).font(.caption)
                         }
                     }
@@ -369,54 +300,9 @@ struct ControlView: View {
         }
     }
 
-    private func formatDuration(_ s: Double) -> String {
-        let total = Int(s)
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let sec = total % 60
-        return String(format: "%02d:%02d:%02d", h, m, sec)
-    }
-
-    private func makeDirectoryPanel(title: String? = nil, message: String? = nil) -> NSOpenPanel {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        if let title { panel.title = title }
-        if let message { panel.message = message }
-        return panel
-    }
-
-    private func pickNativeWatchFolderLive() {
-        pickWatchFolderLive(
-            sourceMode: .nativeStack,
-            title: "Choose Live FITS Folder",
-            message: "Select the folder where NINA, ASIAIR, or another capture app writes new FITS light frames."
-        )
-    }
-
-    private func pickWatchFolderLive(sourceMode: AppModel.SourceMode,
-                                     title: String,
-                                     message: String) {
-        let panel = makeDirectoryPanel(title: title, message: message)
-        panel.prompt = "Watch"
-        if panel.runModal() == .OK, let url = panel.url {
-            model.sourceMode = sourceMode
-            model.liveSource.startWatchFolderLive(source: url, sourceMode: sourceMode)
-        }
-    }
-
-    private func pickImportFolder() {
-        let panel = makeDirectoryPanel(title: "Choose Subs Folder",
-                                       message: "Select a folder containing raw FITS subs to import")
-        if panel.runModal() == .OK, let url = panel.url {
-            model.importer.importSubs(from: url)
-        }
-    }
-
     private func pickSessionDirectory() {
-        let panel = makeDirectoryPanel(title: "Choose Session Directory",
-                                       message: "Select a past session folder containing manifest.json")
+        let panel = model.makeDirectoryPanel(title: "Choose Session Directory",
+                                             message: "Select a past session folder containing manifest.json")
         let liveAstro = model.liveAstroRoot
         if FileManager.default.fileExists(atPath: liveAstro.path) {
             panel.directoryURL = liveAstro
@@ -514,14 +400,14 @@ struct ControlView: View {
         App: \(appVersionText)
 
         Session Health
-        State: \(sessionStateText)
-        Source: \(sourceSummaryText)
-        Folder: \(watchFolderSummaryText)
-        Last update: \(lastUpdateSummaryText)
-        Frames: \(framesSummaryText)
-        Last rejection: \(lastRejectionSummaryText)
-        OBS: \(obsSummaryText)
-        Outputs: \(outputsSummaryText)
+        State: \(model.sessionStateText)
+        Source: \(model.sourceSummaryText)
+        Folder: \(model.watchFolderSummaryText)
+        Last update: \(model.lastUpdateSummaryText)
+        Frames: \(model.framesSummaryText)
+        Last rejection: \(model.lastRejectionSummaryText)
+        OBS: \(model.obsSummaryText)
+        Outputs: \(model.outputsSummaryText)
 
         Session Outputs
         Target: \(target.isEmpty ? "(untitled)" : target)

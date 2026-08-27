@@ -1123,4 +1123,129 @@ final class AppModel {
             }
         }
     }
+
+    // MARK: - Session Health summary text
+    //
+    // Single home for these formatters — previously duplicated between ControlView's
+    // "Copy Support Bundle" footer action and DiagnosticsView's Session Health grid.
+    // Both views reference these directly off the model.
+
+    var sessionStateText: String {
+        if liveSource.isDetecting { return "Detecting source" }
+        if importer.isImporting { return "Importing" }
+        if importer.isGeneratingReplay { return "Rendering replay" }
+        if isRunning { return "Running" }
+        return "Idle"
+    }
+
+    var sourceSummaryText: String {
+        switch sourceMode {
+        case .nativeStack:
+            return "Native stacking"
+        case .stackerOutput:
+            return "Siril / external stacker"
+        }
+    }
+
+    var watchFolderSummaryText: String {
+        watchFolder?.path ?? "(none selected)"
+    }
+
+    var lastUpdateSummaryText: String {
+        guard let record = latestRecord else { return integrationCaption }
+        return "#\(record.index) · \(record.snapshotFile)"
+    }
+
+    var framesSummaryText: String {
+        "accepted \(acceptedCount) · rejected \(rejectedCount)"
+    }
+
+    var lastRejectionSummaryText: String {
+        guard let line = log.last(where: { $0.hasPrefix("✗ rejected ") }) else {
+            return "(none)"
+        }
+        let prefix = "✗ rejected "
+        if line.hasPrefix(prefix) {
+            return String(line.dropFirst(prefix.count))
+        }
+        return line
+    }
+
+    var obsSummaryText: String {
+        switch broadcast.broadcastState {
+        case .idle:
+            return "idle"
+        case .unknown:
+            return "not checked"
+        case .connecting:
+            return "connecting"
+        case .live:
+            if let h = broadcast.streamHealth {
+                return "live · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% congestion"
+            }
+            return "live"
+        case .endingSession:
+            return "ending session"
+        case .stopping:
+            return "stopping"
+        case .stopUnconfirmed:
+            return "may still be live"
+        }
+    }
+
+    var outputsSummaryText: String {
+        if replayURL != nil { return "replay ready" }
+        if lastSessionDirectory != nil { return "session folder ready" }
+        return "no finished session yet"
+    }
+
+    func formatDuration(_ s: Double) -> String {
+        let total = Int(s)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let sec = total % 60
+        return String(format: "%02d:%02d:%02d", h, m, sec)
+    }
+
+    // MARK: - Folder pickers
+    //
+    // Single home for these — previously duplicated between ControlView's pinned
+    // footer and CaptureSettingsView's Start Workflow / Watch Folder sections.
+
+    func makeDirectoryPanel(title: String? = nil, message: String? = nil) -> NSOpenPanel {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if let title { panel.title = title }
+        if let message { panel.message = message }
+        return panel
+    }
+
+    func pickNativeWatchFolderLive() {
+        pickWatchFolderLive(
+            sourceMode: .nativeStack,
+            title: "Choose Live FITS Folder",
+            message: "Select the folder where NINA, ASIAIR, or another capture app writes new FITS light frames."
+        )
+    }
+
+    func pickWatchFolderLive(sourceMode: AppModel.SourceMode,
+                              title: String,
+                              message: String) {
+        let panel = makeDirectoryPanel(title: title, message: message)
+        panel.prompt = "Watch"
+        if panel.runModal() == .OK, let url = panel.url {
+            self.sourceMode = sourceMode
+            self.liveSource.startWatchFolderLive(source: url, sourceMode: sourceMode)
+        }
+    }
+
+    func pickImportFolder() {
+        let panel = makeDirectoryPanel(title: "Choose Subs Folder",
+                                       message: "Select a folder containing raw FITS subs to import")
+        if panel.runModal() == .OK, let url = panel.url {
+            importer.importSubs(from: url)
+        }
+    }
 }

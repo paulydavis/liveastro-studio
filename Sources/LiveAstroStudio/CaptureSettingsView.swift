@@ -41,7 +41,7 @@ struct CaptureSettingsView: View {
                         systemImage: "folder.badge.plus",
                         disabled: liveWorkflowDisabled
                     ) {
-                        pickNativeWatchFolderLive()
+                        model.pickNativeWatchFolderLive()
                     }
 
                     WorkflowActionRow(
@@ -59,7 +59,7 @@ struct CaptureSettingsView: View {
                         systemImage: "tray.and.arrow.down",
                         disabled: offlineWorkflowDisabled
                     ) {
-                        pickImportFolder()
+                        model.pickImportFolder()
                     }
 
                     WorkflowActionRow(
@@ -209,53 +209,16 @@ struct CaptureSettingsView: View {
         .scrollIndicators(.visible)
     }
 
-    private func makeDirectoryPanel(title: String? = nil, message: String? = nil) -> NSOpenPanel {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        if let title { panel.title = title }
-        if let message { panel.message = message }
-        return panel
-    }
-
     private func pickFolder() {
-        let panel = makeDirectoryPanel()
+        let panel = model.makeDirectoryPanel()
         if panel.runModal() == .OK { model.watchFolder = panel.url }
     }
 
-    private func pickNativeWatchFolderLive() {
-        pickWatchFolderLive(
-            sourceMode: .nativeStack,
-            title: "Choose Live FITS Folder",
-            message: "Select the folder where NINA, ASIAIR, or another capture app writes new FITS light frames."
-        )
-    }
-
     private func pickStackerOutputWatchFolder() {
-        pickWatchFolderLive(
+        model.pickWatchFolderLive(
             sourceMode: .stackerOutput,
             title: "Choose Stacker Output Folder",
             message: "Select the folder where Siril or another stacker writes live_stack FITS output."
         )
-    }
-
-    private func pickWatchFolderLive(sourceMode: AppModel.SourceMode,
-                                     title: String,
-                                     message: String) {
-        let panel = makeDirectoryPanel(title: title, message: message)
-        panel.prompt = "Watch"
-        if panel.runModal() == .OK, let url = panel.url {
-            model.sourceMode = sourceMode
-            model.liveSource.startWatchFolderLive(source: url, sourceMode: sourceMode)
-        }
-    }
-
-    private func pickImportFolder() {
-        let panel = makeDirectoryPanel(title: "Choose Subs Folder",
-                                       message: "Select a folder containing raw FITS subs to import")
-        if panel.runModal() == .OK, let url = panel.url {
-            model.importer.importSubs(from: url)
-        }
     }
 }
