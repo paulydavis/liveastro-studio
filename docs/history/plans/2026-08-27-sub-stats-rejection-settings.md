@@ -1192,3 +1192,46 @@ git commit -F /tmp/las-commit.txt   # "feat: export sub-frames.csv + offer final
 **Type consistency:** `SubFrameRecord`/`SubFrameOutcome` field names and `ProcessResult`/`RestackReport`/`RestackError` signatures are identical across T1→T11. `onSubFrame: ((SubFrameRecord) -> Void)?`, `processDetailed -> ProcessResult`, `restack(rawURLs:excludingSourceFiles:makeEngine:minRows:)`, `toggleReject(index:)`, `restackWithoutFlagged()`, `SetupSubTab` used consistently.
 
 **Known implementer-judgment points (flagged inline, not placeholders):** exact persist helper in `SessionManager` (mirror `recordSnapshot`), the synthetic-frame test builders' real names (reuse from existing test files), the raw-URL loader name in `ImageLoader`, and whether an app-level test target exists (T8). Each names the existing code to read and the fallback if it differs.
+
+---
+
+## Task 8 Refinement (resolved during execution — architecture decisions)
+
+Reading the real `AppModel`/`SessionPipeline` surface surfaced ownership and concurrency
+facts the original Task 8 under-specified. Resolved decisions (these BIND Tasks 8a/8b/11):
+
+- **`SessionPipeline.session` is `public let session: SessionManager`.** The manifest is
+  mutated on the pipeline's callback-delivery thread (where `recordSnapshot` runs). AppModel
+  must NOT write the manifest from the main actor — that races the consume task.
+- **Sub-record persistence lives in the pipeline**, not AppModel: `handleNative` calls
+  `try? session.recordSubFrame(record)` right where it emits `onSubFrame` (same thread as
+  `recordSnapshot`, for every sub — accepted AND rejected). This completes the Task-6 emit.
+- **AppModel holds a main-actor `@Published private(set) var subFrames` mirror**, appended in
+  the `onSubFrame` handler's `Task { @MainActor }`. It is the source of truth for the Stats UI
+  and the re-stack excluded set.
+- **Flagging (`toggleReject`) mutates the AppModel mirror only** during a live session — it does
+  NOT write the manifest mid-session (would race the consume task). Flags are persisted to the
+  manifest at the race-free points: `end()` and re-stack (Task 11 writes them before the CSV).
+  v1 limitation (documented): a flag made mid-session is not crash-durable until `end()`.
+- **Re-stack is gated on `!isRunning`** (available after capture stops / import finishes).
+  Rationale: applying a rebuilt master to a live pipeline's display would be overwritten by the
+  next frame, and it avoids concurrent-writer hazards. Faithful to the spec's "deliberate button
+  / offered at session end." Live re-stack is a possible v1.1 follow-up.
+- **Raw-sub directory for re-stack:** AppModel records the directory the just-finished session
+  drew subs from (relay session dir for live; the chosen folder for import) and passes it to the
+  coordinator. `RestackCoordinator.restack` takes raw URLs, so AppModel lists that directory's
+  FITS files.
+
+### Task 8a — Sub-frame data plane (pipeline persistence + AppModel mirror + flagging)
+- Amend `SessionPipeline.handleNative`: after the `onSubFrame?` emit, `try? session.recordSubFrame(record)`.
+- AppModel: `@Published private(set) var subFrames: [SubFrameRecord] = []`; wire `pipeline.onSubFrame`
+  in `wireCallbacks` to append on the main actor; `var flaggedCount`; `func toggleReject(index:)`
+  (mirror-only mutation); reset `subFrames = []` at session start.
+- Tests: a pipeline test asserting subs land in `session.subFrames` (accepted + rejected); the
+  AppModel mirror/toggle logic is thin over tested core.
+
+### Task 8b — Re-stack drive
+- `@Published private(set) var isRestacking`; `func restackWithoutFlagged()` gated on `!isRunning`
+  and `flaggedCount > 0`; resolve raw dir → list FITS URLs → `RestackCoordinator.restack(rawURLs:excludingSourceFiles:makeEngine:)`
+  off-main → on success write `master.fit` (reuse the master-write path) + update `latestImage`
+  via `displayCGImage`; guard concurrent runs; surface missing-raw / errors via `log`/`errorMessage`.
