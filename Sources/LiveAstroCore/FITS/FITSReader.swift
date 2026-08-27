@@ -113,10 +113,16 @@ public enum FITSReader {
         return beforeComment.trimmingCharacters(in: .whitespaces)
     }
 
-    /// Test-only: counts full pixel DECODES (every `read`/`readLinear`). Lets a test prove a frame was
-    /// skipped BEFORE its pixels were decoded (via the header) rather than decoded-then-discarded.
-    /// Never read in production. (LiveAstroCore's suite runs serially, so a plain counter suffices.)
-    public static var decodeCountForTesting = 0
+    /// Test-only counter of full pixel DECODES (every `read`/`readLinear`), letting a test prove a
+    /// frame was skipped BEFORE its pixels were decoded rather than decoded-then-discarded. INTERNAL
+    /// (not public API) and lock-guarded so concurrent reads / parallel tests can't race it.
+    private static let decodeCountLock = NSLock()
+    private static var _decodeCount = 0
+    static var decodeCountForTesting: Int {
+        get { decodeCountLock.withLock { _decodeCount } }
+        set { decodeCountLock.withLock { _decodeCount = newValue } }
+    }
+    private static func noteDecodeForTesting() { decodeCountLock.withLock { _decodeCount += 1 } }
 
     public static func read(_ data: Data, normalizeRowOrder: Bool = true) throws -> FITSImage {
         try read(data, normalizeRowOrder: normalizeRowOrder, clampToDisplayRange: true)
@@ -134,7 +140,7 @@ public enum FITSReader {
     private static func read(_ data: Data,
                              normalizeRowOrder: Bool,
                              clampToDisplayRange: Bool) throws -> FITSImage {
-        decodeCountForTesting += 1   // test seam (see property doc); harmless in production
+        noteDecodeForTesting()   // test seam (see property doc); lock-guarded, harmless in production
         let data = data.startIndex == 0 ? data : Data(data)
         let h = try readHeader(data)
         guard data.count >= h.minimumFileSize else {
