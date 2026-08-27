@@ -70,8 +70,13 @@ public enum FITSReader {
         let bscale = try doubleValue("BSCALE", default: 1, cards: cards)
         let bzero = try doubleValue("BZERO", default: 0, cards: cards)
         let bottomUp = (cards["ROWORDER"] ?? "BOTTOM-UP").uppercased() != "TOP-DOWN"
-        return FITSHeader(bitpix: bitpix, dims: dims, bscale: bscale, bzero: bzero,
-                          bottomUp: bottomUp, headerBytes: headerBytes!, keywords: cards)
+        // The checks above already enforce the validating init's constraints, so this never fails;
+        // the guard is the belt to the init's braces (a validating init is the single source of truth).
+        guard let header = FITSHeader(bitpix: bitpix, dims: dims, bscale: bscale, bzero: bzero,
+                                      bottomUp: bottomUp, headerBytes: headerBytes!, keywords: cards) else {
+            throw FITSError.malformedHeader("invalid header values")
+        }
+        return header
     }
 
     /// `normalizeRowOrder`: true (default) flips bottom-up files to top-down for
