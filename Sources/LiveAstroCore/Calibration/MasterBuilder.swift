@@ -82,12 +82,17 @@ public enum MasterBuilder {
             // force a multi-GB decode allocation in FITSReader.read just to be rejected by the ceiling
             // afterward. checkedElementCount returns nil when the pixel count overflows or exceeds it.
             guard let header = try? FITSReader.readHeader(data),
-                  checkedElementCount(header.width, header.height, header.channels) != nil,
-                  let img = try? FITSReader.read(data, normalizeRowOrder: true) else { continue }
+                  checkedElementCount(header.width, header.height, header.channels) != nil else { continue }
+            // Once a reference exists (from `expected` or the first frame), skip a dimension-mismatched
+            // frame from its HEADER too — before decoding — so a huge-but-under-ceiling wrong-size frame
+            // (e.g. a stray 150 MP RGB calibration frame among 26 MP lights) can't force a big decode
+            // allocation just to be discarded for size.
+            if haveRef, header.width != refW || header.height != refH || header.channels != refC { continue }
+            guard let img = try? FITSReader.read(data, normalizeRowOrder: true) else { continue }
             if !haveRef {
                 refW = img.width; refH = img.height; refC = img.channels; haveRef = true
             } else if img.width != refW || img.height != refH || img.channels != refC {
-                continue    // doesn't match the reference (expected, or first-readable) → skip
+                continue    // defensive; the header already matched the reference above
             }
             // Allocate the accumulator on the FIRST contributing frame, bounded by a pixel ceiling so
             // a corrupt/hostile dimension can't demand a multi-terabyte buffer.

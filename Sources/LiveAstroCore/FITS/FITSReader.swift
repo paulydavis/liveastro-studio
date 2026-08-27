@@ -113,6 +113,11 @@ public enum FITSReader {
         return beforeComment.trimmingCharacters(in: .whitespaces)
     }
 
+    /// Test-only: counts full pixel DECODES (every `read`/`readLinear`). Lets a test prove a frame was
+    /// skipped BEFORE its pixels were decoded (via the header) rather than decoded-then-discarded.
+    /// Never read in production. (LiveAstroCore's suite runs serially, so a plain counter suffices.)
+    public static var decodeCountForTesting = 0
+
     public static func read(_ data: Data, normalizeRowOrder: Bool = true) throws -> FITSImage {
         try read(data, normalizeRowOrder: normalizeRowOrder, clampToDisplayRange: true)
     }
@@ -129,6 +134,7 @@ public enum FITSReader {
     private static func read(_ data: Data,
                              normalizeRowOrder: Bool,
                              clampToDisplayRange: Bool) throws -> FITSImage {
+        decodeCountForTesting += 1   // test seam (see property doc); harmless in production
         let data = data.startIndex == 0 ? data : Data(data)
         let h = try readHeader(data)
         guard data.count >= h.minimumFileSize else {

@@ -124,10 +124,30 @@ final class MasterBuilderTests: XCTestCase {
         _ = try writeConst(dir, "b.fit", 0.6, w: 2, h: 2)
         let urls = [dir.appendingPathComponent("00_hostile.fit"),
                     dir.appendingPathComponent("a.fit"), dir.appendingPathComponent("b.fit")]
+        FITSReader.decodeCountForTesting = 0
         let r = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .dark, bias: nil)
         XCTAssertEqual(r.contributingCount, 2, "oversized frame skipped; valid neighbors contribute")
         XCTAssertEqual(r.image.width, 2)
         for p in r.image.pixels { XCTAssertEqual(p, 0.5, accuracy: 1e-5) }   // mean(0.4, 0.6)
+        // PROOF the over-ceiling frame is skipped BEFORE decode: only the two valid frames are decoded.
+        XCTAssertEqual(FITSReader.decodeCountForTesting, 2, "over-ceiling frame rejected before decode")
+    }
+
+    /// A COMPLETE (non-truncated) wrong-size frame under the ceiling must be skipped from its header —
+    /// before decode — when it doesn't match the target/reference dimensions, so it can't force a big
+    /// decode allocation just to be discarded for size. The decode counter proves read was not called
+    /// on it (2 decodes for the valid neighbors, not 3).
+    func testWrongSizeFrameRejectedBeforeDecodeAgainstReference() throws {
+        let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
+        _ = try writeConst(dir, "00_wrong.fit", 0.9, w: 8, h: 8)   // complete 8×8 — truncation can't skip it
+        _ = try writeConst(dir, "a.fit", 0.4, w: 2, h: 2)
+        _ = try writeConst(dir, "b.fit", 0.6, w: 2, h: 2)
+        let urls = [dir.appendingPathComponent("00_wrong.fit"),
+                    dir.appendingPathComponent("a.fit"), dir.appendingPathComponent("b.fit")]
+        FITSReader.decodeCountForTesting = 0
+        let r = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .dark, bias: nil, expected: (2, 2, 1))
+        XCTAssertEqual(r.contributingCount, 2)
+        XCTAssertEqual(FITSReader.decodeCountForTesting, 2, "wrong-size frame rejected before decode (was 3)")
     }
 
     func testFlatBiasSubtractedAndNormalizedToMedianOne() throws {
