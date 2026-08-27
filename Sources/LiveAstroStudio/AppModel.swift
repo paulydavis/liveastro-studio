@@ -909,9 +909,9 @@ final class AppModel {
     var flaggedCount: Int { subFrames.filter(\.rejectedByUser).count }
 
     /// Flips the operator reject flag on the in-memory mirror for the sub with `index`.
-    /// Mirror-only: does NOT write the manifest mid-session (would race the pipeline's
-    /// consume task). Flags are persisted to the manifest at the race-free points —
-    /// session end() and re-stack (later tasks); see Task 8 Refinement.
+    /// Mirror-only: does NOT write mid-session (would race the pipeline's consume task).
+    /// Flags are persisted to sub-frames.csv (NOT the manifest) at the race-free points —
+    /// session end() and re-stack; see Task 8 Refinement.
     func toggleReject(index: Int) {
         guard let i = subFrames.firstIndex(where: { $0.index == index }) else { return }
         subFrames[i].rejectedByUser.toggle()
@@ -941,8 +941,14 @@ final class AppModel {
             log.append("Re-stack unavailable — couldn't read the raw subs folder: \(error)")
             return
         }
+        let prefix = fileNamePrefix.lowercased()
         let urls = entries
             .filter { ImageLoader.fitsExtensions.contains($0.pathExtension.lowercased()) }
+            // Match the session's file-name prefix, same as live (StackFileWatcher.
+            // isTrackedFileName) and import (ImportCursor) — otherwise the survivor set
+            // wrongly includes other-filter/foreign/calibration FITS sitting in the same
+            // folder (Fix C). Empty prefix accepts all, matching existing semantics.
+            .filter { fileNamePrefix.isEmpty || $0.lastPathComponent.lowercased().hasPrefix(prefix) }
             // Numeric-aware order so Light_2 precedes Light_10 (capture sequence order) —
             // matches FolderFrameSource, so the first surviving frame (the stack's seed)
             // is the same one the live pipeline would have chosen.
@@ -955,6 +961,16 @@ final class AppModel {
         let excluded = Set(subFrames.filter(\.rejectedByUser).map(\.sourceFile))
         let excludedCount = excluded.count
 
+        // Rebuild the same calibrator the live pipeline applied before stacking
+        // (SessionPipeline.handleNative), the same way ImportController.beginImport does —
+        // otherwise a restack would overwrite a calibrated master.fit with an uncalibrated
+        // one (Fix B). Built on the main actor (current calibration paths), then captured
+        // into the detached task's `prepare` closure.
+        let (restackCalibrator, calWarnings) = CalibrationLoader.makeCalibrator(
+            dark: calibration.darkPath.map { URL(fileURLWithPath: $0) },
+            flat: calibration.flatPath.map { URL(fileURLWithPath: $0) })
+        calWarnings.forEach { log.append("⚠ \($0)") }
+
         restackOfferPending = false
         isRestacking = true
         let engine = makeStackEngine()
@@ -962,7 +978,8 @@ final class AppModel {
             guard let self else { return }
             do {
                 let report = try RestackCoordinator.restack(
-                    rawURLs: urls, excludingSourceFiles: excluded, makeEngine: { engine })
+                    rawURLs: urls, excludingSourceFiles: excluded, makeEngine: { engine },
+                    prepare: { restackCalibrator?.apply($0) ?? $0 })
                 await MainActor.run { self.applyRestackedMaster(report, excludedCount: excludedCount) }
             } catch {
                 await MainActor.run {
@@ -992,7 +1009,11 @@ final class AppModel {
             // Re-write sub-frames.csv from the in-memory mirror so it reflects the operator's
             // flags at re-stack time — the manifest's persisted records were written before
             // flagging (rejectedByUser = false at persist time), so this is the accurate copy.
-            try? SubFrameCSV.write(subFrames: subFrames, to: sessionDirectory)
+            do {
+                try SubFrameCSV.write(subFrames: subFrames, to: sessionDirectory)
+            } catch {
+                log.append("Re-stack: could not write sub-frames.csv (\(error)).")
+            }
         } else {
             log.append("Re-stack: no session directory on record — master.fit was not written.")
         }
@@ -1099,6 +1120,13 @@ final class AppModel {
                     self.replayURL = url
                     self.lastSessionDirectory = url.deletingLastPathComponent()
                     self.log.append("Replay ready: \(url.lastPathComponent)")
+                    // Overwrite the Core-written sub-frames.csv (rejectedByUser=false at
+                    // persist time — Core has no durable flag-setter, see Fix D) with one
+                    // reflecting the AppModel mirror's operator flags. Post-drain, main
+                    // actor: race-free against the pipeline's consume task.
+                    if !self.subFrames.isEmpty, let dir = self.lastSessionDirectory {
+                        try? SubFrameCSV.write(subFrames: self.subFrames, to: dir)
+                    }
                 }
                 shouldCompleteSession = true
             } catch {

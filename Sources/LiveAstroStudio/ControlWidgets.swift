@@ -1,5 +1,10 @@
 import SwiftUI
 
+/// Cap on how many trailing log lines the UI renders (ControlView's footer log tail,
+/// DiagnosticsView's log list/copy). Kept in one place — was previously duplicated as a
+/// private constant in both views.
+let logDisplayCap = 200
+
 /// A Form toggle row with a visible ⓘ info button next to the label. macOS `Form`
 /// only attaches `.help()` tooltips to the switch control, not the label text, so
 /// hovering the label showed nothing. A tap-to-reveal info button is an explicit,

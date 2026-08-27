@@ -4,7 +4,6 @@ import AppKit
 struct DiagnosticsView: View {
     @Bindable var model: AppModel
 
-    private let logDisplayCap = 200
     private let logMinHeight: CGFloat = 120
 
     // Session Health summary text (sessionStateText, sourceSummaryText, etc.) and

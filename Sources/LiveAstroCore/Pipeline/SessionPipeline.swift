@@ -609,9 +609,15 @@ public final class SessionPipeline {
             processedCount += 1
             // Emitted BEFORE the switch's snapshot-rendering (which can early-return on a
             // guard/do-catch failure) so onSubFrame fires exactly once per sub regardless of
-            // downstream render success. Accepted subs share their index with the
-            // SnapshotRecord below (engine.acceptedCount); rejected subs have no snapshot, so
-            // they're indexed by processedCount instead.
+            // downstream render success. Indexed by processedCount for EVERY sub (accepted and
+            // rejected alike) — processedCount and engine.acceptedCount overlap (acceptedCount
+            // <= processedCount), so using acceptedCount for accepted subs and processedCount
+            // for rejected ones could collide (e.g. a rejection followed by an accept can land
+            // on the same index), which broke StatsView's ForEach(id: \.index) and
+            // toggleReject's firstIndex(by index) lookup. processedCount is monotonic and
+            // unique per sub, so it can't collide. Note this decouples subRecord.index from the
+            // SnapshotRecord's index (engine.acceptedCount) for accepted subs — the
+            // SnapshotRecord-shared-index property isn't consumed anywhere.
             let subOutcome: SubFrameOutcome
             var rejectionReason: String? = nil
             switch outcome {
@@ -620,7 +626,7 @@ public final class SessionPipeline {
             case .rejected(let r): subOutcome = .rejected; rejectionReason = "\(r)"
             }
             let subRecord = SubFrameRecord(
-                index: subOutcome == .rejected ? processedCount : engine.acceptedCount,
+                index: processedCount,
                 timestamp: frame.timestamp, sourceFile: frame.sourceName,
                 starCount: result.starCount, backgroundSigma: result.backgroundSigma,
                 weight: result.weight, outcome: subOutcome, rejectionReason: rejectionReason,
@@ -629,7 +635,11 @@ public final class SessionPipeline {
             // Persist every sub (accepted AND rejected) on this same callback-delivery
             // thread — the same serial context recordSnapshot runs on below, so this is
             // race-free against AppModel's main-actor mirror (Task 8 Refinement).
-            try? session.recordSubFrame(subRecord)
+            do {
+                try session.recordSubFrame(subRecord)
+            } catch {
+                onLog?("Failed to record sub-frame stats for \(frame.sourceName): \(error)")
+            }
             switch outcome {
             case .becameReference, .stacked:
                 guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }

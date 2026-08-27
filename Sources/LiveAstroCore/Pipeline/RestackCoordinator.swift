@@ -43,15 +43,22 @@ public struct RestackReport {
 /// the resulting master live in the app layer (Task 8) — kept out of this function so it
 /// stays a pure, easily golden-tested transform.
 public enum RestackCoordinator {
+    /// - Parameter prepare: Applied to every loaded raw frame BEFORE `engine.process(...)`,
+    ///   including the seed frame — every frame goes through the same `prepare`. The live
+    ///   pipeline applies a calibrator (darks/flats/bias) before stacking
+    ///   (`SessionPipeline.handleNative`); without this, a restack of a calibrated session
+    ///   would overwrite a calibrated master.fit with an uncalibrated one. Defaults to
+    ///   identity so existing callers/tests are unaffected.
     public static func restack(rawURLs: [URL], excludingSourceFiles: Set<String>,
-                               makeEngine: () -> StackEngine) throws -> RestackReport {
+                               makeEngine: () -> StackEngine,
+                               prepare: (RawFrame) -> RawFrame = { $0 }) throws -> RestackReport {
         let kept = rawURLs.filter { !excludingSourceFiles.contains($0.lastPathComponent) }
 
         var frames: [RawFrame] = []
         var skippedMissing = 0
         for url in kept {
             if let frame = try? FolderFrameSource.loadRawFrame(url: url) {
-                frames.append(frame)
+                frames.append(prepare(frame))
             } else {
                 skippedMissing += 1
             }

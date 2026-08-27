@@ -23,28 +23,6 @@ final class SessionManagerSubFrameTests: XCTestCase {
         XCTAssertEqual(mgr.subFrames.map(\.index), [1, 2])
     }
 
-    func testSetUserRejectedFlipsFlag() throws {
-        let (mgr, _) = try startedManager()
-        try mgr.recordSubFrame(rec(1))
-        try mgr.setSubFrameUserRejected(index: 1, rejected: true)
-        XCTAssertTrue(mgr.subFrames.first!.rejectedByUser)
-        try mgr.setSubFrameUserRejected(index: 1, rejected: false)
-        XCTAssertFalse(mgr.subFrames.first!.rejectedByUser)
-    }
-
-    func testSetUserRejectedUnknownIndexIsNoOp() throws {
-        let (mgr, _) = try startedManager()
-        try mgr.recordSubFrame(rec(1))
-        try mgr.setSubFrameUserRejected(index: 999, rejected: true)   // must not throw
-        XCTAssertFalse(mgr.subFrames.first!.rejectedByUser)
-    }
-
-    func testSetUserRejectedBeforeAnyRecordIsNoOp() throws {
-        let (mgr, _) = try startedManager()
-        XCTAssertNoThrow(try mgr.setSubFrameUserRejected(index: 1, rejected: true))
-        XCTAssertTrue(mgr.subFrames.isEmpty)
-    }
-
     func testSubFramesPersistAcrossReload() throws {
         let (mgr, _) = try startedManager()
         try mgr.recordSubFrame(rec(1, rejected: true))

@@ -112,19 +112,6 @@ public final class SessionManager {
         manifest = proposed
     }
 
-    /// Set the operator reject flag on the record with `index`. No-op if absent. Persists.
-    public func setSubFrameUserRejected(index: Int, rejected: Bool) throws {
-        guard state == .running, var proposed = manifest, let dir = sessionDirectory else {
-            throw SessionError.notRunning
-        }
-        var subs = proposed.subFrames ?? []
-        guard let i = subs.firstIndex(where: { $0.index == index }) else { return }
-        subs[i].rejectedByUser = rejected
-        proposed.subFrames = subs
-        try persist(proposed, to: dir)
-        manifest = proposed
-    }
-
     public func endSession(at date: Date = .init(),
                            finalization: SessionFinalizationFacts? = nil) throws {
         guard state == .running, var proposed = manifest, let dir = sessionDirectory else {

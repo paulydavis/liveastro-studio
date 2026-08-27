@@ -99,4 +99,43 @@ final class SessionPipelineSubFrameTests: XCTestCase {
         XCTAssertEqual(persisted.filter { $0.outcome == .rejected }.count, 1)
         XCTAssertEqual(persisted.filter { $0.outcome != .rejected }.count, 2)
     }
+
+    /// Fix A regression: a rejection that lands BEFORE a later accept must not collide
+    /// indices. Before the fix, `index` was `processedCount` for rejected subs but
+    /// `engine.acceptedCount` for accepted subs — two counters that overlap
+    /// (acceptedCount <= processedCount), so a reject-then-accept sequence could produce
+    /// duplicate indices (the seed's acceptedCount, then the reject's processedCount, then
+    /// the next accept's acceptedCount collide once processedCount outruns acceptedCount).
+    /// This broke StatsView's `ForEach(id: \.index)` and `toggleReject`'s
+    /// `firstIndex(by index)` lookup. Sequence: seed (accept/reference) -> blank
+    /// (reject) -> good (accept/stacked) — the reject is NOT last, reproducing the
+    /// collision (seed.index == acceptedCount 1; blank.index == processedCount 2;
+    /// good.index == acceptedCount 2 — collides with blank pre-fix).
+    func testSubFrameIndicesAreDistinctWhenRejectionPrecedesAccepts() throws {
+        let root = try sandbox()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = root.appendingPathComponent("sessions")
+        let source = NativePipelineTests.ControlledLiveSource()
+        let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
+                                       profile: profile(), rootDirectory: sessions)
+
+        let subFrameCount = expectation(description: "onSubFrame fired 3 times")
+        subFrameCount.expectedFulfillmentCount = 3
+        pipeline.onSubFrame = { _ in subFrameCount.fulfill() }
+
+        try pipeline.start()
+        // seed -> becomes reference (accepted)
+        source.send(FaultMatrixLifecycleTests.starField(name: "seed.fit", dx: 0, dy: 0))
+        // star-less frame -> rejected, BEFORE the next accept
+        source.send(FaultMatrixLifecycleTests.blankField(name: "too_few_stars.fit"))
+        // registers against the seed -> stacked (accepted)
+        source.send(FaultMatrixLifecycleTests.starField(name: "good.fit", dx: 1.1, dy: -0.9))
+        wait(for: [subFrameCount], timeout: 5)
+
+        _ = try pipeline.end()
+
+        let indices = pipeline.session.subFrames.map(\.index)
+        XCTAssertEqual(indices.count, 3)
+        XCTAssertEqual(Set(indices).count, indices.count, "sub-frame indices must all be distinct, got \(indices)")
+    }
 }

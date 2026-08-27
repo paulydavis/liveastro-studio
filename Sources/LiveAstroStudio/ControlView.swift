@@ -5,7 +5,6 @@ import LiveAstroCore
 struct ControlView: View {
     @Environment(AppModel.self) private var model
 
-    private let logDisplayCap = 200
     @State private var outputFootprintText = "not checked"
 
     private var hasSessionOutputs: Bool {
