@@ -44,6 +44,10 @@ public final class SessionPipeline {
     /// frame-consumer task — same reentrancy rule as `onUpdate`.
     public var onImportProgress: ((_ processed: Int, _ total: Int,
                                    _ accepted: Int, _ rejected: Int) -> Void)?
+    /// Fired once per processed native sub with its measured quality (spec §Data flow).
+    /// Same delivery context as onUpdate/onRejected. Watcher mode does not fire this
+    /// (no per-sub stacking there).
+    public var onSubFrame: ((SubFrameRecord) -> Void)?
     private let cancelled = NSLock_Flag()
 
     // MARK: Reentrancy detection (review10 item 4)
@@ -590,7 +594,8 @@ public final class SessionPipeline {
                 }
             }
             let frame = (calibrator ?? providerCalibrator)?.apply(rawFrame) ?? rawFrame
-            let outcome = engine.process(frame)
+            let result = engine.processDetailed(frame)
+            let outcome = result.outcome
             if engine.autoReseedCount != lastAutoReseedCount {
                 lastAutoReseedCount = engine.autoReseedCount
                 // The engine dropped its reference and will re-seed on the next good sub — void the
@@ -602,6 +607,24 @@ public final class SessionPipeline {
             }
             attemptPlateSolveIfNeeded(engine: engine)   // idempotent; no-op until a reference is seeded
             processedCount += 1
+            // Emitted BEFORE the switch's snapshot-rendering (which can early-return on a
+            // guard/do-catch failure) so onSubFrame fires exactly once per sub regardless of
+            // downstream render success. Accepted subs share their index with the
+            // SnapshotRecord below (engine.acceptedCount); rejected subs have no snapshot, so
+            // they're indexed by processedCount instead.
+            let subOutcome: SubFrameOutcome
+            var rejectionReason: String? = nil
+            switch outcome {
+            case .becameReference: subOutcome = .reference
+            case .stacked:         subOutcome = .stacked
+            case .rejected(let r): subOutcome = .rejected; rejectionReason = "\(r)"
+            }
+            onSubFrame?(SubFrameRecord(
+                index: subOutcome == .rejected ? processedCount : engine.acceptedCount,
+                timestamp: frame.timestamp, sourceFile: frame.sourceName,
+                starCount: result.starCount, backgroundSigma: result.backgroundSigma,
+                weight: result.weight, outcome: subOutcome, rejectionReason: rejectionReason,
+                rejectedByUser: false))
             switch outcome {
             case .becameReference, .stacked:
                 guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }

@@ -1,0 +1,63 @@
+import XCTest
+@testable import LiveAstroCore
+
+/// Covers Task 6: `SessionPipeline.onSubFrame` fires once per processed native sub with
+/// outcome mapped from `ProcessResult` (Task 5). Reuses the native live-source harness
+/// (ControlledLiveSource + FaultMatrixLifecycleTests.starField/blankField) already used
+/// by NativePipelineTests, since there's no shared `NativePipelineHarness` type.
+final class SessionPipelineSubFrameTests: XCTestCase {
+    private func profile(_ target: String = "SubFrame Test") -> SessionProfile {
+        SessionProfile(targetName: target, telescope: "T", camera: "C",
+                       mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                       subExposureSeconds: 20, notes: "")
+    }
+
+    private func sandbox() throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    func testOnSubFrameFiresForEachNativeSub() throws {
+        let root = try sandbox()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = root.appendingPathComponent("sessions")
+        let source = NativePipelineTests.ControlledLiveSource()
+        let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
+                                       profile: profile(), rootDirectory: sessions)
+
+        let captureLock = NSLock()
+        var captured: [SubFrameRecord] = []
+        let subFrameCount = expectation(description: "onSubFrame fired 3 times")
+        subFrameCount.expectedFulfillmentCount = 3
+        pipeline.onSubFrame = { record in
+            captureLock.withLock { captured.append(record) }
+            subFrameCount.fulfill()
+        }
+
+        try pipeline.start()
+        // seed
+        source.send(FaultMatrixLifecycleTests.starField(name: "seed.fit", dx: 0, dy: 0))
+        // registers against the seed -> stacked
+        source.send(FaultMatrixLifecycleTests.starField(name: "good.fit", dx: 1.1, dy: -0.9))
+        // star-less frame -> rejected (insufficient stars)
+        source.send(FaultMatrixLifecycleTests.blankField(name: "too_few_stars.fit"))
+        wait(for: [subFrameCount], timeout: 5)
+
+        _ = try pipeline.end()
+
+        let records = captureLock.withLock { captured }
+        XCTAssertEqual(records.count, 3)
+        XCTAssertEqual(records[0].outcome, .reference)
+        XCTAssertEqual(records[0].sourceFile, "seed.fit")
+        XCTAssertEqual(records[1].outcome, .stacked)
+        XCTAssertEqual(records[1].sourceFile, "good.fit")
+        XCTAssertEqual(records[2].outcome, .rejected)
+        XCTAssertEqual(records[2].sourceFile, "too_few_stars.fit")
+        XCTAssertNotNil(records[2].rejectionReason)
+        // Accepted subs' indices must match the snapshot index (engine.acceptedCount).
+        XCTAssertEqual(records[0].index, 1)
+        XCTAssertEqual(records[1].index, 2)
+    }
+}
