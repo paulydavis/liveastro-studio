@@ -76,7 +76,13 @@ public enum MasterBuilder {
         }
 
         for url in fitsURLs {
-            guard let data = try? Data(contentsOf: url),
+            guard let data = try? Data(contentsOf: url) else { continue }
+            // Reject an oversized frame from its HEADER, BEFORE decoding its pixels. A syntactically
+            // valid but hostile header (large-but-allowed axes, e.g. 25001×20000) would otherwise
+            // force a multi-GB decode allocation in FITSReader.read just to be rejected by the ceiling
+            // afterward. checkedElementCount returns nil when the pixel count overflows or exceeds it.
+            guard let header = try? FITSReader.readHeader(data),
+                  checkedElementCount(header.width, header.height, header.channels) != nil,
                   let img = try? FITSReader.read(data, normalizeRowOrder: true) else { continue }
             if !haveRef {
                 refW = img.width; refH = img.height; refC = img.channels; haveRef = true

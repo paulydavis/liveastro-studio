@@ -111,6 +111,25 @@ final class MasterBuilderTests: XCTestCase {
         XCTAssertEqual(MasterBuilder.checkedElementCount(6248, 4176, 1), 6248 * 4176)   // real 26 MP
     }
 
+    /// A frame whose HEADER declares a pixel count above the ceiling (here 25001×20000 = 500,020,000
+    /// > 500M) must be rejected from the header — without a full multi-GB decode — while the valid
+    /// neighbors still build. The header (BITPIX=8, axes ≤ 100k) is itself valid, so it passes
+    /// readHeader; MasterBuilder's element-count ceiling is what skips it, before FITSReader.read.
+    func testOversizedHeaderFrameSkippedAndNeighborsBuild() throws {
+        let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
+        let hostile = FITSTestBuilder.header(cards: [("SIMPLE", "T"), ("BITPIX", "8"), ("NAXIS", "2"),
+                                                     ("NAXIS1", "25001"), ("NAXIS2", "20000")])
+        try hostile.write(to: dir.appendingPathComponent("00_hostile.fit"))
+        _ = try writeConst(dir, "a.fit", 0.4, w: 2, h: 2)
+        _ = try writeConst(dir, "b.fit", 0.6, w: 2, h: 2)
+        let urls = [dir.appendingPathComponent("00_hostile.fit"),
+                    dir.appendingPathComponent("a.fit"), dir.appendingPathComponent("b.fit")]
+        let r = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .dark, bias: nil)
+        XCTAssertEqual(r.contributingCount, 2, "oversized frame skipped; valid neighbors contribute")
+        XCTAssertEqual(r.image.width, 2)
+        for p in r.image.pixels { XCTAssertEqual(p, 0.5, accuracy: 1e-5) }   // mean(0.4, 0.6)
+    }
+
     func testFlatBiasSubtractedAndNormalizedToMedianOne() throws {
         let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
         // flat frames constant 0.6; bias constant 0.1 → (0.6-0.1)=0.5 everywhere;
