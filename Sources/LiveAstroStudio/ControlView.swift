@@ -5,17 +5,7 @@ import LiveAstroCore
 struct ControlView: View {
     @Environment(AppModel.self) private var model
 
-    private let logDisplayCap = 200
-    private let logMinHeight: CGFloat = 120
     @State private var outputFootprintText = "not checked"
-
-    private var liveWorkflowDisabled: Bool {
-        model.isRunning || model.importer.isImporting || model.liveSource.isDetecting
-    }
-
-    private var offlineWorkflowDisabled: Bool {
-        model.isRunning || model.importer.isImporting
-    }
 
     private var hasSessionOutputs: Bool {
         !model.isRunning && (model.replayURL != nil || model.lastSessionDirectory != nil)
@@ -45,6 +35,12 @@ struct ControlView: View {
         return FileManager.default.fileExists(atPath: csv.path) ? csv : nil
     }
 
+    private var subFramesURL: URL? {
+        guard let dir = model.lastSessionDirectory else { return nil }
+        let csv = dir.appendingPathComponent(SubFrameCSV.filename)
+        return FileManager.default.fileExists(atPath: csv.path) ? csv : nil
+    }
+
     private var appVersionText: String {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = (info["CFBundleShortVersionString"] as? String)?
@@ -59,812 +55,264 @@ struct ControlView: View {
         return "LiveAstro v\(version)"
     }
 
-    private var sessionStateText: String {
-        if model.liveSource.isDetecting { return "Detecting source" }
-        if model.importer.isImporting { return "Importing" }
-        if model.importer.isGeneratingReplay { return "Rendering replay" }
-        if model.isRunning { return "Running" }
-        return "Idle"
-    }
-
-    private var sourceSummaryText: String {
-        switch model.sourceMode {
-        case .nativeStack:
-            return "Native stacking"
-        case .stackerOutput:
-            return "Siril / external stacker"
-        }
-    }
-
-    private var watchFolderSummaryText: String {
-        model.watchFolder?.path ?? "(none selected)"
-    }
-
-    private var lastUpdateSummaryText: String {
-        guard let record = model.latestRecord else { return model.integrationCaption }
-        return "#\(record.index) · \(record.snapshotFile)"
-    }
-
-    private var framesSummaryText: String {
-        "accepted \(model.acceptedCount) · rejected \(model.rejectedCount)"
-    }
-
-    private var lastRejectionSummaryText: String {
-        guard let line = model.log.last(where: { $0.hasPrefix("✗ rejected ") }) else {
-            return "(none)"
-        }
-        let prefix = "✗ rejected "
-        if line.hasPrefix(prefix) {
-            return String(line.dropFirst(prefix.count))
-        }
-        return line
-    }
-
-    private var obsSummaryText: String {
-        switch model.broadcast.broadcastState {
-        case .idle:
-            return "idle"
-        case .unknown:
-            return "not checked"
-        case .connecting:
-            return "connecting"
-        case .live:
-            if let h = model.broadcast.streamHealth {
-                return "live · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% congestion"
-            }
-            return "live"
-        case .endingSession:
-            return "ending session"
-        case .stopping:
-            return "stopping"
-        case .stopUnconfirmed:
-            return "may still be live"
-        }
-    }
-
-    private var outputsSummaryText: String {
-        if model.replayURL != nil { return "replay ready" }
-        if model.lastSessionDirectory != nil { return "session folder ready" }
-        return "no finished session yet"
-    }
-
-    /// A Form toggle row with a visible ⓘ info button next to the label. macOS `Form`
-    /// only attaches `.help()` tooltips to the switch control, not the label text, so
-    /// hovering the label showed nothing. A tap-to-reveal info button is an explicit,
-    /// discoverable affordance that doesn't depend on hover tracking.
-    private func helpToggle(_ title: String, isOn: Binding<Bool>, help: String) -> some View {
-        HStack(spacing: 6) {
-            Text(title)
-            InfoButton(text: help)
-            Spacer()
-            Toggle("", isOn: isOn).labelsHidden()
-        }
-    }
-
-    /// Small ⓘ affordance that reveals its help text in a popover on tap (and, as a
-    /// bonus, a tooltip on hover — `.help()` works reliably on a Button control).
-    private struct InfoButton: View {
-        let text: String
-        @State private var showing = false
-        var body: some View {
-            Button { showing.toggle() } label: {
-                Image(systemName: "info.circle").foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help(text)
-            .popover(isPresented: $showing, arrowEdge: .bottom) {
-                Text(text)
-                    .font(.callout)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(12)
-                    .frame(width: 300)
-            }
-        }
-    }
-
-    private struct HealthItem: View {
-        let label: String
-        let value: String
-
-        var body: some View {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(label)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text(value)
-                    .font(.system(.caption, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-        }
-    }
-
-    private struct WorkflowActionRow: View {
-        let title: String
-        let subtitle: String
-        let systemImage: String
-        var badge: String?
-        var disabled = false
-        let action: () -> Void
-
-        var body: some View {
-            Button(action: action) {
-                HStack(alignment: .top, spacing: 12) {
-                    Image(systemName: systemImage)
-                        .font(.title3)
-                        .frame(width: 26)
-                        .foregroundStyle(disabled ? Color.secondary : Color.accentColor)
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 8) {
-                            Text(title)
-                                .font(.headline)
-                            if let badge {
-                                Text(badge)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(.quaternary, in: Capsule())
-                            }
-                        }
-                        Text(subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                        .padding(.top, 3)
-                }
-                .contentShape(Rectangle())
-                .padding(.vertical, 4)
-            }
-            .buttonStyle(.plain)
-            .disabled(disabled)
-        }
-    }
+    // Session Health summary text (sessionStateText, sourceSummaryText, etc.) used by
+    // the "Copy Support Bundle" action below now lives on AppModel — shared with
+    // DiagnosticsView's Session Health grid.
 
     var body: some View {
         @Bindable var model = model
         VStack(spacing: 0) {
-            ScrollView {
-                Form {
-                    Section("Start Workflow") {
-                        WorkflowActionRow(
-                            title: "Live from Seestar",
-                            subtitle: "Auto-detect the mounted Seestar folder, relay new subs, and start native live stacking.",
-                            systemImage: "dot.radiowaves.left.and.right",
-                            disabled: liveWorkflowDisabled
-                        ) {
-                            model.liveSource.startSeestarLive()
-                        }
-
-                        WorkflowActionRow(
-                            title: "Live from ASIAIR",
-                            subtitle: "Auto-detect the ASIAIR Autorun/Light folder and start native live stacking.",
-                            systemImage: "camera.aperture",
-                            disabled: liveWorkflowDisabled
-                        ) {
-                            model.liveSource.startASIAIRLive()
-                        }
-
-                        WorkflowActionRow(
-                            title: "Live from Folder / NINA",
-                            subtitle: "Watch any folder where NINA or another capture app writes new FITS light frames.",
-                            systemImage: "folder.badge.plus",
-                            disabled: liveWorkflowDisabled
-                        ) {
-                            pickNativeWatchFolderLive()
-                        }
-
-                        WorkflowActionRow(
-                            title: "Watch Siril / External Stacker",
-                            subtitle: "Watch a live_stack FITS output from Siril or another stacker instead of stacking raw subs.",
-                            systemImage: "rectangle.stack.badge.play",
-                            disabled: liveWorkflowDisabled
-                        ) {
-                            pickStackerOutputWatchFolder()
-                        }
-
-                        WorkflowActionRow(
-                            title: "Stack Previous Shoot",
-                            subtitle: "Choose a folder of existing FITS light frames and stack them offline.",
-                            systemImage: "tray.and.arrow.down",
-                            disabled: offlineWorkflowDisabled
-                        ) {
-                            pickImportFolder()
-                        }
-
-                        WorkflowActionRow(
-                            title: "Try Demo",
-                            subtitle: "Start a local sample stack stream so you can test the display, outputs, and replay without clear skies.",
-                            systemImage: "sparkles",
-                            disabled: liveWorkflowDisabled
-                        ) {
-                            model.startDemoSession()
-                        }
-                    }
-                    Section("Watch Folder") {
-                        Picker("Source", selection: $model.sourceMode) {
-                            ForEach(AppModel.SourceMode.allCases, id: \.self) { mode in
-                                Text(mode.rawValue).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .disabled(model.isRunning || model.importer.isImporting)
-                        .help("Seestar Live displays Siril's live_stack.fit directly; Raw subs stacks individual exposures natively using LiveAstro's built-in stacker.")
-
-                        HStack {
-                            Text(model.watchFolder?.path ?? "none selected")
-                                .lineLimit(1).truncationMode(.middle)
-                            Spacer()
-                            Button("Choose…") { pickFolder() }
-                                .disabled(model.isRunning || model.importer.isImporting)
-                                .help("Choose the folder to watch for incoming FITS subs or the Seestar relay folder.")
-                        }
-                        TextField("File prefix (empty = any; e.g. Light_ for native subs)",
-                                  text: $model.fileNamePrefix)
-                            .disabled(model.isRunning || model.importer.isImporting)
-                            .help("Only process files whose name starts with this prefix; leave empty to accept all FITS files in the watch folder.")
-                        helpToggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground,
-                                   help: "Apply a per-channel background neutralization pass after stacking to correct OSC white balance drift.")
-                            .disabled(model.isRunning || model.importer.isImporting)
-                        helpToggle("Reject outliers (σ-clip)", isOn: $model.rejectionEnabled,
-                                   help: "Drop satellite / plane / cosmic-ray streaks by clamping pixels that deviate from the per-pixel stack statistics (winsorized κ-σ). On by default.")
-                            .disabled(model.isRunning || model.importer.isImporting)
-                        helpToggle("Weight frames by quality", isOn: $model.frameWeightingEnabled,
-                                   help: "Give sharper, lower-noise subs more influence in the stack (star count + background noise). Turn off for an equal-weight stack.")
-                            .disabled(model.isRunning || model.importer.isImporting)
-                        helpToggle("Match sky background", isOn: $model.backgroundNormalizationEnabled,
-                                   help: "Level each sub's sky gradient to the reference before stacking, so a drifting light-pollution ramp or moonrise gradient doesn't leave a residual gradient the master can't remove. Low-order per channel; off for an unadjusted stack.")
-                            .disabled(model.isRunning || model.importer.isImporting)
-                        helpToggle("Match transparency", isOn: $model.scaleNormalizationEnabled,
-                                   help: "Scale each sub's signal to the reference brightness using matched star fluxes, so haze or thin cloud doesn't dim the master. Off for an unadjusted stack. Requires Match sky background (scaling pivots about the matched background).")
-                            .disabled(model.isRunning || model.importer.isImporting)
-                        HStack(spacing: 6) {
-                            Text("Keep relay sessions")
-                            InfoButton(text: "Live sessions stage incoming subs in ~/LiveAstro/relay. Sessions older than this are deleted automatically when a new session starts — they are copies; originals stay on the Seestar/rig. Off disables pruning.")
-                            Spacer()
-                            Picker("", selection: $model.liveSource.relayRetentionDays) {
-                                Text("Off").tag(0)
-                                Text("3d").tag(3)
-                                Text("7d").tag(7)
-                                Text("14d").tag(14)
-                                Text("30d").tag(30)
-                            }
-                            .pickerStyle(.segmented)
-                            .labelsHidden()
-                            .frame(maxWidth: 300)
-                            .disabled(model.isRunning || model.importer.isImporting)
-                        }
-                        HStack(spacing: 6) {
-                            Text("Debayer")
-                            InfoButton(text: "Malvar (high quality) keeps star cores sharp and fringe-free (recommended). Bilinear is the legacy demosaic.")
-                            Spacer()
-                            Picker("", selection: $model.demosaic) {
-                                Text("Bilinear").tag(DemosaicMethod.bilinear)
-                                Text("Malvar (high quality)").tag(DemosaicMethod.malvar)
-                            }
-                            .pickerStyle(.segmented)
-                            .labelsHidden()
-                            .frame(maxWidth: 220)
-                            .disabled(model.isRunning || model.importer.isImporting)
-                        }
-                        if model.rejectionEnabled {
-                            Picker("Strength", selection: $model.rejectionStrength) {
-                                Text("Low").tag(RejectionStrength.low)
-                                Text("Medium").tag(RejectionStrength.medium)
-                                Text("High").tag(RejectionStrength.high)
-                            }
-                            .pickerStyle(.segmented)
-                            .disabled(model.isRunning || model.importer.isImporting)
-                            .help("Higher = safer (rejects less); lower = more aggressive. Medium (κ=3) is the validated default.")
-                        }
-                        Picker("Post-process", selection: $model.processorBackend) {
-                            Text("None").tag(ProcessorBackend.none)
-                            Text("GraXpert").tag(ProcessorBackend.graxpert)
-                            Text("Native NR").tag(ProcessorBackend.nativeDenoise)
-                        }
-                        .pickerStyle(.segmented)
-                        .disabled(model.isRunning || model.importer.isImporting || model.importer.isProcessing)
-                        .help("After stacking, optionally post-process the master to a master_processed FITS: GraXpert (background extraction + denoise, requires install) or the built-in Native NR denoiser.")
-                    }
-                    if model.sourceMode == .nativeStack {
-                        Section("Calibration") {
-                            CalibrationSection(model: model)
-                        }
-                    }
-                    Section("Session Profile") {
-                        TextField("Target name", text: $model.targetName)
-                        TextField("Telescope", text: $model.telescope)
-                        TextField("Camera", text: $model.camera)
-                        TextField("Mount", text: $model.mount)
-                        TextField("Filter", text: $model.filter)
-                        TextField("Location", text: $model.locationLabel)
-                        TextField("Bortle (1–9)", text: $model.bortleText)
-                        TextField("Sub-exposure seconds", text: $model.subExposureText)
-                            .help("Individual sub-exposure length in seconds; recorded in the session manifest and used for dark-frame matching.")
-                        TextField("Notes", text: $model.notes)
-                    }
-                    Section("Session end") {
-                        helpToggle("Idle safeguard — save master if capture stalls",
-                                   isOn: $model.idleSafeguardEnabled,
-                                   help: "Writes master.fit and keeps stacking; a cloud gap resumes normally.")
-                            .disabled(model.sourceMode != .nativeStack)
-                        if model.sourceMode != .nativeStack {
-                            Text("Native stacking only — external stackers own their own master.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        if model.idleSafeguardEnabled {
-                            Stepper("After \(model.idleSafeguardMinutes) min idle",
-                                    value: $model.idleSafeguardMinutes, in: 5...120, step: 5)
-                                .help("How long capture may stall before a master snapshot is written. Stacking continues; a resumed feed re-arms the safeguard.")
-                                .disabled(model.sourceMode != .nativeStack)
-                        }
-                        helpToggle("Auto-stop at a set time", isOn: $model.plannedStopEnabled,
-                                   help: "Runs a full End Session at this time (writes master + replay, ends an owned broadcast). Does not quit the app.")
-                        if model.plannedStopEnabled {
-                            DatePicker("Stop at", selection: Binding(
-                                get: { Calendar.current.date(bySettingHour: model.plannedStopHour,
-                                        minute: model.plannedStopMinute, second: 0, of: Date()) ?? Date() },
-                                set: { newDate in
-                                    let c = Calendar.current.dateComponents([.hour, .minute], from: newDate)
-                                    model.plannedStopHour = c.hour ?? 3
-                                    model.plannedStopMinute = c.minute ?? 0
-                                }), displayedComponents: .hourAndMinute)
-                                .help("Runs a full End Session at this clock time (next occurrence, crosses midnight).")
-                        }
-                    }
-                    // Observes the OBSController (Combine ObservableObject) so its
-                    // @Published state/scene/record changes re-render this section.
-                    OBSSection(model: model)
-                    Section("Night vision") {
-                        helpToggle("Red screen", isOn: $model.nightVisionOn,
-                                   help: "Tints the whole Mac display red to protect your dark adaptation at the scope — affects every app, not just LiveAstro. Clears when you quit.")
-                            .onChange(of: model.nightVisionOn) { _, _ in model.applyNightVision() }
-                        if model.nightVisionOn {
-                            HStack {
-                                Text("Brightness").frame(width: 90, alignment: .leading)
-                                Slider(value: $model.nightVisionLevel, in: 1...100)
-                                    .onChange(of: model.nightVisionLevel) { _, _ in
-                                        if model.nightVisionOn { model.applyNightVision() }
-                                    }
-                                Text("\(Int(model.nightVisionLevel))%")
-                                    .frame(width: 48, alignment: .trailing).monospacedDigit()
-                            }
-                            .help("Lower = dimmer and deeper red. Your keyboard brightness keys still work on top.")
-                        }
-                        Text("A screenshot still looks normal — macOS captures the image before the display tint is applied.")
-                            .font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Section("Display Adjustments") {
-                        VStack(alignment: .leading) {
-                            Text("Black point")
-                            Slider(value: $model.displayAdjustments.blackPoint, in: 0...0.2) { editing in
-                                if !editing { model.applyDisplayAdjustments() }
-                            }
-                            .help("Darken the sky background. 0 = auto.")
-                        }
-                        VStack(alignment: .leading) {
-                            Text("Stretch strength")
-                            Slider(value: $model.displayAdjustments.midtoneStrength, in: -1...1) { editing in
-                                if !editing { model.applyDisplayAdjustments() }
-                            }
-                            .help("How aggressive the stretch is. 0 = auto.")
-                        }
-                        VStack(alignment: .leading) {
-                            Text("Saturation")
-                            Slider(value: $model.displayAdjustments.saturation, in: 0...2) { editing in
-                                if !editing { model.applyDisplayAdjustments() }
-                            }
-                            .help("Color intensity. 1 = unchanged.")
-                        }
-                        helpToggle("Flatten background (DBE)", isOn: $model.displayAdjustments.backgroundExtraction,
-                                   help: "Remove the light-pollution gradient so the sky darkens evenly. Off by default.")
-                            .onChange(of: model.displayAdjustments.backgroundExtraction) { _, _ in
-                                model.applyDisplayAdjustments()
-                            }
-                        if model.displayAdjustments.backgroundExtraction {
-                            HStack {
-                                Text("Scale").frame(width: 90, alignment: .leading)
-                                Slider(value: $model.displayAdjustments.bgScale, in: 1...15) { editing in
-                                    if !editing { model.applyDisplayAdjustments() }
-                                }
-                                Text(String(format: "%.1f%%", model.displayAdjustments.bgScale))
-                                    .frame(width: 48, alignment: .trailing).monospacedDigit()
-                            }
-                            .help("Smoothing scale as % of image size — lower follows local/corner gradients, higher removes only broad gradients.")
-                            HStack {
-                                Text("Smoothest").frame(width: 90, alignment: .leading)
-                                Slider(value: $model.displayAdjustments.bgSmoothest, in: 0...3) { editing in
-                                    if !editing { model.applyDisplayAdjustments() }
-                                }
-                                Text(String(format: "%.1f", model.displayAdjustments.bgSmoothest))
-                                    .frame(width: 48, alignment: .trailing).monospacedDigit()
-                            }
-                            .help("Extra blur on the background model — raise to remove residual blotchiness, lower to track non-smooth gradients.")
-                        }
-                        VStack(alignment: .leading) {
-                            Text("Denoise")
-                            Slider(value: $model.displayAdjustments.denoiseStrength, in: 0...1) { editing in
-                                if !editing { model.applyDisplayAdjustments() }
-                            }
-                            .help("Classic noise reduction — smooths background grain and color mottle on the displayed stack. 0 = off. master.fit is never modified.")
-                        }
-                        switch model.catalogState {
-                        case .installed:
-                            helpToggle("North up", isOn: $model.displayAdjustments.northUp,
-                                       help: "Rotate the view so celestial north is up (display only — master.fit stays native). Needs a plate solve; enabled once the reference frame is solved.")
-                                .onChange(of: model.displayAdjustments.northUp) { _, _ in
-                                    model.applyDisplayAdjustments()
-                                }
-                                .disabled(!model.solveAvailable)
-                        case .notInstalled:
-                            Button("Download star catalog (~32 MB) — enables North up") {
-                                model.downloadCatalog()
-                            }
-                            .help("Downloads the Gaia bright-star catalog used to plate-solve and orient the view north-up. One-time, cached locally.")
-                        case .downloading(let p):
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Downloading star catalog…").font(.caption)
-                                ProgressView(value: p)
-                            }
-                        case .failed(let msg):
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(msg).font(.caption).foregroundStyle(.red)
-                                Button("Retry download") { model.downloadCatalog() }
-                            }
-                        }
-                        Text("Star catalog: Gaia DR3 (ESA/DPAC)")
-                            .font(.caption2).foregroundStyle(.secondary)
-                        Button("Reset") {
-                            model.displayAdjustments = .liveDefault
-                            model.applyDisplayAdjustments()
-                        }
-                        .help("Back to the recommended look (auto-stretch with background flattening on).")
-                    }
-                    Section {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 2) {
-                                ForEach(Array(model.log.suffix(logDisplayCap).enumerated()), id: \.offset) {
-                                    Text($0.element).font(.system(.caption, design: .monospaced))
-                                }
-                            }.frame(maxWidth: .infinity, alignment: .leading)
-                        }.frame(minHeight: logMinHeight)
-                    } header: {
-                        HStack {
-                            Text("Log")
-                            Spacer()
-                            Button("Copy Log") { copyLogTail() }
-                                .font(.caption)
-                                .disabled(model.log.isEmpty)
-                                .help("Copy the visible recent log lines for sharing or debugging.")
-                        }
-                    }
-                }
-                .formStyle(.grouped)
-                // Force a permanent legacy scrollbar on the backing NSScrollView — a
-                // zero-size probe inside the scroll content reaches up to it. This is
-                // what actually keeps the bar visible; .scrollIndicators(.visible) alone
-                // doesn't override the macOS overlay auto-hide.
-                .background(AlwaysVisibleScroller())
+            TabView(selection: $model.setupSubTab) {
+                CaptureSettingsView(model: model)
+                    .tabItem { Label("Capture", systemImage: "camera") }
+                    .tag(AppModel.SetupSubTab.capture)
+                DisplaySettingsView(model: model)
+                    .tabItem { Label("Display", systemImage: "slider.horizontal.3") }
+                    .tag(AppModel.SetupSubTab.display)
+                StatsView(model: model)
+                    .tabItem { Label("Stats", systemImage: "chart.bar") }
+                    .tag(AppModel.SetupSubTab.stats)
+                BroadcastSettingsView(model: model)
+                    .tabItem { Label("Broadcast", systemImage: "dot.radiowaves.left.and.right") }
+                    .tag(AppModel.SetupSubTab.broadcast)
+                DiagnosticsView(model: model)
+                    .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
+                    .tag(AppModel.SetupSubTab.diagnostics)
             }
-            .scrollIndicators(.visible)
 
             Divider()
 
-            // Fixed footer — always visible regardless of scroll position.
-            VStack(spacing: 8) {
-                HStack {
-                    if model.isRunning {
-                        Button("End Session", role: .destructive) { model.endSession() }
-                            .disabled(model.importer.isGeneratingReplay)
-                    } else {
-                        Button("Start Session") { model.startSession() }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(model.importer.isImporting)
-                    }
-                    Spacer()
-                    Button {
-                        model.liveSource.startSeestarLive()
-                    } label: { Label("Start Seestar", systemImage: "dot.radiowaves.left.and.right") }
-                    .help("Auto-detect the mounted Seestar folder, start relaying its 10s subs, and begin native stacking — one tap.")
-                    .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
-                    Button {
-                        model.liveSource.startASIAIRLive()
-                    } label: { Label("Start ASIAIR", systemImage: "camera.aperture") }
-                    .help("Auto-detect the ASIAIR's Autorun/Light folder, relay its subs, and begin native stacking — one tap.")
-                    .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
-                    Button("Live from Folder / NINA…") { pickNativeWatchFolderLive() }
-                        .help("Live-stack subs from any folder your rig writes to, including NINA or another FITS capture app.")
-                        .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
-                    Button("Stack Previous Shoot…") { pickImportFolder() }
-                        .disabled(model.isRunning || model.importer.isImporting)
-                        .help("Select a folder of previously captured FITS light frames to stack offline, with progress tracking and Cancel support.")
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text("Session Health")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Open Watch Folder") { openWatchFolder() }
-                            .font(.caption)
-                            .disabled(model.watchFolder == nil)
-                            .help("Open the folder LiveAstro is currently watching for FITS files.")
-                        Button("Copy Health") { copyHealthSnapshot() }
-                            .font(.caption)
-                            .help("Copy the current session health snapshot for sharing or debugging.")
-                    }
-
-                    LazyVGrid(columns: [
-                        GridItem(.flexible(minimum: 120), alignment: .leading),
-                        GridItem(.flexible(minimum: 120), alignment: .leading),
-                        GridItem(.flexible(minimum: 120), alignment: .leading),
-                        GridItem(.flexible(minimum: 120), alignment: .leading)
-                    ], alignment: .leading, spacing: 8) {
-                        HealthItem(label: "State", value: sessionStateText)
-                        HealthItem(label: "Source", value: sourceSummaryText)
-                        HealthItem(label: "Folder", value: watchFolderSummaryText)
-                        HealthItem(label: "Last update", value: lastUpdateSummaryText)
-                        HealthItem(label: "Frames", value: framesSummaryText)
-                        HealthItem(label: "Last rejection", value: lastRejectionSummaryText)
-                        HealthItem(label: "OBS", value: obsSummaryText)
-                        HealthItem(label: "Outputs", value: outputsSummaryText)
-                    }
-                }
-                // Go Live / End Broadcast — decoupled from session start.
-                HStack {
-                    switch model.broadcast.broadcastState {
-                    case .idle:
-                        Button("Go Live") { model.broadcast.goLive() }
-                            .help("Broadcast the live stack to YouTube via OBS (configure the YouTube key in OBS ▸ Settings ▸ Stream first).")
-                    case .unknown:
-                        // Review7: initial state — OBS output state never confirmed, so
-                        // no idle claim. Go Live still works one-click: it connects and
-                        // reconciles with OBS's actual state first (adopting an
-                        // already-live stream instead of double-starting it).
-                        HStack(spacing: 10) {
-                            Button("Go Live") { model.broadcast.goLive() }
-                                .help("Connect to OBS, sync with its actual stream state, and start broadcasting if nothing is already live.")
-                            Text("OBS not checked yet")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    case .connecting:
-                        HStack { ProgressView().controlSize(.small); Text("Connecting OBS…") }
-                    case .live:
-                        HStack(spacing: 10) {
-                            Button("End Broadcast", role: .destructive) { model.broadcast.endBroadcast() }
-                            if let h = model.broadcast.streamHealth {
-                                Text("● LIVE · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
-                                    .foregroundStyle(.red).font(.caption)
-                            }
-                        }
-                    case .endingSession:
-                        // Review5 P2: the stream deliberately stays live until the replay
-                        // finishes — don't offer Go Live, and keep showing live health truth.
-                        // Review6: offer End Broadcast as an operator override (stream down
-                        // NOW while the replay renders).
-                        HStack(spacing: 10) {
-                            ProgressView().controlSize(.small)
-                            Text("Ending broadcast…")
-                            Button("End Broadcast", role: .destructive) { model.broadcast.endBroadcast() }
-                                .help("Stop the stream now instead of waiting for the replay to finish rendering.")
-                            if let h = model.broadcast.streamHealth {
-                                Text("● LIVE · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
-                                    .foregroundStyle(.red).font(.caption)
-                            }
-                        }
-                    case .stopping:
-                        HStack { ProgressView().controlSize(.small); Text("Stopping…") }
-                    case .stopUnconfirmed:
-                        // Review6 P1: the stop was never confirmed — OBS may still be live.
-                        // Honest state: block Go Live and offer Retry.
-                        HStack(spacing: 10) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.yellow)
-                            Text("OBS may still be live — check OBS")
-                                .font(.caption)
-                            Button("Retry") { model.broadcast.retryStop() }
-                                .help("Re-attempt the stop and confirm the stream and recording are down.")
-                        }
-                    }
-                    Spacer()
-                }
-                if model.isRunning && model.sourceMode == .nativeStack {
-                    HStack {
-                        Text("accepted \(model.acceptedCount) · rejected \(model.rejectedCount)")
-                            .font(.system(.caption, design: .monospaced))
-                        Spacer()
-                        Button("Reseed Reference") { model.reseedReference() }
-                            .help("Replace the alignment reference frame with the latest accepted sub so subsequent subs align to it.")
-                    }
-                }
-                if model.importer.isImporting {
-                    VStack(spacing: 4) {
-                        ProgressView(value: Double(model.importer.importProcessed),
-                                     total: Double(max(model.importer.importTotal, 1)))
-                        HStack {
-                            Text("\(model.importer.importProcessed) / \(model.importer.importTotal)")
-                            Spacer()
-                            Text("✓ \(model.acceptedCount)  ✗ \(model.rejectedCount)").foregroundStyle(.secondary)
-                            Button("Cancel", role: .cancel) { model.importer.cancelImport() }
-                        }.font(.caption)
-                    }.padding(.horizontal)
-                }
-                if !model.isRunning {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text("Session Outputs")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text("Output footprint: \(outputFootprintText)")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                            Button("Refresh Sizes") { refreshOutputFootprint() }
-                                .help("Calculate the size of the LiveAstro output root and latest session folder.")
-                            Button("Open Sessions Folder") { openSessionsRoot() }
-                                .help("Open the root folder where LiveAstro writes session outputs.")
-                            Button("Regenerate Replay…") { pickSessionDirectory() }
-                                .disabled(model.importer.isGeneratingReplay)
-                        }
-
-                        if hasSessionOutputs {
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack(spacing: 8) {
-                                    Button("Open Replay") { openReplay() }
-                                        .disabled(model.replayURL == nil)
-                                        .help("Open the latest replay video with the default macOS app.")
-
-                                    Button("Reveal Replay") { revealReplay() }
-                                        .disabled(model.replayURL == nil)
-                                        .help("Show the latest replay video in Finder.")
-
-                                    Button("Open Session Folder") { openSessionFolder() }
-                                        .disabled(model.lastSessionDirectory == nil)
-                                        .help("Open the folder containing this session's manifest, snapshots, replay, and native master when present.")
-
-                                    if latestImageURL != nil {
-                                        Button("Open Latest Image") { openLatestImage() }
-                                            .help("Open the session's latest.png monitor image.")
-
-                                        Button("Reveal latest.png") { revealLatestImage() }
-                                            .help("Show the session's latest.png monitor image in Finder.")
-                                    }
-
-                                    if latestMasterURL != nil {
-                                        Button("Open master.fit") { openMaster() }
-                                            .help("Open master.fit in your default FITS app (e.g. Siril) for further processing.")
-                                        Button("Reveal master.fit") { revealMaster() }
-                                            .help("Show the native stacking master in Finder.")
-                                    } else if model.lastSessionDirectory != nil {
-                                        Button("No master.fit") {}
-                                            .disabled(true)
-                                            .help("Native sessions write master.fit when a current stack exists. Siril/external stacker sessions may not create one.")
-                                    }
-
-                                    Spacer()
-                                }
-
-                                HStack(spacing: 8) {
-                                    if sessionSummaryURL != nil {
-                                        Button("Open Summary") { openSessionSummary() }
-                                            .help("Open the session-summary.md human-readable session report.")
-                                    }
-
-                                    if frameSummaryURL != nil {
-                                        Button("Open Frame CSV") { openFrameSummary() }
-                                            .help("Open the frame-summary.csv per-snapshot table.")
-                                    }
-
-                                    Spacer()
-
-                                    Button("Copy Support Bundle") { copySupportBundle() }
-                                        .help("Copy health, output paths, and recent log lines for sharing or debugging.")
-
-                                    Button("Copy Summary") { copySessionSummary() }
-                                        .help("Copy target, output paths, and accepted/rejected frame counts.")
-                                }
-                            }
-                            .font(.caption)
-                        } else {
-                            Text("Finish a session or stack a previous shoot to see output shortcuts here.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                if model.processorBackend != .none, model.sourceMode == .nativeStack, let dir = model.lastSessionDirectory {
-                    Button(model.importer.isProcessing ? "Processing…" : "Process master") {
-                        model.importer.processMaster(sessionDirectory: dir)
-                    }
-                    .disabled(model.importer.isProcessing
-                              || (model.processorBackend == .graxpert && GraXpertProcessor.defaultExecutable() == nil))
-                    .help(model.processorBackend == .graxpert
-                          ? (GraXpertProcessor.defaultExecutable() == nil
-                             ? "GraXpert not found — install from graxpert.com"
-                             : "Run GraXpert on the last stacked master → master_processed FITS")
-                          : "Run the native denoiser on the last stacked master → master_processed FITS")
-                }
-                if model.importer.isGeneratingReplay { ProgressView("Rendering replay…") }
-                Text(appVersionText)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
+            controlFooter
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
         }
         .alert("LiveAstro", isPresented: $model.isShowingError) {
             Button("OK") { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
     }
 
-    private func formatDuration(_ s: Double) -> String {
-        let total = Int(s)
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let sec = total % 60
-        return String(format: "%02d:%02d:%02d", h, m, sec)
-    }
+    // Fixed footer — always visible regardless of which Setup sub-tab is selected.
+    @ViewBuilder
+    private var controlFooter: some View {
+        VStack(spacing: 8) {
+            HStack {
+                if model.isRunning {
+                    Button("End Session", role: .destructive) { model.endSession() }
+                        .disabled(model.importer.isGeneratingReplay)
+                } else {
+                    Button("Start Session") { model.startSession() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.importer.isImporting)
+                }
+                Spacer()
+                Button {
+                    model.liveSource.startSeestarLive()
+                } label: { Label("Start Seestar", systemImage: "dot.radiowaves.left.and.right") }
+                .help("Auto-detect the mounted Seestar folder, start relaying its 10s subs, and begin native stacking — one tap.")
+                .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
+                Button {
+                    model.liveSource.startASIAIRLive()
+                } label: { Label("Start ASIAIR", systemImage: "camera.aperture") }
+                .help("Auto-detect the ASIAIR's Autorun/Light folder, relay its subs, and begin native stacking — one tap.")
+                .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
+                Button("Live from Folder / NINA…") { model.pickNativeWatchFolderLive() }
+                    .help("Live-stack subs from any folder your rig writes to, including NINA or another FITS capture app.")
+                    .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
+                Button("Stack Previous Shoot…") { model.pickImportFolder() }
+                    .disabled(model.isRunning || model.importer.isImporting)
+                    .help("Select a folder of previously captured FITS light frames to stack offline, with progress tracking and Cancel support.")
+            }
+            // Go Live / End Broadcast — decoupled from session start.
+            HStack {
+                switch model.broadcast.broadcastState {
+                case .idle:
+                    Button("Go Live") { model.broadcast.goLive() }
+                        .help("Broadcast the live stack to YouTube via OBS (configure the YouTube key in OBS ▸ Settings ▸ Stream first).")
+                case .unknown:
+                    // Review7: initial state — OBS output state never confirmed, so
+                    // no idle claim. Go Live still works one-click: it connects and
+                    // reconciles with OBS's actual state first (adopting an
+                    // already-live stream instead of double-starting it).
+                    HStack(spacing: 10) {
+                        Button("Go Live") { model.broadcast.goLive() }
+                            .help("Connect to OBS, sync with its actual stream state, and start broadcasting if nothing is already live.")
+                        Text("OBS not checked yet")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                case .connecting:
+                    HStack { ProgressView().controlSize(.small); Text("Connecting OBS…") }
+                case .live:
+                    HStack(spacing: 10) {
+                        Button("End Broadcast", role: .destructive) { model.broadcast.endBroadcast() }
+                        if let h = model.broadcast.streamHealth {
+                            Text("● LIVE · \(model.formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
+                                .foregroundStyle(.red).font(.caption)
+                        }
+                    }
+                case .endingSession:
+                    // Review5 P2: the stream deliberately stays live until the replay
+                    // finishes — don't offer Go Live, and keep showing live health truth.
+                    // Review6: offer End Broadcast as an operator override (stream down
+                    // NOW while the replay renders).
+                    HStack(spacing: 10) {
+                        ProgressView().controlSize(.small)
+                        Text("Ending broadcast…")
+                        Button("End Broadcast", role: .destructive) { model.broadcast.endBroadcast() }
+                            .help("Stop the stream now instead of waiting for the replay to finish rendering.")
+                        if let h = model.broadcast.streamHealth {
+                            Text("● LIVE · \(model.formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% cong")
+                                .foregroundStyle(.red).font(.caption)
+                        }
+                    }
+                case .stopping:
+                    HStack { ProgressView().controlSize(.small); Text("Stopping…") }
+                case .stopUnconfirmed:
+                    // Review6 P1: the stop was never confirmed — OBS may still be live.
+                    // Honest state: block Go Live and offer Retry.
+                    HStack(spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.yellow)
+                        Text("OBS may still be live — check OBS")
+                            .font(.caption)
+                        Button("Retry") { model.broadcast.retryStop() }
+                            .help("Re-attempt the stop and confirm the stream and recording are down.")
+                    }
+                }
+                Spacer()
+            }
+            if model.isRunning && model.sourceMode == .nativeStack {
+                HStack {
+                    Text("accepted \(model.acceptedCount) · rejected \(model.rejectedCount)")
+                        .font(.system(.caption, design: .monospaced))
+                    Spacer()
+                    Button("Reseed Reference") { model.reseedReference() }
+                        .help("Replace the alignment reference frame with the latest accepted sub so subsequent subs align to it.")
+                }
+            }
+            if model.importer.isImporting {
+                VStack(spacing: 4) {
+                    ProgressView(value: Double(model.importer.importProcessed),
+                                 total: Double(max(model.importer.importTotal, 1)))
+                    HStack {
+                        Text("\(model.importer.importProcessed) / \(model.importer.importTotal)")
+                        Spacer()
+                        Text("✓ \(model.acceptedCount)  ✗ \(model.rejectedCount)").foregroundStyle(.secondary)
+                        Button("Cancel", role: .cancel) { model.importer.cancelImport() }
+                    }.font(.caption)
+                }.padding(.horizontal)
+            }
+            if !model.isRunning {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Session Outputs")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("Output footprint: \(outputFootprintText)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Button("Refresh Sizes") { refreshOutputFootprint() }
+                            .help("Calculate the size of the LiveAstro output root and latest session folder.")
+                        Button("Open Sessions Folder") { openSessionsRoot() }
+                            .help("Open the root folder where LiveAstro writes session outputs.")
+                        Button("Regenerate Replay…") { pickSessionDirectory() }
+                            .disabled(model.importer.isGeneratingReplay)
+                    }
 
-    private func makeDirectoryPanel(title: String? = nil, message: String? = nil) -> NSOpenPanel {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        if let title { panel.title = title }
-        if let message { panel.message = message }
-        return panel
-    }
+                    if hasSessionOutputs {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 8) {
+                                Button("Open Replay") { openReplay() }
+                                    .disabled(model.replayURL == nil)
+                                    .help("Open the latest replay video with the default macOS app.")
 
-    private func pickFolder() {
-        let panel = makeDirectoryPanel()
-        if panel.runModal() == .OK { model.watchFolder = panel.url }
-    }
+                                Button("Reveal Replay") { revealReplay() }
+                                    .disabled(model.replayURL == nil)
+                                    .help("Show the latest replay video in Finder.")
 
-    private func pickNativeWatchFolderLive() {
-        pickWatchFolderLive(
-            sourceMode: .nativeStack,
-            title: "Choose Live FITS Folder",
-            message: "Select the folder where NINA, ASIAIR, or another capture app writes new FITS light frames."
-        )
-    }
+                                Button("Open Session Folder") { openSessionFolder() }
+                                    .disabled(model.lastSessionDirectory == nil)
+                                    .help("Open the folder containing this session's manifest, snapshots, replay, and native master when present.")
 
-    private func pickStackerOutputWatchFolder() {
-        pickWatchFolderLive(
-            sourceMode: .stackerOutput,
-            title: "Choose Stacker Output Folder",
-            message: "Select the folder where Siril or another stacker writes live_stack FITS output."
-        )
-    }
+                                if latestImageURL != nil {
+                                    Button("Open Latest Image") { openLatestImage() }
+                                        .help("Open the session's latest.png monitor image.")
 
-    private func pickWatchFolderLive(sourceMode: AppModel.SourceMode,
-                                     title: String,
-                                     message: String) {
-        let panel = makeDirectoryPanel(title: title, message: message)
-        panel.prompt = "Watch"
-        if panel.runModal() == .OK, let url = panel.url {
-            model.sourceMode = sourceMode
-            model.liveSource.startWatchFolderLive(source: url, sourceMode: sourceMode)
-        }
-    }
+                                    Button("Reveal latest.png") { revealLatestImage() }
+                                        .help("Show the session's latest.png monitor image in Finder.")
+                                }
 
-    private func pickImportFolder() {
-        let panel = makeDirectoryPanel(title: "Choose Subs Folder",
-                                       message: "Select a folder containing raw FITS subs to import")
-        if panel.runModal() == .OK, let url = panel.url {
-            model.importer.importSubs(from: url)
+                                if latestMasterURL != nil {
+                                    Button("Open master.fit") { openMaster() }
+                                        .help("Open master.fit in your default FITS app (e.g. Siril) for further processing.")
+                                    Button("Reveal master.fit") { revealMaster() }
+                                        .help("Show the native stacking master in Finder.")
+                                } else if model.lastSessionDirectory != nil {
+                                    Button("No master.fit") {}
+                                        .disabled(true)
+                                        .help("Native sessions write master.fit when a current stack exists. Siril/external stacker sessions may not create one.")
+                                }
+
+                                Spacer()
+                            }
+
+                            HStack(spacing: 8) {
+                                if sessionSummaryURL != nil {
+                                    Button("Open Summary") { openSessionSummary() }
+                                        .help("Open the session-summary.md human-readable session report.")
+                                }
+
+                                if frameSummaryURL != nil {
+                                    Button("Open Frame CSV") { openFrameSummary() }
+                                        .help("Open the frame-summary.csv per-snapshot table.")
+                                }
+
+                                if subFramesURL != nil {
+                                    Button("Open sub-frames.csv") { openSubFrames() }
+                                        .help("Open the per-sub quality + rejection table.")
+                                }
+
+                                Spacer()
+
+                                Button("Copy Support Bundle") { copySupportBundle() }
+                                    .help("Copy health, output paths, and recent log lines for sharing or debugging.")
+
+                                Button("Copy Summary") { copySessionSummary() }
+                                    .help("Copy target, output paths, and accepted/rejected frame counts.")
+                            }
+                        }
+                        .font(.caption)
+                    } else {
+                        Text("Finish a session or stack a previous shoot to see output shortcuts here.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if model.processorBackend != .none, model.sourceMode == .nativeStack, let dir = model.lastSessionDirectory {
+                Button(model.importer.isProcessing ? "Processing…" : "Process master") {
+                    model.importer.processMaster(sessionDirectory: dir)
+                }
+                .disabled(model.importer.isProcessing
+                          || (model.processorBackend == .graxpert && GraXpertProcessor.defaultExecutable() == nil))
+                .help(model.processorBackend == .graxpert
+                      ? (GraXpertProcessor.defaultExecutable() == nil
+                         ? "GraXpert not found — install from graxpert.com"
+                         : "Run GraXpert on the last stacked master → master_processed FITS")
+                      : "Run the native denoiser on the last stacked master → master_processed FITS")
+            }
+            if model.importer.isGeneratingReplay { ProgressView("Rendering replay…") }
+            Text(appVersionText)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
     }
 
     private func pickSessionDirectory() {
-        let panel = makeDirectoryPanel(title: "Choose Session Directory",
-                                       message: "Select a past session folder containing manifest.json")
+        let panel = model.makeDirectoryPanel(title: "Choose Session Directory",
+                                             message: "Select a past session folder containing manifest.json")
         let liveAstro = model.liveAstroRoot
         if FileManager.default.fileExists(atPath: liveAstro.path) {
             panel.directoryURL = liveAstro
@@ -891,6 +339,11 @@ struct ControlView: View {
 
     private func openFrameSummary() {
         guard let url = frameSummaryURL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func openSubFrames() {
+        guard let url = subFramesURL else { return }
         NSWorkspace.shared.open(url)
     }
 
@@ -938,12 +391,6 @@ struct ControlView: View {
         }
     }
 
-    private func openWatchFolder() {
-        guard let url = model.watchFolder else { return }
-        NSWorkspace.shared.open(url)
-        model.log.append("Opened watch folder")
-    }
-
     private func openMaster() {
         guard let url = latestMasterURL else { return }
         NSWorkspace.shared.open(url)   // opens in the user's default FITS app (Siril if configured)
@@ -952,32 +399,6 @@ struct ControlView: View {
     private func revealMaster() {
         guard let url = latestMasterURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
-    }
-
-    private func copyLogTail() {
-        let tail = model.log.suffix(logDisplayCap).joined(separator: "\n")
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(tail, forType: .string)
-        model.log.append("Copied log tail")
-    }
-
-    private func copyHealthSnapshot() {
-        let summary = """
-        LiveAstro Session Health
-        State: \(sessionStateText)
-        Source: \(sourceSummaryText)
-        Folder: \(watchFolderSummaryText)
-        Last update: \(lastUpdateSummaryText)
-        Frames: \(framesSummaryText)
-        Last rejection: \(lastRejectionSummaryText)
-        OBS: \(obsSummaryText)
-        Outputs: \(outputsSummaryText)
-        """
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(summary, forType: .string)
-        model.log.append("Copied session health")
     }
 
     private func copySupportBundle() {
@@ -994,14 +415,14 @@ struct ControlView: View {
         App: \(appVersionText)
 
         Session Health
-        State: \(sessionStateText)
-        Source: \(sourceSummaryText)
-        Folder: \(watchFolderSummaryText)
-        Last update: \(lastUpdateSummaryText)
-        Frames: \(framesSummaryText)
-        Last rejection: \(lastRejectionSummaryText)
-        OBS: \(obsSummaryText)
-        Outputs: \(outputsSummaryText)
+        State: \(model.sessionStateText)
+        Source: \(model.sourceSummaryText)
+        Folder: \(model.watchFolderSummaryText)
+        Last update: \(model.lastUpdateSummaryText)
+        Frames: \(model.framesSummaryText)
+        Last rejection: \(model.lastRejectionSummaryText)
+        OBS: \(model.obsSummaryText)
+        Outputs: \(model.outputsSummaryText)
 
         Session Outputs
         Target: \(target.isEmpty ? "(untitled)" : target)
@@ -1047,164 +468,4 @@ struct ControlView: View {
         pasteboard.setString(summary, forType: .string)
         model.log.append("Copied session summary")
     }
-}
-
-/// OBS controls, split out so it can `@ObservedObject` the controller.
-///
-/// `OBSController` is a Combine `ObservableObject` (not `@Observable`), held as a
-/// plain `let` on the `@Observable` AppModel — so its `@Published` state/scene/
-/// record changes would NOT drive a re-render if we only read them through the
-/// model. Observing it directly here restores reactivity. Config fields
-/// (host/port/password/toggles) are `@Observable` AppModel props, bound via
-/// `@Bindable`.
-private struct OBSSection: View {
-    @Bindable var model: AppModel
-    @ObservedObject private var obs: OBSController
-
-    init(model: AppModel) {
-        self.model = model
-        self.obs = model.broadcast.obs
-    }
-
-    /// True once the controller is connected (any non-disconnected state).
-    private var connected: Bool { obs.state != .disconnected }
-
-    /// Short human label + status dot color for the current OBS state.
-    private var status: (text: String, color: Color) {
-        switch obs.state {
-        case .disconnected: return ("disconnected", .secondary)
-        case .connecting:   return ("connecting…", .orange)
-        case .connected:    return ("connected", .green)
-        case .streaming:    return ("streaming", .green)
-        }
-    }
-
-    /// Two-way binding for the program-scene Picker: reads OBS's current program
-    /// scene, writes go through `setScene` (operator override).
-    private var sceneSelection: Binding<String?> {
-        Binding(
-            get: { obs.currentScene },
-            set: { newValue in
-                guard let name = newValue else { return }
-                Task { await obs.setScene(name) }
-            }
-        )
-    }
-
-    /// Human label for a pre-flight chain link (Task 6 status panel).
-    private func label(for link: PreflightLink) -> String {
-        switch link {
-        case .obsRunning:    return "OBS running"
-        case .connected:     return "Connected"
-        case .sceneCapture:  return "Stack scene capture"
-        case .streamService: return "Stream service"
-        case .streaming:     return "Streaming"
-        }
-    }
-
-    var body: some View {
-        Section("OBS") {
-            // Go Live pre-flight chain (T5 state, T6 render): dumbly reflects
-            // model.broadcast.preflight in chain order — no logic here.
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(PreflightLink.chainOrder, id: \.self) { link in
-                    let status = model.broadcast.preflight[link]
-                    HStack(spacing: 6) {
-                        switch status {
-                        case .unknown:  Image(systemName: "circle").foregroundStyle(.secondary)
-                        case .checking: ProgressView().controlSize(.mini)
-                        case .ok:       Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                        case .failed:   Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
-                        }
-                        Text(label(for: link))
-                        if case .failed(let reason, let remedy) = status {
-                            Text("— \(reason). \(remedy)")
-                                .font(.caption).foregroundStyle(.red)
-                                .lineLimit(2)
-                        }
-                    }
-                }
-            }
-            .padding(.vertical, 4)
-
-            // Status line: ● state text, plus a REC dot when recording.
-            HStack(spacing: 6) {
-                Image(systemName: "circle.fill")
-                    .font(.system(size: 8))
-                    .foregroundStyle(status.color)
-                Text(status.text)
-                    .font(.system(.caption, design: .monospaced))
-                if obs.isRecording {
-                    Spacer()
-                    Image(systemName: "record.circle").foregroundStyle(.red)
-                    Text("REC").font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.red)
-                }
-                Spacer()
-                if connected {
-                    // Route through BroadcastController so a disconnect that strands a
-                    // live stream lands in .stopUnconfirmed (honest state), never .idle.
-                    // Disconnect ≠ stop, by design: no StopStream is sent.
-                    Button("Disconnect") { model.broadcast.disconnect() }
-                } else {
-                    // Synchronous entry (review8 item 2): .connecting is reserved AT
-                    // the click, so Go Live can't race the connect await — and after
-                    // the link comes up the controller RECONCILES broadcastState with
-                    // OBS's actual stream/record state (review7: an already-streaming
-                    // OBS is adopted, never offered a double-starting Go Live).
-                    // Cold-review1 finding 2: the enable-state mirrors the
-                    // controller's entry guard — Connect is only legal when no
-                    // broadcast machinery owns the session (the guard also no-ops
-                    // defensively, so a stale render can't slip a reconnect in).
-                    Button("Connect") { model.broadcast.beginConnectAndReconcile() }
-                        .disabled(!model.broadcast.connectAllowed)
-                }
-            }
-
-            // Connection config — locked while connected.
-            TextField("Host", text: $model.broadcast.obsHost)
-                .disabled(connected)
-                .help("Hostname or IP address of the machine running OBS (use 127.0.0.1 when OBS is on the same Mac).")
-            TextField("Port", value: $model.broadcast.obsPort, format: .number.grouping(.never))
-                .disabled(connected)
-                .help("OBS WebSocket server port — default is 4455; change only if you customised it in OBS → Tools → WebSocket Server Settings.")
-            SecureField("Password (empty if auth off)", text: $model.broadcast.obsPassword)
-                .disabled(connected)
-                .help("Auto-filled from OBS's local settings when left empty; paste manually only for remote OBS.")
-            Toggle("Auto-launch OBS on Go Live", isOn: $model.broadcast.obsAutoLaunch)
-                .help("When OBS is unreachable at Go Live, launch it in the background and retry the connection for up to 20 seconds. Session start and manual Connect never launch OBS.")
-
-            // Scene selection, fed by the controller's live scene list.
-            HStack {
-                Picker("Scene", selection: sceneSelection) {
-                    Text("—").tag(String?.none)
-                    ForEach(obs.sceneNames, id: \.self) { name in
-                        Text(name).tag(String?.some(name))
-                    }
-                }
-                Button {
-                    Task { await obs.refreshScenes() }
-                } label: { Image(systemName: "arrow.clockwise") }
-                .help("Refresh scene list")
-                .disabled(!connected)
-            }
-
-            Toggle("Record while streaming", isOn: $model.broadcast.obsRecord)
-
-            // Scene automation: switch to the scope scene on a stall, back to the
-            // stack scene on resume.
-            Toggle("Scene automation (scope on stall)", isOn: $model.broadcast.sceneAutomationOn)
-            Picker("Stack scene", selection: $model.broadcast.stackSceneName) {
-                Text("—").tag("")
-                ForEach(obs.sceneNames, id: \.self) { Text($0).tag($0) }
-            }
-            .disabled(!model.broadcast.sceneAutomationOn)
-            Picker("Scope scene", selection: $model.broadcast.scopeSceneName) {
-                Text("—").tag("")
-                ForEach(obs.sceneNames, id: \.self) { Text($0).tag($0) }
-            }
-            .disabled(!model.broadcast.sceneAutomationOn)
-        }
-    }
-
 }

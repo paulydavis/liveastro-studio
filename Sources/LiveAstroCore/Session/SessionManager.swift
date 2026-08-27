@@ -98,6 +98,20 @@ public final class SessionManager {
         manifest = proposed
     }
 
+    public var subFrames: [SubFrameRecord] { manifest?.subFrames ?? [] }
+
+    /// Append a per-sub record and persist. Mirrors recordSnapshot's write-then-commit path.
+    public func recordSubFrame(_ record: SubFrameRecord) throws {
+        guard state == .running, var proposed = manifest, let dir = sessionDirectory else {
+            throw SessionError.notRunning
+        }
+        var subs = proposed.subFrames ?? []
+        subs.append(record)
+        proposed.subFrames = subs
+        try persist(proposed, to: dir)
+        manifest = proposed
+    }
+
     public func endSession(at date: Date = .init(),
                            finalization: SessionFinalizationFacts? = nil) throws {
         guard state == .running, var proposed = manifest, let dir = sessionDirectory else {
@@ -112,6 +126,7 @@ public final class SessionManager {
         state = .ended
         try? SessionSummaryMarkdown.write(manifest: proposed, to: dir)
         try? SessionFrameCSV.write(manifest: proposed, to: dir)
+        try? SubFrameCSV.write(subFrames: proposed.subFrames ?? [], to: dir)
     }
 
     /// Fill blank manifest metadata from the source header. User-entered values always win.

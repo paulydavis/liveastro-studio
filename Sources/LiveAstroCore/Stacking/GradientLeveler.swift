@@ -27,7 +27,7 @@ public enum GradientLeveler {
     /// frame-wide (scaling only some channels color-shifts the sub). This is the exact guard
     /// `apply` uses internally; it is exposed so callers that compute the frame weight (which
     /// must see the ACTUALLY-APPLIED scale) can agree with `apply` about whether scale took
-    /// effect — see StackEngine.processLocked / BatchImporter.
+    /// effect — see StackEngine.processDetailedLocked / BatchImporter.
     public static func scalingApplies(subModel: BackgroundExtraction.BackgroundModel,
                                       refModel: BackgroundExtraction.BackgroundModel,
                                       channels: Int) -> Bool {

@@ -44,6 +44,10 @@ public final class SessionPipeline {
     /// frame-consumer task — same reentrancy rule as `onUpdate`.
     public var onImportProgress: ((_ processed: Int, _ total: Int,
                                    _ accepted: Int, _ rejected: Int) -> Void)?
+    /// Fired once per processed native sub with its measured quality (spec §Data flow).
+    /// Same delivery context as onUpdate/onRejected. Watcher mode does not fire this
+    /// (no per-sub stacking there).
+    public var onSubFrame: ((SubFrameRecord) -> Void)?
     private let cancelled = NSLock_Flag()
 
     // MARK: Reentrancy detection (review10 item 4)
@@ -232,6 +236,13 @@ public final class SessionPipeline {
     private let calibratorProvider: ((SourceMetadata) -> Calibrator?)?
     private var providerCalibrator: Calibrator?
     private var providerAttempted = false
+    /// The calibrator the pipeline ACTUALLY applied to frames before stacking: the
+    /// explicit `calibrator` if one was supplied, otherwise the one lazily auto-resolved
+    /// from the first frame's metadata (`providerCalibrator`). This is the calibrator a
+    /// post-session re-stack must reuse — rebuilding one from legacy config paths would
+    /// overwrite a calibrated master.fit with an uncalibrated one. `Calibrator.apply` is
+    /// NSLock-guarded, so the returned instance is safe to call off the main actor.
+    public var effectiveCalibrator: Calibrator? { calibrator ?? providerCalibrator }
     /// Injectable for the master-snapshot atomic swap (FileReplace). Tests substitute a
     /// FileManager whose replace/move throws to prove a prior good master survives a
     /// failed write. Production uses `.default`.
@@ -590,7 +601,8 @@ public final class SessionPipeline {
                 }
             }
             let frame = (calibrator ?? providerCalibrator)?.apply(rawFrame) ?? rawFrame
-            let outcome = engine.process(frame)
+            let result = engine.processDetailed(frame)
+            let outcome = result.outcome
             if engine.autoReseedCount != lastAutoReseedCount {
                 lastAutoReseedCount = engine.autoReseedCount
                 // The engine dropped its reference and will re-seed on the next good sub — void the
@@ -602,6 +614,39 @@ public final class SessionPipeline {
             }
             attemptPlateSolveIfNeeded(engine: engine)   // idempotent; no-op until a reference is seeded
             processedCount += 1
+            // Emitted BEFORE the switch's snapshot-rendering (which can early-return on a
+            // guard/do-catch failure) so onSubFrame fires exactly once per sub regardless of
+            // downstream render success. Indexed by processedCount for EVERY sub (accepted and
+            // rejected alike) — processedCount and engine.acceptedCount overlap (acceptedCount
+            // <= processedCount), so using acceptedCount for accepted subs and processedCount
+            // for rejected ones could collide (e.g. a rejection followed by an accept can land
+            // on the same index), which broke StatsView's ForEach(id: \.index) and
+            // toggleReject's firstIndex(by index) lookup. processedCount is monotonic and
+            // unique per sub, so it can't collide. Note this decouples subRecord.index from the
+            // SnapshotRecord's index (engine.acceptedCount) for accepted subs — the
+            // SnapshotRecord-shared-index property isn't consumed anywhere.
+            let subOutcome: SubFrameOutcome
+            var rejectionReason: String? = nil
+            switch outcome {
+            case .becameReference: subOutcome = .reference
+            case .stacked:         subOutcome = .stacked
+            case .rejected(let r): subOutcome = .rejected; rejectionReason = "\(r)"
+            }
+            let subRecord = SubFrameRecord(
+                index: processedCount,
+                timestamp: frame.timestamp, sourceFile: frame.sourceName,
+                starCount: result.starCount, backgroundSigma: result.backgroundSigma,
+                weight: result.weight, outcome: subOutcome, rejectionReason: rejectionReason,
+                rejectedByUser: false)
+            onSubFrame?(subRecord)
+            // Persist every sub (accepted AND rejected) on this same callback-delivery
+            // thread — the same serial context recordSnapshot runs on below, so this is
+            // race-free against AppModel's main-actor mirror (Task 8 Refinement).
+            do {
+                try session.recordSubFrame(subRecord)
+            } catch {
+                onLog?("Failed to record sub-frame stats for \(frame.sourceName): \(error)")
+            }
             switch outcome {
             case .becameReference, .stacked:
                 guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }
@@ -695,10 +740,10 @@ public final class SessionPipeline {
         return image.cropped(to: rect)
     }
 
-    /// The running session's directory (nil before start / after teardown). Internal so
-    /// the snapshot path and tests can address `master.fit` without reaching through
-    /// `session`.
-    var sessionDir: URL? { session.sessionDirectory }
+    /// The running session's directory (nil before start / after teardown). Public so the
+    /// snapshot path, tests, and the app layer (a committed-but-replay-failed End Session,
+    /// Fix 3) can address `master.fit` / `sub-frames.csv` without reaching through `session`.
+    public var sessionDir: URL? { session.sessionDirectory }
 
     /// Write `master.fit` from the CURRENT live stack WITHOUT ending the session
     /// (idle safeguard, spec §2). Native mode only. Mirrors the master write inside
