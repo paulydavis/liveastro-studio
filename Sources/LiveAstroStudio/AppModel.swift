@@ -18,6 +18,9 @@ final class AppModel {
     var selectedTab: MainTab = .setup
     var isDetached = false
 
+    enum SetupSubTab: Hashable { case capture, display, stats, broadcast, diagnostics }
+    var setupSubTab: SetupSubTab = .capture
+
     enum SourceMode: String, CaseIterable {
         case stackerOutput = "Stacker output (Siril)"
         case nativeStack   = "Raw subs (native stacking)"
