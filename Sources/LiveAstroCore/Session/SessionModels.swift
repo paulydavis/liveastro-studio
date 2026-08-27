@@ -96,6 +96,11 @@ public struct SessionManifest: Codable, Equatable {
     public internal(set) var sessionAcceptedCount: Int? = nil
     public internal(set) var sessionRejectedCount: Int? = nil
 
+    /// Per-sub quality records (spec §Data model). Optional for backward compatibility:
+    /// legacy manifests decode with this absent (nil — synthesized Codable uses
+    /// decodeIfPresent). Written incrementally during a live session and at finalize.
+    public internal(set) var subFrames: [SubFrameRecord]? = nil
+
     /// Grouped view over the flat JSON schema. The manifest keeps top-level keys for backward
     /// compatibility, but production code writes them as one value so outcome/count drift has a
     /// single choke point.
