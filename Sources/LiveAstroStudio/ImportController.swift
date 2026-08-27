@@ -49,6 +49,11 @@ final class ImportController {
     func importSubs(from folder: URL) {
         surface.saveSettings?()
         guard !surface.isSessionRunning() else { surface.presentError("End the session before importing."); return }
+        // Refuse while a post-session re-stack is in flight: an import would clear the stats /
+        // session-dir state the re-stack's finalize still needs (Fix D belt-and-suspenders).
+        guard !(surface.isRestacking?() ?? false) else {
+            surface.presentError("Finish the re-stack before importing."); return
+        }
         guard !isImporting else { return }
         // Offline import: `onSubFrame` fires native-only, so clear the native-session-only
         // stats/re-stack state now — otherwise Stats would show a prior live session's rows and

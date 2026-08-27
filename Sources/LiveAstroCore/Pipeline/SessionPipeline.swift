@@ -732,18 +732,17 @@ public final class SessionPipeline {
     /// unchanged when coverage is unavailable, the rect is nil, the rect is the
     /// full frame, or the crop would remove more than ~40% of the area.
     private func cropToCoverage(_ image: AstroImage, coverage: [Float]?) -> AstroImage {
-        guard let cov = coverage,
-              let rect = CoverageCrop.rect(coverage: cov, width: image.width, height: image.height)
-        else { return image }
-        if rect.x0 == 0 && rect.y0 == 0 && rect.x1 == image.width - 1 && rect.y1 == image.height - 1 {
-            return image   // full-frame rect: no-op
-        }
-        let croppedArea = rect.width * rect.height
-        guard croppedArea >= (image.width * image.height) * 6 / 10 else {
+        let out = CoverageCrop.cropToCoverage(image, coverage: coverage)
+        // The shared util is pure; preserve this method's "keeping full frame" log for the
+        // one case the util declines silently: a valid non-full-frame rect existed but was
+        // rejected for removing >40% of the area (out keeps the original dimensions).
+        if out.width == image.width, out.height == image.height,
+           let cov = coverage,
+           let rect = CoverageCrop.rect(coverage: cov, width: image.width, height: image.height),
+           !(rect.x0 == 0 && rect.y0 == 0 && rect.x1 == image.width - 1 && rect.y1 == image.height - 1) {
             onLog?("Crop-to-overlap: rect \(rect.width)x\(rect.height) would remove >40% — keeping full frame")
-            return image
         }
-        return image.cropped(to: rect)
+        return out
     }
 
     /// The running session's directory (nil before start / after teardown). Public so the

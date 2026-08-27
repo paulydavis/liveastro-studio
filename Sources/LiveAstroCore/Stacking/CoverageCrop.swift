@@ -43,4 +43,24 @@ public enum CoverageCrop {
               let (x0, x1) = trim(colCount, height) else { return nil }
         return CropRect(x0: x0, y0: y0, x1: x1, y1: y1)
     }
+
+    /// Crop `image` to its well-covered region (a copy). Returns the image unchanged
+    /// when coverage is unavailable, the rect is nil, the rect is the full frame, or
+    /// the crop would remove more than ~40% of the area. This is the pure core of
+    /// `SessionPipeline.cropToCoverage` (which adds an `onLog` side effect for the
+    /// >40%-removal case); a post-session re-stack reuses it to write a `master.fit`
+    /// cropped to parity with the live pipeline's master.
+    public static func cropToCoverage(_ image: AstroImage, coverage: [Float]?) -> AstroImage {
+        guard let cov = coverage,
+              let rect = rect(coverage: cov, width: image.width, height: image.height)
+        else { return image }
+        if rect.x0 == 0 && rect.y0 == 0 && rect.x1 == image.width - 1 && rect.y1 == image.height - 1 {
+            return image   // full-frame rect: no-op
+        }
+        let croppedArea = rect.width * rect.height
+        guard croppedArea >= (image.width * image.height) * 6 / 10 else {
+            return image   // >40% removal: keep full frame
+        }
+        return image.cropped(to: rect)
+    }
 }
