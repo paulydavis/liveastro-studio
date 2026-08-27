@@ -124,6 +124,10 @@ final class AppModel {
     /// handler is UI-mirror only (no manifest write here — that would race the
     /// consume task; see Task 8 Refinement in the sub-stats plan).
     private(set) var subFrames: [SubFrameRecord] = []
+    /// True while a re-stack (Task 8b) is rebuilding the master off the main actor.
+    /// Guards against concurrent restack runs; also usable to disable the re-stack
+    /// button in the Stats UI (Task 10).
+    private(set) var isRestacking = false
     var latestImage: CGImage?
     var latestRecord: SnapshotRecord?
     var sessionStart: Date?
@@ -904,6 +908,81 @@ final class AppModel {
     func toggleReject(index: Int) {
         guard let i = subFrames.firstIndex(where: { $0.index == index }) else { return }
         subFrames[i].rejectedByUser.toggle()
+    }
+
+    /// Rebuilds the master from the session's raw subs, excluding every sub the
+    /// operator has flagged, and applies the result (Task 8b). Post-capture only
+    /// (`!isRunning`, per Task 8 Refinement) — a live pipeline's display would just
+    /// overwrite a mid-session restack on the next frame, and this avoids concurrent
+    /// writers on the master/manifest.
+    func restackWithoutFlagged() {
+        guard !isRunning else { return }
+        guard !isRestacking else { return }
+        guard flaggedCount > 0 else {
+            log.append("Re-stack skipped — no subs are flagged.")
+            return
+        }
+        guard let dir = watchFolder else {
+            log.append("Re-stack unavailable — the raw subs folder is unknown.")
+            return
+        }
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: nil)) ?? []
+        let urls = entries
+            .filter { ["fit", "fits"].contains($0.pathExtension.lowercased()) }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard !urls.isEmpty else {
+            log.append("Re-stack unavailable — no raw subs found on disk (they may have been pruned).")
+            return
+        }
+
+        let excluded = Set(subFrames.filter(\.rejectedByUser).map(\.sourceFile))
+        let excludedCount = excluded.count
+
+        isRestacking = true
+        let engine = makeStackEngine()
+        Task.detached { [weak self] in
+            guard let self else { return }
+            do {
+                let report = try RestackCoordinator.restack(
+                    rawURLs: urls, excludingSourceFiles: excluded, makeEngine: { engine })
+                await MainActor.run { self.applyRestackedMaster(report, excludedCount: excludedCount) }
+            } catch {
+                await MainActor.run {
+                    self.log.append("Re-stack failed: \(error). Master unchanged.")
+                    self.isRestacking = false
+                }
+            }
+        }
+    }
+
+    /// Applies a completed re-stack: writes the rebuilt master over `master.fit` (if the
+    /// session directory is known), refreshes the on-screen preview, and logs the outcome.
+    ///
+    /// v1 preview limitation: `AutoStretch.makeCGImage` is a basic stretch only — it does
+    /// NOT run the live DisplayAdjustments/DBE/denoise/north-up pipeline (that lives on
+    /// `SessionPipeline`, which has already ended by the time a restack is offered). The
+    /// durable deliverable is the corrected `master.fit`; the on-screen preview is a
+    /// basic-stretch confirmation that the restack happened, not a faithful re-render of
+    /// the operator's display settings.
+    private func applyRestackedMaster(_ report: RestackReport, excludedCount: Int) {
+        if let sessionDirectory = lastSessionDirectory {
+            do {
+                try MasterBuilder.save(report.master, to: sessionDirectory.appendingPathComponent("master.fit"))
+            } catch {
+                log.append("Re-stack: could not write master.fit (\(error)).")
+            }
+        } else {
+            log.append("Re-stack: no session directory on record — master.fit was not written.")
+        }
+        if let cg = AutoStretch.makeCGImage(report.master) {
+            latestImage = cg
+        }
+        if report.skippedMissing > 0 {
+            log.append("Re-stack: \(report.skippedMissing) raw sub(s) missing — used the rest.")
+        }
+        log.append("Re-stacked without \(excludedCount) flagged sub(s): \(report.stackedCount) frames.")
+        isRestacking = false
     }
 
     /// Reseeds the stacking engine reference frame (native mode only).
