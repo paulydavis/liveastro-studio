@@ -39,6 +39,12 @@ final class SessionManagerSubFrameTests: XCTestCase {
         XCTAssertFalse(mgr.subFrames.first!.rejectedByUser)
     }
 
+    func testSetUserRejectedBeforeAnyRecordIsNoOp() throws {
+        let (mgr, _) = try startedManager()
+        XCTAssertNoThrow(try mgr.setSubFrameUserRejected(index: 1, rejected: true))
+        XCTAssertTrue(mgr.subFrames.isEmpty)
+    }
+
     func testSubFramesPersistAcrossReload() throws {
         let (mgr, _) = try startedManager()
         try mgr.recordSubFrame(rec(1, rejected: true))
