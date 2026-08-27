@@ -236,6 +236,13 @@ public final class SessionPipeline {
     private let calibratorProvider: ((SourceMetadata) -> Calibrator?)?
     private var providerCalibrator: Calibrator?
     private var providerAttempted = false
+    /// The calibrator the pipeline ACTUALLY applied to frames before stacking: the
+    /// explicit `calibrator` if one was supplied, otherwise the one lazily auto-resolved
+    /// from the first frame's metadata (`providerCalibrator`). This is the calibrator a
+    /// post-session re-stack must reuse — rebuilding one from legacy config paths would
+    /// overwrite a calibrated master.fit with an uncalibrated one. `Calibrator.apply` is
+    /// NSLock-guarded, so the returned instance is safe to call off the main actor.
+    public var effectiveCalibrator: Calibrator? { calibrator ?? providerCalibrator }
     /// Injectable for the master-snapshot atomic swap (FileReplace). Tests substitute a
     /// FileManager whose replace/move throws to prove a prior good master survives a
     /// failed write. Production uses `.default`.
@@ -733,10 +740,10 @@ public final class SessionPipeline {
         return image.cropped(to: rect)
     }
 
-    /// The running session's directory (nil before start / after teardown). Internal so
-    /// the snapshot path and tests can address `master.fit` without reaching through
-    /// `session`.
-    var sessionDir: URL? { session.sessionDirectory }
+    /// The running session's directory (nil before start / after teardown). Public so the
+    /// snapshot path, tests, and the app layer (a committed-but-replay-failed End Session,
+    /// Fix 3) can address `master.fit` / `sub-frames.csv` without reaching through `session`.
+    public var sessionDir: URL? { session.sessionDirectory }
 
     /// Write `master.fit` from the CURRENT live stack WITHOUT ending the session
     /// (idle safeguard, spec §2). Native mode only. Mirrors the master write inside

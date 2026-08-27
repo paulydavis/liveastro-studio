@@ -135,6 +135,17 @@ final class AppModel {
     /// "re-stack for a clean final master?" confirm in StatsView (Task 11). Never triggers a
     /// re-stack automatically; the operator must tap "Re-stack now".
     var restackOfferPending = false
+    /// The calibrator the just-ended session's pipeline actually applied (explicit or
+    /// auto-resolved from the first frame). Captured in `endSession` before the pipeline is
+    /// released so a post-session re-stack reuses the SAME calibration the live master used —
+    /// rebuilding from legacy config paths (usually nil) would overwrite a calibrated
+    /// master.fit with an uncalibrated one (Fix 1). Nil = an uncalibrated session → identity.
+    private var sessionCalibrator: Calibrator?
+    /// The watch folder / file-name prefix captured at session START, so a re-stack lists the
+    /// session's own subs even if the operator changed the live `watchFolder`/`fileNamePrefix`
+    /// (or source mode) after End but before Re-stack (Fix 4).
+    private var restackSourceDir: URL?
+    private var restackPrefix: String = ""
     var latestImage: CGImage?
     var latestRecord: SnapshotRecord?
     var sessionStart: Date?
@@ -732,12 +743,17 @@ final class AppModel {
             p = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
                 rootDirectory: root, neutralizeBackground: neutralizeBackground,
                 calibrator: cal.calibrator, calibratorProvider: provider)
+            // Pin the session's own subs folder + prefix so a later re-stack lists THEM,
+            // not whatever the operator has since changed the live controls to (Fix 4).
+            restackSourceDir = folder
+            restackPrefix = fileNamePrefix
         }
         p.displayAdjustments = displayAdjustments
 
         acceptedCount = 0
         rejectedCount = 0
         subFrames = []
+        sessionCalibrator = nil   // captured at end() from the pipeline's effectiveCalibrator (Fix 1)
 
         // Reset per-session completion state and ask for notification permission
         // once (no-op if already granted/denied). The tick starts only on success.
@@ -909,12 +925,20 @@ final class AppModel {
     var flaggedCount: Int { subFrames.filter(\.rejectedByUser).count }
 
     /// Flips the operator reject flag on the in-memory mirror for the sub with `index`.
-    /// Mirror-only: does NOT write mid-session (would race the pipeline's consume task).
-    /// Flags are persisted to sub-frames.csv (NOT the manifest) at the race-free points —
-    /// session end() and re-stack; see Task 8 Refinement.
+    /// During a LIVE session this is mirror-only — writing mid-session would race the
+    /// pipeline's consume task. Once the session has FINISHED (`!isRunning`), there is no
+    /// consume task, so the flip is persisted to `sub-frames.csv` IMMEDIATELY — this keeps
+    /// the Siril review workflow (flag → export CSV → reject in Siril, never re-stack) and a
+    /// subsequent quit truthful. Flags persist to sub-frames.csv, NEVER to the manifest
+    /// (whose per-sub `rejectedByUser` is always the record-time value, false). Refused while
+    /// a re-stack is in flight, so a toggle can't desync the master from the CSV (Fix 5).
     func toggleReject(index: Int) {
+        guard !isRestacking else { return }
         guard let i = subFrames.firstIndex(where: { $0.index == index }) else { return }
         subFrames[i].rejectedByUser.toggle()
+        if !isRunning, let dir = lastSessionDirectory {
+            try? SubFrameCSV.write(subFrames: subFrames, to: dir)   // keep sub-frames.csv truthful during review
+        }
     }
 
     /// Rebuilds the master from the session's raw subs, excluding every sub the
@@ -922,6 +946,10 @@ final class AppModel {
     /// (`!isRunning`, per Task 8 Refinement) — a live pipeline's display would just
     /// overwrite a mid-session restack on the next frame, and this avoids concurrent
     /// writers on the master/manifest.
+    ///
+    /// The re-stack uses the CURRENT stacking settings (rejection / weighting /
+    /// normalization / demosaic) via `makeStackEngine()`, so changing those after capture
+    /// changes the integration relative to the live master — intended for now.
     func restackWithoutFlagged() {
         guard !isRunning else { return }
         guard !isRestacking else { return }
@@ -929,7 +957,10 @@ final class AppModel {
             log.append("Re-stack skipped — no subs are flagged.")
             return
         }
-        guard let dir = watchFolder else {
+        // Use the folder/prefix captured at session START, not the live-mutable controls —
+        // the operator may have changed watchFolder/fileNamePrefix (or source mode) after End
+        // but before Re-stack (Fix 4).
+        guard let dir = restackSourceDir else {
             log.append("Re-stack unavailable — the raw subs folder is unknown.")
             return
         }
@@ -941,14 +972,17 @@ final class AppModel {
             log.append("Re-stack unavailable — couldn't read the raw subs folder: \(error)")
             return
         }
-        let prefix = fileNamePrefix.lowercased()
+        let prefix = restackPrefix.lowercased()
         let urls = entries
             .filter { ImageLoader.fitsExtensions.contains($0.pathExtension.lowercased()) }
             // Match the session's file-name prefix, same as live (StackFileWatcher.
             // isTrackedFileName) and import (ImportCursor) — otherwise the survivor set
             // wrongly includes other-filter/foreign/calibration FITS sitting in the same
             // folder (Fix C). Empty prefix accepts all, matching existing semantics.
-            .filter { fileNamePrefix.isEmpty || $0.lastPathComponent.lowercased().hasPrefix(prefix) }
+            .filter { restackPrefix.isEmpty || $0.lastPathComponent.lowercased().hasPrefix(prefix) }
+            // Drop dotfiles and .tmp sidecars, matching StackFileWatcher.isTrackedFileName —
+            // an in-flight atomic write (".foo.fit.tmp") must never enter the survivor set (Fix 5).
+            .filter { !$0.lastPathComponent.hasPrefix(".") && !$0.lastPathComponent.hasSuffix(".tmp") }
             // Numeric-aware order so Light_2 precedes Light_10 (capture sequence order) —
             // matches FolderFrameSource, so the first surviving frame (the stack's seed)
             // is the same one the live pipeline would have chosen.
@@ -961,25 +995,21 @@ final class AppModel {
         let excluded = Set(subFrames.filter(\.rejectedByUser).map(\.sourceFile))
         let excludedCount = excluded.count
 
-        // Rebuild the same calibrator the live pipeline applied before stacking
-        // (SessionPipeline.handleNative), the same way ImportController.beginImport does —
-        // otherwise a restack would overwrite a calibrated master.fit with an uncalibrated
-        // one (Fix B). Built on the main actor (current calibration paths), then captured
-        // into the detached task's `prepare` closure.
-        let (restackCalibrator, calWarnings) = CalibrationLoader.makeCalibrator(
-            dark: calibration.darkPath.map { URL(fileURLWithPath: $0) },
-            flat: calibration.flatPath.map { URL(fileURLWithPath: $0) })
-        calWarnings.forEach { log.append("⚠ \($0)") }
-
-        restackOfferPending = false
+        // Reuse the EXACT calibrator the live pipeline applied before stacking (captured in
+        // endSession as effectiveCalibrator — explicit or first-frame auto-resolved), NOT a
+        // rebuild from legacy config paths (usually nil → an uncalibrated master would silently
+        // overwrite the good one). A nil sessionCalibrator (uncalibrated session) yields an
+        // identity prepare. Calibrator.apply is NSLock-guarded, safe off the main actor (Fix 1).
+        // restackOfferPending stays set until the re-stack SUCCEEDS (cleared in
+        // applyRestackedMaster), so a failed re-stack leaves the offer up for retry (Fix 5).
         isRestacking = true
         let engine = makeStackEngine()
-        Task.detached { [weak self] in
+        Task.detached { [weak self, sessionCalibrator] in
             guard let self else { return }
             do {
                 let report = try RestackCoordinator.restack(
                     rawURLs: urls, excludingSourceFiles: excluded, makeEngine: { engine },
-                    prepare: { restackCalibrator?.apply($0) ?? $0 })
+                    prepare: { sessionCalibrator?.apply($0) ?? $0 })
                 await MainActor.run { self.applyRestackedMaster(report, excludedCount: excludedCount) }
             } catch {
                 await MainActor.run {
@@ -1024,6 +1054,9 @@ final class AppModel {
             log.append("Re-stack: \(report.skippedMissing) raw sub(s) missing — used the rest.")
         }
         log.append("Re-stacked without \(excludedCount) flagged sub(s): \(report.stackedCount) frames.")
+        // Clear the offer only now, on the SUCCESS path — a failed re-stack (handled in the
+        // detached task's catch) leaves restackOfferPending up so the operator can retry (Fix 5).
+        restackOfferPending = false
         isRestacking = false
     }
 
@@ -1144,6 +1177,17 @@ final class AppModel {
                         return false
                     }
                     self.errorMessage = "Replay failed: \(error)"
+                    // The session DID commit (manifest + master.fit persisted); only the replay
+                    // render failed. The success path's lastSessionDirectory update + flag-CSV
+                    // write live in the `do` block we skipped, so do them here too — otherwise a
+                    // committed session ends with a stale/nil lastSessionDirectory and an all-false
+                    // sub-frames.csv (Fix 3). Use the committed session's own directory.
+                    if let dir = p.sessionDir {
+                        self.lastSessionDirectory = dir
+                        if !self.subFrames.isEmpty {
+                            try? SubFrameCSV.write(subFrames: self.subFrames, to: dir)
+                        }
+                    }
                     return true
                 }
             }
@@ -1151,6 +1195,10 @@ final class AppModel {
             await MainActor.run {
                 self.isRunning = false
                 self.importer.isGeneratingReplay = false
+                // Stash the calibrator the pipeline ACTUALLY applied (explicit or first-frame
+                // auto-resolved) BEFORE releasing the pipeline, so a post-session re-stack reuses
+                // the exact same calibration the live master used (Fix 1).
+                self.sessionCalibrator = p.effectiveCalibrator
                 self.pipeline = nil
                 self.sessionEnd = Date()
                 self.restackOfferPending = self.flaggedCount > 0

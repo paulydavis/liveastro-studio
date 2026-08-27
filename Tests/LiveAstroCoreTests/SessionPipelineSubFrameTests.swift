@@ -19,6 +19,16 @@ final class SessionPipelineSubFrameTests: XCTestCase {
         return root
     }
 
+    /// Fix 6: `rejectionReason` is persisted to the manifest / sub-frames.csv as the enum's
+    /// default reflected description (`"\(r)"` in SessionPipeline). Pin the EXACT wire string
+    /// for a known case so a future `RejectionReason` rename or associated-value change breaks
+    /// this test loudly instead of silently altering historical session data.
+    func testRejectionReasonWireStringIsPinned() {
+        XCTAssertEqual("\(RejectionReason.insufficientStars(found: 0))", "insufficientStars(found: 0)")
+        XCTAssertEqual("\(RejectionReason.noTransform)", "noTransform")
+        XCTAssertEqual("\(RejectionReason.dimensionMismatch)", "dimensionMismatch")
+    }
+
     func testOnSubFrameFiresForEachNativeSub() throws {
         let root = try sandbox()
         defer { try? FileManager.default.removeItem(at: root) }

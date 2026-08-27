@@ -94,6 +94,39 @@ final class RestackCoordinatorTests: XCTestCase {
         }
     }
 
+    /// The `prepare` closure (production: the session's calibrator, Fix 1) must run on EVERY
+    /// surviving loaded frame BEFORE it reaches the engine, and the prepared frame — not the
+    /// raw one — is what gets stacked. Proves the AppModel wiring's contract: a calibrator
+    /// passed as `prepare` actually calibrates the re-stacked master.
+    func testPrepareAppliedToEverySurvivingFrame() throws {
+        let urls = try writeSubs(4)
+        let excluded: Set<String> = [urls[1].lastPathComponent]
+
+        var prepareCount = 0
+        let report = try RestackCoordinator.restack(
+            rawURLs: urls, excludingSourceFiles: excluded, makeEngine: makeEngine,
+            prepare: { frame in prepareCount += 1; return frame })
+        XCTAssertEqual(prepareCount, 3, "prepare runs once per surviving loadable frame (4 written − 1 excluded)")
+        XCTAssertEqual(report.stackedCount, 3)
+
+        // A non-identity prepare must change the master vs. identity — i.e. the PREPARED
+        // pixels are what the engine stacks, not the raw ones.
+        let identity = try RestackCoordinator.restack(
+            rawURLs: urls, excludingSourceFiles: excluded, makeEngine: makeEngine)
+        let scaled = try RestackCoordinator.restack(
+            rawURLs: urls, excludingSourceFiles: excluded, makeEngine: makeEngine,
+            prepare: { frame in
+                let img = AstroImage(width: frame.image.width, height: frame.image.height,
+                                     channels: frame.image.channels,
+                                     pixels: frame.image.pixels.map { $0 * 0.5 },
+                                     sourceIsLinear: frame.image.sourceIsLinear)
+                return RawFrame(image: img, bayerPattern: frame.bayerPattern, bottomUp: frame.bottomUp,
+                                timestamp: frame.timestamp, sourceName: frame.sourceName,
+                                metadata: frame.metadata)
+            })
+        XCTAssertNotEqual(identity.master.pixels, scaled.master.pixels)
+    }
+
     func testMissingRawCountedAsSkipped() throws {
         var urls = try writeSubs(3)
         urls.append(URL(fileURLWithPath: "/nonexistent/ghost.fit"))
