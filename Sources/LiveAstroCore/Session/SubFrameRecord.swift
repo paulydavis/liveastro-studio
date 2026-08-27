@@ -12,9 +12,14 @@ public enum SubFrameOutcome: String, Codable, Equatable {
 /// stacker and never rewritten; `rejectedByUser` is the operator's flag and the
 /// only mutable field. Drives the Stats view and re-stack exclusion.
 ///
-/// NOTE: in the persisted `manifest.json`, a record's `rejectedByUser` is ALWAYS the
-/// record-time value (false) — the operator flags subs only after the stacker emitted
-/// the record, and those flags are never written back into the manifest. The
+/// NOTE: `recordSubFrame` faithfully persists whatever value the record holds into
+/// `manifest.json` — it is NOT a type/writer invariant that the manifest's
+/// `rejectedByUser` is false (see `SessionManagerSubFrameTests.
+/// testSubFramesPersistAcrossReload`, which records `rejected: true` and reads it back
+/// true). Rather, in the CURRENT production flow `onSubFrame` always emits
+/// `rejectedByUser: false`, and operator flags are written only to `sub-frames.csv`
+/// (never back into the manifest) — so a PRODUCTION manifest happens to show false.
+/// That is a property of the production flow, not of the type or `recordSubFrame`. The
 /// authoritative user-flag artifact is `sub-frames.csv` (written at session end, at
 /// re-stack, and on each post-session toggle). Do not treat manifest `rejectedByUser`
 /// as the source of truth for operator flags.
