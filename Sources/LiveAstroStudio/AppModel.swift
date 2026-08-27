@@ -926,11 +926,20 @@ final class AppModel {
             log.append("Re-stack unavailable — the raw subs folder is unknown.")
             return
         }
-        let entries = (try? FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: nil)) ?? []
+        let entries: [URL]
+        do {
+            entries = try FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: nil)
+        } catch {
+            log.append("Re-stack unavailable — couldn't read the raw subs folder: \(error)")
+            return
+        }
         let urls = entries
-            .filter { ["fit", "fits"].contains($0.pathExtension.lowercased()) }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .filter { ImageLoader.fitsExtensions.contains($0.pathExtension.lowercased()) }
+            // Numeric-aware order so Light_2 precedes Light_10 (capture sequence order) —
+            // matches FolderFrameSource, so the first surviving frame (the stack's seed)
+            // is the same one the live pipeline would have chosen.
+            .sorted { $0.lastPathComponent.compare($1.lastPathComponent, options: [.numeric, .caseInsensitive]) == .orderedAscending }
         guard !urls.isEmpty else {
             log.append("Re-stack unavailable — no raw subs found on disk (they may have been pruned).")
             return
