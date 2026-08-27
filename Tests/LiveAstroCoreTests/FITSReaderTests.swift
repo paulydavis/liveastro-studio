@@ -214,21 +214,29 @@ final class FITSReaderTests: XCTestCase {
         XCTAssertEqual(h.keywords["EXPTIME"], "30.0")
     }
 
-    /// FITSHeader.dataBytes / minimumFileSize are public and were an unchecked product — a hostile
-    /// header (huge NAXIS, or bitpix == Int.min) would trap. They must SATURATE to Int.max instead.
-    func testFITSHeaderDimensionProductSaturatesOnOverflow() {
-        let hostile = FITSHeader(bitpix: 32, dims: [Int.max, 2], bscale: 1, bzero: 0,
-                                 bottomUp: false, headerBytes: 2880)
-        XCTAssertEqual(hostile.dataBytes, Int.max)
-        XCTAssertEqual(hostile.minimumFileSize, Int.max)
-        // abs(Int.min) traps — a hostile bitpix must saturate, not crash.
-        let hostileBitpix = FITSHeader(bitpix: Int.min, dims: [100, 100], bscale: 1, bzero: 0,
-                                       bottomUp: false, headerBytes: 2880)
-        XCTAssertEqual(hostileBitpix.dataBytes, Int.max)
-        let normal = FITSHeader(bitpix: 32, dims: [100, 100], bscale: 1, bzero: 0,
-                                bottomUp: false, headerBytes: 2880)
-        XCTAssertEqual(normal.dataBytes, 100 * 100 * 4)
-        XCTAssertEqual(normal.minimumFileSize, 2880 + 100 * 100 * 4)
+    /// The FITSHeader init is failable + validating: it REJECTS hostile values at construction (the
+    /// whole class of overflow/negative/trap edges from prior rounds), so a FITSHeader can never hold
+    /// them and the accessors stay simple. Valid headers construct and compute normally.
+    func testFITSHeaderInitValidatesAndRejectsHostileValues() {
+        func make(_ bitpix: Int, _ dims: [Int], headerBytes: Int = 2880) -> FITSHeader? {
+            FITSHeader(bitpix: bitpix, dims: dims, bscale: 1, bzero: 0, bottomUp: false, headerBytes: headerBytes)
+        }
+        XCTAssertNil(make(32, [Int.max, 2]))        // oversized axis (would overflow the product)
+        XCTAssertNil(make(32, [-100, 100]))         // non-positive
+        XCTAssertNil(make(32, [0, 100]))
+        XCTAssertNil(make(32, []))                  // not 2-D/3-D
+        XCTAssertNil(make(32, [100]))
+        XCTAssertNil(make(32, [100, 100, 4]))       // a 3-D cube's 3rd axis must be 3 channels
+        XCTAssertNil(make(Int.min, [100, 100]))     // unsupported BITPIX (and abs(Int.min) would trap)
+        XCTAssertNil(make(7, [100, 100]))           // unsupported BITPIX
+        XCTAssertNil(make(32, [100, 100], headerBytes: -1))
+
+        let h = make(32, [100, 100])
+        XCTAssertNotNil(h)
+        XCTAssertEqual(h?.width, 100); XCTAssertEqual(h?.height, 100)
+        XCTAssertEqual(h?.dataBytes, 100 * 100 * 4)
+        XCTAssertEqual(h?.minimumFileSize, 2880 + 100 * 100 * 4)
+        XCTAssertEqual(make(16, [100, 100, 3])?.channels, 3)
     }
 }
 
