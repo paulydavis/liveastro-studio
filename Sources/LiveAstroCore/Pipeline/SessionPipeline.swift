@@ -243,6 +243,12 @@ public final class SessionPipeline {
     /// overwrite a calibrated master.fit with an uncalibrated one. `Calibrator.apply` is
     /// NSLock-guarded, so the returned instance is safe to call off the main actor.
     public var effectiveCalibrator: Calibrator? { calibrator ?? providerCalibrator }
+    /// The astronomical source metadata (RA/DEC/FOCALLEN/…) the pipeline resolved from the
+    /// first frame's FITS header — the same value stamped into master.fit by end()/
+    /// writeMasterSnapshot. Captured by the app layer before the pipeline is released so a
+    /// post-session re-stack writes a master with the SAME metadata as the live one, instead
+    /// of a bare header (Fix P1b). Nil = no metadata was resolved this session.
+    public var capturedSourceMetadata: SourceMetadata? { sourceMetadata }
     /// Injectable for the master-snapshot atomic swap (FileReplace). Tests substitute a
     /// FileManager whose replace/move throws to prove a prior good master survives a
     /// failed write. Production uses `.default`.

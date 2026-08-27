@@ -50,6 +50,11 @@ final class ImportController {
         surface.saveSettings?()
         guard !surface.isSessionRunning() else { surface.presentError("End the session before importing."); return }
         guard !isImporting else { return }
+        // Offline import: `onSubFrame` fires native-only, so clear the native-session-only
+        // stats/re-stack state now — otherwise Stats would show a prior live session's rows and
+        // a re-stack could target the prior session's folder (Fix P2-import). Full import
+        // stats-wiring (populating subFrames for imports) is a future feature.
+        surface.resetSessionStatsForImport?()
         let prefix = surface.currentFileNamePrefix?() ?? ""
         importProcessed = 0
         importTotal = 0
