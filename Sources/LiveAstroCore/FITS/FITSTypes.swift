@@ -34,7 +34,10 @@ public struct FITSHeader: Equatable {
             if o { return Int.max }
             acc = p
         }
-        let (bytes, o) = acc.multipliedReportingOverflow(by: abs(bitpix))
+        // abs(bitpix) traps for bitpix == Int.min; take the magnitude safely (saturate that
+        // impossible-in-practice case to Int.max rather than crash a public caller).
+        guard let absBitpix = Int(exactly: bitpix.magnitude) else { return Int.max }
+        let (bytes, o) = acc.multipliedReportingOverflow(by: absBitpix)
         return o ? Int.max : bytes / 8
     }
     /// Watcher completeness check: file must be at least this many bytes. Saturating add.

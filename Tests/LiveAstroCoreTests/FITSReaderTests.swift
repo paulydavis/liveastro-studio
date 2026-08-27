@@ -213,6 +213,23 @@ final class FITSReaderTests: XCTestCase {
         XCTAssertEqual(h.keywords["OBJECT"], "M 101 / Pinwheel")
         XCTAssertEqual(h.keywords["EXPTIME"], "30.0")
     }
+
+    /// FITSHeader.dataBytes / minimumFileSize are public and were an unchecked product — a hostile
+    /// header (huge NAXIS, or bitpix == Int.min) would trap. They must SATURATE to Int.max instead.
+    func testFITSHeaderDimensionProductSaturatesOnOverflow() {
+        let hostile = FITSHeader(bitpix: 32, dims: [Int.max, 2], bscale: 1, bzero: 0,
+                                 bottomUp: false, headerBytes: 2880)
+        XCTAssertEqual(hostile.dataBytes, Int.max)
+        XCTAssertEqual(hostile.minimumFileSize, Int.max)
+        // abs(Int.min) traps — a hostile bitpix must saturate, not crash.
+        let hostileBitpix = FITSHeader(bitpix: Int.min, dims: [100, 100], bscale: 1, bzero: 0,
+                                       bottomUp: false, headerBytes: 2880)
+        XCTAssertEqual(hostileBitpix.dataBytes, Int.max)
+        let normal = FITSHeader(bitpix: 32, dims: [100, 100], bscale: 1, bzero: 0,
+                                bottomUp: false, headerBytes: 2880)
+        XCTAssertEqual(normal.dataBytes, 100 * 100 * 4)
+        XCTAssertEqual(normal.minimumFileSize, 2880 + 100 * 100 * 4)
+    }
 }
 
 /// Builds raw FITS headers for edge-case tests (FITSWriter covers the happy path).
@@ -226,18 +243,5 @@ enum FITSTestBuilder {
         s += "END".padding(toLength: 80, withPad: " ", startingAt: 0)
         while s.count % 2880 != 0 { s += String(repeating: " ", count: 80) }
         return s.data(using: .ascii)!
-    }
-
-    /// FITSHeader.dataBytes / minimumFileSize are public and were an unchecked product — a hostile
-    /// header (huge NAXIS) would trap. They must SATURATE to Int.max instead.
-    func testFITSHeaderDimensionProductSaturatesOnOverflow() {
-        let hostile = FITSHeader(bitpix: 32, dims: [Int.max, 2], bscale: 1, bzero: 0,
-                                 bottomUp: false, headerBytes: 2880)
-        XCTAssertEqual(hostile.dataBytes, Int.max)
-        XCTAssertEqual(hostile.minimumFileSize, Int.max)
-        let normal = FITSHeader(bitpix: 32, dims: [100, 100], bscale: 1, bzero: 0,
-                                bottomUp: false, headerBytes: 2880)
-        XCTAssertEqual(normal.dataBytes, 100 * 100 * 4)
-        XCTAssertEqual(normal.minimumFileSize, 2880 + 100 * 100 * 4)
     }
 }
