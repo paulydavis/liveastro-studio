@@ -74,6 +74,17 @@ struct AppSurface {
     /// same cross-cutting counters the live path does).
     var setAcceptedRejectedCounts: ((Int, Int) -> Void)?
 
+    /// Resets the native-session-only stats/re-stack state (`subFrames`,
+    /// `restackSourceDir`, `sessionCalibrator`, `sessionSourceMetadata`,
+    /// `restackOfferPending`) at import START, so an offline import never leaves
+    /// stale Stats rows or a re-stack pointed at a prior live session (Fix P2-import).
+    var resetSessionStatsForImport: (() -> Void)?
+
+    /// Reads `AppModel.isRestacking` — the import path refuses to start while a
+    /// post-session re-stack is in flight, so the two never race on the session
+    /// dir / stats state (Fix D). Defaults to "not re-stacking" when unwired.
+    var isRestacking: (() -> Bool)?
+
     /// Publishes the generated replay URL.
     var setReplayURL: ((URL) -> Void)?
     /// Publishes the finished session directory.
@@ -99,6 +110,8 @@ struct AppSurface {
          currentProcessorBackend: (() -> ProcessorBackend)? = nil,
          wireImportCallbacks: ((SessionPipeline, @escaping () -> Void) -> Void)? = nil,
          setAcceptedRejectedCounts: ((Int, Int) -> Void)? = nil,
+         resetSessionStatsForImport: (() -> Void)? = nil,
+         isRestacking: (() -> Bool)? = nil,
          setReplayURL: ((URL) -> Void)? = nil,
          setLastSessionDirectory: ((URL) -> Void)? = nil) {
         self.log = log
@@ -121,6 +134,8 @@ struct AppSurface {
         self.currentProcessorBackend = currentProcessorBackend
         self.wireImportCallbacks = wireImportCallbacks
         self.setAcceptedRejectedCounts = setAcceptedRejectedCounts
+        self.resetSessionStatsForImport = resetSessionStatsForImport
+        self.isRestacking = isRestacking
         self.setReplayURL = setReplayURL
         self.setLastSessionDirectory = setLastSessionDirectory
     }

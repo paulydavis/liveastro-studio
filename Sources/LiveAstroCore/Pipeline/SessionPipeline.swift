@@ -243,6 +243,12 @@ public final class SessionPipeline {
     /// overwrite a calibrated master.fit with an uncalibrated one. `Calibrator.apply` is
     /// NSLock-guarded, so the returned instance is safe to call off the main actor.
     public var effectiveCalibrator: Calibrator? { calibrator ?? providerCalibrator }
+    /// The astronomical source metadata (RA/DEC/FOCALLEN/…) the pipeline resolved from the
+    /// first frame's FITS header — the same value stamped into master.fit by end()/
+    /// writeMasterSnapshot. Captured by the app layer before the pipeline is released so a
+    /// post-session re-stack writes a master with the SAME metadata as the live one, instead
+    /// of a bare header (Fix P1b). Nil = no metadata was resolved this session.
+    public var capturedSourceMetadata: SourceMetadata? { sourceMetadata }
     /// Injectable for the master-snapshot atomic swap (FileReplace). Tests substitute a
     /// FileManager whose replace/move throws to prove a prior good master survives a
     /// failed write. Production uses `.default`.
@@ -726,18 +732,17 @@ public final class SessionPipeline {
     /// unchanged when coverage is unavailable, the rect is nil, the rect is the
     /// full frame, or the crop would remove more than ~40% of the area.
     private func cropToCoverage(_ image: AstroImage, coverage: [Float]?) -> AstroImage {
-        guard let cov = coverage,
-              let rect = CoverageCrop.rect(coverage: cov, width: image.width, height: image.height)
-        else { return image }
-        if rect.x0 == 0 && rect.y0 == 0 && rect.x1 == image.width - 1 && rect.y1 == image.height - 1 {
-            return image   // full-frame rect: no-op
-        }
-        let croppedArea = rect.width * rect.height
-        guard croppedArea >= (image.width * image.height) * 6 / 10 else {
+        let out = CoverageCrop.cropToCoverage(image, coverage: coverage)
+        // The shared util is pure; preserve this method's "keeping full frame" log for the
+        // one case the util declines silently: a valid non-full-frame rect existed but was
+        // rejected for removing >40% of the area (out keeps the original dimensions).
+        if out.width == image.width, out.height == image.height,
+           let cov = coverage,
+           let rect = CoverageCrop.rect(coverage: cov, width: image.width, height: image.height),
+           !(rect.x0 == 0 && rect.y0 == 0 && rect.x1 == image.width - 1 && rect.y1 == image.height - 1) {
             onLog?("Crop-to-overlap: rect \(rect.width)x\(rect.height) would remove >40% — keeping full frame")
-            return image
         }
-        return image.cropped(to: rect)
+        return out
     }
 
     /// The running session's directory (nil before start / after teardown). Public so the

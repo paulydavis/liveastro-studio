@@ -24,6 +24,12 @@ public struct RestackReport {
     /// Kept (non-excluded) URLs that failed to load as a `RawFrame` (missing file,
     /// unreadable, corrupt, etc.) — skipped rather than aborting the restack.
     public let skippedMissing: Int
+    /// Per-pixel coverage (frame-count) map of the rebuilt stack, read from
+    /// `engine.currentCoverage()` at the same point as `master`. Lets the app layer
+    /// crop the written `master.fit` to its covered region (parity with the live
+    /// pipeline's master write). Nil when the engine has no coverage. Additive — the
+    /// `master` pixels are unchanged, so the golden restack test stays valid.
+    public let coverage: [Float]?
 }
 
 /// The pure core of "re-stack the master from raw subs minus a flagged set."
@@ -73,6 +79,7 @@ public enum RestackCoordinator {
         guard let master = engine.currentStack() else {
             throw RestackError.belowSeedMinimum(surviving: frames.count, needed: engine.minimumSeedStars)
         }
-        return RestackReport(master: master, stackedCount: engine.stackFrameCount, skippedMissing: skippedMissing)
+        return RestackReport(master: master, stackedCount: engine.stackFrameCount,
+                             skippedMissing: skippedMissing, coverage: engine.currentCoverage())
     }
 }

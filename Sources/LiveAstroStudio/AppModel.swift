@@ -141,11 +141,24 @@ final class AppModel {
     /// rebuilding from legacy config paths (usually nil) would overwrite a calibrated
     /// master.fit with an uncalibrated one (Fix 1). Nil = an uncalibrated session → identity.
     private var sessionCalibrator: Calibrator?
-    /// The watch folder / file-name prefix captured at session START, so a re-stack lists the
-    /// session's own subs even if the operator changed the live `watchFolder`/`fileNamePrefix`
-    /// (or source mode) after End but before Re-stack (Fix 4).
+    /// The source metadata (RA/DEC/FOCALLEN/…) the just-ended session's pipeline resolved.
+    /// Captured in `endSession` beside `sessionCalibrator` (before the pipeline is released)
+    /// so a post-session re-stack writes master.fit with the SAME metadata the live master
+    /// had, not a bare header (Fix P1b). Nil = no metadata resolved this session.
+    private var sessionSourceMetadata: SourceMetadata?
+    /// The watch folder captured at session START, so a re-stack resolves the session's own
+    /// recorded subs under it even if the operator changed the live `watchFolder` (or source
+    /// mode) after End but before Re-stack (Fix 4). (Re-stack now selects frames from the
+    /// recorded `subFrames`, not a folder listing, so no file-name prefix is needed — Fix P1a.)
     private var restackSourceDir: URL?
-    private var restackPrefix: String = ""
+    /// The neutralize-background flag captured at NATIVE session START, so a post-session
+    /// re-stack writes `master.fit` with the SAME background treatment the live master had
+    /// (the toggle is disabled while running, so this is stable across the session).
+    private var sessionNeutralizeBackground = false
+    /// The sub-exposure (seconds) captured at NATIVE session START, so a re-stack's TOTALEXP
+    /// uses the value the session actually ran at — not a live `profile.subExposureSeconds`
+    /// that the operator may have edited after End but before Re-stack.
+    private var sessionSubExposureSeconds: Double = 60
     var latestImage: CGImage?
     var latestRecord: SnapshotRecord?
     var sessionStart: Date?
@@ -332,6 +345,8 @@ final class AppModel {
                 MainActor.assumeIsolated { self?.wireCallbacks(to: pipeline, onAnyFrame: onAnyFrame) } },
             setAcceptedRejectedCounts: { [weak self] accepted, rejected in
                 MainActor.assumeIsolated { self?.acceptedCount = accepted; self?.rejectedCount = rejected } },
+            resetSessionStatsForImport: { [weak self] in MainActor.assumeIsolated { self?.resetSessionStatsForImport() } },
+            isRestacking: { [weak self] in MainActor.assumeIsolated { self?.isRestacking ?? false } },
             setReplayURL: { [weak self] url in MainActor.assumeIsolated { self?.replayURL = url } },
             setLastSessionDirectory: { [weak self] url in MainActor.assumeIsolated { self?.lastSessionDirectory = url } }))
         loadSettings()
@@ -743,10 +758,14 @@ final class AppModel {
             p = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
                 rootDirectory: root, neutralizeBackground: neutralizeBackground,
                 calibrator: cal.calibrator, calibratorProvider: provider)
-            // Pin the session's own subs folder + prefix so a later re-stack lists THEM,
-            // not whatever the operator has since changed the live controls to (Fix 4).
+            // Pin the session's own subs folder so a later re-stack resolves the recorded
+            // subs under IT, not whatever the operator has since changed the live controls to (Fix 4).
             restackSourceDir = folder
-            restackPrefix = fileNamePrefix
+            // Capture the background/exposure the live master was built with, so a re-stack
+            // writes a master.fit at parity (neutralize) and with a truthful TOTALEXP even if
+            // the operator edits these controls after End.
+            sessionNeutralizeBackground = neutralizeBackground
+            sessionSubExposureSeconds = profile.subExposureSeconds
         }
         p.displayAdjustments = displayAdjustments
 
@@ -754,6 +773,7 @@ final class AppModel {
         rejectedCount = 0
         subFrames = []
         sessionCalibrator = nil   // captured at end() from the pipeline's effectiveCalibrator (Fix 1)
+        sessionSourceMetadata = nil   // captured at end() from the pipeline's capturedSourceMetadata (Fix P1b)
 
         // Reset per-session completion state and ask for notification permission
         // once (no-op if already granted/denied). The tick starts only on success.
@@ -941,6 +961,38 @@ final class AppModel {
         }
     }
 
+    /// Clears the native-session-only stats/re-stack state at the START of an offline import
+    /// (called via the `AppSurface.resetSessionStatsForImport` seam). `onSubFrame` fires
+    /// native-only, so without this an import would leave a prior live session's `subFrames`
+    /// (stale Stats rows) and `restackSourceDir`/calibrator/metadata (a re-stack pointed at the
+    /// prior folder) in place. After this, re-stack is cleanly unavailable for imports:
+    /// `flaggedCount` is 0 (empty subFrames) AND `restackSourceDir` is nil, so both
+    /// `restackOfferPending` and `restackWithoutFlagged`'s guards refuse it. Full import
+    /// stats-wiring (populating `subFrames` for imports) is a future feature (Fix P2-import).
+    func resetSessionStatsForImport() {
+        subFrames = []
+        restackSourceDir = nil
+        sessionCalibrator = nil
+        sessionSourceMetadata = nil
+        sessionNeutralizeBackground = false
+        sessionSubExposureSeconds = 60
+        restackOfferPending = false
+    }
+
+    /// The survivor set for a re-stack: the session's RECORDED subs (the exact frames the live
+    /// pipeline processed), in recorded `index` order, minus user-flagged, each resolved as a
+    /// basename under the session's pinned subs folder `dir` (Fix P1a).
+    ///
+    /// Pure/static so the selection logic is reviewable in isolation. NOTE: this lives on the
+    /// LiveAstroStudio executable target, which the sole test target (`LiveAstroCoreTests`,
+    /// over `LiveAstroCore`) does not `@testable import`, so it has no direct unit test — the
+    /// three sort/filter/resolve steps below are kept trivially reviewable instead.
+    static func restackSurvivorURLs(subFrames: [SubFrameRecord], in dir: URL) -> [URL] {
+        subFrames.sorted { $0.index < $1.index }        // recorded order (UI mirror may be out-of-order)
+                 .filter { !$0.rejectedByUser }
+                 .map { dir.appendingPathComponent($0.sourceFile) }
+    }
+
     /// Rebuilds the master from the session's raw subs, excluding every sub the
     /// operator has flagged, and applies the result (Task 8b). Post-capture only
     /// (`!isRunning`, per Task 8 Refinement) — a live pipeline's display would just
@@ -964,36 +1016,19 @@ final class AppModel {
             log.append("Re-stack unavailable — the raw subs folder is unknown.")
             return
         }
-        let entries: [URL]
-        do {
-            entries = try FileManager.default.contentsOfDirectory(
-                at: dir, includingPropertiesForKeys: nil)
-        } catch {
-            log.append("Re-stack unavailable — couldn't read the raw subs folder: \(error)")
-            return
-        }
-        let prefix = restackPrefix.lowercased()
-        let urls = entries
-            .filter { ImageLoader.fitsExtensions.contains($0.pathExtension.lowercased()) }
-            // Match the session's file-name prefix, same as live (StackFileWatcher.
-            // isTrackedFileName) and import (ImportCursor) — otherwise the survivor set
-            // wrongly includes other-filter/foreign/calibration FITS sitting in the same
-            // folder (Fix C). Empty prefix accepts all, matching existing semantics.
-            .filter { restackPrefix.isEmpty || $0.lastPathComponent.lowercased().hasPrefix(prefix) }
-            // Drop dotfiles and .tmp sidecars, matching StackFileWatcher.isTrackedFileName —
-            // an in-flight atomic write (".foo.fit.tmp") must never enter the survivor set (Fix 5).
-            .filter { !$0.lastPathComponent.hasPrefix(".") && !$0.lastPathComponent.hasSuffix(".tmp") }
-            // Numeric-aware order so Light_2 precedes Light_10 (capture sequence order) —
-            // matches FolderFrameSource, so the first surviving frame (the stack's seed)
-            // is the same one the live pipeline would have chosen.
-            .sorted { $0.lastPathComponent.compare($1.lastPathComponent, options: [.numeric, .caseInsensitive]) == .orderedAscending }
+        // Build the survivor set from the session's RECORDED subs (the exact frames the live
+        // pipeline processed and the Stats UI offered), in recorded order, minus user-flagged —
+        // NOT a folder listing, which would wrongly sweep in post-session or foreign same-prefix
+        // FITS the session never touched (Fix P1a). RestackCoordinator.skippedMissing still
+        // absorbs any recorded sub since deleted from disk. `excludingSourceFiles` is empty
+        // because `urls` is already the survivor set.
+        let urls = Self.restackSurvivorURLs(subFrames: subFrames, in: dir)
         guard !urls.isEmpty else {
-            log.append("Re-stack unavailable — no raw subs found on disk (they may have been pruned).")
+            log.append("Re-stack unavailable — no surviving subs (all recorded subs are flagged or none were recorded).")
             return
         }
 
-        let excluded = Set(subFrames.filter(\.rejectedByUser).map(\.sourceFile))
-        let excludedCount = excluded.count
+        let excludedCount = flaggedCount
 
         // Reuse the EXACT calibrator the live pipeline applied before stacking (captured in
         // endSession as effectiveCalibrator — explicit or first-frame auto-resolved), NOT a
@@ -1001,27 +1036,87 @@ final class AppModel {
         // overwrite the good one). A nil sessionCalibrator (uncalibrated session) yields an
         // identity prepare. Calibrator.apply is NSLock-guarded, safe off the main actor (Fix 1).
         // restackOfferPending stays set until the re-stack SUCCEEDS (cleared in
-        // applyRestackedMaster), so a failed re-stack leaves the offer up for retry (Fix 5).
+        // finishRestack only after the durable master.fit write succeeds), so a failed re-stack
+        // OR a failed master write leaves the offer up for retry (Fix 5 / Fix P2).
         isRestacking = true
         let engine = makeStackEngine()
-        Task.detached { [weak self, sessionCalibrator] in
+        // Capture on the main actor everything the off-actor write needs: the session's metadata
+        // (Fix P1b — write master.fit with the SAME header the live master had), the pinned
+        // session directory, and the sub exposure (for TOTALEXP).
+        Task.detached { [weak self, sessionCalibrator, sessionSourceMetadata,
+                         sessionDir = lastSessionDirectory, sessionNeutralizeBackground,
+                         sessionSubExposureSeconds] in
             guard let self else { return }
+            let report: RestackReport
             do {
-                let report = try RestackCoordinator.restack(
-                    rawURLs: urls, excludingSourceFiles: excluded, makeEngine: { engine },
+                report = try RestackCoordinator.restack(
+                    rawURLs: urls, excludingSourceFiles: [], makeEngine: { engine },
                     prepare: { sessionCalibrator?.apply($0) ?? $0 })
-                await MainActor.run { self.applyRestackedMaster(report, excludedCount: excludedCount) }
             } catch {
                 await MainActor.run {
                     self.log.append("Re-stack failed: \(error). Master unchanged.")
                     self.isRestacking = false
                 }
+                return
             }
+            // The master.fit write is the REQUIRED durable deliverable — do the (26MP) FITS
+            // encode + atomic write off the main actor so it never janks the UI, and gate
+            // success strictly on it (Fix P1b full metadata, Fix P2 gate-on-write).
+            let writeResult = Self.writeRestackedMaster(
+                report, to: sessionDir, metadata: sessionSourceMetadata,
+                coverage: report.coverage, neutralize: sessionNeutralizeBackground,
+                subExposureSeconds: sessionSubExposureSeconds)
+            await MainActor.run { self.finishRestack(report, excludedCount: excludedCount,
+                                                     writeResult: writeResult, sessionDir: sessionDir) }
         }
     }
 
-    /// Applies a completed re-stack: writes the rebuilt master over `master.fit` (if the
-    /// session directory is known), refreshes the on-screen preview, and logs the outcome.
+    /// Result of the off-actor durable master.fit write. `ok == false` means the durable
+    /// deliverable did not land, so the caller must keep `restackOfferPending` up for retry.
+    private struct RestackMasterWrite { let ok: Bool; let logMessage: String? }
+
+    /// Encodes the re-stacked master to a full-metadata FITS and writes it atomically over
+    /// `master.fit`, matching the pipeline's own write (`SessionPipeline.writeMasterSnapshot` /
+    /// `end()`): `FITSWriter.float32(..., metadata:, stackCount:, totalExposureSeconds:)` +
+    /// tmp-then-`FileReplace.replaceItem`, so a failed write never truncates the existing good
+    /// master (Fix P1b + P2). Pure/static so it runs safely off the main actor.
+    ///
+    /// Parity with the live pipeline's master write: the re-stacked master is cropped to its
+    /// covered region (`CoverageCrop.cropToCoverage`) and, when the session ran with the flag
+    /// set, background-neutralized (`AutoStretch.neutralizeBackgroundAdditive`) — matching
+    /// `SessionPipeline.end()`/`writeMasterSnapshot`, so a re-stack no longer replaces a good
+    /// cropped/neutralized master with an uncropped/un-neutralized one.
+    nonisolated private static func writeRestackedMaster(_ report: RestackReport, to sessionDir: URL?,
+                                     metadata: SourceMetadata?, coverage: [Float]?,
+                                     neutralize: Bool, subExposureSeconds: Double) -> RestackMasterWrite {
+        guard let sessionDir else {
+            return RestackMasterWrite(ok: false,
+                logMessage: "Re-stack: no session directory on record — master.fit not written; re-stack offer left up to retry.")
+        }
+        let cropped = CoverageCrop.cropToCoverage(report.master, coverage: coverage)   // crop BEFORE balance
+        let balanced = neutralize ? AutoStretch.neutralizeBackgroundAdditive(cropped) : cropped
+        let totalExp = Double(report.stackedCount) * subExposureSeconds
+        let data = FITSWriter.float32(
+            width: balanced.width, height: balanced.height,
+            channels: balanced.channels, pixels: balanced.pixels,
+            metadata: metadata, stackCount: report.stackedCount, totalExposureSeconds: totalExp)
+        let target = sessionDir.appendingPathComponent("master.fit")
+        let tmp = sessionDir.appendingPathComponent(".restacked-master-\(UUID().uuidString).fit")
+        do {
+            try data.write(to: tmp)
+            try FileReplace.replaceItem(at: target, withItemAt: tmp)
+            return RestackMasterWrite(ok: true, logMessage: nil)
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            return RestackMasterWrite(ok: false,
+                logMessage: "Re-stack: could not write master.fit (\(error)). Master unchanged; re-stack offer left up to retry.")
+        }
+    }
+
+    /// Applies a completed re-stack on the main actor. Success is GATED strictly on the durable
+    /// master.fit write (Fix P2): if the write failed, log it, leave `restackOfferPending` up for
+    /// retry, and do NOT update the preview or log "Re-stacked…". Only on a successful write do we
+    /// write sub-frames.csv (best-effort), refresh the preview, log success, and clear the offer.
     ///
     /// v1 preview limitation: `AutoStretch.makeCGImage` is a basic stretch only — it does
     /// NOT run the live DisplayAdjustments/DBE/denoise/north-up pipeline (that lives on
@@ -1029,23 +1124,28 @@ final class AppModel {
     /// durable deliverable is the corrected `master.fit`; the on-screen preview is a
     /// basic-stretch confirmation that the restack happened, not a faithful re-render of
     /// the operator's display settings.
-    private func applyRestackedMaster(_ report: RestackReport, excludedCount: Int) {
-        if let sessionDirectory = lastSessionDirectory {
-            do {
-                try MasterBuilder.save(report.master, to: sessionDirectory.appendingPathComponent("master.fit"))
-            } catch {
-                log.append("Re-stack: could not write master.fit (\(error)).")
-            }
-            // Re-write sub-frames.csv from the in-memory mirror so it reflects the operator's
-            // flags at re-stack time — the manifest's persisted records were written before
-            // flagging (rejectedByUser = false at persist time), so this is the accurate copy.
+    private func finishRestack(_ report: RestackReport, excludedCount: Int,
+                               writeResult: RestackMasterWrite, sessionDir: URL?) {
+        guard writeResult.ok else {
+            if let m = writeResult.logMessage { log.append(m) }
+            // Durable write failed — do NOT report success: leave the offer up, don't touch the
+            // preview, don't log "Re-stacked…". (Fix P2)
+            isRestacking = false
+            return
+        }
+        // Master written durably. sub-frames.csv is best-effort — the master is the deliverable,
+        // so a CSV failure is logged but does not fail the op. Re-written from the in-memory mirror
+        // so it reflects the operator's flags at re-stack time (the manifest's persisted records
+        // were written before flagging, rejectedByUser = false at persist time).
+        // Write to the session dir captured ONCE at re-stack start (the same dir the master
+        // was written to), NOT a re-read of `lastSessionDirectory` — an import started mid
+        // re-stack could otherwise redirect this CSV to the wrong (or a cleared) dir (Fix D).
+        if let sessionDirectory = sessionDir {
             do {
                 try SubFrameCSV.write(subFrames: subFrames, to: sessionDirectory)
             } catch {
                 log.append("Re-stack: could not write sub-frames.csv (\(error)).")
             }
-        } else {
-            log.append("Re-stack: no session directory on record — master.fit was not written.")
         }
         if let cg = AutoStretch.makeCGImage(report.master) {
             latestImage = cg
@@ -1054,8 +1154,8 @@ final class AppModel {
             log.append("Re-stack: \(report.skippedMissing) raw sub(s) missing — used the rest.")
         }
         log.append("Re-stacked without \(excludedCount) flagged sub(s): \(report.stackedCount) frames.")
-        // Clear the offer only now, on the SUCCESS path — a failed re-stack (handled in the
-        // detached task's catch) leaves restackOfferPending up so the operator can retry (Fix 5).
+        // Clear the offer only now, on the SUCCESS path — a failed re-stack or failed master
+        // write leaves restackOfferPending up so the operator can retry (Fix 5 / Fix P2).
         restackOfferPending = false
         isRestacking = false
     }
@@ -1199,6 +1299,7 @@ final class AppModel {
                 // auto-resolved) BEFORE releasing the pipeline, so a post-session re-stack reuses
                 // the exact same calibration the live master used (Fix 1).
                 self.sessionCalibrator = p.effectiveCalibrator
+                self.sessionSourceMetadata = p.capturedSourceMetadata   // stamp re-stacked master.fit like the live one (Fix P1b)
                 self.pipeline = nil
                 self.sessionEnd = Date()
                 self.restackOfferPending = self.flaggedCount > 0
