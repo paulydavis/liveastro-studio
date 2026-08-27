@@ -14,6 +14,10 @@ struct StatsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if model.restackOfferPending {
+                restackOfferBanner
+                Divider()
+            }
             rollup
             Divider()
             ScrollView {
@@ -24,6 +28,22 @@ struct StatsView: View {
             Divider()
             footer
         }
+    }
+
+    /// Non-blocking session-end confirm (Task 11) — never re-stacks automatically.
+    private var restackOfferBanner: some View {
+        HStack {
+            Text("\(model.flaggedCount) sub(s) flagged — re-stack for a clean final master.")
+                .font(.caption)
+            Spacer()
+            Button("Re-stack now") { model.restackWithoutFlagged() }
+                .disabled(model.isRestacking)
+            Button("Dismiss") { model.restackOfferPending = false }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.12))
     }
 
     private var rollup: some View {

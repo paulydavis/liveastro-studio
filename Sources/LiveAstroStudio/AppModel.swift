@@ -131,6 +131,10 @@ final class AppModel {
     /// Guards against concurrent restack runs; also usable to disable the re-stack
     /// button in the Stats UI (Task 10).
     private(set) var isRestacking = false
+    /// True right after a session ends with flagged subs on record — surfaces a non-blocking
+    /// "re-stack for a clean final master?" confirm in StatsView (Task 11). Never triggers a
+    /// re-stack automatically; the operator must tap "Re-stack now".
+    var restackOfferPending = false
     var latestImage: CGImage?
     var latestRecord: SnapshotRecord?
     var sessionStart: Date?
@@ -951,6 +955,7 @@ final class AppModel {
         let excluded = Set(subFrames.filter(\.rejectedByUser).map(\.sourceFile))
         let excludedCount = excluded.count
 
+        restackOfferPending = false
         isRestacking = true
         let engine = makeStackEngine()
         Task.detached { [weak self] in
@@ -984,6 +989,10 @@ final class AppModel {
             } catch {
                 log.append("Re-stack: could not write master.fit (\(error)).")
             }
+            // Re-write sub-frames.csv from the in-memory mirror so it reflects the operator's
+            // flags at re-stack time — the manifest's persisted records were written before
+            // flagging (rejectedByUser = false at persist time), so this is the accurate copy.
+            try? SubFrameCSV.write(subFrames: subFrames, to: sessionDirectory)
         } else {
             log.append("Re-stack: no session directory on record — master.fit was not written.")
         }
@@ -1116,6 +1125,7 @@ final class AppModel {
                 self.importer.isGeneratingReplay = false
                 self.pipeline = nil
                 self.sessionEnd = Date()
+                self.restackOfferPending = self.flaggedCount > 0
                 // Common completion (success OR replay failure): only now stop
                 // the OBS stream/recording — a failed replay must still stop
                 // the stream, so this lives here, not on the success path.

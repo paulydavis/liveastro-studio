@@ -5,6 +5,8 @@ import Foundation
 /// quote, or newline is wrapped in double quotes with internal quotes doubled)
 /// and the same date formatter, so the two CSVs agree.
 public enum SubFrameCSV {
+    public static let filename = "sub-frames.csv"
+
     private static let header = "index,timestamp,source_file,star_count,background_sigma,weight,outcome,rejection_reason,rejected_by_user"
 
     private static let dateFormatter: ISO8601DateFormatter = {
@@ -30,6 +32,10 @@ public enum SubFrameCSV {
             out += cols.joined(separator: ",") + "\n"
         }
         return out
+    }
+
+    public static func write(subFrames: [SubFrameRecord], to directory: URL) throws {
+        try string(from: subFrames).write(to: directory.appendingPathComponent(filename), atomically: true, encoding: .utf8)
     }
 
     private static func escape(_ field: String) -> String {

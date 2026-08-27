@@ -36,6 +36,12 @@ struct ControlView: View {
         return FileManager.default.fileExists(atPath: csv.path) ? csv : nil
     }
 
+    private var subFramesURL: URL? {
+        guard let dir = model.lastSessionDirectory else { return nil }
+        let csv = dir.appendingPathComponent(SubFrameCSV.filename)
+        return FileManager.default.fileExists(atPath: csv.path) ? csv : nil
+    }
+
     private var appVersionText: String {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = (info["CFBundleShortVersionString"] as? String)?
@@ -263,6 +269,11 @@ struct ControlView: View {
                                         .help("Open the frame-summary.csv per-snapshot table.")
                                 }
 
+                                if subFramesURL != nil {
+                                    Button("Open sub-frames.csv") { openSubFrames() }
+                                        .help("Open the per-sub quality + rejection table.")
+                                }
+
                                 Spacer()
 
                                 Button("Copy Support Bundle") { copySupportBundle() }
@@ -329,6 +340,11 @@ struct ControlView: View {
 
     private func openFrameSummary() {
         guard let url = frameSummaryURL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func openSubFrames() {
+        guard let url = subFramesURL else { return }
         NSWorkspace.shared.open(url)
     }
 
