@@ -12,6 +12,17 @@ public enum RejectionReason: Equatable {
     case dimensionMismatch
 }
 
+/// `process` outcome plus the per-sub quality metrics the stacker measured while
+/// deciding it (spec §Data flow). Surfaced so the session can retain per-sub stats
+/// without recomputation. Weight is the value actually applied (1.0 for the reference,
+/// 0 for a rejected sub).
+public struct ProcessResult: Equatable {
+    public let outcome: StackOutcome
+    public let starCount: Int
+    public let backgroundSigma: Float
+    public let weight: Float
+}
+
 /// Native stacking core (spec §4.2): registration on half-res superpixel luminance,
 /// full-res accumulation. Rejection is registration-failure only (spec §3).
 public final class StackEngine {
@@ -239,21 +250,23 @@ public final class StackEngine {
         }
     }
 
-    public func process(_ frame: RawFrame) -> StackOutcome {
-        lock.withLock { processLocked(frame) }
+    public func process(_ frame: RawFrame) -> StackOutcome { processDetailed(frame).outcome }
+
+    public func processDetailed(_ frame: RawFrame) -> ProcessResult {
+        lock.withLock { processDetailedLocked(frame) }
     }
 
-    private func processLocked(_ frame: RawFrame) -> StackOutcome {
+    private func processDetailedLocked(_ frame: RawFrame) -> ProcessResult {
         let raw = frame.image
         // Degenerate frames (a half-res luminance needs at least a 2×2 source) would
         // crash star detection / superpixel binning — reject before any luminance work.
         guard raw.width >= 2, raw.height >= 2 else {
             rejectedCount += 1
-            return .rejected(.dimensionMismatch)
+            return ProcessResult(outcome: .rejected(.dimensionMismatch), starCount: 0, backgroundSigma: 0, weight: 0)
         }
         if let size = referenceSize, size != (raw.width, raw.height) {
             rejectedCount += 1
-            return .rejected(.dimensionMismatch)
+            return ProcessResult(outcome: .rejected(.dimensionMismatch), starCount: 0, backgroundSigma: 0, weight: 0)
         }
         let (lum, hw, hh) = Self.halfResLuminance(frame: frame)
         let (stars, sigma) = StarDetector.detectWithStats(luminance: lum, width: hw, height: hh)
@@ -261,7 +274,8 @@ public final class StackEngine {
         if referenceSize == nil {
             guard stars.count >= seedMinStars else {
                 rejectedCount += 1
-                return .rejected(.insufficientStars(found: stars.count))
+                return ProcessResult(outcome: .rejected(.insufficientStars(found: stars.count)),
+                                     starCount: stars.count, backgroundSigma: sigma, weight: 0)
             }
             let rgb = displayRGB(frame)
             let ones = [Float](repeating: 1, count: rgb.width * rgb.height)
@@ -278,14 +292,15 @@ public final class StackEngine {
             acceptedCount += 1
             consecutiveNoTransform = 0
             currentStackState = .active
-            return .becameReference
+            return ProcessResult(outcome: .becameReference, starCount: stars.count, backgroundSigma: sigma, weight: 1.0)
         }
 
         // 3 = TriangleMatcher minimum (one triangle); RANSAC's minMatches is
         // enforced later by TransformSolver.
         guard stars.count >= 3 else {
             rejectedCount += 1
-            return .rejected(.insufficientStars(found: stars.count))
+            return ProcessResult(outcome: .rejected(.insufficientStars(found: stars.count)),
+                                 starCount: stars.count, backgroundSigma: sigma, weight: 0)
         }
         let pairs = TriangleMatcher.correspondences(source: stars, target: referenceStars)
         guard let half = TransformSolver.solve(source: stars, target: referenceStars, pairs: pairs,
@@ -310,7 +325,7 @@ public final class StackEngine {
                     auto: autoReseedCount
                 )
             }
-            return .rejected(.noTransform)
+            return ProcessResult(outcome: .rejected(.noTransform), starCount: stars.count, backgroundSigma: sigma, weight: 0)
         }
         var scale: Float = 1.0
         if scaleNormalization {
@@ -321,7 +336,7 @@ public final class StackEngine {
         let rgb = displayRGB(frame)
         guard rgb.channels == referenceChannels else {
             rejectedCount += 1
-            return .rejected(.dimensionMismatch)
+            return ProcessResult(outcome: .rejected(.dimensionMismatch), starCount: stars.count, backgroundSigma: sigma, weight: 0)
         }
         // Invariant: referenceSize != nil (checked above) implies the accumulator was
         // created when the reference seeded. Guard rather than trap so a violated
@@ -331,7 +346,7 @@ public final class StackEngine {
         // count toward auto-reseed (would only ever under-count, never spuriously trip).
         guard let accumulator else {
             rejectedCount += 1
-            return .rejected(.noTransform)
+            return ProcessResult(outcome: .rejected(.noTransform), starCount: stars.count, backgroundSigma: sigma, weight: 0)
         }
         let (warped, mask) = Warp.apply(rgb, transform: half.liftedToFullResolution())
         // R5: solve BOTH the sub and reference models over the SAME masked tile subset of the
@@ -353,10 +368,12 @@ public final class StackEngine {
         }
         let cleaned = rejection.apply(frame, mask: mask)
         // σ·effectiveScale: scaling amplifies noise too — weight must see the POST-(applied-)scale noise
-        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma * effectiveScale))
+        let appliedWeight = frameWeight(stars: stars.count, sigma: sigma * effectiveScale)
+        accumulator.add(cleaned, mask: mask, frameWeight: appliedWeight)
         acceptedCount += 1
         consecutiveNoTransform = 0
-        return .stacked(frameCount: accumulator.frameCount)
+        return ProcessResult(outcome: .stacked(frameCount: accumulator.frameCount),
+                             starCount: stars.count, backgroundSigma: sigma, weight: appliedWeight)
     }
 
     /// Half-res superpixel luminance in DISPLAY orientation (flip rows if bottom-up).
@@ -425,7 +442,7 @@ public final class StackEngine {
         // ACTUALLY-APPLIED scale, which is only known after the leveling pair is fit and the
         // all-or-nothing scalingApplies guard is evaluated (a suppressed scale must weight σ·1,
         // not σ·s). Callers compute weight via frameWeight(stars:sigma:) once effectiveScale is
-        // known (BatchImporter worker / processLocked). frameWeight reads only weightBaseline
+        // known (BatchImporter worker / processDetailedLocked). frameWeight reads only weightBaseline
         // (immutable during a batch — same lock-free contract as referenceStars).
         // R4/R5: backgroundModel removed from RegisteredFrame — fits are now done on the WARPED
         // frame (see levelingModels). Fitting pre-warp injected rotation-induced gradient error (C1).
@@ -517,7 +534,7 @@ public final class StackEngine {
     /// Pure and lock-free: reads only `normalization` (immutable) + `referenceBackgroundSamples`,
     /// which is set at seed (serial, before the concurrent register/warp phase per the batch
     /// contract) and treated as immutable for the batch — same contract as `referenceStars`.
-    /// The live path calls this inside `processLocked` (under the lock).
+    /// The live path calls this inside `processDetailedLocked` (under the lock).
     public func levelingModels(image: AstroImage, mask: [Float])
         -> (sub: BackgroundExtraction.BackgroundModel, ref: BackgroundExtraction.BackgroundModel)? {
         guard normalization, let refSamples = referenceBackgroundSamples else { return nil }
