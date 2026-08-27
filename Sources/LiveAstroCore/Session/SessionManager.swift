@@ -98,6 +98,33 @@ public final class SessionManager {
         manifest = proposed
     }
 
+    public var subFrames: [SubFrameRecord] { manifest?.subFrames ?? [] }
+
+    /// Append a per-sub record and persist. Mirrors recordSnapshot's write-then-commit path.
+    public func recordSubFrame(_ record: SubFrameRecord) throws {
+        guard state == .running, var proposed = manifest, let dir = sessionDirectory else {
+            throw SessionError.notRunning
+        }
+        var subs = proposed.subFrames ?? []
+        subs.append(record)
+        proposed.subFrames = subs
+        try persist(proposed, to: dir)
+        manifest = proposed
+    }
+
+    /// Set the operator reject flag on the record with `index`. No-op if absent. Persists.
+    public func setSubFrameUserRejected(index: Int, rejected: Bool) throws {
+        guard state == .running, var proposed = manifest, let dir = sessionDirectory,
+              var subs = proposed.subFrames else {
+            throw SessionError.notRunning
+        }
+        guard let i = subs.firstIndex(where: { $0.index == index }) else { return }
+        subs[i].rejectedByUser = rejected
+        proposed.subFrames = subs
+        try persist(proposed, to: dir)
+        manifest = proposed
+    }
+
     public func endSession(at date: Date = .init(),
                            finalization: SessionFinalizationFacts? = nil) throws {
         guard state == .running, var proposed = manifest, let dir = sessionDirectory else {
