@@ -7,13 +7,22 @@ final class AppSourceRegressionTests: XCTestCase {
 
     func testStackerOutputWorkflowPassesRequestedModeThroughLiveSourceController() throws {
         let controllerURL = root.appendingPathComponent("Sources/LiveAstroStudio/LiveSourceController.swift")
-        let controlViewURL = root.appendingPathComponent("Sources/LiveAstroStudio/ControlView.swift")
+        // The Start Workflow rows moved from ControlView to CaptureSettingsView, and the shared
+        // watch-folder picker to AppModel, in the Setup TabView split. The behavioral guard is
+        // unchanged: the row must pass its OWN sourceMode explicitly, never rely on ambient state.
+        let captureViewURL = root.appendingPathComponent("Sources/LiveAstroStudio/CaptureSettingsView.swift")
+        let appModelURL = root.appendingPathComponent("Sources/LiveAstroStudio/AppModel.swift")
         let controller = try String(contentsOf: controllerURL, encoding: .utf8)
-        let controlView = try String(contentsOf: controlViewURL, encoding: .utf8)
+        let captureView = try String(contentsOf: captureViewURL, encoding: .utf8)
+        let appModel = try String(contentsOf: appModelURL, encoding: .utf8)
 
         XCTAssertTrue(
-            controlView.contains("model.liveSource.startWatchFolderLive(source: url, sourceMode: sourceMode)"),
-            "ControlView must pass the row's selected sourceMode into LiveSourceController instead of relying on mutable AppModel state."
+            appModel.contains("startWatchFolderLive(source: url, sourceMode: sourceMode)"),
+            "pickWatchFolderLive must forward the REQUESTED sourceMode into LiveSourceController, not read back mutable AppModel state."
+        )
+        XCTAssertTrue(
+            captureView.contains("sourceMode: .stackerOutput"),
+            "The Watch Siril / External Stacker row must pass .stackerOutput explicitly instead of relying on mutable AppModel.sourceMode."
         )
         XCTAssertTrue(
             controller.contains("func startWatchFolderLive(source: URL, sourceMode: AppModel.SourceMode = .nativeStack)"),
