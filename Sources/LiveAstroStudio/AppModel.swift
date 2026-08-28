@@ -983,16 +983,6 @@ final class AppModel {
     /// pipeline processed), in recorded `index` order, minus user-flagged, each resolved as a
     /// basename under the session's pinned subs folder `dir` (Fix P1a).
     ///
-    /// Pure/static so the selection logic is reviewable in isolation. NOTE: this lives on the
-    /// LiveAstroStudio executable target, which the sole test target (`LiveAstroCoreTests`,
-    /// over `LiveAstroCore`) does not `@testable import`, so it has no direct unit test — the
-    /// three sort/filter/resolve steps below are kept trivially reviewable instead.
-    static func restackSurvivorURLs(subFrames: [SubFrameRecord], in dir: URL) -> [URL] {
-        subFrames.sorted { $0.index < $1.index }        // recorded order (UI mirror may be out-of-order)
-                 .filter { !$0.rejectedByUser }
-                 .map { dir.appendingPathComponent($0.sourceFile) }
-    }
-
     /// Rebuilds the master from the session's raw subs, excluding every sub the
     /// operator has flagged, and applies the result (Task 8b). Post-capture only
     /// (`!isRunning`, per Task 8 Refinement) — a live pipeline's display would just
@@ -1022,7 +1012,7 @@ final class AppModel {
         // FITS the session never touched (Fix P1a). RestackCoordinator.skippedMissing still
         // absorbs any recorded sub since deleted from disk. `excludingSourceFiles` is empty
         // because `urls` is already the survivor set.
-        let urls = Self.restackSurvivorURLs(subFrames: subFrames, in: dir)
+        let urls = RestackPlanning.survivorURLs(subFrames: subFrames, in: dir)
         guard !urls.isEmpty else {
             log.append("Re-stack unavailable — no surviving subs (all recorded subs are flagged or none were recorded).")
             return
@@ -1064,7 +1054,7 @@ final class AppModel {
             // success strictly on it (Fix P1b full metadata, Fix P2 gate-on-write).
             let writeResult = Self.writeRestackedMaster(
                 report, to: sessionDir, metadata: sessionSourceMetadata,
-                coverage: report.coverage, neutralize: sessionNeutralizeBackground,
+                neutralize: sessionNeutralizeBackground,
                 subExposureSeconds: sessionSubExposureSeconds)
             await MainActor.run { self.finishRestack(report, excludedCount: excludedCount,
                                                      writeResult: writeResult, sessionDir: sessionDir) }
@@ -1087,19 +1077,16 @@ final class AppModel {
     /// `SessionPipeline.end()`/`writeMasterSnapshot`, so a re-stack no longer replaces a good
     /// cropped/neutralized master with an uncropped/un-neutralized one.
     nonisolated private static func writeRestackedMaster(_ report: RestackReport, to sessionDir: URL?,
-                                     metadata: SourceMetadata?, coverage: [Float]?,
+                                     metadata: SourceMetadata?,
                                      neutralize: Bool, subExposureSeconds: Double) -> RestackMasterWrite {
         guard let sessionDir else {
             return RestackMasterWrite(ok: false,
                 logMessage: "Re-stack: no session directory on record — master.fit not written; re-stack offer left up to retry.")
         }
-        let cropped = CoverageCrop.cropToCoverage(report.master, coverage: coverage)   // crop BEFORE balance
-        let balanced = neutralize ? AutoStretch.neutralizeBackgroundAdditive(cropped) : cropped
-        let totalExp = Double(report.stackedCount) * subExposureSeconds
-        let data = FITSWriter.float32(
-            width: balanced.width, height: balanced.height,
-            channels: balanced.channels, pixels: balanced.pixels,
-            metadata: metadata, stackCount: report.stackedCount, totalExposureSeconds: totalExp)
+        // Pure crop + neutralize + FITS encode lives in core (RestackPlanning.encodeMaster,
+        // unit-tested); only the atomic tmp-write + FileReplace stays here (needs FileManager).
+        let data = RestackPlanning.encodeMaster(report, neutralize: neutralize,
+                                                metadata: metadata, subExposureSeconds: subExposureSeconds)
         let target = sessionDir.appendingPathComponent("master.fit")
         let tmp = sessionDir.appendingPathComponent(".restacked-master-\(UUID().uuidString).fit")
         do {

@@ -60,24 +60,23 @@ public enum RestackCoordinator {
                                prepare: (RawFrame) -> RawFrame = { $0 }) throws -> RestackReport {
         let kept = rawURLs.filter { !excludingSourceFiles.contains($0.lastPathComponent) }
 
-        var frames: [RawFrame] = []
+        // Stream: load → prepare → process one frame at a time, keeping only a single
+        // RawFrame resident. Buffering all survivors first cost gigabytes for 26MP × N.
+        // The load/prepare/process sequence and order are identical to the buffered form,
+        // so a restack stays byte-identical to a fresh stack of the same survivors (the
+        // golden property `testRestackEqualsFreshStackOfSurvivors` pins).
+        let engine = makeEngine()
+        var loadedCount = 0
         var skippedMissing = 0
         for url in kept {
-            if let frame = try? FolderFrameSource.loadRawFrame(url: url) {
-                frames.append(prepare(frame))
-            } else {
-                skippedMissing += 1
-            }
+            guard let frame = try? FolderFrameSource.loadRawFrame(url: url) else { skippedMissing += 1; continue }
+            _ = engine.process(prepare(frame))
+            loadedCount += 1
         }
-        guard !frames.isEmpty else { throw RestackError.noSurvivingSubs }
-
-        let engine = makeEngine()
-        for frame in frames {
-            _ = engine.process(frame)
-        }
+        guard loadedCount > 0 else { throw RestackError.noSurvivingSubs }
 
         guard let master = engine.currentStack() else {
-            throw RestackError.belowSeedMinimum(surviving: frames.count, needed: engine.minimumSeedStars)
+            throw RestackError.belowSeedMinimum(surviving: loadedCount, needed: engine.minimumSeedStars)
         }
         return RestackReport(master: master, stackedCount: engine.stackFrameCount,
                              skippedMissing: skippedMissing, coverage: engine.currentCoverage())
