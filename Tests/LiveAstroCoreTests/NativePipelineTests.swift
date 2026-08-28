@@ -56,7 +56,9 @@ final class NativePipelineTests: XCTestCase {
         try FITSReader.readHeader(Data(contentsOf: dir.appendingPathComponent("master.fit")))
     }
 
-    private func wait(for expectation: XCTestExpectation, timeout: TimeInterval = 5) {
+    private func wait(for expectation: XCTestExpectation, timeout: TimeInterval = 30) {
+        // Expectations fulfil the instant the pipeline callbacks fire; the generous timeout
+        // only guards against heavy-load stalls (the 5s default flaked under concurrent test load).
         wait(for: [expectation], timeout: timeout)
     }
 

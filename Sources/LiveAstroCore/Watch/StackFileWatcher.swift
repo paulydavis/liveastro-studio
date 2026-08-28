@@ -6,7 +6,7 @@ import CryptoKit
 /// mtime at nanosecond precision) pin the content version, and `digest` (when present) is the
 /// watcher's content digest over the same descriptor. Consumers use `read(url:verifying:)` to
 /// refuse a file that was replaced between the watcher's validation and their own read.
-public struct FileIdentity: Equatable, Sendable {
+public struct FileIdentity: Equatable, Sendable, Codable {
     public let dev: Int64
     public let ino: UInt64
     public let size: Int
