@@ -5,8 +5,10 @@ import Foundation
 /// with the rest, mirroring how the live/import pipeline logs-and-skips a bad frame
 /// rather than aborting the whole session (see `FolderFrameSource.frame(for:log:)`).
 public enum RestackError: Error, Equatable {
-    /// Every raw sub was either excluded or failed to load — nothing to stack.
-    case noSurvivingSubs
+    /// Every raw sub was either excluded or failed to load — nothing to stack. Carries the
+    /// skip accounting so the caller can report WHY (changed on disk vs. missing) instead of
+    /// a bare "no surviving subs".
+    case noSurvivingSubs(skippedMissing: Int, skippedMismatch: Int)
     /// Frames survived and loaded, but none had enough detected stars to seed the
     /// engine's reference frame (`engine.currentStack() == nil` after processing all of
     /// them). `surviving` is the count of frames actually handed to the engine;
@@ -78,10 +80,6 @@ public enum RestackCoordinator {
         var skippedMismatch = 0
         var sawLegacyUnverified = false
         for sub in subs {
-            // A nil recorded digest is a legacy/unverifiable record (predates content-digest
-            // capture, or an old stat-only record): the loader reads by path, unverified — the
-            // same load path as before this feature (golden-preserving).
-            sawLegacyUnverified = sawLegacyUnverified || (sub.expectedIdentity?.digest == nil)
             let frame: RawFrame
             do {
                 // DIGEST-ONLY validation: ignore inode/mtime. On Google Drive mirror / SMB, a
@@ -98,8 +96,16 @@ public enum RestackCoordinator {
             }
             _ = engine.process(prepare(frame))
             loadedCount += 1
+            // A nil recorded digest is a legacy/unverifiable record (predates content-digest
+            // capture, or an old stat-only record): the loader read by path, unverified — the
+            // same load path as before this feature (golden-preserving). Set only AFTER a
+            // successful load, so a missing/mismatched legacy sub (never actually loaded) does
+            // not wrongly mark the run "loaded unverified".
+            if sub.expectedIdentity?.digest == nil { sawLegacyUnverified = true }
         }
-        guard loadedCount > 0 else { throw RestackError.noSurvivingSubs }
+        guard loadedCount > 0 else {
+            throw RestackError.noSurvivingSubs(skippedMissing: skippedMissing, skippedMismatch: skippedMismatch)
+        }
 
         guard let master = engine.currentStack() else {
             throw RestackError.belowSeedMinimum(surviving: loadedCount, needed: engine.minimumSeedStars)

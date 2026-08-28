@@ -1042,6 +1042,17 @@ final class AppModel {
                 report = try RestackCoordinator.restack(
                     subs: survivorSubs, makeEngine: { engine },
                     prepare: { sessionCalibrator?.apply($0) ?? $0 })
+            } catch let e as RestackError {
+                await MainActor.run {
+                    switch e {
+                    case let .noSurvivingSubs(missing, mismatch):
+                        self.log.append("Re-stack: no usable subs — \(mismatch) changed on disk, \(missing) missing. Master unchanged.")
+                    case let .belowSeedMinimum(surviving, needed):
+                        self.log.append("Re-stack: \(surviving) sub(s) loaded but too few stars to seed (need \(needed)). Master unchanged.")
+                    }
+                    self.isRestacking = false
+                }
+                return
             } catch {
                 await MainActor.run {
                     self.log.append("Re-stack failed: \(error). Master unchanged.")
@@ -1057,7 +1068,8 @@ final class AppModel {
                 neutralize: sessionNeutralizeBackground,
                 subExposureSeconds: sessionSubExposureSeconds)
             await MainActor.run { self.finishRestack(report, excludedCount: excludedCount,
-                                                     writeResult: writeResult, sessionDir: sessionDir) }
+                                                     writeResult: writeResult, sessionDir: sessionDir,
+                                                     neutralize: sessionNeutralizeBackground) }
         }
     }
 
@@ -1112,7 +1124,7 @@ final class AppModel {
     /// basic-stretch confirmation that the restack happened, not a faithful re-render of
     /// the operator's display settings.
     private func finishRestack(_ report: RestackReport, excludedCount: Int,
-                               writeResult: RestackMasterWrite, sessionDir: URL?) {
+                               writeResult: RestackMasterWrite, sessionDir: URL?, neutralize: Bool) {
         guard writeResult.ok else {
             if let m = writeResult.logMessage { log.append(m) }
             // Durable write failed — do NOT report success: leave the offer up, don't touch the
@@ -1134,7 +1146,7 @@ final class AppModel {
                 log.append("Re-stack: could not write sub-frames.csv (\(error)).")
             }
         }
-        if let cg = AutoStretch.makeCGImage(report.master) {
+        if let cg = AutoStretch.makeCGImage(RestackPlanning.presentationMaster(report, neutralize: neutralize)) {
             latestImage = cg
         }
         if report.skippedMissing > 0 {
