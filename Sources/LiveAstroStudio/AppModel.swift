@@ -1012,8 +1012,8 @@ final class AppModel {
         // FITS the session never touched (Fix P1a). RestackCoordinator.skippedMissing still
         // absorbs any recorded sub since deleted from disk. `excludingSourceFiles` is empty
         // because `urls` is already the survivor set.
-        let urls = RestackPlanning.survivorURLs(subFrames: subFrames, in: dir)
-        guard !urls.isEmpty else {
+        let survivorSubs = RestackPlanning.survivorSubs(subFrames: subFrames, in: dir)
+        guard !survivorSubs.isEmpty else {
             log.append("Re-stack unavailable — no surviving subs (all recorded subs are flagged or none were recorded).")
             return
         }
@@ -1035,12 +1035,12 @@ final class AppModel {
         // session directory, and the sub exposure (for TOTALEXP).
         Task.detached { [weak self, sessionCalibrator, sessionSourceMetadata,
                          sessionDir = lastSessionDirectory, sessionNeutralizeBackground,
-                         sessionSubExposureSeconds] in
+                         sessionSubExposureSeconds, survivorSubs] in
             guard let self else { return }
             let report: RestackReport
             do {
                 report = try RestackCoordinator.restack(
-                    rawURLs: urls, excludingSourceFiles: [], makeEngine: { engine },
+                    subs: survivorSubs, makeEngine: { engine },
                     prepare: { sessionCalibrator?.apply($0) ?? $0 })
             } catch {
                 await MainActor.run {
@@ -1139,6 +1139,12 @@ final class AppModel {
         }
         if report.skippedMissing > 0 {
             log.append("Re-stack: \(report.skippedMissing) raw sub(s) missing — used the rest.")
+        }
+        if report.skippedMismatch > 0 {
+            log.append("Re-stack: \(report.skippedMismatch) sub(s) changed on disk since capture — skipped.")
+        }
+        if report.unverifiedLegacy {
+            log.append("Re-stack: some subs predate content verification — loaded unverified.")
         }
         log.append("Re-stacked without \(excludedCount) flagged sub(s): \(report.stackedCount) frames.")
         // Clear the offer only now, on the SUCCESS path — a failed re-stack or failed master

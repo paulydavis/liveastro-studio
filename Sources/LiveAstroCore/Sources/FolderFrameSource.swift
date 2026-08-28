@@ -533,9 +533,12 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
             timestamp = modDate(url: url)
         }
 
+        // Cheap stat-only identity of the exact file version we just decoded, so a re-stack can
+        // later detect this sub being replaced on disk. No hash — this is the frame-load hot path.
+        let identity = FileIdentity.statIdentity(url: url)
         return RawFrame(image: image, bayerPattern: bayerPattern, bottomUp: bottomUp,
                         timestamp: timestamp, sourceName: url.lastPathComponent,
-                        metadata: metadata)
+                        metadata: metadata, identity: identity)
     }
 
     // Date() fallback covers the file vanishing between load and attribute read

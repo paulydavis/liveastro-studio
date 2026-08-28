@@ -61,7 +61,8 @@ public final class Calibrator {
         let image = AstroImage(width: light.width, height: light.height,
                                channels: light.channels, pixels: out, sourceIsLinear: true)
         return RawFrame(image: image, bayerPattern: frame.bayerPattern, bottomUp: frame.bottomUp,
-                        timestamp: frame.timestamp, sourceName: frame.sourceName)
+                        timestamp: frame.timestamp, sourceName: frame.sourceName,
+                        identity: frame.identity)
     }
 
     private func computeAlignment(for bottomUp: Bool) {

@@ -6,7 +6,7 @@ import CryptoKit
 /// mtime at nanosecond precision) pin the content version, and `digest` (when present) is the
 /// watcher's content digest over the same descriptor. Consumers use `read(url:verifying:)` to
 /// refuse a file that was replaced between the watcher's validation and their own read.
-public struct FileIdentity: Equatable, Sendable {
+public struct FileIdentity: Equatable, Sendable, Codable {
     public let dev: Int64
     public let ino: UInt64
     public let size: Int
@@ -53,6 +53,20 @@ public struct FileIdentity: Equatable, Sendable {
     public static func capture(url: URL) -> FileIdentity? {
         var st = Darwin.stat()
         guard stat(url.path, &st) == 0 else { return nil }
+        return FileIdentity(stat: st)
+    }
+
+    /// CHEAP stat-only identity of the file version currently at `url` — opens the file and
+    /// fstat(2)s that descriptor (dev, ino, size, mtime-ns), digest LEFT nil. NO full-file hash:
+    /// this runs on the live frame-load hot path, so it must not read/hash the bytes. Returns nil
+    /// on any open/fstat failure. (The fstat-on-an-open-descriptor form, rather than stat-by-path,
+    /// mirrors the verified `read` path so the captured identity refers to a descriptor that was
+    /// actually opened.)
+    public static func statIdentity(url: URL) -> FileIdentity? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? fh.close() }
+        var st = Darwin.stat()
+        guard fstat(fh.fileDescriptor, &st) == 0 else { return nil }
         return FileIdentity(stat: st)
     }
 

@@ -33,13 +33,20 @@ public struct SubFrameRecord: Codable, Equatable {
     public let outcome: SubFrameOutcome
     public let rejectionReason: String?
     public var rejectedByUser: Bool
+    /// Stat-only identity (dev, ino, size, mtime-ns; digest nil) of the raw sub file as it was
+    /// captured, forwarded from the loaded `RawFrame`. Lets a post-session re-stack detect a sub
+    /// that was REPLACED on disk since capture and skip it. Optional so LEGACY manifests written
+    /// before this field decode it as nil (synthesized Codable treats an absent key as nil) — such
+    /// subs re-stack unverified, exactly as before. Not a `sub-frames.csv` column (internal).
+    public var identity: FileIdentity?
 
     public init(index: Int, timestamp: Date, sourceFile: String, starCount: Int,
                 backgroundSigma: Float, weight: Float, outcome: SubFrameOutcome,
-                rejectionReason: String?, rejectedByUser: Bool) {
+                rejectionReason: String?, rejectedByUser: Bool, identity: FileIdentity? = nil) {
         self.index = index; self.timestamp = timestamp; self.sourceFile = sourceFile
         self.starCount = starCount; self.backgroundSigma = backgroundSigma
         self.weight = weight; self.outcome = outcome
         self.rejectionReason = rejectionReason; self.rejectedByUser = rejectedByUser
+        self.identity = identity
     }
 }

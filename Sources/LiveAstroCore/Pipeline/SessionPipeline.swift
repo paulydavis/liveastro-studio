@@ -643,7 +643,7 @@ public final class SessionPipeline {
                 timestamp: frame.timestamp, sourceFile: frame.sourceName,
                 starCount: result.starCount, backgroundSigma: result.backgroundSigma,
                 weight: result.weight, outcome: subOutcome, rejectionReason: rejectionReason,
-                rejectedByUser: false)
+                rejectedByUser: false, identity: frame.identity)
             onSubFrame?(subRecord)
             // Persist every sub (accepted AND rejected) on this same callback-delivery
             // thread — the same serial context recordSnapshot runs on below, so this is

@@ -8,10 +8,11 @@ final class RestackPlanningTests: XCTestCase {
     // MARK: helpers
 
     private func record(index: Int, file: String, outcome: SubFrameOutcome,
-                        rejectedByUser: Bool) -> SubFrameRecord {
+                        rejectedByUser: Bool, identity: FileIdentity? = nil) -> SubFrameRecord {
         SubFrameRecord(index: index, timestamp: Date(timeIntervalSince1970: 0),
                        sourceFile: file, starCount: 100, backgroundSigma: 1, weight: 1,
-                       outcome: outcome, rejectionReason: nil, rejectedByUser: rejectedByUser)
+                       outcome: outcome, rejectionReason: nil, rejectedByUser: rejectedByUser,
+                       identity: identity)
     }
 
     private func image(width: Int, height: Int, channels: Int,
@@ -27,7 +28,7 @@ final class RestackPlanningTests: XCTestCase {
 
     // MARK: 1 — survivor selection
 
-    func testSurvivorURLsOrdersAscendingExcludesUserFlaggedKeepsIntakeRejected() {
+    func testSurvivorSubsOrdersAscendingExcludesUserFlaggedKeepsIntakeRejected() {
         let dir = URL(fileURLWithPath: "/tmp/session")
         // Shuffled input: mixed indices, some rejectedByUser, some intake-.rejected.
         let subs = [
@@ -37,19 +38,36 @@ final class RestackPlanningTests: XCTestCase {
             record(index: 2, file: "b.fit", outcome: .rejected,  rejectedByUser: false),  // intake-rejected → KEPT
             record(index: 1, file: "e.fit", outcome: .stacked,   rejectedByUser: true),   // user-flagged → dropped
         ]
-        let urls = RestackPlanning.survivorURLs(subFrames: subs, in: dir)
+        let survivors = RestackPlanning.survivorSubs(subFrames: subs, in: dir)
 
         // Ascending by index, user-flagged excluded, intake-.rejected included.
-        XCTAssertEqual(urls.map { $0.lastPathComponent }, ["a.fit", "b.fit", "c.fit"])
+        XCTAssertEqual(survivors.map { $0.url.lastPathComponent }, ["a.fit", "b.fit", "c.fit"])
         // Each URL is dir/sourceFile.
-        XCTAssertEqual(urls, ["a.fit", "b.fit", "c.fit"].map { dir.appendingPathComponent($0) })
+        XCTAssertEqual(survivors.map(\.url), ["a.fit", "b.fit", "c.fit"].map { dir.appendingPathComponent($0) })
+    }
+
+    /// survivorSubs must carry each record's captured `identity` onto the matching RestackSub,
+    /// so the re-stack can content-verify each sub on reload (and load legacy nil-identity
+    /// records unverified).
+    func testSurvivorSubsCarryRecordedIdentity() {
+        let dir = URL(fileURLWithPath: "/tmp/session")
+        let idA = FileIdentity(dev: 1, ino: 10, size: 1000, mtimeSec: 111, mtimeNsec: 222)
+        let idC = FileIdentity(dev: 1, ino: 12, size: 3000, mtimeSec: 333, mtimeNsec: 444, digest: "deadbeef")
+        let subs = [
+            record(index: 0, file: "a.fit", outcome: .reference, rejectedByUser: false, identity: idA),
+            record(index: 1, file: "b.fit", outcome: .stacked,   rejectedByUser: false, identity: nil),  // legacy
+            record(index: 2, file: "c.fit", outcome: .stacked,   rejectedByUser: false, identity: idC),
+        ]
+        let survivors = RestackPlanning.survivorSubs(subFrames: subs, in: dir)
+        XCTAssertEqual(survivors.map(\.expectedIdentity), [idA, nil, idC])
     }
 
     // MARK: 2 — metadata headers
 
     func testEncodeMasterStampsStackCountAndTotalExposure() throws {
         let master = image(width: 4, height: 4, channels: 1) { _, _, _ in 0.5 }
-        let report = RestackReport(master: master, stackedCount: 5, skippedMissing: 0, coverage: nil)
+        let report = RestackReport(master: master, stackedCount: 5, skippedMissing: 0,
+                                   skippedMismatch: 0, unverifiedLegacy: false, coverage: nil)
         let subExp = 30.0   // 5 × 30 = 150, a clean whole-number TOTALEXP
 
         let data = RestackPlanning.encodeMaster(report, neutralize: false,
@@ -67,7 +85,8 @@ final class RestackPlanningTests: XCTestCase {
         let master = image(width: w, height: h, channels: 1) { x, y, _ in Float(y * w + x) }
         var coverage = [Float](repeating: 0, count: w * h)
         for y in 1...8 { for x in 1...8 { coverage[y * w + x] = 10 } }
-        let report = RestackReport(master: master, stackedCount: 1, skippedMissing: 0, coverage: coverage)
+        let report = RestackReport(master: master, stackedCount: 1, skippedMissing: 0,
+                                   skippedMismatch: 0, unverifiedLegacy: false, coverage: coverage)
 
         let data = RestackPlanning.encodeMaster(report, neutralize: false,
                                                 metadata: nil, subExposureSeconds: 1)
@@ -85,7 +104,8 @@ final class RestackPlanningTests: XCTestCase {
         let master = image(width: 64, height: 64, channels: 3) { x, _, c in
             c == 0 ? 0.1 + Float(x) / 640.0 : 0.1
         }
-        let report = RestackReport(master: master, stackedCount: 1, skippedMissing: 0, coverage: nil)
+        let report = RestackReport(master: master, stackedCount: 1, skippedMissing: 0,
+                                   skippedMismatch: 0, unverifiedLegacy: false, coverage: nil)
 
         let plain      = RestackPlanning.encodeMaster(report, neutralize: false, metadata: nil, subExposureSeconds: 1)
         let neutralized = RestackPlanning.encodeMaster(report, neutralize: true,  metadata: nil, subExposureSeconds: 1)

@@ -47,6 +47,15 @@ final class RestackCoordinatorTests: XCTestCase {
 
     private func makeEngine() -> StackEngine { StackEngine() }
 
+    /// Build the survivor `RestackSub`s the coordinator now takes: drop `excluding` basenames
+    /// and map each remaining URL to a RestackSub with the given identity (nil = legacy/unverified,
+    /// the same load path these tests used before identity threading).
+    private func subs(_ urls: [URL], excluding: Set<String> = [],
+                      identity: (URL) -> FileIdentity? = { _ in nil }) -> [RestackSub] {
+        urls.filter { !excluding.contains($0.lastPathComponent) }
+            .map { RestackSub(url: $0, expectedIdentity: identity($0)) }
+    }
+
     /// Reference "fresh stack": load each URL through the SAME loader RestackCoordinator
     /// uses (FolderFrameSource.loadRawFrame) and process() each in order through a fresh
     /// engine — the exact sequence restack() performs. Any divergence here (loader,
@@ -63,7 +72,9 @@ final class RestackCoordinatorTests: XCTestCase {
     func testRestackEqualsFreshStackOfSurvivors() throws {
         let urls = try writeSubs(5)
         let excluded: Set<String> = [urls[2].lastPathComponent]
-        let report = try RestackCoordinator.restack(rawURLs: urls, excludingSourceFiles: excluded,
+        // Nil identities → unverified load, the SAME load path as before identity threading, so
+        // the golden byte-identity property must still hold exactly.
+        let report = try RestackCoordinator.restack(subs: subs(urls, excluding: excluded),
                                                     makeEngine: makeEngine)
 
         let survivors = urls.enumerated().filter { $0.offset != 2 }.map(\.element)
@@ -72,15 +83,17 @@ final class RestackCoordinatorTests: XCTestCase {
         XCTAssertEqual(report.master.pixels, reference.pixels)   // byte-identical, exact ==
         XCTAssertEqual(report.stackedCount, 4)
         XCTAssertEqual(report.skippedMissing, 0)
+        XCTAssertEqual(report.skippedMismatch, 0)
+        XCTAssertTrue(report.unverifiedLegacy)   // all nil-identity survivors → loaded unverified
     }
 
     func testFlagIsOrderIndependent() throws {
         let urls = try writeSubs(4)
         let a = try RestackCoordinator.restack(
-            rawURLs: urls, excludingSourceFiles: [urls[1].lastPathComponent, urls[3].lastPathComponent],
+            subs: subs(urls, excluding: [urls[1].lastPathComponent, urls[3].lastPathComponent]),
             makeEngine: makeEngine)
         let b = try RestackCoordinator.restack(
-            rawURLs: urls, excludingSourceFiles: [urls[3].lastPathComponent, urls[1].lastPathComponent],
+            subs: subs(urls, excluding: [urls[3].lastPathComponent, urls[1].lastPathComponent]),
             makeEngine: makeEngine)
         XCTAssertEqual(a.master.pixels, b.master.pixels)
     }
@@ -88,7 +101,7 @@ final class RestackCoordinatorTests: XCTestCase {
     func testAllExcludedThrowsNoSurviving() throws {
         let urls = try writeSubs(3)
         let all = Set(urls.map(\.lastPathComponent))
-        XCTAssertThrowsError(try RestackCoordinator.restack(rawURLs: urls, excludingSourceFiles: all,
+        XCTAssertThrowsError(try RestackCoordinator.restack(subs: subs(urls, excluding: all),
                                                              makeEngine: makeEngine)) {
             XCTAssertEqual($0 as? RestackError, .noSurvivingSubs)
         }
@@ -104,7 +117,7 @@ final class RestackCoordinatorTests: XCTestCase {
 
         var prepareCount = 0
         let report = try RestackCoordinator.restack(
-            rawURLs: urls, excludingSourceFiles: excluded, makeEngine: makeEngine,
+            subs: subs(urls, excluding: excluded), makeEngine: makeEngine,
             prepare: { frame in prepareCount += 1; return frame })
         XCTAssertEqual(prepareCount, 3, "prepare runs once per surviving loadable frame (4 written − 1 excluded)")
         XCTAssertEqual(report.stackedCount, 3)
@@ -112,9 +125,9 @@ final class RestackCoordinatorTests: XCTestCase {
         // A non-identity prepare must change the master vs. identity — i.e. the PREPARED
         // pixels are what the engine stacks, not the raw ones.
         let identity = try RestackCoordinator.restack(
-            rawURLs: urls, excludingSourceFiles: excluded, makeEngine: makeEngine)
+            subs: subs(urls, excluding: excluded), makeEngine: makeEngine)
         let scaled = try RestackCoordinator.restack(
-            rawURLs: urls, excludingSourceFiles: excluded, makeEngine: makeEngine,
+            subs: subs(urls, excluding: excluded), makeEngine: makeEngine,
             prepare: { frame in
                 let img = AstroImage(width: frame.image.width, height: frame.image.height,
                                      channels: frame.image.channels,
@@ -130,8 +143,44 @@ final class RestackCoordinatorTests: XCTestCase {
     func testMissingRawCountedAsSkipped() throws {
         var urls = try writeSubs(3)
         urls.append(URL(fileURLWithPath: "/nonexistent/ghost.fit"))
-        let report = try RestackCoordinator.restack(rawURLs: urls, excludingSourceFiles: [], makeEngine: makeEngine)
+        let report = try RestackCoordinator.restack(subs: subs(urls), makeEngine: makeEngine)
         XCTAssertEqual(report.skippedMissing, 1)
         XCTAssertEqual(report.stackedCount, 3)
+    }
+
+    // MARK: identity revalidation (review finding P2-identity)
+
+    /// A recorded sub whose on-disk file no longer matches its `expectedIdentity` (same basename,
+    /// different bytes — replaced since capture) is SKIPPED as a mismatch, counted in
+    /// `skippedMismatch`, and never enters the stack. The other (nil-identity) subs still stack.
+    func testChangedSubIsSkippedAsMismatch() throws {
+        let urls = try writeSubs(3)
+        // A deliberately-wrong recorded identity (wrong size/mtime) for the middle sub → the
+        // verified loader throws FileIdentityMismatchError → the coordinator skips it.
+        let wrong = FileIdentity(dev: 0, ino: 0, size: 999_999, mtimeSec: 1, mtimeNsec: 1)
+        let restackSubs = [
+            RestackSub(url: urls[0], expectedIdentity: nil),
+            RestackSub(url: urls[1], expectedIdentity: wrong),
+            RestackSub(url: urls[2], expectedIdentity: nil),
+        ]
+        let report = try RestackCoordinator.restack(subs: restackSubs, makeEngine: makeEngine)
+        XCTAssertEqual(report.skippedMismatch, 1)
+        XCTAssertEqual(report.skippedMissing, 0)
+        XCTAssertEqual(report.stackedCount, 2, "only the two matching/unverified subs stacked")
+        XCTAssertTrue(report.unverifiedLegacy, "the two nil-identity survivors loaded unverified")
+    }
+
+    /// A sub whose recorded identity MATCHES the file on disk loads through the VERIFIED path
+    /// (no mismatch), and `unverifiedLegacy` stays false when every survivor carries an identity.
+    func testMatchingIdentityLoadsVerified() throws {
+        let urls = try writeSubs(3)
+        let restackSubs = try urls.map {
+            RestackSub(url: $0, expectedIdentity: try XCTUnwrap(FileIdentity.statIdentity(url: $0)))
+        }
+        let report = try RestackCoordinator.restack(subs: restackSubs, makeEngine: makeEngine)
+        XCTAssertEqual(report.skippedMismatch, 0)
+        XCTAssertEqual(report.skippedMissing, 0)
+        XCTAssertEqual(report.stackedCount, 3)
+        XCTAssertFalse(report.unverifiedLegacy)
     }
 }
