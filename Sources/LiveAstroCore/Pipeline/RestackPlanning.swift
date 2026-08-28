@@ -43,11 +43,18 @@ public enum RestackPlanning {
     /// (it needs FileManager). Relocating it here does NOT change a pixel or a header.
     public static func encodeMaster(_ report: RestackReport, neutralize: Bool,
                                     metadata: SourceMetadata?, subExposureSeconds: Double) -> Data {
-        let cropped = CoverageCrop.cropToCoverage(report.master, coverage: report.coverage)   // crop BEFORE balance
-        let balanced = neutralize ? AutoStretch.neutralizeBackgroundAdditive(cropped) : cropped
+        let balanced = presentationMaster(report, neutralize: neutralize)
         let totalExp = Double(report.stackedCount) * subExposureSeconds
         return FITSWriter.float32(width: balanced.width, height: balanced.height,
             channels: balanced.channels, pixels: balanced.pixels,
             metadata: metadata, stackCount: report.stackedCount, totalExposureSeconds: totalExp)
+    }
+
+    /// The presentation master: report.master cropped to coverage and (optionally) background-neutralized —
+    /// the exact image that encodeMaster writes to master.fit. Used for both the FITS write and the UI preview
+    /// so they never disagree.
+    public static func presentationMaster(_ report: RestackReport, neutralize: Bool) -> AstroImage {
+        let cropped = CoverageCrop.cropToCoverage(report.master, coverage: report.coverage)   // crop BEFORE balance
+        return neutralize ? AutoStretch.neutralizeBackgroundAdditive(cropped) : cropped
     }
 }

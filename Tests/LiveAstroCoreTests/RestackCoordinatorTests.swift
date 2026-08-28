@@ -103,7 +103,20 @@ final class RestackCoordinatorTests: XCTestCase {
         let all = Set(urls.map(\.lastPathComponent))
         XCTAssertThrowsError(try RestackCoordinator.restack(subs: subs(urls, excluding: all),
                                                              makeEngine: makeEngine)) {
-            XCTAssertEqual($0 as? RestackError, .noSurvivingSubs)
+            // All-excluded means no subs were even attempted, so the skip accounting is 0/0.
+            XCTAssertEqual($0 as? RestackError, .noSurvivingSubs(skippedMissing: 0, skippedMismatch: 0))
+        }
+    }
+
+    /// `.noSurvivingSubs` carries the skip accounting so the caller can report WHY nothing
+    /// survived — here every recorded sub is missing on disk (review finding P2).
+    func testAllMissingThrowsNoSurvivingWithMissingCount() throws {
+        let urls = [
+            URL(fileURLWithPath: "/nonexistent/ghost1.fit"),
+            URL(fileURLWithPath: "/nonexistent/ghost2.fit"),
+        ]
+        XCTAssertThrowsError(try RestackCoordinator.restack(subs: subs(urls), makeEngine: makeEngine)) {
+            XCTAssertEqual($0 as? RestackError, .noSurvivingSubs(skippedMissing: 2, skippedMismatch: 0))
         }
     }
 
@@ -232,5 +245,35 @@ final class RestackCoordinatorTests: XCTestCase {
         XCTAssertEqual(report.skippedMissing, 0)
         XCTAssertEqual(report.stackedCount, 3, "nil-digest survivors load unverified, not skipped")
         XCTAssertTrue(report.unverifiedLegacy)
+    }
+
+    /// Review finding: `unverifiedLegacy` must reflect subs actually LOADED without content
+    /// verification, not merely RECORDED without a digest. A legacy (nil-digest) sub that is
+    /// MISSING on disk never loads, so it must NOT set the flag; a legacy sub that IS present
+    /// loads unverified and DOES set it.
+    func testLegacyFlagOnlySetAfterASuccessfulUnverifiedLoad() throws {
+        let urls = try writeSubs(1)
+        let restackSubs = [
+            RestackSub(url: urls[0], expectedIdentity: nil),
+            RestackSub(url: URL(fileURLWithPath: "/nonexistent/legacy-ghost.fit"), expectedIdentity: nil),
+        ]
+        let report = try RestackCoordinator.restack(subs: restackSubs, makeEngine: makeEngine)
+        XCTAssertEqual(report.skippedMissing, 1)
+        XCTAssertEqual(report.stackedCount, 1)
+        XCTAssertTrue(report.unverifiedLegacy, "the one legacy sub that DID load set the flag")
+    }
+
+    /// Companion to the above: when the ONLY legacy sub is missing (never loads), the flag stays
+    /// false — a missing/mismatched legacy record must not be reported as "loaded unverified".
+    func testMissingLegacySubDoesNotSetUnverifiedFlag() throws {
+        let urls = try writeSubs(1)
+        let restackSubs = [
+            RestackSub(url: urls[0], expectedIdentity: try recordedIdentity(urls[0])),   // verified, loads
+            RestackSub(url: URL(fileURLWithPath: "/nonexistent/legacy-ghost.fit"), expectedIdentity: nil),   // legacy, missing
+        ]
+        let report = try RestackCoordinator.restack(subs: restackSubs, makeEngine: makeEngine)
+        XCTAssertEqual(report.skippedMissing, 1)
+        XCTAssertEqual(report.stackedCount, 1)
+        XCTAssertFalse(report.unverifiedLegacy, "the missing legacy sub never loaded, so it must not set the flag")
     }
 }

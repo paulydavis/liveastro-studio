@@ -8,9 +8,10 @@ public struct RawFrame {
     public let timestamp: Date
     public let sourceName: String
     public let metadata: SourceMetadata?
-    /// Stat-only identity (dev, ino, size, mtime-ns; digest nil) of the on-disk file this frame
-    /// was loaded from, captured at load time. Threaded through so a post-session re-stack can
-    /// detect a recorded raw sub that was REPLACED on disk since capture and skip it rather than
+    /// Content-digest identity (SHA-256 over the bytes actually loaded; stat fields zeroed and
+    /// unused) of the on-disk file this frame was loaded from, captured at load time. Threaded
+    /// through so a post-session re-stack can verify each recorded sub by CONTENT — not
+    /// inode/mtime — and skip one whose bytes changed on disk since capture, rather than
     /// silently stacking different bytes. nil for frames not loaded from a file (in-memory/synthetic).
     public let identity: FileIdentity?
 
