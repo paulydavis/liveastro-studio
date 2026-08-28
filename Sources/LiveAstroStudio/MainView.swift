@@ -28,11 +28,17 @@ struct MainView: View {
                 }
             }.padding(8)
             Divider()
-            switch model.selectedTab {
-            case .live:  model.isDetached ? AnyView(detachedPlaceholder) : AnyView(BroadcastView(configuresWindow: false))
-            case .setup: AnyView(ControlView())
-            case .help:  AnyView(HelpView())
+            // Give the active tab the full remaining window height — otherwise a scrolling
+            // tab (Help) sizes to its content's ideal height and its overflow is clipped
+            // instead of scrolling.
+            Group {
+                switch model.selectedTab {
+                case .live:  model.isDetached ? AnyView(detachedPlaceholder) : AnyView(BroadcastView(configuresWindow: false))
+                case .setup: AnyView(ControlView())
+                case .help:  AnyView(HelpView())
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .onAppear {
             // Wires BroadcastDeps.openBroadcastWindow (AppModel can't touch
