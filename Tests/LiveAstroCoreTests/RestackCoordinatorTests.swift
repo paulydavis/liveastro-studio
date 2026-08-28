@@ -120,6 +120,31 @@ final class RestackCoordinatorTests: XCTestCase {
         }
     }
 
+    /// `.belowSeedMinimum` with MIXED skips: one sub LOADS but can't seed (starless → too few
+    /// stars), while another is missing and another is digest-mismatched. The error must carry
+    /// the skip accounting (review P3 test-pin) so the UI reports the WHOLE truth — not just
+    /// "too few stars" while silently hiding that other recorded subs changed/vanished on disk.
+    func testBelowSeedMinimumCarriesSkipCounts() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // A flat, starless frame: loads fine but has 0 detectable stars, so the engine never seeds.
+        let starless = dir.appendingPathComponent("starless.fit")
+        try FITSWriter.float32(width: 256, height: 256, channels: 1,
+                               pixels: [Float](repeating: 0.05, count: 256 * 256)).write(to: starless)
+        let real = try writeSub(dir, name: "real.fit", dx: 0, dy: 0)   // real file paired with a WRONG digest
+        let subsIn = [
+            RestackSub(url: starless, expectedIdentity: nil),                                   // loads → surviving 1, never seeds
+            RestackSub(url: dir.appendingPathComponent("ghost.fit"), expectedIdentity: nil),     // missing → skippedMissing
+            RestackSub(url: real, expectedIdentity: FileIdentity(dev: 0, ino: 0, size: 0,        // wrong digest → skippedMismatch
+                                                                 mtimeSec: 0, mtimeNsec: 0, digest: "0000")),
+        ]
+        XCTAssertThrowsError(try RestackCoordinator.restack(subs: subsIn, makeEngine: makeEngine)) {
+            XCTAssertEqual($0 as? RestackError,
+                           .belowSeedMinimum(surviving: 1, needed: StackEngine().minimumSeedStars,
+                                             skippedMissing: 1, skippedMismatch: 1))
+        }
+    }
+
     /// The `prepare` closure (production: the session's calibrator, Fix 1) must run on EVERY
     /// surviving loaded frame BEFORE it reaches the engine, and the prepared frame — not the
     /// raw one — is what gets stacked. Proves the AppModel wiring's contract: a calibrator
