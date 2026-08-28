@@ -1047,8 +1047,8 @@ final class AppModel {
                     switch e {
                     case let .noSurvivingSubs(missing, mismatch):
                         self.log.append("Re-stack: no usable subs — \(mismatch) changed on disk, \(missing) missing. Master unchanged.")
-                    case let .belowSeedMinimum(surviving, needed):
-                        self.log.append("Re-stack: \(surviving) sub(s) loaded but too few stars to seed (need \(needed)). Master unchanged.")
+                    case let .belowSeedMinimum(surviving, needed, missing, mismatch):
+                        self.log.append("Re-stack: \(surviving) sub(s) loaded but too few stars to seed (need \(needed)); \(mismatch) changed on disk, \(missing) missing. Master unchanged.")
                     }
                     self.isRestacking = false
                 }

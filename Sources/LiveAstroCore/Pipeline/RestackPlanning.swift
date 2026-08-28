@@ -7,9 +7,10 @@ import Foundation
 /// pinned by unit tests; `AppModel` keeps only the main-actor driving + FileManager I/O.
 /// One survivor the re-stack must reload: its on-disk URL plus the file identity recorded at
 /// capture (nil for legacy subs predating identity capture). The re-stack loads via
-/// `FolderFrameSource.loadRawFrame(url:expectedIdentity:)` so a recorded sub that was REPLACED
-/// on disk since capture (same basename, different bytes) is detected and skipped rather than
-/// silently stacked. `expectedIdentity == nil` → loaded unverified (legacy back-compat).
+/// `FolderFrameSource.loadRawFrame(url:expectedDigest:)` — CONTENT-DIGEST validation that
+/// IGNORES inode/mtime, so a Google-Drive-mirror / SMB re-sync that recreates a byte-identical
+/// file is kept, while a genuine content change (different SHA-256) is skipped.
+/// `expectedIdentity?.digest == nil` (legacy, predates content-digest capture) loads unverified.
 public struct RestackSub: Equatable {
     public let url: URL
     public let expectedIdentity: FileIdentity?
