@@ -12,8 +12,10 @@ public enum RestackError: Error, Equatable {
     /// Frames survived and loaded, but none had enough detected stars to seed the
     /// engine's reference frame (`engine.currentStack() == nil` after processing all of
     /// them). `surviving` is the count of frames actually handed to the engine;
-    /// `needed` is `StackEngine.minimumSeedStars`.
-    case belowSeedMinimum(surviving: Int, needed: Int)
+    /// `needed` is `StackEngine.minimumSeedStars`. Also carries the same skip accounting
+    /// as `noSurvivingSubs` (changed on disk vs. missing) so the caller can report WHY
+    /// so few subs survived to seed the engine, not just that they weren't enough.
+    case belowSeedMinimum(surviving: Int, needed: Int, skippedMissing: Int, skippedMismatch: Int)
 }
 
 /// Result of a successful restack: the rebuilt master plus accounting so the caller
@@ -108,7 +110,8 @@ public enum RestackCoordinator {
         }
 
         guard let master = engine.currentStack() else {
-            throw RestackError.belowSeedMinimum(surviving: loadedCount, needed: engine.minimumSeedStars)
+            throw RestackError.belowSeedMinimum(surviving: loadedCount, needed: engine.minimumSeedStars,
+                                                skippedMissing: skippedMissing, skippedMismatch: skippedMismatch)
         }
         return RestackReport(master: master, stackedCount: engine.stackFrameCount,
                              skippedMissing: skippedMissing, skippedMismatch: skippedMismatch,

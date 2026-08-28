@@ -77,6 +77,25 @@ final class RestackPlanningTests: XCTestCase {
         XCTAssertEqual(header.keywords["TOTALEXP"], "150")
     }
 
+    /// Session metadata (object/RA/Dec/focal length) must survive into the encoded FITS —
+    /// otherwise a re-stack would silently drop it from master.fit even though the live
+    /// pipeline's master write always stamps it (Fix P1b).
+    func testEncodeMasterPreservesSessionMetadata() throws {
+        let master = image(width: 4, height: 4, channels: 1) { _, _, _ in 0.5 }
+        let report = RestackReport(master: master, stackedCount: 3, skippedMissing: 0,
+                                   skippedMismatch: 0, unverifiedLegacy: false, coverage: nil)
+        var meta = SourceMetadata()
+        meta.object = "M63"; meta.ra = 196.36; meta.dec = 42.03; meta.focalLengthMM = 672
+
+        let data = RestackPlanning.encodeMaster(report, neutralize: false,
+                                                metadata: meta, subExposureSeconds: 20)
+        let header = try FITSReader.readHeader(data)
+        XCTAssertEqual(header.keywords["OBJECT"], "M63")
+        XCTAssertEqual(header.keywords["FOCALLEN"], "672")
+        XCTAssertNotNil(header.keywords["RA"])
+        XCTAssertNotNil(header.keywords["DEC"])
+    }
+
     // MARK: 3 — crop-to-coverage applied
 
     func testEncodeMasterCropsToCoverage() throws {
