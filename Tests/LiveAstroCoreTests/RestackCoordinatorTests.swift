@@ -148,39 +148,89 @@ final class RestackCoordinatorTests: XCTestCase {
         XCTAssertEqual(report.stackedCount, 3)
     }
 
-    // MARK: identity revalidation (review finding P2-identity)
+    // MARK: identity revalidation (review finding P2-identity — now CONTENT-DIGEST, not stat)
 
-    /// A recorded sub whose on-disk file no longer matches its `expectedIdentity` (same basename,
-    /// different bytes — replaced since capture) is SKIPPED as a mismatch, counted in
-    /// `skippedMismatch`, and never enters the stack. The other (nil-identity) subs still stack.
+    /// The digest identity a re-stack would have recorded for `url` at capture: the SHA-256 over
+    /// the decoded bytes (stat fields zero). Load the frame and take its recorded identity.
+    private func recordedIdentity(_ url: URL) throws -> FileIdentity {
+        try XCTUnwrap(FolderFrameSource.loadRawFrame(url: url).identity)
+    }
+
+    /// A recorded sub whose on-disk BYTES no longer match its recorded content digest (same
+    /// basename, different bytes — overwritten since capture) is SKIPPED as a mismatch, counted in
+    /// `skippedMismatch`, and never enters the stack. The other (nil-digest) subs still stack.
     func testChangedSubIsSkippedAsMismatch() throws {
         let urls = try writeSubs(3)
-        // A deliberately-wrong recorded identity (wrong size/mtime) for the middle sub → the
-        // verified loader throws FileIdentityMismatchError → the coordinator skips it.
-        let wrong = FileIdentity(dev: 0, ino: 0, size: 999_999, mtimeSec: 1, mtimeNsec: 1)
+        // Record the middle sub's real content digest, THEN overwrite the file with different
+        // bytes → the digest-only loader throws FileIdentityMismatchError → the coordinator skips.
+        let recorded = try recordedIdentity(urls[1])
+        _ = try writeSub(urls[1].deletingLastPathComponent(),
+                         name: urls[1].lastPathComponent, dx: 3, dy: -3)   // overwrite, new content (in bounds)
         let restackSubs = [
             RestackSub(url: urls[0], expectedIdentity: nil),
-            RestackSub(url: urls[1], expectedIdentity: wrong),
+            RestackSub(url: urls[1], expectedIdentity: recorded),
             RestackSub(url: urls[2], expectedIdentity: nil),
         ]
         let report = try RestackCoordinator.restack(subs: restackSubs, makeEngine: makeEngine)
         XCTAssertEqual(report.skippedMismatch, 1)
         XCTAssertEqual(report.skippedMissing, 0)
         XCTAssertEqual(report.stackedCount, 2, "only the two matching/unverified subs stacked")
-        XCTAssertTrue(report.unverifiedLegacy, "the two nil-identity survivors loaded unverified")
+        XCTAssertTrue(report.unverifiedLegacy, "the two nil-digest survivors loaded unverified")
     }
 
-    /// A sub whose recorded identity MATCHES the file on disk loads through the VERIFIED path
-    /// (no mismatch), and `unverifiedLegacy` stays false when every survivor carries an identity.
-    func testMatchingIdentityLoadsVerified() throws {
+    /// KEY REGRESSION (the whole point of the stat→digest fix): a sub whose file was replaced by
+    /// a BYTE-IDENTICAL copy with a DIFFERENT inode/mtime (exactly what Google Drive mirror mode
+    /// and the SMB relay do on a re-sync) must STILL load — the digest matches, stat is ignored.
+    /// A stat-based check would wrongly skip it. Assert it stacks and `skippedMismatch == 0`.
+    func testSameBytesNewInodeIsNotSkipped() throws {
         let urls = try writeSubs(3)
-        let restackSubs = try urls.map {
-            RestackSub(url: $0, expectedIdentity: try XCTUnwrap(FileIdentity.statIdentity(url: $0)))
-        }
+        let recorded = try urls.map { try recordedIdentity($0) }   // digests over the original bytes
+        let statBefore = try XCTUnwrap(FileIdentity.capture(url: urls[1]))
+        // Reproduce a mirror re-sync of the middle sub: read the exact bytes, delete the file
+        // (frees the inode), then rewrite the SAME bytes → new inode/mtime, identical content.
+        let bytes = try Data(contentsOf: urls[1])
+        try FileManager.default.removeItem(at: urls[1])
+        try bytes.write(to: urls[1])
+        let statAfter = try XCTUnwrap(FileIdentity.capture(url: urls[1]))
+        XCTAssertNotEqual(statBefore.ino, statAfter.ino, "delete+rewrite must produce a NEW inode")
+
+        // The recorded digest is over the pre-replace bytes; the bytes are identical so the digest
+        // still matches even though inode/mtime changed — a stat check would have wrongly skipped.
+        let restackSubs = zip(urls, recorded).map { RestackSub(url: $0, expectedIdentity: $1) }
+        let report = try RestackCoordinator.restack(subs: restackSubs, makeEngine: makeEngine)
+        XCTAssertEqual(report.skippedMismatch, 0, "byte-identical re-sync (new inode/mtime) must NOT skip")
+        XCTAssertEqual(report.skippedMissing, 0)
+        XCTAssertEqual(report.stackedCount, 3, "all three subs — including the re-synced one — stacked")
+        XCTAssertFalse(report.unverifiedLegacy, "every survivor carried a content digest")
+    }
+
+    /// A sub whose recorded content digest MATCHES the file on disk loads through the VERIFIED
+    /// (digest) path, and `unverifiedLegacy` stays false when every survivor carries a digest.
+    func testMatchingDigestLoadsVerified() throws {
+        let urls = try writeSubs(3)
+        let restackSubs = try urls.map { RestackSub(url: $0, expectedIdentity: try recordedIdentity($0)) }
         let report = try RestackCoordinator.restack(subs: restackSubs, makeEngine: makeEngine)
         XCTAssertEqual(report.skippedMismatch, 0)
         XCTAssertEqual(report.skippedMissing, 0)
         XCTAssertEqual(report.stackedCount, 3)
         XCTAssertFalse(report.unverifiedLegacy)
+    }
+
+    /// A survivor carrying NO digest (legacy record, or a stat-only identity with digest nil) is
+    /// loaded UNVERIFIED and `unverifiedLegacy` is set — not skipped.
+    func testNilDigestLoadsUnverified() throws {
+        let urls = try writeSubs(3)
+        // One nil identity, one stat-shaped identity whose digest is nil — both are "unverified".
+        let statOnly = FileIdentity(dev: 1, ino: 2, size: 3, mtimeSec: 4, mtimeNsec: 5)  // digest nil
+        let restackSubs = [
+            RestackSub(url: urls[0], expectedIdentity: nil),
+            RestackSub(url: urls[1], expectedIdentity: statOnly),
+            RestackSub(url: urls[2], expectedIdentity: try recordedIdentity(urls[2])),
+        ]
+        let report = try RestackCoordinator.restack(subs: restackSubs, makeEngine: makeEngine)
+        XCTAssertEqual(report.skippedMismatch, 0)
+        XCTAssertEqual(report.skippedMissing, 0)
+        XCTAssertEqual(report.stackedCount, 3, "nil-digest survivors load unverified, not skipped")
+        XCTAssertTrue(report.unverifiedLegacy)
     }
 }

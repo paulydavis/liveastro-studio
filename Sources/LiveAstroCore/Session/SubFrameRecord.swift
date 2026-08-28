@@ -33,11 +33,14 @@ public struct SubFrameRecord: Codable, Equatable {
     public let outcome: SubFrameOutcome
     public let rejectionReason: String?
     public var rejectedByUser: Bool
-    /// Stat-only identity (dev, ino, size, mtime-ns; digest nil) of the raw sub file as it was
-    /// captured, forwarded from the loaded `RawFrame`. Lets a post-session re-stack detect a sub
-    /// that was REPLACED on disk since capture and skip it. Optional so LEGACY manifests written
-    /// before this field decode it as nil (synthesized Codable treats an absent key as nil) — such
-    /// subs re-stack unverified, exactly as before. Not a `sub-frames.csv` column (internal).
+    /// CONTENT-DIGEST identity of the raw sub file as it was captured, forwarded from the loaded
+    /// `RawFrame` (its `digest` is a SHA-256 over the exact decoded bytes; the stat fields are
+    /// zero). Lets a post-session re-stack detect a sub whose BYTES were REPLACED on disk since
+    /// capture and skip it — validation is digest-only, so inode/mtime churn (Google Drive mirror
+    /// / SMB re-sync of byte-identical data) does NOT trigger a false skip. Optional so LEGACY
+    /// manifests written before this field decode it as nil (synthesized Codable treats an absent
+    /// key as nil) — such subs re-stack unverified, exactly as before. A record whose `digest` is
+    /// nil (legacy stat-only) also re-stacks unverified. Not a `sub-frames.csv` column (internal).
     public var identity: FileIdentity?
 
     public init(index: Int, timestamp: Date, sourceFile: String, starCount: Int,

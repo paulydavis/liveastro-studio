@@ -78,12 +78,16 @@ public enum RestackCoordinator {
         var skippedMismatch = 0
         var sawLegacyUnverified = false
         for sub in subs {
-            // A nil expectedIdentity is a legacy record (predates identity capture): the loader
-            // reads by path, unverified — same load path as before this feature (golden-preserving).
-            sawLegacyUnverified = sawLegacyUnverified || (sub.expectedIdentity == nil)
+            // A nil recorded digest is a legacy/unverifiable record (predates content-digest
+            // capture, or an old stat-only record): the loader reads by path, unverified — the
+            // same load path as before this feature (golden-preserving).
+            sawLegacyUnverified = sawLegacyUnverified || (sub.expectedIdentity?.digest == nil)
             let frame: RawFrame
             do {
-                frame = try FolderFrameSource.loadRawFrame(url: sub.url, expectedIdentity: sub.expectedIdentity)
+                // DIGEST-ONLY validation: ignore inode/mtime. On Google Drive mirror / SMB, a
+                // re-sync recreates a byte-identical file with a new inode/mtime — a stat check
+                // would wrongly skip a good sub. Only a CONTENT change (different digest) skips.
+                frame = try FolderFrameSource.loadRawFrame(url: sub.url, expectedDigest: sub.expectedIdentity?.digest)
             } catch is FileIdentityMismatchError {
                 // The recorded sub changed on disk since capture (same basename, different bytes) —
                 // skip it rather than silently stacking different data.

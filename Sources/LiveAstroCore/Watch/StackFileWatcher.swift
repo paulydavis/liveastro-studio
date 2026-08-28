@@ -56,20 +56,6 @@ public struct FileIdentity: Equatable, Sendable, Codable {
         return FileIdentity(stat: st)
     }
 
-    /// CHEAP stat-only identity of the file version currently at `url` — opens the file and
-    /// fstat(2)s that descriptor (dev, ino, size, mtime-ns), digest LEFT nil. NO full-file hash:
-    /// this runs on the live frame-load hot path, so it must not read/hash the bytes. Returns nil
-    /// on any open/fstat failure. (The fstat-on-an-open-descriptor form, rather than stat-by-path,
-    /// mirrors the verified `read` path so the captured identity refers to a descriptor that was
-    /// actually opened.)
-    public static func statIdentity(url: URL) -> FileIdentity? {
-        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? fh.close() }
-        var st = Darwin.stat()
-        guard fstat(fh.fileDescriptor, &st) == 0 else { return nil }
-        return FileIdentity(stat: st)
-    }
-
     /// Read `url`'s ENTIRE contents from ONE opened descriptor, verifying THAT descriptor's own
     /// fstat (dev, ino, size, mtime ns) against `expected` BEFORE reading and AGAIN AFTER
     /// readToEnd() (review6 finding 1: an in-place writer active DURING the read can yield torn

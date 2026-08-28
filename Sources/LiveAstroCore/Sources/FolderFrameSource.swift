@@ -511,6 +511,31 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
     /// (`FileIdentityMismatchError` on mismatch). nil identity = plain path read, unchanged.
     public static func loadRawFrame(url: URL, expectedIdentity: FileIdentity? = nil) throws -> RawFrame {
         let data = try FileIdentity.read(url: url, verifying: expectedIdentity)
+        return try decodeRawFrame(data: data, url: url)
+    }
+
+    /// DIGEST-ONLY load for the post-session re-stack path: read the file by path and, when a
+    /// digest was recorded at capture, refuse it ONLY if the content SHA-256 differs — inode and
+    /// mtime are intentionally IGNORED. On this app's real filesystems (Google Drive mirror mode,
+    /// SMB relay) a re-sync recreates a byte-identical file with a NEW inode/mtime; a stat check
+    /// would wrongly SKIP the good sub (a regression), and a same-mtime byte change would pass
+    /// silently. Digest-only fixes both. A nil `expectedDigest` (legacy record) loads unverified.
+    /// Throws `FileIdentityMismatchError` on a digest mismatch.
+    public static func loadRawFrame(url: URL, expectedDigest: String?) throws -> RawFrame {
+        let data = try Data(contentsOf: url)
+        if let want = expectedDigest, FileIdentity.contentDigest(data: data) != want {
+            throw FileIdentityMismatchError(fileName: url.lastPathComponent)
+        }
+        return try decodeRawFrame(data: data, url: url)
+    }
+
+    /// Shared FITS → RawFrame decode over bytes a caller already loaded (and, for the verified/
+    /// digest paths, already validated). Records a CONTENT-DIGEST identity over EXACTLY these
+    /// bytes: `FileIdentity(dev:0, ino:0, size:data.count, mtime:0, digest:sha256)`. The stat
+    /// fields are intentionally zero — re-stack validates DIGEST-ONLY, so zeros keep the record
+    /// honest that stat is not the trust field. Computing the digest here (not by re-opening the
+    /// file) means the recorded digest is exactly the bytes that get decoded/stacked — no TOCTOU.
+    private static func decodeRawFrame(data: Data, url: URL) throws -> RawFrame {
         let header = try FITSReader.readHeader(data)
         let bayerPattern = BayerPattern(headerValue: header.bayerPattern)
         let bottomUp = header.bottomUp
@@ -533,9 +558,9 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
             timestamp = modDate(url: url)
         }
 
-        // Cheap stat-only identity of the exact file version we just decoded, so a re-stack can
-        // later detect this sub being replaced on disk. No hash — this is the frame-load hot path.
-        let identity = FileIdentity.statIdentity(url: url)
+        let digest = FileIdentity.contentDigest(data: data)
+        let identity = FileIdentity(dev: 0, ino: 0, size: data.count,
+                                    mtimeSec: 0, mtimeNsec: 0, digest: digest)
         return RawFrame(image: image, bayerPattern: bayerPattern, bottomUp: bottomUp,
                         timestamp: timestamp, sourceName: url.lastPathComponent,
                         metadata: metadata, identity: identity)
