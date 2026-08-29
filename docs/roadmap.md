@@ -211,9 +211,40 @@ that the online engine cannot:
   online engine and be removed by the global/median combine; golden byte tests
   pin the combine math; the live path is asserted unchanged.
 
-**Non-goal.** Do not push this into the live engine — live stays online/O(1) for
-timely broadcast. This is the offline-quality escape hatch, alongside the
-per-sub reject → re-stack flow (which remains the manual counterpart).
+**Live variant — cadence-driven global refresh (import-first, then live).** The
+blocker for a global combine is memory + the single-pass online nature, NOT
+compute time. Live subs arrive every ~3–5 min (180 s exposures), which is huge
+idle headroom. So the same two-pass global combine can run *live* by
+**recomputing the full global median / κ-σ-clip from the on-disk subs each time
+a new sub lands** (or every K subs), streaming from disk — memory stays O(one
+image), and a full re-read + combine of a few dozen 300 MB subs off SSD is tens
+of seconds, trivial inside a 3-minute window. The broadcast master just
+*refreshes* every few minutes with a fully trail-free combine instead of the
+online winsorized mean. Two properties make this attractive:
+
+- **Cheapest exactly when it helps most.** Global rejection's advantage is in
+  *shallow* stacks (few subs, hard outliers). Early in a session there are only
+  5–15 subs to re-read (fast); by the time re-reading gets expensive (40+ subs)
+  the plain online mean is already statistically good. Natural design:
+  **global-combine for the first N subs, hand off to the online mean once
+  deep** (or throttle the refresh interval up as depth grows).
+- **Requires subs on fast LOCAL disk, not slow SMB** — re-reading 10+ GB over a
+  network share every 3 min would be brutal. The relay already localizes subs
+  (`~/LiveAstro/relay`), so the plumbing exists. Gate the live variant on a
+  local source; keep online-only for network/SMB live.
+
+This does not run the online engine differently — it's a *separate periodic
+refresh path* that produces the master alongside (or in place of) the online
+accumulator's output, driven by sub-arrival cadence. Cost: two moving parts (an
+online path for instant per-sub feedback + a periodic global-refresh path) and
+disk I/O that grows with depth — hence the cap / hand-off above.
+
+**Non-goal.** Do not make the *online accumulator* itself do global rejection —
+it stays online/O(1) for timely, network-tolerant broadcast. The global combine
+is always a distinct full-set pass (at end-of-session for import, or on a
+cadence timer for the live variant), never a change to the per-frame online
+kernel. It sits alongside the per-sub reject → re-stack flow (the manual
+counterpart).
 
 ### 8. Visual Identity
 
