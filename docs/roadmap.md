@@ -156,6 +156,65 @@ deep-registration path. Live stacking should stay optimized for timely,
 consistent-frame broadcast work rather than trying to solve arbitrary
 multi-rig archival registration in real time.
 
+#### 7a. Import-only robust-combine (global rejection) mode
+
+**Problem.** Live and import currently share the *same* rejection: a single
+`WinsorizedSigmaClip` instance (`StackEngine.rejection`, built once in
+`AppModel`) applied by both `processDetailed` (live) and `commit`/
+`applyAccumulating` (import). It is an *online* winsorized κ-σ estimator —
+O(1) memory in frame count, with an 8-frame per-pixel warm-up, and it *clamps*
+outliers to ±κσ rather than dropping them. That design is correct for live
+26 MP broadcast (bounded memory, no buffering), but it is structurally weak at
+removing single-frame outliers in shallow stacks:
+
+- nothing is rejected until a pixel has ≥ 8 samples (warm-up), so an outlier in
+  the first 8 subs enters the accumulated mean un-clipped;
+- a bright outlier that lands during warm-up inflates both the running mean and
+  σ at those pixels, widening the ±κσ window so later crossings also escape;
+- winsorizing clamps, it cannot retroactively remove a warm-up contribution.
+
+Observed live on real data (2026-08-29): an 11-sub M 51 stack kept a visible
+satellite trail; the same trail would be statistically clipped in a deep (30–50
+sub) stack, but not in a shallow one. Import inherits this exactly — it is **not**
+a stronger combine, just the same online engine fed in parallel. Verified: there
+is no global/median/all-frames rejection anywhere in `Stacking/`.
+
+**Opportunity.** The import / "Stack Previous Shoot" path is *not* latency- or
+memory-constrained the way live is, so it can afford a true full-stack combine
+that the online engine cannot:
+
+- **Global κ-σ clipped mean** — per pixel, gather all N samples, iteratively
+  reject values beyond κσ of the (robust) center, average the survivors. Best
+  SNR; removes trails/cosmic rays cleanly regardless of stack depth.
+- **Median combine** — the non-rejection, non-averaging option: the middle
+  sample per pixel is inherently immune to single-frame outliers (the trail is
+  never *selected*, not clamped, no threshold). ~25 % noisier than a good
+  clipped mean, so best offered as an explicit "maximum trail/artifact removal"
+  choice rather than the default.
+
+**Design sketch.**
+
+- Add a `RejectionMethod` variant (or a distinct combine stage) that operates on
+  the full per-pixel sample set. Keep the live online `WinsorizedSigmaClip`
+  untouched — this is import-only, selected by the pipeline, not a global swap.
+- Memory: prefer a **two-pass** re-read over buffering all frames — the
+  `RestackCoordinator` already streams recorded subs by identity, and every sub
+  carries a content-digest (`SubFrameRecord.identity`), so pass 1 accumulates
+  per-pixel running stats (or a t-digest / sorted reservoir for median) and pass
+  2 combines. This preserves the "no [RawFrame] buffer" property the streaming
+  re-stack already guarantees. Must run **after** registration + warp (same
+  point the online rejection runs), on the warped, gradient-leveled frames.
+- UI: a Capture/Import setting — e.g. Rejection: *Online (live)* /
+  *Global κ-σ (import)* / *Median (import)* — defaulting to online; the global
+  options only enabled for finite (import/re-stack) sessions.
+- Tests: a synthetic trail across one sub of a small stack must survive the
+  online engine and be removed by the global/median combine; golden byte tests
+  pin the combine math; the live path is asserted unchanged.
+
+**Non-goal.** Do not push this into the live engine — live stays online/O(1) for
+timely broadcast. This is the offline-quality escape hatch, alongside the
+per-sub reject → re-stack flow (which remains the manual counterpart).
+
 ### 8. Visual Identity
 
 After the workflow is clearer:
