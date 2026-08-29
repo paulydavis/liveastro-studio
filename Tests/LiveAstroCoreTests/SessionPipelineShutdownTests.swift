@@ -20,6 +20,57 @@ final class SessionPipelineShutdownTests: XCTestCase {
         func stop() {}
     }
 
+    /// A live (isFinite == false) source that yields a BACKLOG of frames up front (all
+    /// buffered before end()), stays open like a real live source, and finishes its stream
+    /// on stop(). Models the 2026-08-28 ASI2600 real-data case: subs arrive faster than the
+    /// consumer can register+stack 50 MB frames, so at end() a queue is still draining. The
+    /// consumer is HEALTHY (each frame finalizes), just slow — the drain must wait it out,
+    /// not cancel and discard the whole master.
+    final class BacklogLiveSource: FrameSource {
+        let frames: AsyncStream<RawFrame>
+        private let cont: AsyncStream<RawFrame>.Continuation
+        var isFinite: Bool { false }
+        var totalCount: Int? { nil }
+        init(seed: RawFrame, count: Int) {
+            var c: AsyncStream<RawFrame>.Continuation!
+            frames = AsyncStream(bufferingPolicy: .unbounded) { c = $0 }
+            cont = c
+            for i in 0..<count {
+                cont.yield(RawFrame(image: seed.image, bayerPattern: nil, bottomUp: false,
+                                    timestamp: Date(timeIntervalSince1970: TimeInterval(i)),
+                                    sourceName: "sub\(i).fit"))
+            }
+            // Stream stays open (live source) until stop().
+        }
+        func start() throws {}
+        func stop() { cont.finish() }
+    }
+
+    /// Like BacklogLiveSource but its stop() BLOCKS before finishing the stream — models a slow
+    /// SMB/Drive watcher stop. The cold review (2026-08-28) PROVED that seeding the drain's first
+    /// window from a deadline captured BEFORE this blocking stop shrank the first window to ~0 and
+    /// discarded a healthy backlog. The fix must survive a slow stop.
+    final class SlowStopBacklogLiveSource: FrameSource {
+        let frames: AsyncStream<RawFrame>
+        private let cont: AsyncStream<RawFrame>.Continuation
+        private let stopDelay: TimeInterval
+        var isFinite: Bool { false }
+        var totalCount: Int? { nil }
+        init(seed: RawFrame, count: Int, stopDelay: TimeInterval) {
+            self.stopDelay = stopDelay
+            var c: AsyncStream<RawFrame>.Continuation!
+            frames = AsyncStream(bufferingPolicy: .unbounded) { c = $0 }
+            cont = c
+            for i in 0..<count {
+                cont.yield(RawFrame(image: seed.image, bayerPattern: nil, bottomUp: false,
+                                    timestamp: Date(timeIntervalSince1970: TimeInterval(i)),
+                                    sourceName: "sub\(i).fit"))
+            }
+        }
+        func start() throws {}
+        func stop() { Thread.sleep(forTimeInterval: stopDelay); cont.finish() }
+    }
+
     final class WedgingFiniteSource: FrameSource {
         let frames: AsyncStream<RawFrame>
         var isFinite: Bool { true }
@@ -201,8 +252,10 @@ final class SessionPipelineShutdownTests: XCTestCase {
         // consume task cannot return even after cancellation → drain must give up and throw.
         let wedged = DispatchSemaphore(value: 0)
         pipeline.onUpdate = { _, _ in wedged.wait() }   // never signalled
-        // Shrink the drain deadlines so the test runs fast.
+        // Shrink the drain deadlines so the test runs fast. The live drain's wedge window is
+        // liveDrainStallTimeout (not drainPrimaryTimeout), so shrink that too.
         pipeline.drainPrimaryTimeout = .milliseconds(200)
+        pipeline.liveDrainStallTimeout = .milliseconds(200)
         pipeline.drainGraceTimeout = .milliseconds(200)
         try pipeline.start()
         // Give the consumer a moment to enter the wedged callback before ending.
@@ -213,6 +266,91 @@ final class SessionPipelineShutdownTests: XCTestCase {
                            "end() must throw shutdownTimeout rather than finalizing a racing stack")
         }
         wedged.signal()   // release the wedged task so the process can exit cleanly
+    }
+
+    /// Regression (2026-08-28 ASI2600 real-data run): a LIVE session ended while the consumer
+    /// is still draining a backlog of accepted frames — the frames arrived faster than the
+    /// 50 MB register+stack could keep up — must DRAIN and write the master, not cancel the
+    /// still-progressing consumer and discard the whole stack. Pre-fix the live drain waited a
+    /// single flat `drainPrimaryTimeout` window and then cancelled, so a backlog that took
+    /// longer than one window threw `.shutdownTimeout` and produced no master.fit (observed on
+    /// three separate real sessions). Six frames × a 100 ms per-frame consumer cost = ~600 ms of
+    /// draining, far past the 200 ms primary window; each frame finalizes within a window, so a
+    /// PROGRESS-AWARE drain keeps waiting and all six stack.
+    func testLiveDrainWaitsOutHealthyBacklogInsteadOfDiscardingMaster() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "Backlog", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let pipeline = SessionPipeline(nativeSource: BacklogLiveSource(seed: seedFrame(), count: 6),
+                                       engine: engine, profile: profile, rootDirectory: sessions)
+        // Each accepted frame costs ~200 ms of consumer time (a Thread.sleep on top of the real
+        // register + stack + snapshot-encode); the whole 6-frame backlog takes ~1.2 s+. Two things
+        // are proven at once:
+        //   • drainPrimaryTimeout is TINY (100 ms) — the wedge window must NOT be keyed on it, or
+        //     the drain would cancel almost immediately (this pins the cold-review CRITICAL: a
+        //     single 26 MP frame outlives the 10 s stop budget).
+        //   • liveDrainStallTimeout (500 ms) is larger than one frame (~250 ms) but smaller than the
+        //     whole backlog (1.2 s): a flat 500 ms window would cancel mid-backlog, but each frame
+        //     finalizes within a window, so the progress-aware drain resets and waits it all out.
+        pipeline.onUpdate = { _, _ in Thread.sleep(forTimeInterval: 0.2) }
+        pipeline.drainPrimaryTimeout = .milliseconds(100)     // stop budget — deliberately tiny
+        pipeline.liveDrainStallTimeout = .milliseconds(500)   // wedge window — one frame < this < backlog
+        pipeline.drainGraceTimeout = .milliseconds(100)
+        pipeline.rendersReplay = false   // exercise the drain, not the replay render
+
+        try pipeline.start()
+        // Let a couple of frames finalize so end() lands with the backlog still draining.
+        Thread.sleep(forTimeInterval: 0.15)
+        // Pre-fix this throws .shutdownTimeout (the flat window expires mid-backlog and cancels
+        // the progressing consumer); post-fix it drains and returns the session dir.
+        let dir = try pipeline.end()
+        XCTAssertEqual(engine.stackFrameCount, 6,
+                       "all six backlog subs must stack — the drain must wait out a progressing consumer")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("master.fit").path),
+                      "the drained session must have written master.fit")
+    }
+
+    /// Cold-review PROVEN regression (2026-08-28): a SLOW `stop()` (dead/laggy SMB share) used to
+    /// eat the drain's first window — it was seeded from a deadline captured BEFORE stop(), so by
+    /// the time the drain ran the window was already expired and the consumer's during-stop progress
+    /// was invisible → a healthy backlog was cancelled and the master discarded. The drain's wedge
+    /// window must be a fresh full `liveDrainStallTimeout` independent of the (separately-bounded)
+    /// stop time.
+    func testLiveDrainSurvivesSlowStopWithBacklog() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "SlowStop", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        // stop() blocks 400 ms (≫ drainPrimaryTimeout 100 ms) while a 6-frame backlog drains.
+        let source = SlowStopBacklogLiveSource(seed: seedFrame(), count: 6, stopDelay: 0.4)
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine,
+                                       profile: profile, rootDirectory: sessions)
+        pipeline.onUpdate = { _, _ in Thread.sleep(forTimeInterval: 0.15) }
+        pipeline.drainPrimaryTimeout = .milliseconds(100)     // stop budget — far shorter than stop()
+        pipeline.liveDrainStallTimeout = .milliseconds(500)   // wedge window — must be fresh & full
+        pipeline.drainGraceTimeout = .milliseconds(100)
+        pipeline.rendersReplay = false
+
+        try pipeline.start()
+        Thread.sleep(forTimeInterval: 0.05)
+        let dir = try pipeline.end()
+        XCTAssertEqual(engine.stackFrameCount, 6,
+                       "a slow stop() must not shrink the drain window — all six backlog subs must stack")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("master.fit").path),
+                      "the drained session must have written master.fit despite the slow stop")
     }
 
     func testFiniteImportDrainDoesNotCancelHealthySlowFirstRead() throws {
@@ -549,6 +687,7 @@ final class SessionPipelineShutdownTests: XCTestCase {
         let wedged = DispatchSemaphore(value: 0)
         pipeline.onUpdate = { _, _ in wedged.wait() }
         pipeline.drainPrimaryTimeout = .milliseconds(200)
+        pipeline.liveDrainStallTimeout = .milliseconds(200)   // live wedge window (else the 120 s default)
         pipeline.drainGraceTimeout = .milliseconds(200)
         try pipeline.start()
         Thread.sleep(forTimeInterval: 0.3)
