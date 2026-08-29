@@ -246,6 +246,31 @@ cadence timer for the live variant), never a change to the per-frame online
 kernel. It sits alongside the per-sub reject → re-stack flow (the manual
 counterpart).
 
+**Sensor-size dimension — the live variant splits by frame size, not just
+cadence.** Faster cadence and smaller frames tend to move together, and they
+roughly cancel, so the live global combine stays feasible across rigs — but the
+*implementation* differs:
+
+- **Large sensor, slow cadence** (ASI2600: 26 MP, ~180 s subs; ~300 MB/frame).
+  Holding a night in RAM is infeasible (180 × 300 MB ≈ 54 GB), but the generous
+  cadence leaves time for a **two-pass streaming re-read from local disk** each
+  refresh. Global-combine's advantage persists longer because depth accrues
+  slowly. This is the primary variant above.
+- **Small sensor, fast cadence** (Seestar S50: ~2 MP, 20–30 s subs;
+  ~15–25 MB/frame). Frames are ~12× smaller, so a global pass is cheap even in a
+  20–30 s window — and a night's worth fits in RAM (180 × 20 MB ≈ 3.6 GB), so an
+  **in-RAM rolling-buffer** median/κ-σ needs no disk re-read at all. Decouple the
+  refresh from arrival: the display still updates per-sub via the online mean,
+  the global master refreshes on a **timer** (~1–2 min) or every K subs, not
+  every sub. Depth accrues fast (past the 8-frame warm-up in ~4 min), so the
+  global combine's useful window is short — the online hand-off comes quickly.
+
+Shared caveat: fast-cadence rigs rack up **hundreds** of subs per night, so the
+working set must be capped regardless of variant — a rolling window of the last
+N (or a subsample) — so late-session RAM / re-read cost doesn't balloon. Pick
+the variant from the source's frame size and locality at session start (in-RAM
+for small/local, disk-two-pass for large/local, online-only for network/SMB).
+
 ### 8. Visual Identity
 
 After the workflow is clearer:
