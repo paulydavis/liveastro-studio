@@ -272,6 +272,15 @@ public final class SessionPipeline {
     /// (2026-08-16 ASI2600). 120 s tolerates a slow frame (even on modest hardware) while a
     /// genuinely wedged consumer is still caught. Internal so tests can shrink it.
     var importPrimaryTimeout: DispatchTimeInterval = .seconds(120)
+    /// Live/watcher analogue of `importPrimaryTimeout`: the "no finalized frame for this long →
+    /// the consumer is wedged" window for the LIVE drain (`drainConsumeTaskOrThrow`). It is
+    /// deliberately NOT `drainPrimaryTimeout` (the 10 s stop budget): a single healthy 26 MP sub
+    /// takes ~12 s+ to finalize (register + warp + full-res snapshot encode — see the
+    /// importPrimaryTimeout note), so keying the wedge check on the 10 s stop budget cancels a
+    /// healthy slow frame and discards the master — the exact failure this fix exists to cure
+    /// (2026-08-28 ASI2600 real-data run + cold review). 120 s tolerates the slowest single frame
+    /// while still catching a genuinely wedged consumer. Internal so tests can shrink it.
+    var liveDrainStallTimeout: DispatchTimeInterval = .seconds(120)
     /// Long-edge cap for the import preview/snapshot render (Approach B): finalizeCommitted
     /// downsamples the stacked image to this before displayCGImage so the neutralize/stretch
     /// passes don't run on all 26 MP. Defaults to the SnapshotRecorder cap; internal so tests
@@ -620,6 +629,12 @@ public final class SessionPipeline {
             }
             attemptPlateSolveIfNeeded(engine: engine)   // idempotent; no-op until a reference is seeded
             processedCount += 1
+            // A frame the engine has finalized (accepted OR rejected) is drain progress for the
+            // progress-aware live drain in end() — ticked HERE, before the snapshot-render guards
+            // below (which can early-return on a nil coverage/recorder), so an accepted frame whose
+            // render is skipped still counts as progress. Live never ticked before, so progressTicks
+            // was frozen and the live drain could never see progress (2026-08-28).
+            noteFrameProgress()
             // Emitted BEFORE the switch's snapshot-rendering (which can early-return on a
             // guard/do-catch failure) so onSubFrame fires exactly once per sub regardless of
             // downstream render success. Indexed by processedCount for EVERY sub (accepted and
@@ -712,6 +727,9 @@ public final class SessionPipeline {
                 // Spec §7: skip bad updates, keep the last good frame on the broadcast.
                 onLog?("Skipped update (\(update.url.lastPathComponent)): \(error)")
             }
+            // A processed update is drain progress (parity with handleNative) so the shared
+            // progress-aware live drain waits out a watcher-mode backlog instead of cancelling it.
+            noteFrameProgress()
         }
     }
 
@@ -795,22 +813,44 @@ public final class SessionPipeline {
         }
     }
 
-    /// Drain the frame-consuming task with a bounded wait. On the primary timeout the task is
-    /// CANCELLED and given a further grace period to acknowledge. If it STILL has not signalled,
-    /// throw SessionPipelineError.shutdownTimeout rather than proceeding to finalize — a
-    /// still-running consumer would race the accumulator/snapshots during finalization and could
-    /// write a corrupt master. The previous code discarded the wait result and finalized anyway.
-    /// `primaryDeadline` (review10 item 3) lets the watcher path charge its bounded
-    /// watcher-stop against the SAME primary budget: stop + drain together never exceed
-    /// drainPrimaryTimeout (+ grace). nil → the full primary budget from now (native paths).
-    private func drainConsumeTaskOrThrow(primaryDeadline: DispatchTime? = nil) throws {
+    /// Drain the frame-consuming task, PROGRESS-AWARE (mirrors drainFiniteImportOrThrow). A live
+    /// session ended while the consumer is still draining a BACKLOG of accepted frames is
+    /// progressing, not wedged; the pre-fix flat single window cancelled it and threw
+    /// shutdownTimeout, discarding the whole master (2026-08-28 ASI2600 real-data run, three
+    /// sessions lost). As long as the consumer keeps FINALIZING frames (progressTicks advances —
+    /// handleNative/handle tick it), keep draining; only a full `liveDrainStallTimeout` window with
+    /// ZERO progress means it is genuinely wedged, at which point the task is CANCELLED and given a
+    /// grace period, then shutdownTimeout is thrown rather than finalizing over a still-running
+    /// consumer (which would race the accumulator/snapshots and could write a corrupt master).
+    ///
+    /// The wedge window is `liveDrainStallTimeout` (120 s), NOT `drainPrimaryTimeout` (10 s): one
+    /// healthy 26 MP frame takes longer than the stop budget to finalize (cold review 2026-08-28).
+    /// The source/watcher stop is bounded SEPARATELY by its own `stop(timeout: drainPrimaryTimeout)`
+    /// in end(), so this drain does NOT re-charge it — an earlier version seeded the first window
+    /// from a pre-stop deadline, which a slow stop() shrank to ~0 and discarded a healthy backlog
+    /// (cold-review PROVEN). Every window here is a full fresh `liveDrainStallTimeout`.
+    ///
+    /// TRADE-OFF: end() is no longer hard-bounded to ~primary+grace — a large healthy backlog
+    /// drains fully (bounded by the backlog size, since the source stream ends on stop()). Losing
+    /// the whole master to a fixed deadline was the worse outcome.
+    private func drainConsumeTaskOrThrow() throws {
         let grace = drainGraceTimeout
         guard let task = consumeTask else { return }
-        if consumeDone.wait(timeout: primaryDeadline ?? .now() + drainPrimaryTimeout) == .success {
-            consumeTask = nil
-            return
+        // The common case (an idle consumer at end()) returns on the first wait at once.
+        var last = progressSnapshot
+        while true {
+            if consumeDone.wait(timeout: .now() + liveDrainStallTimeout) == .success {
+                consumeTask = nil
+                return
+            }
+            let now = progressSnapshot
+            if now != last {
+                last = now
+                continue   // progressed within the window → keep draining
+            }
+            break          // a full stall window passed with no finalized frame → wedged
         }
-        // Timed out: stop the consumer cooperatively and wait a bounded grace period.
+        // No progress across a full window: stop the consumer cooperatively, bounded grace.
         task.cancel()
         if consumeDone.wait(timeout: .now() + grace) == .success {
             consumeTask = nil
@@ -940,26 +980,24 @@ public final class SessionPipeline {
                 } else {
                     // Live source: the stream never ends by itself — stop it first, then drain.
                     // Cold1 M1: the source's own bounded stop (FolderFrameSource → inner
-                    // watcher, previously an un-budgeted 5 s default ON TOP of the drain) is
-                    // charged against the SAME primary budget, mirroring the watcher-mode
-                    // branch below: stop + drain together never exceed primary (+ grace).
-                    let primaryDeadline = DispatchTime.now() + drainPrimaryTimeout
+                    // watcher, previously an un-budgeted 5 s default) is bounded by the stop
+                    // budget. The stop is a SEPARATE bound from the progress-aware drain below:
+                    // a dead share can no longer pin end() outside stop's own timeout, while a
+                    // healthy backlog drains without the stop time eating the drain's window.
                     if let folderSource = source as? FolderFrameSource {
                         folderSource.stop(timeout: Self.seconds(drainPrimaryTimeout))
                     } else {
                         source?.stop()
                     }
-                    try drainConsumeTaskOrThrow(primaryDeadline: primaryDeadline)
+                    try drainConsumeTaskOrThrow()
                 }
             } else {
                 // Watcher mode: stop the watcher to terminate the updates stream, then drain.
-                // Review10 item 3: the watcher stop is itself BOUNDED and shares the primary
-                // drain budget — a scan stalled on a dead share can no longer pin end()
-                // outside the documented primary+grace timeout. The deadline is captured
-                // before the stop so stop-time is charged against the same budget.
-                let primaryDeadline = DispatchTime.now() + drainPrimaryTimeout
+                // The watcher stop is itself BOUNDED (a scan stalled on a dead share can no longer
+                // pin end() outside stop's own timeout); the progress-aware drain then waits out
+                // any healthy backlog without the stop time shrinking its window.
                 watcher?.stop(timeout: Self.seconds(drainPrimaryTimeout))
-                try drainConsumeTaskOrThrow(primaryDeadline: primaryDeadline)
+                try drainConsumeTaskOrThrow()
             }
             if let meta = sourceMetadata { session.fillMissingMetadata(from: meta) }
             guard let dir = session.sessionDirectory else {
