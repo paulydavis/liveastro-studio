@@ -142,11 +142,11 @@ Two composable, pure functions (no I/O, no live/import knowledge):
 - `stackGeneration`/`referenceIdentity`: the engine increments a generation on every reseed
   (manual or auto). Transforms from generation G reference generation-G's frame and **cannot**
   be combined with generation-G+1 subs. The refiner filters to the current generation only.
-- **Seam:** `StackEngine.processDetailed` currently discards the internal
-  `RegisteredFrame.transform`/`scale` and the applied `weight`/leveling model. Surface them
-  for accepted subs — extend `ProcessResult` with an optional `registration` payload (additive,
-  preserving existing equality for current callers) or a dedicated `onRegistered` callback.
-  Also expose the current `stackGeneration` + reference identity. Chosen in the plan.
+- **Seam (chosen):** `StackEngine.processDetailed` currently discards the internal
+  `RegisteredFrame.transform`/`scale` and the applied `weight`/leveling model. Surface them for
+  accepted subs by extending `ProcessResult` with an optional `registration: RegistrationPayload?`
+  (additive, `nil` default — existing call sites compile unchanged), plus a public locked
+  `currentStackGeneration` accessor. (Plan Task 4.)
 - `SessionPipeline` keeps an **ordered `[SubRegistration]`** (capture order; `subIndex` is the key),
   populated in `handleNative` alongside the existing `onSubFrame` record, session-scoped. The user-reject
   set is `Set<Int>` of `subIndex`es. **`relayURL` must survive calibration:** `handleNative` calibrates the
@@ -154,8 +154,9 @@ Two composable, pure functions (no I/O, no live/import knowledge):
   MUST preserve `sourceURL`, or every calibrated live frame is silently skipped (nil URL).
 
 ### 3. `GlobalRefiner` — `Sources/LiveAstroCore/Pipeline/GlobalRefiner.swift`
-- Owns a serial background queue; reads via the concurrent reader path
-  (`FolderFrameSource.loadRawFrame(url:expectedDigest:)`, from the watcher-async-reads fix).
+- Owns a serial background queue; the loader wraps the concurrent reader path
+  (`FolderFrameSource.loadRawFrame(url:expectedDigest:)`, from the watcher-async-reads fix) with
+  **content-digest-only verification** (`expectedContentDigest: String?` — stat fields zeroed).
   One pass in flight at a time.
 - Selects survivors = accepted, non-user-rejected subs **of the current stackGeneration**,
   ordered; resolves each to `(relayURL, SubRegistration)`.
