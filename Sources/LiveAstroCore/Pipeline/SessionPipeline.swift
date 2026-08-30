@@ -22,6 +22,19 @@ final class NSLock_Flag {
     func set() { lock.lock(); value = true; lock.unlock() }
 }
 
+/// Composite freshness key for a background-refiner-published master (Task 7): identifies exactly
+/// which generation / survivor-set / user-reject-state / κ a published master was computed from.
+/// `publishedMasterIfCurrent()` invalidates the stored master the instant ANY of these change —
+/// a reseed, a user reject, or a κ change — so broadcast/end() never consume a stale trail-free
+/// master. `survivorSubIndices` is the SORTED list of survivor `subIndex`es (unique per sub —
+/// byte-identical subs stay distinct entries, never collapsed to a digest set).
+public struct FreshnessKey: Equatable {
+    let stackGeneration: Int
+    let survivorSubIndices: [Int]
+    let userRejectGeneration: Int
+    let kappa: Float
+}
+
 /// Glue: watcher → loader → stretch → broadcast callback + snapshot + manifest (spec §5.1).
 /// Also supports native stacking mode: FrameSource → StackEngine → snapshot + manifest.
 /// UI-free so the end-to-end test and the app share the same wiring.
@@ -228,9 +241,15 @@ public final class SessionPipeline {
     }
 
     /// The pipeline's own reject set (subIndexes), distinct from AppModel's UI array —
-    /// AppModel pushes the flagged subIndexes here (Task 11). Thread-safe.
+    /// AppModel pushes the flagged subIndexes here (Task 11). Bumps `userRejectGeneration`
+    /// (part of `FreshnessKey`) and recomputes the cached key so a previously-published
+    /// master immediately goes stale. Thread-safe.
     func setUserRejected(_ ids: Set<Int>) {
-        regLock.withLock { _userRejected = ids }
+        regLock.withLock {
+            _userRejected = ids
+            userRejectGeneration += 1
+            recomputeCachedFreshnessKeyLocked()
+        }
     }
 
     /// Subs of `currentGeneration`, minus any `subIndex` the user has flagged, in capture
@@ -245,6 +264,80 @@ public final class SessionPipeline {
     /// non-recursive NSLock and deadlocks.
     func currentSurvivorsLocked(currentGeneration: Int) -> [SubRegistration] {
         _subRegistrations.filter { $0.stackGeneration == currentGeneration && !_userRejected.contains($0.subIndex) }
+    }
+
+    // MARK: FreshnessKey + publishedMaster (Task 7)
+    //
+    // A later background refiner (Task 6, GlobalRefiner) recombines the current survivor set
+    // off the hot path and publishes a trail-free master here. Broadcast/end() must consume it
+    // ONLY while it is still current — not stale after a reseed, a user reject, or a κ change —
+    // AND only while the live-rejection feature is on. `FreshnessKey` is the composite identity
+    // that pins all of that; `_freshnessKey` is a CACHE (M1) refreshed at every mutation point
+    // so the per-render broadcast path (`currentFreshnessKey()`) never re-sorts N survivor ids.
+    private var userRejectGeneration: Int = 0                      // guarded by regLock; part of FreshnessKey
+    /// Live-rejection feature gate (Task 11 wires this from AppModel via `configureLiveRejection`).
+    /// Deliberately NOT encoded in `FreshnessKey` — see `publishedMasterIfCurrent`.
+    private var liveRejectionActive: Bool = false                  // guarded by regLock
+    /// κ (sigma-clip multiple) the background refiner combines survivors with — part of
+    /// `FreshnessKey` so a κ change invalidates any published master computed with the old κ.
+    /// Defaults to `RejectionStrength.medium.kappa`: the engine's own `RejectionMethod` is a
+    /// private, non-introspectable instance (no public κ accessor), so there is no single
+    /// "current engine value" to read at init; Task 11's `configureLiveRejection(kappa:)` sets
+    /// the real value from `SessionSettings.rejectionStrength.kappa` once AppModel wires it.
+    private var liveRejectionKappa: Float = RejectionStrength.medium.kappa   // guarded by regLock
+    /// Cached composite key (M1) — refreshed by `recomputeCachedFreshnessKeyLocked()` at every
+    /// mutation point (sub appended, `setUserRejected`, κ change, generation change). Given a
+    /// sensible pre-first-sub initial value so `currentFreshnessKey()` is well-defined from t=0.
+    private var _freshnessKey = FreshnessKey(stackGeneration: 0, survivorSubIndices: [],
+                                             userRejectGeneration: 0, kappa: RejectionStrength.medium.kappa)
+    /// The background refiner's most recently published trail-free master, stamped with the
+    /// `FreshnessKey` it was computed from. `internal` — Task 6/11 publish here directly.
+    internal var publishedMaster: (image: AstroImage, coverage: [Float], survivorCount: Int, key: FreshnessKey)?   // guarded by regLock
+
+    /// Recompute `_freshnessKey` from the current generation/survivors/reject-generation/κ.
+    /// Assumes the caller already holds `regLock` — calling `currentFreshnessKey()` (or any
+    /// other locking accessor) from here re-enters the non-recursive NSLock and deadlocks.
+    private func recomputeCachedFreshnessKeyLocked() {
+        let gen = engine?.currentStackGeneration ?? 0
+        let survivors = currentSurvivorsLocked(currentGeneration: gen).map(\.subIndex).sorted()
+        _freshnessKey = FreshnessKey(stackGeneration: gen, survivorSubIndices: survivors,
+                                     userRejectGeneration: userRejectGeneration, kappa: liveRejectionKappa)
+    }
+
+    /// O(1) locked read of the cached key (M1) — the broadcast-preference path calls this once
+    /// per render instead of re-sorting N survivor ids. Code already holding `regLock` (e.g. the
+    /// Task 8 snapshot) reads `_freshnessKey` directly instead of calling this.
+    public func currentFreshnessKey() -> FreshnessKey { regLock.withLock { _freshnessKey } }
+
+    /// Live-rejection feature gate (Task 11 wires this from AppModel). Turning it OFF also
+    /// clears `publishedMaster` (belt-and-suspenders): `FreshnessKey` does not encode
+    /// enabled-ness, so without this an already-published master would otherwise still read as
+    /// "current" the instant the feature is re-enabled with nothing else changed.
+    public func configureLiveRejection(enabled: Bool) {
+        regLock.withLock {
+            liveRejectionActive = enabled
+            if !enabled { publishedMaster = nil }
+        }
+    }
+
+    /// Sets the κ the background refiner should combine survivors with and recomputes the
+    /// cached freshness key — a κ change invalidates any master published under the old κ.
+    public func configureLiveRejection(kappa: Float) {
+        regLock.withLock {
+            liveRejectionKappa = kappa
+            recomputeCachedFreshnessKeyLocked()
+        }
+    }
+
+    /// Returns the published master ONLY while the live-rejection feature is ON and its stored
+    /// key still equals the CURRENT freshness key — i.e. no reseed, user reject, or κ change has
+    /// landed since it was published. Both reads happen under one `regLock` acquisition so a
+    /// concurrent publish/mutation can't be observed torn.
+    public func publishedMasterIfCurrent() -> (image: AstroImage, coverage: [Float], survivorCount: Int)? {
+        regLock.withLock {
+            guard liveRejectionActive, let pm = publishedMaster, pm.key == _freshnessKey else { return nil }
+            return (pm.image, pm.coverage, pm.survivorCount)
+        }
     }
 
     private let adjLock = NSLock()
@@ -714,6 +807,9 @@ public final class SessionPipeline {
                         stackGeneration: reg.stackGeneration, referenceIdentity: reg.referenceIdentity,
                         transform: reg.transform, effectiveScale: reg.effectiveScale,
                         weight: reg.weight, leveling: reg.leveling))
+                    // Task 7: a sub append changes the survivor set (and possibly the generation,
+                    // on the first sub of a new reference) — refresh the cached freshness key.
+                    recomputeCachedFreshnessKeyLocked()
                 }
             }
             switch outcome {

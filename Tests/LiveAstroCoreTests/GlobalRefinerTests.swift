@@ -22,6 +22,10 @@ final class GlobalRefinerTests: XCTestCase {
         }
         func start() throws {}
         func stop() { cont.finish() }
+        /// Task 7: push an additional frame after construction (e.g. post-reseed), so a test can
+        /// drive a NEW reference through the real handleNative path instead of poking pipeline
+        /// state directly.
+        func send(_ frame: RawFrame) { cont.yield(frame) }
     }
 
     /// A ≥15-star field so the engine accepts every translated variant (mirrors
@@ -462,5 +466,89 @@ final class GlobalRefinerTests: XCTestCase {
         let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
                                     maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
         XCTAssertNotNil(result, "a pre-emptive cancel() targeting passId 0 must not kill passId 1")
+    }
+
+    // MARK: - Task 7: FreshnessKey + publishedMaster
+
+    /// Step 1: a master published under the CURRENT `FreshnessKey` is returned; it goes stale
+    /// (returns nil) the instant ANY of the key's four components changes underneath it — a
+    /// user reject (`userRejectGeneration`), a κ change, a reseed (`stackGeneration`) — and is
+    /// hidden AND cleared the instant the live-rejection feature is turned off, regardless of
+    /// whether the key still matches (feature-off parity: `FreshnessKey` does not encode
+    /// enabled-ness).
+    func testPublishedMasterIfCurrentGoesStaleOnRejectKappaReseedAndFeatureOff() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "Freshness", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+
+        let sub1 = stubFrame(dx: 0, dy: 0, name: "f1.fit", digest: "d1", timestamp: 0)
+        let sub2 = stubFrame(dx: 1.0, dy: -0.5, name: "f2.fit", digest: "d2", timestamp: 1)
+        let sub3 = stubFrame(dx: 1.6, dy: 0.3, name: "f3.fit", digest: "d3", timestamp: 2)
+
+        let source = StubLiveSource(sequence: [sub1, sub2, sub3])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine,
+                                       profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+
+        let regs = waitForRegistrations(pipeline, count: 3)
+        XCTAssertEqual(regs.count, 3)
+
+        // Feature ON — required before any published master is ever served.
+        pipeline.configureLiveRejection(enabled: true)
+
+        let dummyMaster = constImage(0.42)
+        func publishAtCurrentKey() {
+            let key = pipeline.currentFreshnessKey()
+            pipeline.publishedMaster = (image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 3, key: key)
+        }
+
+        // 1. Publish at the CURRENT key -> served.
+        publishAtCurrentKey()
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
+                        "a master published under the current key must be served")
+
+        // 2. User-reject bumps userRejectGeneration -> currentFreshnessKey() changes -> stale.
+        pipeline.setUserRejected([2])
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(),
+                     "a user reject must invalidate a previously-published master")
+
+        // 3. Republish at the new key, then a kappa change -> stale again.
+        publishAtCurrentKey()
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent())
+        pipeline.configureLiveRejection(kappa: 5.0)
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(),
+                     "a kappa change must invalidate a previously-published master")
+
+        // 4. Republish, then reseed. The cache is refreshed on the next real mutation (Task 7
+        //    re-inserts recomputeCachedFreshnessKeyLocked() into handleNative's capture block) —
+        //    drive it through the real path: reseed, then feed one more sub that becomes the new
+        //    reference (new stackGeneration).
+        publishAtCurrentKey()
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent())
+        XCTAssertEqual(pipeline.reseed(), .reseeded)
+        let sub4 = stubFrame(dx: 0, dy: 0, name: "f4.fit", digest: "d4", timestamp: 3)
+        source.send(sub4)
+        let regsAfterReseed = waitForRegistrations(pipeline, count: 4)
+        XCTAssertEqual(regsAfterReseed.count, 4)
+        XCTAssertNotEqual(regsAfterReseed[3].stackGeneration, regsAfterReseed[0].stackGeneration,
+                          "test precondition: the post-reseed sub must land in a NEW generation")
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(),
+                     "a reseed (new stackGeneration) must invalidate a previously-published master")
+
+        // 5. Republish, then turn the feature off -> hidden AND cleared.
+        publishAtCurrentKey()
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent())
+        pipeline.configureLiveRejection(enabled: false)
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(), "feature off must hide any published master")
+        XCTAssertNil(pipeline.publishedMaster, "feature off must CLEAR publishedMaster (belt-and-suspenders)")
+
+        source.stop()
     }
 }
