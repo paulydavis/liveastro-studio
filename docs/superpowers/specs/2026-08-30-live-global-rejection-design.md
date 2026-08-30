@@ -66,15 +66,15 @@ network/SMB live (stays online-only).
 ```
 per accepted sub (ONLINE, unchanged behavior + preview):
     register → warp → warped-domain leveling → online mean → PREVIEW (stays online)
-    ALSO capture SubRegistration{ identity, relayURL, stackGeneration, referenceIdentity,
-                                  transform(half-res), scale, weight, levelingModel }
+    ALSO capture SubRegistration{ subIndex, contentDigest, relayURL, stackGeneration, referenceIdentity,
+                                  transform(half-res), effectiveScale, weight, leveling(sub,ref) }
     notify refiner "new sub"
 
 GlobalRefiner (own serial background queue, self-throttled):
   when idle AND the survivor set changed since the last pass:
     survivors := accepted, non-user-rejected subs OF THE CURRENT stackGeneration
                  (same selection as RestackPlanning.survivorSubs, filtered by generation)
-    per sub → loadRawFrame(relayURL, expectedDigest) → calibrate → debayer/displayRGB
+    per sub → loadRegisteredInput(relayURL, expectedContentDigest) → calibrate → debayer/displayRGB
               → warp(cached transform)
               → warped-domain leveling(cached (sub,ref), effectiveScale)  # scale is FUSED into
                  -- or the warped frame UNSCALED when the leveling pair is nil (matches engine)
@@ -83,7 +83,7 @@ GlobalRefiner (own serial background queue, self-throttled):
                  (all survivors when they fit the RAM budget; a representative subset when deep)
                  → robust center + scale = 1.4826·MAD
     output pass: weighted clipped mean over ALL survivors (reuse the RAM sample when
-                 shallow; stream from disk when deep), keeping v where |v-center| ≤ κ·scale
+                 shallow; stream from disk when deep), keeping v where |v-center| ≤ κ·max(scale, scaleFloor)
     publish: install {image, coverage, survivorCount, freshnessKey} as the published master
 
 outputs:
@@ -109,7 +109,8 @@ Two composable, pure functions (no I/O, no live/import knowledge):
   — per-pixel **median** and **MAD** (`scale = 1.4826·MAD`) over the masked values.
 - `clippedWeightedMean(frames: () -> AnyIterator<(image: AstroImage, mask: [Float], weight: Float)>,
    center: AstroImage, scale: [Float], kappa: Float) -> (image: AstroImage, coverage: [Float])?`
-  — accept `|v-center| ≤ kappa·scale`; accumulate `Σ w·v` / `Σ w` over survivors.
+  — accept `|v-center| ≤ kappa·max(scale, scaleFloor)`; accumulate `Σ w·v` / `Σ w` over survivors
+  (a covered pixel with all survivors clipped → `center`).
 - `frames` is a **factory** (fresh iterator per call) so the refiner can stream the
   output pass from disk for deep stacks; `sample` is materialized in RAM.
 - `CombineMethod { case clippedMean /* future: case median (output) */ }` param on the
