@@ -526,13 +526,16 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertNil(pipeline.publishedMasterIfCurrent(),
                      "a kappa change must invalidate a previously-published master")
 
-        // 4. Republish, then reseed. The cache is refreshed on the next real mutation (Task 7
-        //    re-inserts recomputeCachedFreshnessKeyLocked() into handleNative's capture block) —
-        //    drive it through the real path: reseed, then feed one more sub that becomes the new
-        //    reference (new stackGeneration).
+        // 4. Republish, then reseed. `reseed()` itself now refreshes the cached freshness key
+        //    (T7 review fix — a manual reseed is a mutation point, same as reject/kappa), so the
+        //    master is already stale the instant reseed() returns, with no further frame needed.
+        //    Still feed one more sub afterward and confirm it lands in a NEW generation, matching
+        //    the other sub-cases' end-to-end style.
         publishAtCurrentKey()
         XCTAssertNotNil(pipeline.publishedMasterIfCurrent())
         XCTAssertEqual(pipeline.reseed(), .reseeded)
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(),
+                     "a reseed (new stackGeneration) must invalidate a previously-published master immediately")
         let sub4 = stubFrame(dx: 0, dy: 0, name: "f4.fit", digest: "d4", timestamp: 3)
         source.send(sub4)
         let regsAfterReseed = waitForRegistrations(pipeline, count: 4)
@@ -540,7 +543,7 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertNotEqual(regsAfterReseed[3].stackGeneration, regsAfterReseed[0].stackGeneration,
                           "test precondition: the post-reseed sub must land in a NEW generation")
         XCTAssertNil(pipeline.publishedMasterIfCurrent(),
-                     "a reseed (new stackGeneration) must invalidate a previously-published master")
+                     "still stale after the post-reseed sub lands")
 
         // 5. Republish, then turn the feature off -> hidden AND cleared.
         publishAtCurrentKey()
@@ -548,6 +551,56 @@ final class GlobalRefinerTests: XCTestCase {
         pipeline.configureLiveRejection(enabled: false)
         XCTAssertNil(pipeline.publishedMasterIfCurrent(), "feature off must hide any published master")
         XCTAssertNil(pipeline.publishedMaster, "feature off must CLEAR publishedMaster (belt-and-suspenders)")
+
+        source.stop()
+    }
+
+    /// T7 review regression: `recomputeCachedFreshnessKeyLocked()` was refreshed on sub-append,
+    /// `setUserRejected`, and `configureLiveRejection(kappa:)`, but NOT on a manual `reseed()` —
+    /// leaving a window from the reseed call until the next accepted frame during which
+    /// `publishedMasterIfCurrent()` kept serving the pre-reseed master (observable by a
+    /// broadcast/end consumer that samples on a timer independent of frame arrival). This test
+    /// asserts the master goes stale IMMEDIATELY on `reseed()` — deliberately WITHOUT sending any
+    /// further frame afterward, unlike the multi-mutation test above which also drives a
+    /// post-reseed sub for end-to-end coverage.
+    func testReseedInvalidatesPublishedMasterImmediatelyWithoutAFollowUpSub() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "ReseedFreshness", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+
+        let sub1 = stubFrame(dx: 0, dy: 0, name: "r1.fit", digest: "rd1", timestamp: 0)
+        let sub2 = stubFrame(dx: 1.0, dy: -0.5, name: "r2.fit", digest: "rd2", timestamp: 1)
+        let sub3 = stubFrame(dx: 1.6, dy: 0.3, name: "r3.fit", digest: "rd3", timestamp: 2)
+
+        let source = StubLiveSource(sequence: [sub1, sub2, sub3])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine,
+                                       profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+
+        let regs = waitForRegistrations(pipeline, count: 3)
+        XCTAssertEqual(regs.count, 3)
+
+        pipeline.configureLiveRejection(enabled: true)
+
+        let dummyMaster = constImage(0.42)
+        let key = pipeline.currentFreshnessKey()
+        pipeline.publishedMaster = (image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 3, key: key)
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
+                        "precondition: a master published under the current key must be served")
+
+        XCTAssertEqual(pipeline.reseed(), .reseeded)
+
+        // No frame sent after reseed(). The staleness must come from reseed() itself.
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(),
+                     "a manual reseed must invalidate a previously-published master IMMEDIATELY, " +
+                     "with no further frame required to refresh the cached freshness key")
 
         source.stop()
     }

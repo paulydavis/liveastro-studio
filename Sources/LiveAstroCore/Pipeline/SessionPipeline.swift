@@ -507,7 +507,7 @@ public final class SessionPipeline {
     @discardableResult
     public func reseed() -> ReseedResult {
         guard let engine else { return .notNative }
-        return finalizationLock.withLock {
+        let result = finalizationLock.withLock { () -> ReseedResult in
             guard !finalizationClaimed else {
                 return finalizationFailedAfterClaim ? .finalizationRetryPending : .finalizationInProgress
             }
@@ -520,6 +520,22 @@ public final class SessionPipeline {
             invalidatePlateSolve()
             return .reseeded
         }
+        // Task 7 review fix: a manual reseed is a FreshnessKey mutation point (generation change)
+        // just like a sub append / setUserRejected / kappa change — refresh the cached key so
+        // publishedMasterIfCurrent() stops serving the pre-reseed master immediately, without
+        // waiting for the next accepted frame to happen to refresh it. Done AFTER finalizationLock
+        // is released (not nested inside it) to match the only other path that nests locks around
+        // recomputeCachedFreshnessKeyLocked() — the sub-append path in handleNative, which takes
+        // ONLY regLock (recomputeCachedFreshnessKeyLocked reads engine.currentStackGeneration,
+        // which independently acquires+releases the engine's own `lock`; the engine never calls
+        // back into the pipeline, so regLock -> engine.lock is a one-way leaf edge, not a cycle).
+        // No other path holds engine.lock while waiting on regLock, so this ordering is safe.
+        // By this point engine.reseed() (inside the block above) has already bumped the engine's
+        // generation, so the recompute observes the POST-reseed generation.
+        if result == .reseeded {
+            regLock.withLock { recomputeCachedFreshnessKeyLocked() }
+        }
+        return result
     }
 
     /// Cancel an in-progress import: stops feeding new frames; end() finalizes
