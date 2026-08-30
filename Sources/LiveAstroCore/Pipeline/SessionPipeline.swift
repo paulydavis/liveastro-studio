@@ -719,18 +719,37 @@ public final class SessionPipeline {
     /// throttled per-frame path and end()'s guaranteed final render. Sets lastRenderedAcceptedIndex.
     private func renderSnapshot(index: Int, sourceName: String, timestamp: Date, engine: StackEngine) {
         guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }
-        let mean = cropToCoverage(mean0, coverage: coverage)   // display shows the covered region (like master.fit)
+        let mean = cropToCoverage(mean0, coverage: coverage)   // online — feeds the PREVIEW, unchanged (Task 9)
         guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
         do {
             let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
-            let cg = try displayCGImage(from: displaySource)
+            let previewCG = try displayCGImage(from: displaySource)
+
+            // BROADCAST/latest.png (Task 9): prefer the background refiner's clean published
+            // master when it's still current (the T7 freshness gate — reject/κ/reseed/feature-off
+            // all invalidate it inside publishedMasterIfCurrent() itself); otherwise this is the
+            // SAME online source as the preview above — reuse its render rather than paying the
+            // display pipeline twice on the common (no-clean-master) path. The per-sub PREVIEW
+            // (onUpdate below) never consults publishedMasterIfCurrent() — it always renders from
+            // the online mean, exactly as before this task.
+            let published = publishedMasterIfCurrent()
+            let broadcastCG: CGImage
+            let broadcastMean: AstroImage
+            if let published {
+                broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
+                broadcastCG = try displayCGImage(from: broadcastMean.downsampled(maxLongEdge: importPreviewLongEdge))
+            } else {
+                broadcastMean = mean
+                broadcastCG = previewCG
+            }
+
             let record = try recorder.save(
-                cgImage: cg, linear: mean, sourceFile: sourceName,
+                cgImage: broadcastCG, linear: broadcastMean, sourceFile: sourceName,
                 index: index, timestamp: timestamp,
                 estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
             try session.recordSnapshot(record)
             lastRenderedAcceptedIndex = index
-            onUpdate?(cg, record)
+            onUpdate?(previewCG, record)
         } catch {
             onLog?("Skipped frame (\(sourceName)): \(error)")
         }
@@ -1002,20 +1021,38 @@ public final class SessionPipeline {
             switch outcome {
             case .becameReference, .stacked:
                 guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }
-                let mean = cropToCoverage(mean0, coverage: coverage)   // display shows the covered region (like master.fit)
+                let mean = cropToCoverage(mean0, coverage: coverage)   // online — feeds the PREVIEW, unchanged (Task 9)
                 guard let recorder else {
                     onLog?("recorder missing — frame dropped (\(frame.sourceName))")
                     return
                 }
                 do {
-                    let cg = try displayCGImage(from: mean)
+                    let previewCG = try displayCGImage(from: mean)
+
+                    // BROADCAST/latest.png (Task 9): prefer the background refiner's clean
+                    // published master when it's still current, else this is the SAME online
+                    // source as the preview above — reuse its render rather than paying the
+                    // display pipeline twice on the common (no-clean-master) path. The per-sub
+                    // PREVIEW (onUpdate below) never consults publishedMasterIfCurrent() — it
+                    // always renders from the online mean, exactly as before this task.
+                    let published = publishedMasterIfCurrent()
+                    let broadcastCG: CGImage
+                    let broadcastMean: AstroImage
+                    if let published {
+                        broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
+                        broadcastCG = try displayCGImage(from: broadcastMean)
+                    } else {
+                        broadcastMean = mean
+                        broadcastCG = previewCG
+                    }
+
                     // Pass the raw un-neutralized mean as linear: stats stay raw for v1.1 cloud gate.
                     let record = try recorder.save(
-                        cgImage: cg, linear: mean, sourceFile: frame.sourceName,
+                        cgImage: broadcastCG, linear: broadcastMean, sourceFile: frame.sourceName,
                         index: engine.acceptedCount, timestamp: frame.timestamp,
                         estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
                     try session.recordSnapshot(record)
-                    onUpdate?(cg, record)
+                    onUpdate?(previewCG, record)
                 } catch {
                     onLog?("Skipped frame (\(frame.sourceName)): \(error)")
                 }
@@ -1355,16 +1392,25 @@ public final class SessionPipeline {
                     guard let master0 = final.image else {
                         throw StackEngine.FinalizationError.invariantBreach
                     }
-                    let master = cropToCoverage(master0, coverage: final.coverage)   // crop BEFORE balance
+                    // Task 9: master.fit prefers the background refiner's clean published master
+                    // when it's still current — same freshness gate as broadcast/latest.png
+                    // (publishedMasterIfCurrent() itself refuses a stale/feature-off master). Its
+                    // survivorCount replaces the online frameCount for STACKCNT/TOTALEXP, since
+                    // that's the count that actually combined into the written pixels.
+                    let published = publishedMasterIfCurrent()
+                    let masterSource = published?.image ?? master0
+                    let masterCoverage = published?.coverage ?? final.coverage
+                    let masterFrameCount = published?.survivorCount ?? final.frameCount
+                    let master = cropToCoverage(masterSource, coverage: masterCoverage)   // crop BEFORE balance
                     let balanced = neutralizeBackground
                         ? AutoStretch.neutralizeBackgroundAdditive(master)
                         : master
-                    let totalExp = Double(final.frameCount) * profile.subExposureSeconds
+                    let totalExp = Double(masterFrameCount) * profile.subExposureSeconds
                     let masterData = FITSWriter.float32(
                         width: balanced.width, height: balanced.height,
                         channels: balanced.channels, pixels: balanced.pixels,
                         metadata: sourceMetadata,
-                        stackCount: final.frameCount,
+                        stackCount: masterFrameCount,
                         totalExposureSeconds: totalExp)
                     try masterData.write(to: dir.appendingPathComponent("master.fit"))
                     outcome = .written

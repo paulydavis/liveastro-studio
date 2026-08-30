@@ -1,4 +1,5 @@
 import XCTest
+import CoreGraphics
 @testable import LiveAstroCore
 
 /// Task 5: SessionPipeline captures a thread-safe cache of per-sub SubRegistration records so a
@@ -887,5 +888,205 @@ final class GlobalRefinerTests: XCTestCase {
         }
         let unwrapped = try XCTUnwrap(master, "turning the feature ON with survivors present must build immediately")
         XCTAssertEqual(unwrapped.survivorCount, 15, "no sub was rejected — all 15 survivors contribute")
+    }
+
+    // MARK: - Task 9: broadcast/master prefer the clean published master; preview stays online
+
+    /// A RawFrame with NO `sourceURL` (unlike `stubFrame`) — handleNative's registration-cache
+    /// append is gated on `frame.sourceURL != nil`, so sending this triggers a render WITHOUT
+    /// appending a `SubRegistration` or recomputing the cached `FreshnessKey`. Lets a test drive a
+    /// render through the real `handleNative` path while keeping a previously-published master's
+    /// key intact (a normal `stubFrame` would invalidate it via its own registration append).
+    private func renderTriggerFrame(dx: Double, dy: Double, timestamp: TimeInterval) -> RawFrame {
+        RawFrame(image: starImage(dx: dx, dy: dy), bayerPattern: nil, bottomUp: false,
+                timestamp: Date(timeIntervalSince1970: timestamp), sourceName: "trigger.fit")
+    }
+
+    private func pixelData(_ cg: CGImage) -> Data { (cg.dataProvider?.data as Data?) ?? Data() }
+
+    private func stddev(_ values: [Float]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let n = Double(values.count)
+        let mean = values.reduce(0.0) { $0 + Double($1) } / n
+        let variance = values.reduce(0.0) { $0 + pow(Double($1) - mean, 2) } / n
+        return variance.squareRoot()
+    }
+
+    /// Registers 3 subs and publishes a uniform "clean master" (distinct from the varied online
+    /// star field, and immune to AutoStretch's constant-image fallback degenerating) under the
+    /// pipeline's CURRENT freshness key. Returns the still-running pipeline/source/key so callers
+    /// can drive the render and mutate freshness state before asserting.
+    private func pipelineWithPublishedCleanMaster(sandbox: URL) throws
+        -> (pipeline: SessionPipeline, source: StubLiveSource, engine: StackEngine, key: FreshnessKey) {
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        let profile = SessionProfile(targetName: "Broadcast", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let sub1 = stubFrame(dx: 0, dy: 0, name: "bc1.fit", digest: "bc1", timestamp: 0)
+        let sub2 = stubFrame(dx: 1.0, dy: -0.5, name: "bc2.fit", digest: "bc2", timestamp: 1)
+        let sub3 = stubFrame(dx: 1.6, dy: 0.3, name: "bc3.fit", digest: "bc3", timestamp: 2)
+        let source = StubLiveSource(sequence: [sub1, sub2, sub3])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine,
+                                       profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        let regs = waitForRegistrations(pipeline, count: 3)
+        XCTAssertEqual(regs.count, 3, "test precondition: all 3 subs must register")
+
+        pipeline.configureLiveRejection(enabled: true)
+        guard let (onlineImage, onlineCoverage) = engine.currentStackAndCoverage() else {
+            XCTFail("expected an active online stack after 3 accepted subs")
+            return (pipeline, source, engine, pipeline.currentFreshnessKey())
+        }
+        let cleanMaster = constImage(0.42, w: onlineImage.width, h: onlineImage.height)
+        let key = pipeline.currentFreshnessKey()
+        pipeline.publishedMaster = (
+            image: cleanMaster,
+            coverage: onlineCoverage ?? [Float](repeating: 1, count: onlineImage.width * onlineImage.height),
+            survivorCount: 3, key: key)
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(), "precondition: the master is current")
+        return (pipeline, source, engine, key)
+    }
+
+    /// Step 1a: with a CURRENT published master, the BROADCAST artifact (`latest.png`) must
+    /// reflect the clean (uniform) master while the per-sub PREVIEW (`onUpdate`) must still equal
+    /// a fresh online-only render — proving the preview never consults `publishedMasterIfCurrent()`.
+    func testBroadcastRendersPublishedMasterWhilePreviewStaysOnline() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, _, key) = try pipelineWithPublishedCleanMaster(sandbox: sandbox)
+        defer { source.stop() }
+
+        // Filtered on sourceFile: a render for the 3rd registered sub can still be IN FLIGHT on
+        // the consumer task when `pipelineWithPublishedCleanMaster` returns (registration append
+        // precedes the render in `handleNative`) — its `onUpdate` could fire AFTER this closure is
+        // installed, using a stale (3-sub) online state. Only the trigger frame's own render counts.
+        var previewCG: CGImage?
+        pipeline.onUpdate = { cg, record in
+            guard record.sourceFile == "trigger.fit" else { return }
+            previewCG = cg
+        }
+
+        // A sourceURL-less frame renders WITHOUT mutating survivorSubIndices/the cached key — the
+        // published master stays CURRENT for this render (a normal stubFrame would invalidate it).
+        source.send(renderTriggerFrame(dx: 0.2, dy: 0.1, timestamp: 3))
+        let deadline = Date().addingTimeInterval(5)
+        while previewCG == nil && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+        let preview = try XCTUnwrap(previewCG, "the trigger frame must render via onUpdate")
+
+        XCTAssertEqual(pipeline.currentFreshnessKey(), key,
+                       "test precondition: a sourceURL-less frame must not mutate the freshness key")
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
+                        "test precondition: the master is still current at render time")
+
+        // PREVIEW must match a fresh online-only render (the untouched slider re-render path).
+        let onlineCG = try XCTUnwrap(pipeline.renderCurrentDisplay(adjustments: .neutral))
+        XCTAssertEqual(pixelData(preview), pixelData(onlineCG),
+                       "the per-sub PREVIEW (onUpdate) must render from the online mean, unchanged")
+
+        // BROADCAST (latest.png) must reflect the CLEAN published master (uniform → ~zero
+        // variance), not the varied online star field.
+        let dir = try XCTUnwrap(pipeline.sessionDir)
+        let latest = try ImageLoader.load(url: dir.appendingPathComponent("latest.png"))
+        XCTAssertLessThan(latest.stats[0].stddev, 0.01,
+                          "the broadcast artifact must render the uniform clean master, not the varied online mean")
+    }
+
+    /// Step 1b: with a STALE key (a user reject lands after publish), BOTH the broadcast artifact
+    /// and the preview must fall back to the online mean — `publishedMasterIfCurrent()`'s own
+    /// freshness gate refuses a master whose key no longer matches.
+    func testBroadcastFallsBackToOnlineWhenPublishedMasterKeyGoesStale() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, _, _) = try pipelineWithPublishedCleanMaster(sandbox: sandbox)
+        defer { source.stop() }
+
+        // Go stale: a user reject bumps userRejectGeneration -> the cached key changes underneath
+        // the published master.
+        pipeline.setUserRejected([2])
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(), "precondition: the master must now be stale")
+
+        // Filtered on sourceFile — see the comment in the sibling test above: a render for one of
+        // the 3 registered subs can still be in flight when this closure is installed.
+        var previewCG: CGImage?
+        pipeline.onUpdate = { cg, record in
+            guard record.sourceFile == "trigger.fit" else { return }
+            previewCG = cg
+        }
+        source.send(renderTriggerFrame(dx: 0.2, dy: 0.1, timestamp: 3))
+        let deadline = Date().addingTimeInterval(5)
+        while previewCG == nil && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+        let preview = try XCTUnwrap(previewCG, "the trigger frame must render via onUpdate")
+
+        let onlineCG = try XCTUnwrap(pipeline.renderCurrentDisplay(adjustments: .neutral))
+        XCTAssertEqual(pixelData(preview), pixelData(onlineCG),
+                       "the preview must render from the online mean regardless of staleness")
+
+        let dir = try XCTUnwrap(pipeline.sessionDir)
+        let latest = try ImageLoader.load(url: dir.appendingPathComponent("latest.png"))
+        XCTAssertGreaterThan(latest.stats[0].stddev, 0.01,
+                             "a stale published master must NOT reach the broadcast artifact — " +
+                             "it must fall back to the varied online star field")
+    }
+
+    /// Step 1c, feature-off parity: after publishing a clean master, turning live rejection OFF
+    /// must make BOTH the broadcast artifact and end()'s master.fit fall back to the ONLINE
+    /// master — the disabled feature must never keep serving a stale clean master, even in the
+    /// (belt-and-suspenders-defeated) case where its key would otherwise still match.
+    func testFeatureOffParityBroadcastAndMasterFitFallBackToOnline() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, engine, key) = try pipelineWithPublishedCleanMaster(sandbox: sandbox)
+        pipeline.rendersReplay = false   // exercise the master write, not the AVFoundation replay render
+
+        pipeline.configureLiveRejection(enabled: false)
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(), "feature off must hide the published master")
+        XCTAssertNil(pipeline.publishedMaster, "feature off must CLEAR publishedMaster (belt-and-suspenders)")
+        XCTAssertEqual(pipeline.currentFreshnessKey(), key,
+                       "test precondition: disabling alone must not change the freshness key — " +
+                       "the fallback below is driven by the feature gate, not a stale key")
+
+        // Defeat the belt-and-suspenders clear to isolate the `liveRejectionActive` gate itself:
+        // republish a dummy master at the (still-matching) key, simulating "the key would
+        // otherwise match" from the brief. `publishedMasterIfCurrent()` must still refuse it.
+        guard let (onlineImage, onlineCoverage) = engine.currentStackAndCoverage() else {
+            return XCTFail("expected an active online stack")
+        }
+        let staleButKeyMatchingMaster = constImage(0.42, w: onlineImage.width, h: onlineImage.height)
+        pipeline.publishedMaster = (
+            image: staleButKeyMatchingMaster,
+            coverage: onlineCoverage ?? [Float](repeating: 1, count: onlineImage.width * onlineImage.height),
+            survivorCount: 3, key: pipeline.currentFreshnessKey())
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(),
+                     "feature off must refuse a published master even when its key still matches")
+
+        // BROADCAST: a sourceURL-less trigger frame renders without mutating the key. Filtered on
+        // sourceFile — see the comment in the first Task 9 test above: a render for one of the 3
+        // registered subs can still be in flight when this closure is installed.
+        var rendered = false
+        pipeline.onUpdate = { _, record in
+            guard record.sourceFile == "trigger.fit" else { return }
+            rendered = true
+        }
+        source.send(renderTriggerFrame(dx: 0.2, dy: 0.1, timestamp: 3))
+        let deadline = Date().addingTimeInterval(5)
+        while !rendered && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+        XCTAssertTrue(rendered, "the trigger frame must render")
+
+        let dir = try XCTUnwrap(pipeline.sessionDir)
+        let latest = try ImageLoader.load(url: dir.appendingPathComponent("latest.png"))
+        XCTAssertGreaterThan(latest.stats[0].stddev, 0.01,
+                             "feature-off broadcast must fall back to the varied online star field, " +
+                             "not the uniform dummy master")
+
+        // end()'s master.fit must ALSO fall back to the online master (raw linear domain — no
+        // stretch is applied to master.fit, so a uniform dummy would read back with EXACT ~zero
+        // variance while the real star field does not).
+        let replayDir = try pipeline.end()
+        let masterURL = replayDir.appendingPathComponent("master.fit")
+        let master = try FITSReader.read(Data(contentsOf: masterURL))
+        XCTAssertGreaterThan(stddev(master.pixels), 0.01,
+                             "end()'s master.fit must fall back to the online master, not the uniform dummy")
     }
 }
