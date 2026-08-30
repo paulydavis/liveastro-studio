@@ -75,8 +75,10 @@ GlobalRefiner (own serial background queue, self-throttled):
     survivors := accepted, non-user-rejected subs OF THE CURRENT stackGeneration
                  (same selection as RestackPlanning.survivorSubs, filtered by generation)
     per sub → loadRawFrame(relayURL, expectedDigest) → calibrate → debayer/displayRGB
-              → warp(cached transform) → warped-domain leveling(cached model)
-              → scale                                      # exact online per-sub order (warp FIRST)
+              → warp(cached transform)
+              → warped-domain leveling(cached (sub,ref), effectiveScale)  # scale is FUSED into
+                 -- or the warped frame UNSCALED when the leveling pair is nil (matches engine)
+              # exact online per-sub order: warp FIRST, then leveling
     center pass: per-pixel median + MAD over a RAM-held SAMPLE of survivors
                  (all survivors when they fit the RAM budget; a representative subset when deep)
                  → robust center + scale = 1.4826·MAD
@@ -121,8 +123,16 @@ Two composable, pure functions (no I/O, no live/import knowledge):
 
 ### 2. `SubRegistration` cache — captured in the online pass
 - `struct SubRegistration { let identity: FileIdentity; let relayURL: URL; let stackGeneration: Int;
-   let referenceIdentity: FileIdentity; let transform: SimilarityTransform; let scale: Float;
-   let weight: Float; let leveling: BackgroundExtraction.BackgroundModel? }`
+   let referenceIdentity: FileIdentity; let transform: SimilarityTransform; let effectiveScale: Float;
+   let weight: Float; let leveling: (sub: BackgroundExtraction.BackgroundModel, ref: BackgroundExtraction.BackgroundModel)? }`
+  — matches the engine exactly (`StackEngine.swift:366-373`): leveling is the `(sub, ref)` pair
+  from `levelingModels(...)`, `effectiveScale` is the *applied* scale (1.0 when the pair is nil or
+  `scalingApplies` fails), and `weight` is the `appliedWeight` (`frameWeight(sigma·effectiveScale)`).
+  The refiner re-applies leveling identically: `GradientLeveler.apply(warped, subModel: leveling.sub,
+  refModel: leveling.ref, scale: effectiveScale)` when the pair exists, else the warped frame unscaled.
+- **The reference frame is a survivor** (it seeds the online mean): its record is `transform = identity`,
+  `effectiveScale = 1.0`, `weight = 1.0`, `leveling = nil`, `referenceIdentity = its own identity`, and it
+  is the **generation seed** — every sub of a generation shares that reference's identity.
 - `relayURL` (not just `sourceName`) because `RawFrame` exposes only name + identity; the
   trigger captures the relay destination path so the refiner can re-read.
 - `stackGeneration`/`referenceIdentity`: the engine increments a generation on every reseed
@@ -142,10 +152,17 @@ Two composable, pure functions (no I/O, no live/import knowledge):
   One pass in flight at a time.
 - Selects survivors = accepted, non-user-rejected subs **of the current stackGeneration**,
   ordered; resolves each to `(relayURL, SubRegistration)`.
-- RAM budget (`maxSampleBytes`, default ~6 GB): if the survivor set fits, the sample = all
-  survivors and the output reuses them; if it exceeds the budget, the sample = a
-  most-recent/representative subset for the center, and the output **streams all survivors
-  from disk** (documented cap behavior; logged, not silent).
+- **Sample policy (pinned).** The center/MAD is estimated from a RAM-held sample:
+  - **Under budget** (`sample bytes ≤ maxSampleBytes`, default ~6 GB) → sample = **all**
+    survivors; the output pass reuses them (no disk re-read).
+  - **Capped** → sample = a **deterministic, evenly-strided** subset across the *ordered*
+    survivor list (stride = ⌈count / maxSampleFrames⌉ — temporal coverage, **no RNG**, so a
+    given survivor set always yields the same sample), floored at `minSampleFrames` (default 11)
+    and adjusted to an **odd count** so each pixel's median has a true middle element (no
+    even-count averaging). The output pass **streams all survivors from disk**. Logged, not silent.
+  - **Honesty:** the capped case is a **sample-derived robust center + full-survivor clipped
+    weighted mean** — NOT a full-set median. The center is an estimate from the sample; only the
+    *output* (the clipped weighted mean) is over every survivor. Status/logs say so.
 - Per sub: load (digest-verified) → calibrate → debayer/displayRGB → warp(cached transform)
   → warped-domain leveling(cached model) → scale → `(image, mask, weight)`.
 - Per-sub load/digest failure → skip + count, never abort the pass; if a quorum is lost,
