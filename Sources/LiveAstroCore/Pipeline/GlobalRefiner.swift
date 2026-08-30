@@ -64,6 +64,17 @@ public final class GlobalRefiner {
     /// is never reset, a `cancel()` that lands after its target pass already finished (and
     /// before the NEXT pass starts) leaves a stale id on record that can never equal a later
     /// pass's fresh id — so a late `cancel()` can't kill the next pass.
+    ///
+    /// IMPORTANT: `refine()` is NOT guaranteed to have at most one active caller. `cancel()`
+    /// only flags a pass; it does not wait for it to unwind. `SessionPipeline.end()` calls
+    /// `currentRefiner()?.cancel()` and then, WITHOUT waiting, runs its OWN final `refine(...)`
+    /// call directly on the caller's thread against the SAME `GlobalRefiner` instance — whose
+    /// background pass (on `triggerQueue`) may still be mid-unwind. So two `refine()` calls can
+    /// genuinely execute concurrently on one instance. Every field `refine()` mutates that is
+    /// visible across those two calls (currently: `currentPassId`, `cancelledPassId` via
+    /// `stopRequested()`, and `lastMaterializedSampleCount`) MUST go through `passLock`. Anything
+    /// added to `refine()` in the future that mutates `self` needs the same treatment unless it's
+    /// provably pass-local (a local variable never assigned to a stored property).
     private let passLock = NSLock()
     private var currentPassId = 0
     private var cancelledPassId: Int?
@@ -73,7 +84,17 @@ public final class GlobalRefiner {
     /// `GlobalCombine.robustCenter` is a pure static func with no spy seam, so a capped pass's
     /// selected-frame-failure → even → drop-last behavior is asserted observably through this
     /// rather than inferred indirectly from output pixels.
-    private(set) var lastMaterializedSampleCount: Int?
+    ///
+    /// T10 review fix: backed by `_lastMaterializedSampleCount` and read/written ONLY through
+    /// `passLock` — see the concurrency note on `passLock` above. Two `refine()` calls (a
+    /// background pass and `end()`'s final pass) can run concurrently on the same instance and
+    /// both write this field; unlike `currentPassId`/`cancelledPassId` (already guarded), this
+    /// field was previously read/written with no synchronization at all — a genuine data race
+    /// under Swift's memory model, even though it's test-only and never reaches `master.fit`.
+    private var _lastMaterializedSampleCount: Int?
+    var lastMaterializedSampleCount: Int? {
+        passLock.withLock { _lastMaterializedSampleCount }
+    }
 
     public init(loader: FrameLoader, onLog: @escaping (String) -> Void) {
         self.loader = loader
@@ -281,7 +302,7 @@ public final class GlobalRefiner {
             // reduction) — drop the last for a true per-pixel middle median, deterministically.
             if !sample.isEmpty, sample.count % 2 == 0 { sample.removeLast() }
             guard sample.count >= minSubs else { return nil }   // fail closed
-            lastMaterializedSampleCount = sample.count
+            passLock.withLock { _lastMaterializedSampleCount = sample.count }
 
             guard let centerResult = GlobalCombine.robustCenter(sample: sample) else { return nil }
 
