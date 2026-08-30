@@ -20,8 +20,8 @@
 - Output via `RestackPlanning.encodeMaster`; **STACKCNT/TOTALEXP = global survivor count**.
 - Registration reused, never recomputed in the refiner.
 - Bounded shutdown: an `end()`-triggered pass obeys the live-drain timeout discipline; any failure falls back to the online master.
-- **Product minimum: the feature engages at ≥ `minSubs` (= 5) accepted subs** — the shallow-stack case is the whole point, and N=5 is a supported production case (proven by the GlobalCombine unit test). `minSampleFrames = 11` is ONLY the floor for the capped *deep-stack* subset and never exceeds the actual survivor count (at N=5 the sample is all 5).
-- Sample subset is **deterministic evenly-strided** (no RNG), adjusted to **odd count**, exactly bounded (never > `maxSampleFrames`). Capped case is a *sample-derived* center + full-survivor output, never claimed as full-set median.
+- **Product minimum: the feature engages at ≥ `minSubs` (= 5) accepted subs** — the shallow-stack case is the whole point, and N=5 is a supported production case (proven by the GlobalCombine unit test). At N=5 (≤ `maxSampleFrames`) the sample is all 5 frames.
+- Sample subset is **deterministic evenly-strided** (no RNG); in the **capped** case it is adjusted to **odd count** and **exactly bounded (never > `maxSampleFrames`)**. `maxSampleFrames` (= `maxSampleBytes / frameBytes`) MUST be ≥ 11 — a **config invariant asserted at session start** (raise `maxSampleBytes` for > ~50 MP sensors where < 11 frames fit 6 GB). There is **no `minSampleFrames` floor that overrides the RAM cap** (RAM is the hard bound). Capped case is a *sample-derived* center + full-survivor output, never claimed as full-set median.
 - Commit trailer `Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j`; NO Co-Authored-By. Branch `feature/live-global-rejection`; never commit to main.
 
 ---
@@ -168,7 +168,7 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 
 **Interfaces:**
 - Consumes: `robustCenter` output.
-- Produces: `static func clippedWeightedMean(frames: () -> AnyIterator<(image: AstroImage, mask: [Float], weight: Float)>, center: AstroImage, scale: [Float], kappa: Float) -> (image: AstroImage, coverage: [Float])?`. `frames` is a factory (fresh iterator each call — the refiner may stream from disk). Accept `v` where `scale[idx] <= scaleFloor` (no clipping) OR `|v-center[idx]| <= kappa·scale[idx]`; output `Σw·v / Σw`. `coverage` length width*height, `1` where any survivor contributed, else `0`. nil on dim mismatch/empty.
+- Produces: `static func clippedWeightedMean(frames: () -> AnyIterator<(image: AstroImage, mask: [Float], weight: Float)>, center: AstroImage, scale: [Float], kappa: Float) -> (image: AstroImage, coverage: [Float])?`. `frames` is a factory (fresh iterator each call — the refiner may stream from disk). **Reject** `v` where `|v-center[idx]| > kappa · max(scale[idx], scaleFloor)` (the floor makes a zero-MAD core still reject a gross outlier); output `Σw·v / Σw` over survivors, or `center[idx]` where a covered pixel had all survivors clipped (no black speckle). `coverage` length width*height = per-pixel **frame-count depth** (Σ of covering frames; matches `CoverageCrop`'s peak-relative crop), `0` where uncovered. nil on dim mismatch/empty.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -251,7 +251,10 @@ extension GlobalCombine {
         }
         guard any else { return nil }
         var out = [Float](repeating: 0, count: n)
-        for idx in 0..<n where sumW[idx] > 0 { out[idx] = sumWV[idx] / sumW[idx] }
+        for idx in 0..<n {
+            if sumW[idx] > 0 { out[idx] = sumWV[idx] / sumW[idx] }
+            else if coverage[idx % plane] > 0 { out[idx] = center.pixels[idx] }  // covered but all clipped → center (no black speckle)
+        }
         return (AstroImage(width: w, height: h, channels: c, pixels: out, sourceIsLinear: true), coverage)
     }
 }
@@ -281,7 +284,9 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 
 **Interfaces:**
 - Consumes: `FileIdentity`, `SimilarityTransform`, `BackgroundExtraction.BackgroundModel`.
-- Produces: `struct SubRegistration` (fields per spec §2) and `static func sampleIndices(count: Int, maxSampleFrames: Int, minSampleFrames: Int = 11) -> [Int]` — indices into an ordered survivor list; all when `count <= maxSampleFrames`; else evenly strided, floored at `minSampleFrames`, forced to an odd length; deterministic (no RNG).
+- Produces: `struct SubRegistration` (fields per spec §2, and **`FileIdentity: Hashable`** — see Step 0) and `static func sampleIndices(count: Int, maxSampleFrames: Int) -> [Int]` — indices into an ordered survivor list; all when `count <= maxSampleFrames`; else EXACTLY `maxSampleFrames`-reduced-to-odd evenly-strided indices, never exceeding `maxSampleFrames` (RAM is the hard cap; `maxSampleFrames ≥ 11` is a config invariant, not a runtime floor); deterministic (no RNG).
+
+- [ ] **Step 0: Make `FileIdentity` Hashable** — `SubRegistration` is stored in a `[FileIdentity: SubRegistration]` dictionary (Task 5), but `FileIdentity` (`StackFileWatcher.swift:9`) is only `Equatable, Sendable, Codable` — **not `Hashable`**, so the dictionary won't compile. All its stored fields are `Hashable`, so add `extension FileIdentity: Hashable {}` (synthesized). Commit this one-liner with Task 3.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -303,11 +308,13 @@ final class SubRegistrationTests: XCTestCase {
         XCTAssertTrue(a.allSatisfy { $0 >= 0 && $0 < 100 })
         XCTAssertEqual(a, a.sorted())                          // ascending, strided
     }
-    func testSampleFlooredAtMinimum() {
-        // count 12, maxSampleFrames 4 → must not drop below minSampleFrames (11).
-        let a = SubRegistration.sampleIndices(count: 12, maxSampleFrames: 4, minSampleFrames: 11)
-        XCTAssertGreaterThanOrEqual(a.count, 11)
-        XCTAssertEqual(a.count % 2, 1)
+    func testSampleNeverExceedsCap() {
+        // count 12, cap 4 → EXACTLY the cap reduced to odd (3); RAM is the hard bound, never above it.
+        let a = SubRegistration.sampleIndices(count: 12, maxSampleFrames: 4)
+        XCTAssertLessThanOrEqual(a.count, 4)                   // never > the RAM cap
+        XCTAssertEqual(a.count % 2, 1)                         // odd
+        XCTAssertTrue(a.allSatisfy { $0 >= 0 && $0 < 12 })
+        XCTAssertEqual(Set(a).count, a.count)                 // distinct
     }
 }
 ```
@@ -343,20 +350,18 @@ public struct SubRegistration {
         self.effectiveScale = effectiveScale; self.weight = weight; self.leveling = leveling
     }
 
-    /// Deterministic sample selection for the robust-center estimate (spec §3 sample policy).
-    /// All indices when `count <= maxSampleFrames`; else an evenly-strided subset, never fewer than
-    /// `minSampleFrames`, forced to ODD length (true middle element for the per-pixel median). No RNG.
-    public static func sampleIndices(count: Int, maxSampleFrames: Int, minSampleFrames: Int = 11) -> [Int] {
+    /// Deterministic sample selection for the robust-center estimate (spec §3). All indices when
+    /// `count <= maxSampleFrames`; otherwise EXACTLY k evenly-spaced indices where k = `maxSampleFrames`
+    /// reduced to odd (true middle element for the per-pixel median). RAM is the HARD bound: the result
+    /// NEVER exceeds `maxSampleFrames`. There is no `minSampleFrames` floor that could override the cap;
+    /// `maxSampleFrames >= 11` is a config invariant asserted at session start (Task 11). No RNG.
+    public static func sampleIndices(count: Int, maxSampleFrames: Int) -> [Int] {
         guard count > 0 else { return [] }
         if count <= maxSampleFrames { return Array(0..<count) }        // shallow: use all (incl. N=5)
-        // Cap: pick EXACTLY k evenly-spaced indices, k in [min(minSampleFrames,count), maxSampleFrames],
-        // odd (true per-pixel median), never exceeding count. Inclusive-endpoint mapping ⇒ exact k, no
-        // overshoot (the old floor-stride could yield ceil(count/stride) > maxSampleFrames).
-        var k = min(maxSampleFrames, count)
-        k = max(k, min(minSampleFrames, count))
-        if k % 2 == 0 { k -= 1 }
+        var k = maxSampleFrames
+        if k % 2 == 0 { k -= 1 }                                       // odd — a true per-pixel median
         if k <= 1 { return [0] }
-        return (0..<k).map { $0 * (count - 1) / (k - 1) }             // 0..count-1, ascending, distinct
+        return (0..<k).map { $0 * (count - 1) / (k - 1) }             // exactly k, ascending, distinct, <= count-1
     }
 }
 ```
@@ -384,7 +389,7 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 - Test: `Tests/LiveAstroCoreTests/StackEngineTests.swift` (or the existing engine test file)
 
 **Interfaces:**
-- Produces: `ProcessResult.registration: RegistrationPayload?` (optional, additive — existing equality unaffected because pre-existing callers construct with `registration: nil` default). `struct RegistrationPayload: Equatable { let transform: SimilarityTransform; let effectiveScale: Float; let weight: Float; let leveling: (sub, ref)?; let stackGeneration: Int; let referenceIdentity: FileIdentity? }`. Reference frame → `transform = .identity`, `effectiveScale = 1`, `weight = 1`, `leveling = nil`, and **`referenceIdentity = its own `RawFrame.identity`** — every sub of a generation (including the reference) carries the *same* reference identity, so grouping is consistent (`referenceIdentity` is `FileIdentity?` only because an in-memory frame may have no file identity; `stackGeneration` is the primary generation key). `stackGeneration` increments on every reseed (manual `reseed()` + auto-reseed).
+- Produces: `ProcessResult.registration: RegistrationPayload?` (optional, additive with a `nil` default so all existing `ProcessResult(...)` call sites compile unchanged). Note: `ProcessResult`'s `Equatable` is compiler-synthesized, so `==` now *also* compares `registration` — but no caller compares whole `ProcessResult` values (tests compare `.outcome`/`.weight` individually), so nothing breaks. `struct RegistrationPayload: Equatable { let transform: SimilarityTransform; let effectiveScale: Float; let weight: Float; let leveling: (sub, ref)?; let stackGeneration: Int; let referenceIdentity: FileIdentity? }`. Reference frame → `transform = .identity`, `effectiveScale = 1`, `weight = 1`, `leveling = nil`, and **`referenceIdentity = its own `RawFrame.identity`** — every sub of a generation (including the reference) carries the *same* reference identity, so grouping is consistent (`referenceIdentity` is `FileIdentity?` only because an in-memory frame may have no file identity; `stackGeneration` is the primary generation key). `stackGeneration` increments on every reseed (manual `reseed()` + auto-reseed).
 - Consumes: existing `RegisteredFrame`, `levelingModels`, `effectiveScale`, `appliedWeight`.
 
 > Note to implementer: `leveling`'s tuple isn't `Equatable` for free — give `RegistrationPayload` a hand-written `==` that compares `transform, effectiveScale, weight, stackGeneration, referenceIdentity` and treats `leveling` by nil-ness only (the models are large; identity of presence is enough for the payload's equality, which exists only for test assertions).
@@ -471,16 +476,22 @@ return ProcessResult(outcome: .becameReference, starCount: stars.count, backgrou
         leveling: nil, stackGeneration: stackGeneration, referenceIdentity: frame.identity))
 ```
 
-Stacked return (~377) — capture the `pair` and `effectiveScale` already computed above:
+Stacked return (~377) — **REUSE the `pair` and `effectiveScale` already computed at lines 366-368; do NOT call `levelingModels` a second time** (it runs a full least-squares fit under the engine `lock` on every accepted sub — a real online-path latency regression, even feature-off). Hoist `pair` out of the `if let pair = levelingModels(...)` into an outer binding:
 ```swift
-let levelingPair = levelingModels(image: warped, mask: mask)   // reuse if already computed; else compute once
+// change line ~366 `if let pair = levelingModels(image: warped, mask: mask) {` to:
+let pair = levelingModels(image: warped, mask: mask)          // computed ONCE
+if let pair {
+    effectiveScale = GradientLeveler.scalingApplies(subModel: pair.sub, refModel: pair.ref, channels: warped.channels) ? scale : 1.0
+    frame = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref, scale: effectiveScale)
+}
+// ... existing accumulate/weight ...
 return ProcessResult(outcome: .stacked(frameCount: accumulator.frameCount),
     starCount: stars.count, backgroundSigma: sigma, weight: appliedWeight,
     registration: RegistrationPayload(transform: half, effectiveScale: effectiveScale, weight: appliedWeight,
-        leveling: levelingPair, stackGeneration: stackGeneration, referenceIdentity: referenceIdentity))
+        leveling: pair, stackGeneration: currentStackGeneration, referenceIdentity: referenceIdentity))
 ```
 
-Add `private var stackGeneration = 0` incremented in `reseed()` and the auto-reseed branch; expose `public var currentStackGeneration: Int { stackGeneration }`. Store `private var referenceIdentity: FileIdentity?` set when a frame becomes the reference (from `RawFrame.identity`) so stacked subs carry their reference's identity. `SimilarityTransform.identity` must exist — if not, add a static `identity` (scale 1, rotation 0, tx/ty 0).
+**Generation (M2):** do NOT add new mutable state — the engine already has `manualReseedCount` + `autoReseedCount` (`StackEngine.swift:105-111`). Derive `public var currentStackGeneration: Int { manualReseedCount + autoReseedCount }`; a reseed (manual or the auto-reseed rejection branch ~315-331) bumps it automatically, so no site can be missed. Store `private var referenceIdentity: FileIdentity?` set when a frame becomes the reference (from `RawFrame.identity`) so stacked subs carry their reference's identity. (`SimilarityTransform.identity` already exists — `SimilarityTransform.swift:14` — no need to add it.)
 
 - [ ] **Step 4: Run to verify pass + full engine suite**
 
@@ -513,7 +524,10 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 - [ ] **Step 2: Run to verify fail** — `subRegistrations()` doesn't exist.
 
 - [ ] **Step 3a: Add `RawFrame.sourceURL`** — `RawFrame` exposes `identity` + `sourceName` but not a URL. Reconstructing a URL from a basename is fragile (basename collisions, folder replacement). Add `public let sourceURL: URL?` to `RawFrame` (default `nil`, back-compat) and populate it in `FolderFrameSource.loadRawFrame(url:...)` with the actual `url` it read. Non-file/in-memory frames leave it `nil`. Test: a `FolderFrameSource(.live)` frame carries the real `sourceURL`.
-- [ ] **Step 3b: Capture the cache** — in `handleNative`, after the online commit and `onSubFrame?`, when `result.registration != nil` insert into `private var _subRegistrations: [FileIdentity: SubRegistration]` (same serial-consumer context as `recordSubFrame`, no extra lock needed for writes; a lock only for the `subRegistrations()` read seam). `relayURL = frame.sourceURL` **directly** — never reconstructed. A frame with `sourceURL == nil` is skipped for registration (feature stays off, Task 11 gate). Reference sub → `referenceIdentity = frame.identity`. Expose `func subRegistrations() -> [FileIdentity: SubRegistration]`.
+- [ ] **Step 3b: Capture the cache (thread-safe)** — hold `private let regLock = NSLock()` guarding BOTH `private var _subRegistrations: [FileIdentity: SubRegistration]` (insertion-ordered — keep a parallel `[FileIdentity]` order array) AND `private var _userRejected: Set<FileIdentity>`. In `handleNative`, after the online commit and `onSubFrame?`, when `result.registration != nil`, insert **under `regLock`** — the consumer thread writes but the refiner queue and `currentFreshnessKey()` read from *other* threads, so the writer MUST take the same lock (C2: a locked reader synchronizes nothing if the writer doesn't lock). `relayURL = frame.sourceURL` **directly** — never reconstructed; a frame with `sourceURL == nil` is skipped (feature off, Task 11 gate). Reference sub → `referenceIdentity = frame.identity`. Expose, all under `regLock`:
+  - `func subRegistrations() -> [FileIdentity: SubRegistration]` (test seam),
+  - `func setUserRejected(_ ids: Set<FileIdentity>)` — **C4**: the pipeline's own reject set, distinct from AppModel's UI array; AppModel pushes the flagged identities here (Task 11),
+  - `func currentSurvivors(currentGeneration: Int) -> [SubRegistration]` — accepted subs of `currentGeneration`, **minus `_userRejected`**, in capture order (this is what the refiner and freshnessKey consume — so a reject actually removes the sub, not just bumps a counter).
 
 - [ ] **Step 4: Run to verify pass** + existing pipeline suites green.
 
@@ -528,14 +542,16 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 - Test: `Tests/LiveAstroCoreTests/GlobalRefinerTests.swift`
 
 **Interfaces:**
-- Consumes: `GlobalCombine`, `SubRegistration`, `Warp.apply(_:transform:)`, `GradientLeveler.apply(_:subModel:refModel:scale:)`, a **`FrameLoader`** protocol `func loadCalibratedRGB(url: URL, expectedDigest:) throws -> AstroImage` (injected — production wraps `FolderFrameSource.loadRawFrame` + calibrator + debayer; tests inject a stub).
-- Produces: `struct GlobalRefiner { func refine(survivors: [SubRegistration], currentGeneration: Int, kappa: Float, maxSampleBytes: Int) -> RefineResult? }` where `RefineResult { let image: AstroImage; let coverage: [Float]; let survivorCount: Int; let skipped: Int }`. **Filters survivors to `stackGeneration == currentGeneration` (explicit equality — NEVER a majority heuristic; after a reseed the old frames could be the majority and refine the wrong stack)**, warps each (`transform.liftedToFullResolution()`), applies leveling when the pair exists, produces `(image, mask, weight)`; builds the RAM sample via `SubRegistration.sampleIndices`, calls `robustCenter` then `clippedWeightedMean` (streaming the output via the loader again). Per-sub load failure → skip + count. `currentGeneration` is passed by the caller from `engine.currentStackGeneration`.
+- Consumes: `GlobalCombine`, `SubRegistration`, `Warp.apply(_:transform:)`, `GradientLeveler.apply(_:subModel:refModel:scale:)`, a **`FrameLoader`** protocol `func loadRegisteredInput(url: URL, expectedDigest: FileIdentity?) throws -> AstroImage` returning the **calibrated display-RGB, un-warped** frame — exactly what the online pass fed to `Warp.apply`. **I2 — the production impl MUST**: (a) apply the session's **`effectiveCalibrator`** (`SessionPipeline.swift:245`), NOT a freshly-rebuilt calibrator (the re-stack P1b lesson — a rebuilt one resolves to nil for empty-folder live starts); (b) reproduce the engine's private `displayRGB` with the **same `DemosaicMethod`** the engine was built with (bilinear vs malvar) + the same bottom-up flip, or the warped pixels diverge from the online domain. Extract a shared display-RGB helper (or thread the `DemosaicMethod`) so both call one implementation. Tests inject a stub loader.
+- Produces: `struct GlobalRefiner { func refine(survivors: [SubRegistration], currentGeneration: Int, kappa: Float, maxSampleBytes: Int, deadline: DispatchTime, isCancelled: () -> Bool) -> RefineResult? }` where `RefineResult { let image: AstroImage; let coverage: [Float]; let survivorCount: Int; let skipped: Int }`. **C3 — bounded & cancellable:** checks `isCancelled()` and `DispatchTime.now() < deadline` **between every sub** (per-sub load+warp is the minutes-long part); on cancel/deadline returns `nil` (caller keeps last master / falls back). The single per-pixel CPU reduction inside `robustCenter`/`clippedWeightedMean` (~seconds at 26 MP) is not interruptible mid-loop — acceptable, since the between-sub work the deadline bounds dominates. **Filters survivors to `stackGeneration == currentGeneration`** (explicit equality — NEVER majority; after a reseed old frames could be the majority and refine the wrong stack), warps each (`transform.liftedToFullResolution()`), applies leveling when the pair exists, produces `(image, mask, weight)`; builds the RAM sample via `SubRegistration.sampleIndices(count:maxSampleFrames:)` where `maxSampleFrames = maxSampleBytes / frameBytes`; calls `robustCenter` then `clippedWeightedMean` (streaming the output via the loader again). Per-sub load failure → skip + count. `currentGeneration` from `engine.currentStackGeneration`.
 
-- [ ] **Step 1: Write the failing test** — inject a stub loader returning constant frames + one trail frame; build `SubRegistration`s (identity transforms, generation 0, weight 1); assert `refine(...)` removes the trail (image == clean value), `survivorCount` correct, and a survivor of a *different* generation is excluded. A stub-loader throw for one URL → `skipped == 1` and the pass still returns.
+- [ ] **Step 1: Write the failing test** — inject a stub loader returning constant frames + one trail frame; build `SubRegistration`s (identity transforms, generation 0, weight 1); assert `refine(..., deadline: .distantFuture, isCancelled: { false })` removes the trail (image == clean value), `survivorCount` correct, and a survivor of a *different* `stackGeneration` is excluded. A stub-loader throw for one URL → `skipped == 1` and the pass still returns. **Cancellation:** `isCancelled: { true }` → returns `nil`; a `deadline` already in the past → returns `nil` (loader's stub can count calls to prove it stopped early).
 
 - [ ] **Step 2: Run to verify fail** — `GlobalRefiner` not found.
 
-- [ ] **Step 3: Implement** — the orchestration above. First `let inGen = survivors.filter { $0.stackGeneration == currentGeneration }` (explicit equality). Warp with `Warp.apply(rgb, transform: reg.transform.liftedToFullResolution())` → `(warped, mask)`; if `reg.leveling != nil` → `GradientLeveler.apply(warped, subModel: leveling.sub, refModel: leveling.ref, scale: reg.effectiveScale)` else use `warped`. Sample = `inGen` at `SubRegistration.sampleIndices(count: inGen.count, ...)`, materialized as `(image, mask)`; center = `robustCenter(sample)`; output = `clippedWeightedMean(frames: { re-stream all `inGen` survivors via loader }, center, scale, kappa)`. Skip a survivor whose load throws (`skipped += 1`); if the surviving quorum is too small, return nil (caller keeps last master).
+- [ ] **Step 3: Implement** — the orchestration above. First `let inGen = survivors.filter { $0.stackGeneration == currentGeneration }` (explicit equality). Loop guard for every sub load: `if isCancelled() || DispatchTime.now() >= deadline { return nil }`. Warp with `Warp.apply(rgb, transform: reg.transform.liftedToFullResolution())` → `(warped, mask)`; if `reg.leveling != nil` → `GradientLeveler.apply(warped, subModel: leveling.sub, refModel: leveling.ref, scale: reg.effectiveScale)` else use `warped`. Sample = `inGen` at `SubRegistration.sampleIndices(count: inGen.count, maxSampleFrames: maxSampleBytes / frameBytes)`, materialized as `(image, mask)`; center = `robustCenter(sample)`; output = `clippedWeightedMean(frames: { re-stream all `inGen` survivors via loader (same cancel/deadline guard) }, center, scale, kappa)`. Skip a survivor whose load throws (`skipped += 1`); if the surviving quorum is too small, return nil (caller keeps last master).
+
+  **M3 — atomic snapshot at the call site (Task 8, documented here):** the caller reads `currentGeneration = engine.currentStackGeneration` FIRST, then `survivors = pipeline.currentSurvivors(currentGeneration:)`, then re-reads generation and DISCARDS the pass if it changed between the two reads — so a reseed mid-build can never publish a pass computed against a torn (set, generation) pair.
 
 - [ ] **Step 4: Run to verify pass** — GlobalRefinerTests green.
 
@@ -550,8 +566,9 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 - Test: `Tests/LiveAstroCoreTests/GlobalRefinerTests.swift`
 
 **Interfaces:**
-- Produces: `struct FreshnessKey: Equatable { let stackGeneration: Int; let survivorDigests: [String]; let userRejectGeneration: Int; let kappa: Float }` (`survivorDigests` sorted); `SessionPipeline.currentFreshnessKey() -> FreshnessKey`; internal `publishedMaster: (image: AstroImage, coverage: [Float], survivorCount: Int, key: FreshnessKey)?` under a lock; `func publishedMasterIfCurrent() -> (image, coverage, survivorCount)?` returns the stored master only when `key == currentFreshnessKey()`.
-- Consumes: the survivor set (Task 5 cache), `userRejectGeneration` (bump a counter on every `toggleReject`), `rejectionStrength.kappa`.
+- Produces: `struct FreshnessKey: Equatable { let stackGeneration: Int; let survivorDigests: [String]; let userRejectGeneration: Int; let kappa: Float }` where `survivorDigests` = the SORTED content-digests of `currentSurvivors(currentGeneration:)` — so it already reflects generation AND user rejections (C4). `SessionPipeline.currentFreshnessKey() -> FreshnessKey`; internal `publishedMaster: (image: AstroImage, coverage: [Float], survivorCount: Int, key: FreshnessKey)?` under `regLock`; `func publishedMasterIfCurrent() -> (image, coverage, survivorCount)?` returns the stored master only when `key == currentFreshnessKey()`.
+- **M1 — cache the key, don't recompute per render.** `currentFreshnessKey()` is read on the broadcast-preference path per accepted sub; an O(N log N) sort of N 64-char digests under lock every render is wasteful for deep stacks. Maintain a cached `FreshnessKey`, recomputed ONCE only when the cache mutates — sub inserted, `setUserRejected`, generation change, or κ change — so the render-path read is O(1).
+- Consumes: the survivor set + `_userRejected` (Task 5), `userRejectGeneration` (bumped by `noteUserRejectChanged`, Task 8), `rejectionStrength.kappa`.
 
 - [ ] **Step 1: Write the failing test** — publish a master with key K; assert `publishedMasterIfCurrent()` returns it; then simulate a user reject (bump `userRejectGeneration`) → `currentFreshnessKey()` changes → `publishedMasterIfCurrent()` returns nil (stale). Same for a κ change and a reseed (`stackGeneration` bump).
 
@@ -568,7 +585,7 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 - `SessionPipeline.noteUserRejectChanged()` — bumps `userRejectGeneration`; **`AppModel.toggleReject` calls this** (not the refiner directly).
 - `SessionPipeline.noteReseeded()` — on manual/auto reseed (freshnessKey's `stackGeneration` already changed).
 
-The refiner owns a serial `DispatchQueue`; `noteChanged()` coalesces (idle → dispatch a pass; running → set `dirty`, exactly one more pass afterward) and returns immediately (never blocks the caller). On completion it stores `publishedMaster` (Task 7). Produces no return into the online path.
+Each hook first **refreshes the cached `FreshnessKey`** (Task 7 M1) under `regLock` — these are exactly the cache-mutation points — then calls `refiner.noteChanged()`. The refiner owns a serial `DispatchQueue`; `noteChanged()` coalesces (idle → dispatch a pass; running → set `dirty`, exactly one more pass afterward) and returns immediately (never blocks the caller). On completion it stores `publishedMaster` (Task 7). Produces no return into the online path.
 
 - [ ] **Step 1: Write the failing test** — fire `noteChanged()` 5× rapidly; assert at most one pass runs concurrently and exactly one extra pass runs after the first completes (use a counting stub loader + expectations); assert the calling thread is never blocked (the calls return immediately).
 
@@ -596,13 +613,13 @@ The refiner owns a serial `DispatchQueue`; `noteChanged()` coalesces (idle → d
 1. **stop the source** (existing `folderSource.stop(timeout:)`).
 2. **drain the backlog** (existing progress-aware `drainConsumeTaskOrThrow` — 2026-08-28 fix) so every in-flight accepted sub is recorded first.
 3. **freeze** the survivor set + compute `currentFreshnessKey()` once — from here it does not change.
-4. **cancel** any in-flight refiner and wait its bounded cancellation.
-5. if `publishedMasterIfCurrent()` matches the frozen key → use it; **else** run ONE bounded `refiner.refine(survivors:currentGeneration:...)` against the frozen set.
+4. **cancel** any in-flight refiner — set its `isCancelled` flag and wait, bounded (the running pass checks the flag between subs, C3, so this returns within one sub's load time, not minutes).
+5. if `publishedMasterIfCurrent()` matches the frozen key → use it; **else** run ONE `refiner.refine(survivors: frozenSurvivors, currentGeneration: frozenGen, kappa:, maxSampleBytes:, deadline: .now() + finalRefineBudget, isCancelled: { self.sessionEnded })` against the frozen set. `finalRefineBudget` is an explicit `DispatchTimeInterval` (internal, test-shrinkable).
 6. **write** `master.fit` via `RestackPlanning.encodeMaster` with **STACKCNT = survivorCount** and **TOTALEXP = survivorCount · subExposureSeconds**.
 
-On any refiner failure at step 5 → fall back to the online `finalizationState()` master (today's path); the session still finalizes. The bounded refine at step 5 shares the live-drain timeout budget (no hang).
+If step 5 returns `nil` (deadline/cancel/failure) → fall back to the online `finalizationState()` master (today's path); the session still finalizes. Because `refine` is deadline-bounded and between-sub-cancellable (C3), `end()` can no longer hang — the exact regression class the 2026-08-28 drain fix cured.
 
-- [ ] **Step 1: Write the failing test** — drive a `.live` pipeline (BacklogLiveSource) with a trail sub + feature on; `end()`; assert `master.fit` exists, its STACKCNT == survivor count (not the online stack count if they differ), and the trail-region pixels read background. Add a fault test: a refiner that always fails → `end()` still writes the online master (no throw, no hang).
+- [ ] **Step 1: Write the failing test** — drive a `.live` pipeline (BacklogLiveSource) with a trail sub + feature on; `end()`; assert `master.fit` exists, its STACKCNT == survivor count (not the online stack count if they differ), and the trail-region pixels read background. Fault test: a refiner that always returns nil → `end()` still writes the online master (no throw). **Hang-safety test (C3):** shrink `finalRefineBudget` to e.g. 200 ms and inject a refiner whose loader sleeps per sub → `end()` returns within ~budget and falls back to the online master (bounded, no hang) — mirrors the shutdown-drain hang tests.
 
 - [ ] **Step 2–5:** implement; ensure the final pass shares the bounded-drain cancellation; commit (`feat: end() writes the clean survivor-counted master with online fallback`).
 
@@ -612,7 +629,10 @@ On any refiner failure at step 5 → fall back to the online `finalizationState(
 
 **Files:** Modify `Sources/LiveAstroStudio/AppModel.swift`, `Sources/LiveAstroStudio/CaptureSettingsView.swift`; Test `Tests/LiveAstroCoreTests/` (pure gating helper) or an app-level test.
 
-**Interfaces:** `AppModel.liveTrailRejection: Bool = true`; a pure `LiveRejectionGate.reason(sourceIsLocalLiveRelay: Bool, subCount: Int, minSubs: Int, reseeding: Bool, enabled: Bool) -> LiveRejectionStatus` returning `.active(subs:) | .off(reason: String)` with reasons `"network source"`, `"need ≥ N subs"`, `"reseeding"`, `"turned off"`. The pipeline consults the gate before engaging the refiner; the view shows the status string. κ from `rejectionStrength`.
+**Interfaces:** `AppModel.liveTrailRejection: Bool = true`; κ from `rejectionStrength`. A pure `LiveRejectionGate.reason(sourceIsLocalLiveRelay: Bool, subCount: Int, minSubs: Int, reseeding: Bool, enabled: Bool) -> LiveRejectionStatus` returning `.active(subs:) | .off(reason: String)` (reasons `"network source"`, `"need ≥ N subs"`, `"reseeding"`, `"turned off"`).
+- **I3 — gate inputs live in AppModel, not the pipeline.** The pipeline can't introspect its `FrameSource` for locality, so AppModel computes `sourceIsLocalLiveRelay` (source mode is native `.live` AND the watch folder is a local path) and pushes the resolved config down via `SessionPipeline.configureLiveRejection(enabled: Bool, kappa: Float, maxSampleBytes: Int)`. That call **asserts/logs the config invariant `maxSampleBytes / frameBytes ≥ 11`** (raise the budget for > ~50 MP sensors). Feature stays off (with the reason) for network/watcher/import.
+- **C4 — reject wiring (the functional half).** `AppModel.toggleReject(...)`, after flipping `subFrames[i].rejectedByUser`, computes the current rejected-identity `Set<FileIdentity>` from `subFrames` and calls `pipeline.setUserRejected(_:)` **then** `pipeline.noteUserRejectChanged()`. This is what actually removes the sub from the clean master (bumping the generation counter alone does nothing).
+- The view shows the status string.
 
 - [ ] **Step 1: Write the failing test** — table-test `LiveRejectionGate.reason` for each branch (local+enough subs+on → active; network → off "network source"; too few → off "need ≥ N subs"; reseeding → off "reseeding"; toggle off → off "turned off").
 
@@ -628,6 +648,8 @@ On any refiner failure at step 5 → fall back to the online `finalizationState(
 
 - [ ] **Step 1: Write the tests**
   - **Always-CI synthetic:** build N=11 registered star frames in-memory, one with a bright diagonal streak; drive the `.live` pipeline with the feature ON; `end()`; assert `master.fit`'s streak-path pixels read background (trail removed) while a feature-OFF run keeps them bright. This is the automated form of the demo.
+  - **Feature-OFF byte parity (I4):** with the feature OFF, drive a fixed small sub set and assert the written `master.fit` is **byte-identical to a golden committed from before this branch** (a checked-in fixture, or `git show <base>:<path>` captured pre-Task-1) — proving the online path is unchanged.
+  - **Reject → clean master updates (C4 acceptance):** feature ON; include an un-flagged bad sub so the published clean master initially still shows its artifact; call the reject path (`toggleReject` → `setUserRejected` → `noteUserRejectChanged`); wait for the next refine; assert the artifact's contribution is **gone from the published master** (not merely that `freshnessKey` changed).
   - **Env-gated real data (skippable like `testSolvesRealM63Frame`):** guard on `ProcessInfo.processInfo.environment["LAS_TRAIL_FRAMES"]` pointing at the real M 51 set incl. the trail sub; drive the pipeline, assert (a) the trail is gone from `master.fit` (mean along the trail path ≈ local background), and (b) **SNR does not regress**, measured **ROI-based, not global**: pick a flat background ROI away from the trail and the galaxy, compute SNR = mean/σ there for both masters, and require `globalSNR ≥ 0.9 · onlineSNR` (tolerance for the survivor-count difference — NOT strict ≥). Skip when the env var is unset.
 - [ ] **Step 2: Run** — synthetic passes; real-data test skips without the env var.
 - [ ] **Step 3: Commit** (`test: live global rejection acceptance (synthetic CI + env-gated real M51)`).
