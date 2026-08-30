@@ -465,32 +465,11 @@ public final class StackEngine {
     }
 
     /// Debayer in stored order (never flip the CFA), then flip rows to top-down display.
-    /// RawFrame contract: bayerPattern != nil implies channels == 1 (a violated
-    /// contract traps in Debayer.bilinear rather than silently mis-rendering).
+    /// Delegates to the shared `DisplayRGB.make` (Task 6) so the online engine and the
+    /// live-rejection `GlobalRefiner`'s production `FrameLoader` stay byte-identical —
+    /// one implementation, no drift.
     private func displayRGB(_ frame: RawFrame, minRows: Int = 64) -> AstroImage {
-        var rgb: AstroImage
-        if let pattern = frame.bayerPattern, frame.image.channels == 1 {
-            switch demosaic {
-            case .bilinear:
-                rgb = Debayer.bilinear(cfa: frame.image, pattern: pattern, minRows: minRows)
-            case .malvar:
-                rgb = Debayer.malvar(cfa: frame.image, pattern: pattern, minRows: minRows)
-            }
-        } else {
-            rgb = frame.image
-        }
-        guard frame.bottomUp else { return rgb }
-        let w = rgb.width, h = rgb.height, plane = w * h
-        var flipped = [Float](repeating: 0, count: rgb.pixels.count)
-        for c in 0..<rgb.channels {
-            for y in 0..<h {
-                let src = c * plane + (h - 1 - y) * w
-                let dst = c * plane + y * w
-                flipped.replaceSubrange(dst..<(dst + w), with: rgb.pixels[src..<(src + w)])
-            }
-        }
-        return AstroImage(width: w, height: h, channels: rgb.channels,
-                          pixels: flipped, sourceIsLinear: rgb.sourceIsLinear)
+        DisplayRGB.make(frame, demosaic: demosaic, minRows: minRows)
     }
 
     /// A frame that registered against the current reference; ready to warp+commit.

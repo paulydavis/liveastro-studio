@@ -192,4 +192,275 @@ final class GlobalRefinerTests: XCTestCase {
 
         source.stop()
     }
+
+    // MARK: - Task 6: GlobalRefiner (reproduce + robust combine)
+
+    private enum StubLoadError: Error { case simulated, missing }
+
+    /// Records every call (URL + count) so tests can assert the loader was invoked at most
+    /// once per survivor, or never at all (cancellation / past-deadline).
+    private final class StubFrameLoader: FrameLoader {
+        private var images: [URL: AstroImage]
+        var throwing: Set<URL> = []
+        private(set) var callCount = 0
+        private(set) var calledURLs: [URL] = []
+        init(images: [URL: AstroImage]) { self.images = images }
+        func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
+            callCount += 1
+            calledURLs.append(url)
+            if throwing.contains(url) { throw StubLoadError.simulated }
+            guard let img = images[url] else { throw StubLoadError.missing }
+            return img
+        }
+    }
+
+    private func constImage(_ v: Float, w: Int = 4, h: Int = 4) -> AstroImage {
+        AstroImage(width: w, height: h, channels: 1, pixels: [Float](repeating: v, count: w * h), sourceIsLinear: true)
+    }
+
+    /// A flat frame with ONE pixel elevated — simulates a satellite-trail/cosmic-ray hit that
+    /// only the multi-frame robust combine (not the online single-pass winsorized clip) can see.
+    private func trailImage(base: Float, trail: Float, w: Int = 4, h: Int = 4) -> AstroImage {
+        var px = [Float](repeating: base, count: w * h)
+        px[0] = trail
+        return AstroImage(width: w, height: h, channels: 1, pixels: px, sourceIsLinear: true)
+    }
+
+    private func refinerReg(subIndex: Int, url: URL, gen: Int = 0, weight: Float = 1.0) -> SubRegistration {
+        SubRegistration(subIndex: subIndex, contentDigest: nil, relayURL: url, stackGeneration: gen,
+                        referenceIdentity: nil, transform: .identity, effectiveScale: 1.0,
+                        weight: weight, leveling: nil)
+    }
+
+    /// Core case: the multi-frame robust combine removes a satellite-trail pixel the online
+    /// single-pass winsorized engine can't see (each frame only ever sees itself online).
+    func testRefineRemovesSatelliteTrailViaRobustCombine() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-trail-\(i).fit")
+            images[url] = i == 2 ? trailImage(base: 0.1, trail: 0.9) : constImage(0.1)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
+        let unwrapped = try XCTUnwrap(result)
+        XCTAssertEqual(unwrapped.survivorCount, 5)
+        XCTAssertEqual(unwrapped.skipped, 0)
+        XCTAssertEqual(unwrapped.image.pixels[0], 0.1, accuracy: 1e-6,
+                       "the trail pixel must be clipped out by the robust combine, not blended in")
+        XCTAssertEqual(unwrapped.image.pixels[1], 0.1, accuracy: 1e-6)
+    }
+
+    /// After a reseed, old-generation frames could be the majority — filtering MUST be exact
+    /// equality, never majority. Also proves excluded subs are never even loaded.
+    func testRefineExcludesDifferentStackGenerationSurvivors() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-gen0-\(i).fit")
+            images[url] = constImage(0.2)
+            regs.append(refinerReg(subIndex: i + 1, url: url, gen: 0))
+        }
+        for i in 0..<3 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-gen1-\(i).fit")
+            images[url] = constImage(0.9)
+            regs.append(refinerReg(subIndex: 100 + i, url: url, gen: 1))
+        }
+        let loader = StubFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
+        let unwrapped = try XCTUnwrap(result)
+        XCTAssertEqual(unwrapped.survivorCount, 5)
+        XCTAssertEqual(unwrapped.image.pixels.first, 0.2)
+        XCTAssertFalse(loader.calledURLs.contains { $0.absoluteString.contains("gen1") },
+                       "a different-generation sub must never even be loaded")
+    }
+
+    /// A single sub's URL throws (mid-set, not the first) → counted once by subIndex, the pass
+    /// still returns.
+    func testRefineSkipsOneFailedLoadAndStillReturns() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        var urls: [URL] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-onethrow-\(i).fit")
+            urls.append(url)
+            images[url] = constImage(0.3)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        loader.throwing = [urls[2]]
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 3,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
+        let unwrapped = try XCTUnwrap(result)
+        XCTAssertEqual(unwrapped.skipped, 1)
+        XCTAssertEqual(unwrapped.survivorCount, 4)
+    }
+
+    /// A throw for the FIRST survivor's URL — sizing must fall through to the next successful
+    /// load rather than failing outright.
+    func testRefineFirstSurvivorFailureFallsThroughForSizing() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        var urls: [URL] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-firstthrow-\(i).fit")
+            urls.append(url)
+            images[url] = constImage(0.4)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        loader.throwing = [urls[0]]
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 3,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
+        let unwrapped = try XCTUnwrap(result, "sizing must fall through to the next successful load")
+        XCTAssertEqual(unwrapped.skipped, 1)
+    }
+
+    /// Under budget (`inGen.count <= maxSampleFrames`): output reuses the cached sample —
+    /// each survivor is loaded AT MOST ONCE (no disk re-read to build the output).
+    func testRefineUnderBudgetReusesCachedFramesNoExtraLoads() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-reuse-\(i).fit")
+            images[url] = constImage(0.5)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
+        XCTAssertNotNil(result)
+        XCTAssertEqual(loader.callCount, 5, "each survivor must be loaded at most once under budget")
+    }
+
+    /// HARD floor: `maxSampleFrames < 11` → onLog the insufficient-budget message and return
+    /// nil (online master kept), never a robust center computed from too few RAM samples.
+    func testRefineInsufficientSampleBudgetLogsAndReturnsNil() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-budget-\(i).fit")
+            images[url] = constImage(0.5, w: 2, h: 2)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        var logs: [String] = []
+        let refiner = GlobalRefiner(loader: loader, onLog: { logs.append($0) })
+        // 2x2x1 frame -> sampleFrameBytes = 4·4(pixels) + 4·4(mask) = 32; budget 32 -> maxSampleFrames = 1 < 11.
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 1,
+                                    maxSampleBytes: 32, deadline: .distantFuture, isCancelled: { false })
+        XCTAssertNil(result)
+        XCTAssertEqual(logs, ["live rejection off: insufficient sample budget (1 < 11 frames)"])
+    }
+
+    /// Odd-sample invariant (P2-2/P2-4), asserted observably via the debug hook: a CAPPED pass
+    /// (maxSampleFrames < inGen.count) where one SELECTED sample index fails to load must drop
+    /// the materialized sample's last element to keep it odd (a true middle median) rather than
+    /// leaving it even.
+    func testRefineCappedPassDropsToOddSampleOnSelectedFrameFailure() throws {
+        let n = 15
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        var urls: [URL] = []
+        for i in 0..<n {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-capped-\(i).fit")
+            urls.append(url)
+            images[url] = constImage(0.1, w: 2, h: 2)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        // Pin the selected sample indices so the induced failure lands on a SELECTED one.
+        let idxs = SubRegistration.sampleIndices(count: 15, maxSampleFrames: 12)
+        XCTAssertEqual(idxs, [0, 1, 2, 4, 5, 7, 8, 9, 11, 12, 14], "test precondition")
+        let loader = StubFrameLoader(images: images)
+        loader.throwing = [urls[5]]   // index 5 is a SELECTED sample index
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        // sampleFrameBytes = 32 (2x2x1); maxSampleBytes = 12*32 = 384 -> maxSampleFrames = 12 (>= 11 floor).
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
+                                    maxSampleBytes: 384, deadline: .distantFuture, isCancelled: { false })
+        let unwrapped = try XCTUnwrap(result)
+        XCTAssertEqual(refiner.lastMaterializedSampleCount, 9,
+                       "11 selected - 1 failure = 10 (even) -> drop-last keeps it odd at 9")
+        XCTAssertEqual(unwrapped.skipped, 1)
+        XCTAssertEqual(unwrapped.survivorCount, 14)
+    }
+
+    /// If selected-frame load failures drop the materialized sample below `minSubs`, fail
+    /// closed (return nil) rather than computing a robust center from too few frames.
+    func testRefineBelowMinSubsAfterSampleFailuresReturnsNil() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        var urls: [URL] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-belowmin-\(i).fit")
+            urls.append(url)
+            images[url] = constImage(0.6)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        loader.throwing = [urls[2]]
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        // 5 survivors, 1 fails -> materialized sample 4 (even) -> drop-last -> 3, below minSubs=5.
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
+        XCTAssertNil(result)
+    }
+
+    func testRefineIsCancelledReturnsNilWithoutLoading() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-cancel-\(i).fit")
+            images[url] = constImage(0.7)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { true })
+        XCTAssertNil(result)
+        XCTAssertEqual(loader.callCount, 0, "cancellation must stop before the first load")
+    }
+
+    func testRefinePastDeadlineReturnsNilWithoutLoading() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-deadline-\(i).fit")
+            images[url] = constImage(0.8)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        let past = DispatchTime.now() - 1.0
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
+                                    maxSampleBytes: 10_000_000, deadline: past, isCancelled: { false })
+        XCTAssertNil(result)
+        XCTAssertEqual(loader.callCount, 0, "an already-past deadline must stop before the first load")
+    }
+
+    /// The passId mechanism (step 7): a cancel() that lands before any pass has ever started
+    /// records against passId 0 — it must not poison the FIRST real pass (passId 1).
+    func testRefineCancelBeforeFirstPassDoesNotPoisonIt() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-passid-\(i).fit")
+            images[url] = constImage(0.9)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        refiner.cancel()
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
+        XCTAssertNotNil(result, "a pre-emptive cancel() targeting passId 0 must not kill passId 1")
+    }
 }
