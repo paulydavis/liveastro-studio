@@ -563,7 +563,7 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
                                     mtimeSec: 0, mtimeNsec: 0, digest: digest)
         return RawFrame(image: image, bayerPattern: bayerPattern, bottomUp: bottomUp,
                         timestamp: timestamp, sourceName: url.lastPathComponent,
-                        metadata: metadata, identity: identity)
+                        metadata: metadata, identity: identity, sourceURL: url)
     }
 
     // Date() fallback covers the file vanishing between load and attribute read

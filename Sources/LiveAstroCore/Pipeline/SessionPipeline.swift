@@ -211,6 +211,42 @@ public final class SessionPipeline {
         }
     }
 
+    // MARK: SubRegistration cache (Task 5)
+    //
+    // Thread-safe cache of per-sub registration payloads so a later background refiner
+    // (Task 6) can reuse each accepted sub's transform/leveling/scale without re-registering.
+    // Keyed by `subIndex` (== `processedCount`, the monotonic per-sub ID also used for
+    // SubFrameRecord.index) — an ARRAY in capture order, NOT a FileIdentity/digest dict, so
+    // byte-identical subs still produce distinct entries.
+    private let regLock = NSLock()
+    private var _subRegistrations: [SubRegistration] = []          // guarded by regLock
+    private var _userRejected: Set<Int> = []                       // guarded by regLock; subIndexes
+
+    /// Test seam: the captured registrations in capture order. Thread-safe.
+    func subRegistrations() -> [SubRegistration] {
+        regLock.withLock { _subRegistrations }
+    }
+
+    /// The pipeline's own reject set (subIndexes), distinct from AppModel's UI array —
+    /// AppModel pushes the flagged subIndexes here (Task 11). Thread-safe.
+    func setUserRejected(_ ids: Set<Int>) {
+        regLock.withLock { _userRejected = ids }
+    }
+
+    /// Subs of `currentGeneration`, minus any `subIndex` the user has flagged, in capture
+    /// order. Locks `regLock` — do NOT call from a context already holding it (use
+    /// `currentSurvivorsLocked` there instead, or it deadlocks the non-recursive NSLock).
+    func currentSurvivors(currentGeneration: Int) -> [SubRegistration] {
+        regLock.withLock { currentSurvivorsLocked(currentGeneration: currentGeneration) }
+    }
+
+    /// Same as `currentSurvivors`, but assumes the caller already holds `regLock` (e.g. the
+    /// Task 8 snapshot). No locking — calling `currentSurvivors` instead here re-enters the
+    /// non-recursive NSLock and deadlocks.
+    func currentSurvivorsLocked(currentGeneration: Int) -> [SubRegistration] {
+        _subRegistrations.filter { $0.stackGeneration == currentGeneration && !_userRejected.contains($0.subIndex) }
+    }
+
     private let adjLock = NSLock()
     private var _displayAdjustments = DisplayAdjustments.neutral
     /// Display-path adjustments. Read once per render; lock-guarded because the
@@ -667,6 +703,18 @@ public final class SessionPipeline {
                 try session.recordSubFrame(subRecord)
             } catch {
                 onLog?("Failed to record sub-frame stats for \(frame.sourceName): \(error)")
+            }
+            // Task 5: capture the registration cache for a later background refiner. No URL
+            // (e.g. an in-memory/synthetic frame) skips ONLY the cache insertion — the rest of
+            // handleNative (online render/progress) must continue regardless.
+            if let reg = result.registration, let relayURL = frame.sourceURL {
+                regLock.withLock {
+                    _subRegistrations.append(SubRegistration(
+                        subIndex: processedCount, contentDigest: frame.identity?.digest, relayURL: relayURL,
+                        stackGeneration: reg.stackGeneration, referenceIdentity: reg.referenceIdentity,
+                        transform: reg.transform, effectiveScale: reg.effectiveScale,
+                        weight: reg.weight, leveling: reg.leveling))
+                }
             }
             switch outcome {
             case .becameReference, .stacked:

@@ -62,7 +62,7 @@ public final class Calibrator {
                                channels: light.channels, pixels: out, sourceIsLinear: true)
         return RawFrame(image: image, bayerPattern: frame.bayerPattern, bottomUp: frame.bottomUp,
                         timestamp: frame.timestamp, sourceName: frame.sourceName,
-                        identity: frame.identity)
+                        identity: frame.identity, sourceURL: frame.sourceURL)
     }
 
     private func computeAlignment(for bottomUp: Bool) {
