@@ -427,8 +427,13 @@ public final class SessionPipeline {
     /// constructing the loader/closures here does not itself re-enter `regLock` or block.
     private func makeRefinerLocked() -> GlobalRefiner {
         let demosaic = engine?.demosaicMethod ?? .bilinear
+        // T8 review fix: pass the calibrator LAZILY (a closure re-read at pass time), not baked
+        // in here at refiner-creation time — see ProductionFrameLoader's doc for why. `[weak
+        // self]` because the loader can outlive a single pipeline reference in principle; nil
+        // (uncalibrated) is the same safe fallback `effectiveCalibrator` itself uses elsewhere.
         let loader: FrameLoader = refinerLoaderOverride
-            ?? ProductionFrameLoader(calibrator: effectiveCalibrator, demosaic: demosaic)
+            ?? ProductionFrameLoader(calibratorProvider: { [weak self] in self?.effectiveCalibrator },
+                                     demosaic: demosaic)
         let refiner = GlobalRefiner(loader: loader, onLog: { [weak self] msg in self?.onLog?(msg) })
         refiner.makeSnapshot = { [weak self] in self?.makeRefinerSnapshot() }
         refiner.publish = { [weak self] result, key in self?.publishRefineResult(result, key: key) }
@@ -919,6 +924,18 @@ public final class SessionPipeline {
                 // can differ). MUST run before attemptPlateSolveIfNeeded below so this frame's attempt
                 // sees the reset state (manual reseed() does the same via invalidatePlateSolve()).
                 invalidatePlateSolve()
+                // T8 review fix: an auto-reseed is a FreshnessKey mutation point (generation change)
+                // exactly like manual reseed() (see reseed()'s matching block ~681-685) — refresh the
+                // cached key HERE so publishedMasterIfCurrent() immediately stops serving a master built
+                // from the just-discarded reference, instead of staying stale until the next accepted
+                // sub's .becameReference append happens to recompute it. Lock-safety: neither `regLock`
+                // nor the engine lock is held at this point — `engine.processDetailed` above already
+                // acquired+released the engine's own lock — so this matches reseed()'s established
+                // regLock -> engine.lock leaf-edge ordering with no new cycle. By this point
+                // engine.autoReseedCount has already been bumped (checked just above), so the recompute
+                // observes the POST-reseed generation.
+                regLock.withLock { recomputeCachedFreshnessKeyLocked() }
+                noteReseeded()
                 onLog?("Auto-reseeded — the reference frame didn't match; re-seeding on the next good sub. (Earlier subs that couldn't register stay rejected.)")
             }
             attemptPlateSolveIfNeeded(engine: engine)   // idempotent; no-op until a reference is seeded

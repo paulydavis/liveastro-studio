@@ -605,6 +605,106 @@ final class GlobalRefinerTests: XCTestCase {
         source.stop()
     }
 
+    /// A star field with NO correspondence to `field` (a tight grid packed into one corner,
+    /// unlike `field`'s spread-out pattern) — TriangleMatcher/TransformSolver can't find a
+    /// consistent transform against a `field`-seeded reference, so every frame is rejected
+    /// `.noTransform`. Mirrors `SessionPipelinePlateSolveTests.unmatchedFrame`, sized to match
+    /// `starImage`'s default 512×512 so it can drive an auto-reseed against a `stubFrame` reference.
+    private func unmatchedFrame(name: String, width: Int = 512, height: Int = 512) -> RawFrame {
+        var px = [Float](repeating: 0.05, count: width * height)
+        for gy in 0..<4 { for gx in 0..<4 {
+            let sx = 30 + gx * 12, sy = 30 + gy * 12
+            for y in sy - 3...sy + 3 { for x in sx - 3...sx + 3 {
+                let dx = Double(x - sx), dy = Double(y - sy)
+                px[y * width + x] += 0.8 * Float(exp(-(dx * dx + dy * dy) / (2 * 2.0 * 2.0)))
+            } }
+        } }
+        let img = AstroImage(width: width, height: height, channels: 1, pixels: px, sourceIsLinear: true)
+        return RawFrame(image: img, bayerPattern: nil, bottomUp: false,
+                        timestamp: Date(timeIntervalSince1970: 0), sourceName: name)
+    }
+
+    /// T8 review regression (Fix 1): the engine's internal AUTO-reseed (systematic
+    /// `.noTransform` after `autoReseedThreshold` consecutive failures) drops the reference and
+    /// bumps `engine.autoReseedCount`/`currentStackGeneration` in the SAME `handleNative` call
+    /// that returns `.rejected(.noTransform)` — no `SubRegistration` is appended for that frame,
+    /// so the T7 sub-append recompute doesn't run, and the cached `_freshnessKey` (and therefore
+    /// `publishedMasterIfCurrent()`) would silently keep serving a master built from the
+    /// just-discarded reference until whatever LATER sub happens to become the new reference.
+    /// Mirrors `testReseedInvalidatesPublishedMasterImmediatelyWithoutAFollowUpSub` (the manual-
+    /// reseed analogue) but for the auto-reseed path: publish a dummy master under the
+    /// pre-auto-reseed key, drive a real auto-reseed with unmatched frames, and assert the
+    /// master goes stale THE INSTANT the "Auto-reseeded" log line lands — before any post-reseed
+    /// sub is ever sent (none is: no accepted sub == no `SubRegistration` append == the T7 hook
+    /// never fires — this test would have caught the bug even before the T7 fix existed).
+    func testAutoReseedInvalidatesPublishedMasterImmediatelyWithoutAFollowUpSub() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "AutoReseedFreshness", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine(autoReseedThreshold: 3)   // small threshold — fast, deterministic test
+
+        // Seed the reference from the real `field` pattern (via stubFrame/starImage).
+        let seed = stubFrame(dx: 0, dy: 0, name: "ar-seed.fit", digest: "ar-seed", timestamp: 0)
+        let source = StubLiveSource(sequence: [seed])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine,
+                                       profile: profile, rootDirectory: sessions)
+        var log = ""
+        let logLock = NSLock()
+        pipeline.onLog = { msg in logLock.withLock { log += msg } }
+        try pipeline.start()
+
+        let regs = waitForRegistrations(pipeline, count: 1)
+        XCTAssertEqual(regs.count, 1, "the seed frame must become the reference")
+        let preReseedGeneration = pipeline.currentFreshnessKey().stackGeneration
+
+        // Feature ON — required before any published master is ever served.
+        pipeline.configureLiveRejection(enabled: true)
+
+        // Publish a dummy master under the PRE-auto-reseed key.
+        let dummyMaster = constImage(0.42)
+        let preReseedKey = pipeline.currentFreshnessKey()
+        pipeline.publishedMaster = (image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 1, key: preReseedKey)
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
+                        "precondition: a master published under the current key must be served")
+
+        // Drive the engine's internal auto-reseed with unmatched frames, ONE AT A TIME, stopping
+        // the instant it fires — mirrors SessionPipelinePlateSolveTests.testAutoReseedVoidsStoredWCS
+        // so no extra unmatched frame seeds a stray reference past the one auto-reseed we're testing.
+        var u = 0
+        let deadline = Date().addingTimeInterval(15)
+        while !(logLock.withLock { log.contains("Auto-reseeded") }) && Date() < deadline {
+            source.send(unmatchedFrame(name: "u\(u).fit")); u += 1
+            let step = Date().addingTimeInterval(1)
+            while !(logLock.withLock { log.contains("Auto-reseeded") }) && Date() < step { usleep(30_000) }
+        }
+        XCTAssertTrue(logLock.withLock { log.contains("Auto-reseeded") },
+                     "unmatched frames should trigger the engine's internal auto-reseed")
+
+        // The generation must have advanced (auto-reseed bumps engine.currentStackGeneration).
+        let postReseedKey = pipeline.currentFreshnessKey()
+        XCTAssertNotEqual(postReseedKey.stackGeneration, preReseedGeneration,
+                          "auto-reseed detection must advance the cached freshness key's generation")
+
+        // Core assertion: the pre-reseed master must be stale IMMEDIATELY — no post-reseed sub was
+        // ever sent (the auto-reseed frame itself is a rejection, not an accepted sub), so if this
+        // were still nil-safe only via the LATER sub-append recompute, it would still (wrongly)
+        // report the stale master as current here.
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(),
+                     "an auto-reseed must invalidate a previously-published master IMMEDIATELY, " +
+                     "with no post-reseed sub required to refresh the cached freshness key")
+        XCTAssertEqual(pipeline.subRegistrations().count, 1,
+                       "no accepted sub landed after the auto-reseed — proves the invalidation didn't " +
+                       "come from the (T7) sub-append recompute path")
+
+        source.stop()
+    }
+
     // MARK: - Task 8: trigger + self-throttle (background, off the online path)
 
     /// A `FrameLoader` that signals `entered` on EVERY call (so the test can observe each pass

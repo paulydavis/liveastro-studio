@@ -17,18 +17,29 @@ public protocol FrameLoader {
 /// `DisplayRGB.make` with the SAME `DemosaicMethod` the engine was built with — one
 /// implementation, no drift between the online and refine domains a warped/leveled sub is
 /// compared in.
+///
+/// T8 review fix: the calibrator is resolved LAZILY, at PASS time (inside
+/// `loadRegisteredInput`), via a closure — never baked in at construction. Baking it in at
+/// refiner-creation time (i.e. at `configureLiveRejection(enabled: true)`) was (a) a
+/// cross-thread unsynchronized read of the pipeline's `calibrator`/`providerCalibrator`
+/// (documented "serial consume task, no lock" fields) taken from whatever thread enables live
+/// rejection, and (b) if live rejection was enabled before the first frame resolved the
+/// provider calibrator (empty-folder live start), the refiner would bake in nil forever and
+/// load UNcalibrated frames — diverging from the online (calibrated) path. Reading
+/// `effectiveCalibrator` at pass time still satisfies I2 (it's the SAME stashed field, not a
+/// freshly-rebuilt calibrator), just read later, by which point subs exist and it's resolved.
 public struct ProductionFrameLoader: FrameLoader {
-    private let calibrator: Calibrator?
+    private let calibratorProvider: () -> Calibrator?
     private let demosaic: DemosaicMethod
 
-    public init(calibrator: Calibrator?, demosaic: DemosaicMethod) {
-        self.calibrator = calibrator
+    public init(calibratorProvider: @escaping () -> Calibrator?, demosaic: DemosaicMethod) {
+        self.calibratorProvider = calibratorProvider
         self.demosaic = demosaic
     }
 
     public func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
         let raw = try FolderFrameSource.loadRawFrame(url: url, expectedDigest: expectedContentDigest)
-        let calibrated = calibrator?.apply(raw) ?? raw
+        let calibrated = calibratorProvider()?.apply(raw) ?? raw
         return DisplayRGB.make(calibrated, demosaic: demosaic)
     }
 }
