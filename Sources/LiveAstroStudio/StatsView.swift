@@ -79,7 +79,7 @@ struct StatsView: View {
                     get: { r.rejectedByUser },
                     set: { _ in model.toggleReject(index: r.index) }))
                     .toggleStyle(.button).controlSize(.small)
-                    .disabled(model.isRestacking)
+                    .disabled(model.isRestacking || model.isFinalizing)
             }
         }
         .padding(.horizontal, 10).padding(.vertical, 4)

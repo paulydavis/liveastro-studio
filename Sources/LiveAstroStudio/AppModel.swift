@@ -84,6 +84,20 @@ final class AppModel {
     }
     var rejectionEnabled = true
     var rejectionStrength: RejectionStrength = .medium
+    /// Live trail-rejection (Task 11): a background pass recombines survivors with global
+    /// (whole-frame) outlier rejection so satellite/plane trails drop out of the BROADCAST
+    /// master, distinct from `rejectionEnabled`'s per-pixel online σ-clip. Defaults on; only
+    /// actually engages for a local native `.live` relay with enough subs (see
+    /// `sourceIsLocalLiveRelay` / `liveRejectionStatus`) — off (with the reason shown) for
+    /// network/watcher/import sources. Pushed to the pipeline immediately on toggle so a
+    /// mid-session OFF reverts broadcast/`latest.png`/`end()` to the online master right away
+    /// (`SessionPipeline.configureLiveRejection`, P2).
+    var liveTrailRejection = true {
+        didSet {
+            guard liveTrailRejection != oldValue else { return }
+            updateLiveRejectionConfig()
+        }
+    }
     var frameWeightingEnabled = true
     var backgroundNormalizationEnabled = true
     var scaleNormalizationEnabled = true
@@ -810,6 +824,13 @@ final class AppModel {
             replayURL = nil
             log.append("Session started — watching \(folder.path)")
             broadcast.sessionDidStart(subExposureSeconds: profile.subExposureSeconds)
+            // I3: resolve + push the live-rejection config now that the pipeline exists (stays
+            // off, with the reason shown, for stacker-output/network sources — updateLiveRejectionConfig
+            // folds sourceIsLocalLiveRelay into `enabled`). The advisory budget check uses only
+            // the PRIOR session's resolved frame size (this session's own metadata isn't known
+            // yet); a fresh install logs nothing (deferred to the first-refine hard check).
+            updateLiveRejectionConfig()
+            advisoryCheckLiveRejectionBudget()
             startCompletionTick()
         } catch {
             errorMessage = "Start failed: \(error.localizedDescription)"
@@ -944,21 +965,116 @@ final class AppModel {
     /// Number of subs the operator has flagged for exclusion from a re-stack.
     var flaggedCount: Int { subFrames.filter(\.rejectedByUser).count }
 
+    /// True right after `endSession()` begins finalization, until it completes (mirrors
+    /// `importer.isGeneratingReplay`, which lives on the `importer` controller, not here — a
+    /// bare `isGeneratingReplay` on `AppModel` would not compile). Used to freeze the reject
+    /// state (P2-1): a reject landing after Task 10's `end()` has already frozen the survivor
+    /// set for the clean master would desync the written master from the UI's flags.
+    var isFinalizing: Bool { importer.isGeneratingReplay }
+
+    /// I3: whether the CURRENT source is a native `.live` relay writing to a LOCAL folder — the
+    /// only source shape the background global-rejection pass can run against. The pipeline
+    /// can't introspect its own `FrameSource` for locality, so this lives on `AppModel`, which
+    /// knows `sourceMode` and `watchFolder` directly. `.volumeIsLocalKey` is macOS's own
+    /// local-vs-network-mount distinction (SMB/AFP/NFS shares — the ASIAIR/NINA network case —
+    /// read false); an unresolvable key (folder deleted, permission issue) fails closed to
+    /// "not local" rather than silently enabling the feature.
+    var sourceIsLocalLiveRelay: Bool {
+        guard sourceMode == .nativeStack, let folder = watchFolder else { return false }
+        return (try? folder.resourceValues(forKeys: [.volumeIsLocalKey]).volumeIsLocal) ?? false
+    }
+
+    /// Proxy for the background refiner's survivor count, for the STATUS CAPTION only (the
+    /// refiner's own quorum check inside `GlobalRefiner.refine` is the actual gate — this is
+    /// purely so the operator sees an accurate "need ≥ N subs" / "active: N subs" line without
+    /// AppModel reaching into the pipeline's private `SubRegistration` cache). Accepted subs
+    /// minus whatever the operator has since flagged, mirroring `currentSurvivors` minus the
+    /// generation filter (AppModel doesn't track `stackGeneration`; a reseed already shows as
+    /// "reseeding" via the gate, and this count settles again once the new generation's subs
+    /// start landing).
+    private var liveRejectionSubCount: Int {
+        subFrames.filter { $0.outcome != .rejected && !$0.rejectedByUser }.count
+    }
+
+    /// The resolved live trail-rejection status for the CaptureSettingsView caption (Task 11).
+    var liveRejectionStatus: LiveRejectionStatus {
+        LiveRejectionGate.reason(sourceIsLocalLiveRelay: sourceIsLocalLiveRelay,
+                                  subCount: liveRejectionSubCount,
+                                  minSubs: GlobalRefiner.defaultMinSubs,
+                                  reseeding: false,   // no live "reseed in progress" signal exists yet — reseed()
+                                                       // is synchronous (bumps the generation and returns), so there
+                                                       // is no AppModel-observable in-between window to report here.
+                                  enabled: liveTrailRejection)
+    }
+
+    /// Human caption for `CaptureSettingsView`'s status line.
+    var liveRejectionStatusText: String {
+        switch liveRejectionStatus {
+        case .active(let subs): return "Clean master: \(subs) sub\(subs == 1 ? "" : "s")"
+        case .off(let reason):  return "Clean master off — \(reason)"
+        }
+    }
+
+    /// Pushes the resolved live-rejection config down to the pipeline (I3/P2/P2-1). Called at
+    /// session start and whenever `liveTrailRejection` is toggled while a session is running;
+    /// a no-op when no pipeline exists (e.g. the toggle flipped before Start). `enabled` folds
+    /// in source locality here (not just the operator's toggle) — the pipeline's
+    /// `liveRejectionActive` gate must stay false for a network/watcher/import source
+    /// regardless of the toggle, since `sourceIsLocalLiveRelay` is not something the pipeline
+    /// can determine on its own.
+    private func updateLiveRejectionConfig() {
+        guard let pipeline else { return }
+        let enabled = liveTrailRejection && sourceIsLocalLiveRelay
+        pipeline.configureLiveRejection(enabled: enabled, kappa: rejectionStrength.kappa)
+    }
+
+    /// Advisory-only budget check (Task 11 point 6): only runs when an expected frame size is
+    /// actually known — from the LAST session this launch resolved (`sessionSourceMetadata`,
+    /// captured in `endSession` from `SourceMetadata.width/height`). There is no "selected
+    /// camera profile" elsewhere in AppModel to read dimensions from ahead of a first session,
+    /// so a fresh install / first-ever session logs nothing here and defers entirely to
+    /// `GlobalRefiner`'s own first-refine hard check (Task 6), which knows the real frame size.
+    /// Assumes the refiner's post-debayer working format (RGB warped image + a 1-channel mask,
+    /// 4 bytes/component — see the design spec's sample-policy math), independent of the raw
+    /// FITS `channels` (mono cameras still warp/mask in this same shape).
+    private func advisoryCheckLiveRejectionBudget() {
+        guard let meta = sessionSourceMetadata, let w = meta.width, let h = meta.height, w > 0, h > 0 else { return }
+        let sampleFrameBytes = w * h * 16   // (3 RGB + 1 mask) channels × 4 bytes/component
+        let budget = GlobalRefiner.defaultMaxSampleBytes
+        let framesThatFit = budget / sampleFrameBytes
+        guard framesThatFit < 11 else { return }
+        log.append("Live rejection: sample budget (~\(budget / 1_000_000_000) GB) only fits "
+            + "\(framesThatFit) frame(s) at \(w)×\(h) — raise maxSampleBytes for sensors this large.")
+    }
+
     /// Flips the operator reject flag on the in-memory mirror for the sub with `index`.
-    /// During a LIVE session this is mirror-only — writing mid-session would race the
-    /// pipeline's consume task. Once the session has FINISHED (`!isRunning`), there is no
-    /// consume task, so the flip is persisted to `sub-frames.csv` IMMEDIATELY — this keeps
-    /// the Siril review workflow (flag → export CSV → reject in Siril, never re-stack) and a
-    /// subsequent quit truthful. Flags persist to sub-frames.csv, NEVER to the manifest
-    /// (whose per-sub `rejectedByUser` is always the record-time value, false). Refused while
-    /// a re-stack is in flight, so a toggle can't desync the master from the CSV (Fix 5).
+    /// During a LIVE session this is mirror-only for `sub-frames.csv` — writing mid-session
+    /// would race the pipeline's consume task. Once the session has FINISHED (`!isRunning`),
+    /// there is no consume task, so the flip is persisted to `sub-frames.csv` IMMEDIATELY —
+    /// this keeps the Siril review workflow (flag → export CSV → reject in Siril, never
+    /// re-stack) and a subsequent quit truthful. Flags persist to sub-frames.csv, NEVER to the
+    /// manifest (whose per-sub `rejectedByUser` is always the record-time value, false).
+    /// Refused while a re-stack is in flight (Fix 5) or while `end()` is finalizing (P2-1) —
+    /// the latter because Task 10's `end()` freezes the survivor set for the clean master the
+    /// instant finalization begins, so a reject landing after that point can no longer affect
+    /// the written master and would desync the UI's flags from it.
+    ///
+    /// C4: this is also the FUNCTIONAL half of live trail-rejection — flipping the in-memory
+    /// flag alone does nothing to the background clean master. Pushing the resolved reject set
+    /// to the pipeline (`setUserRejected` then `noteUserRejectChanged`, bumping the generation
+    /// AFTER the set is in place) is what actually excludes the sub. `pipeline` is nil once a
+    /// session has ended, so this is a no-op post-session (the manifest's clean master is fixed
+    /// at that point; only sub-frames.csv / a re-stack still reflect a post-session flag).
     func toggleReject(index: Int) {
-        guard !isRestacking else { return }
+        guard !isRestacking && !isFinalizing else { return }
         guard let i = subFrames.firstIndex(where: { $0.index == index }) else { return }
         subFrames[i].rejectedByUser.toggle()
         if !isRunning, let dir = lastSessionDirectory {
             try? SubFrameCSV.write(subFrames: subFrames, to: dir)   // keep sub-frames.csv truthful during review
         }
+        let rejected = Set(subFrames.filter(\.rejectedByUser).map(\.index))
+        pipeline?.setUserRejected(rejected)
+        pipeline?.noteUserRejectChanged()
     }
 
     /// Clears the native-session-only stats/re-stack state at the START of an offline import

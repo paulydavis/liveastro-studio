@@ -243,8 +243,10 @@ public final class SessionPipeline {
     /// The pipeline's own reject set (subIndexes), distinct from AppModel's UI array —
     /// AppModel pushes the flagged subIndexes here (Task 11). Bumps `userRejectGeneration`
     /// (part of `FreshnessKey`) and recomputes the cached key so a previously-published
-    /// master immediately goes stale. Thread-safe.
-    func setUserRejected(_ ids: Set<Int>) {
+    /// master immediately goes stale. Thread-safe. `public` so `AppModel.toggleReject`
+    /// (a separate module) can call it — Task 8 left this `internal`, callable only from
+    /// `@testable import` test code, which would not compile from `LiveAstroStudio`.
+    public func setUserRejected(_ ids: Set<Int>) {
         regLock.withLock {
             _userRejected = ids
             userRejectGeneration += 1
@@ -279,8 +281,8 @@ public final class SessionPipeline {
     /// back (the expected Task 11 usage: `setUserRejected(ids)` then `noteUserRejectChanged()`)
     /// double-bumps the generation. That's harmless: `userRejectGeneration` only needs to differ
     /// from whatever a previously-stamped `FreshnessKey` recorded, not increment exactly once per
-    /// logical event.
-    func noteUserRejectChanged() {
+    /// logical event. `public` for the same cross-module reason as `setUserRejected` above.
+    public func noteUserRejectChanged() {
         regLock.withLock {
             userRejectGeneration += 1
             recomputeCachedFreshnessKeyLocked()
