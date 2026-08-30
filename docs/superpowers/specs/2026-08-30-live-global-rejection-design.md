@@ -167,9 +167,12 @@ Two composable, pure functions (no I/O, no live/import knowledge):
     (reduced to an **odd count** so each pixel's median has a true middle element), across the
     *ordered* survivor list, **no RNG** (a given survivor set always yields the same sample). RAM is
     the **hard bound** — the sample **never exceeds `maxSampleFrames`**; there is no floor that
-    overrides it. `maxSampleFrames` (= `maxSampleBytes / frameBytes`) MUST be ≥ 11, a config invariant
-    asserted at session start (raise `maxSampleBytes` for > ~50 MP sensors). The output pass
-    **streams all survivors from disk**. Logged, not silent.
+    overrides it. `maxSampleFrames = maxSampleBytes / sampleFrameBytes`, where `sampleFrameBytes =
+    image.pixels.count·4 + mask.count·4` (warped RGB pixels + the per-pixel mask — at 26 MP RGB
+    that's ~312 MB + ~104 MB ≈ 416 MB/frame; the mask is NOT negligible). `maxSampleFrames` MUST be
+    ≥ 11 — **checked hard on the first refine** (frame dims are known only then; a `< 11` result
+    returns nil = live rejection stays off, online master kept) and **advisory-logged at session
+    start**. The output pass **streams all survivors from disk**. Logged, not silent.
   - **Honesty:** the capped case is a **sample-derived robust center + full-survivor clipped
     weighted mean** — NOT a full-set median. The center is an estimate from the sample; only the
     *output* (the clipped weighted mean) is over every survivor. Status/logs say so.
