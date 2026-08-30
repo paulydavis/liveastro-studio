@@ -114,17 +114,20 @@ Two composable, pure functions (no I/O, no live/import knowledge):
   output pass from disk for deep stacks; `sample` is materialized in RAM.
 - `CombineMethod { case clippedMean /* future: case median (output) */ }` param on the
   refiner call so median-output slots in for the in-RAM variant with no core rewrite.
-- Zero-count / all-masked pixels → coverage 0. Zero-MAD pixel (all equal) → scale floor,
-  no clipping.
+- Zero-count / all-masked pixels → coverage 0. The clip denominator is `sigma = max(MAD-scale,
+  scaleFloor)`, so a **zero-MAD core still rejects a gross outlier** (e.g. [1,1,1,1,9] rejects the 9);
+  a covered pixel whose survivors are all clipped falls back to `center` (no black speckle). `coverage`
+  is per-pixel frame-count depth (not binary).
 - **Tests (always in CI, synthetic):** planted trail in 1 of N (N=5,11,30) → trail removed,
   survivor mean == clean-frame mean within ε, *including the shallow N=5 case that mean/σ
   fails*; MAD center unmoved by the outlier; weights honored (a down-weighted sub contributes
   less); zero-MAD / single-frame / all-masked edges; golden byte test; κ monotonicity.
 
 ### 2. `SubRegistration` cache — captured in the online pass
-- `struct SubRegistration { let identity: FileIdentity; let relayURL: URL; let stackGeneration: Int;
-   let referenceIdentity: FileIdentity; let transform: SimilarityTransform; let effectiveScale: Float;
+- `struct SubRegistration { let subIndex: Int; let contentDigest: String?; let relayURL: URL; let stackGeneration: Int;
+   let referenceIdentity: FileIdentity?; let transform: SimilarityTransform; let effectiveScale: Float;
    let weight: Float; let leveling: (sub: BackgroundExtraction.BackgroundModel, ref: BackgroundExtraction.BackgroundModel)? }`
+  — **`subIndex`** is the per-sub monotonic capture ID (= `processedCount`, the same value as `SubFrameRecord.index`) and is the UNIQUE identifier used for cache keying, the user-reject set, and the freshness list; **`contentDigest`** (from `RawFrame.identity`, digest with stat fields zeroed) is kept ONLY for byte re-verification on re-read. Content identity is NOT used as a key — two byte-identical subs are distinct subs (`FileIdentity`-keying would collapse/cross-reject them).
   — matches the engine exactly (`StackEngine.swift:366-373`): leveling is the `(sub, ref)` pair
   from `levelingModels(...)`, `effectiveScale` is the *applied* scale (1.0 when the pair is nil or
   `scalingApplies` fails), and `weight` is the `appliedWeight` (`frameWeight(sigma·effectiveScale)`).
@@ -143,8 +146,11 @@ Two composable, pure functions (no I/O, no live/import knowledge):
   for accepted subs — extend `ProcessResult` with an optional `registration` payload (additive,
   preserving existing equality for current callers) or a dedicated `onRegistered` callback.
   Also expose the current `stackGeneration` + reference identity. Chosen in the plan.
-- `SessionPipeline` keeps `[FileIdentity: SubRegistration]` in memory, populated in
-  `handleNative` alongside the existing `onSubFrame` record. Session-scoped.
+- `SessionPipeline` keeps an **ordered `[SubRegistration]`** (capture order; `subIndex` is the key),
+  populated in `handleNative` alongside the existing `onSubFrame` record, session-scoped. The user-reject
+  set is `Set<Int>` of `subIndex`es. **`relayURL` must survive calibration:** `handleNative` calibrates the
+  frame before recording, and `Calibrator.apply` rebuilds `RawFrame` — it (and any `RawFrame`-copying path)
+  MUST preserve `sourceURL`, or every calibrated live frame is silently skipped (nil URL).
 
 ### 3. `GlobalRefiner` — `Sources/LiveAstroCore/Pipeline/GlobalRefiner.swift`
 - Owns a serial background queue; reads via the concurrent reader path
@@ -155,11 +161,13 @@ Two composable, pure functions (no I/O, no live/import knowledge):
 - **Sample policy (pinned).** The center/MAD is estimated from a RAM-held sample:
   - **Under budget** (`sample bytes ≤ maxSampleBytes`, default ~6 GB) → sample = **all**
     survivors; the output pass reuses them (no disk re-read).
-  - **Capped** → sample = a **deterministic, evenly-strided** subset across the *ordered*
-    survivor list (stride = ⌈count / maxSampleFrames⌉ — temporal coverage, **no RNG**, so a
-    given survivor set always yields the same sample), floored at `minSampleFrames` (default 11)
-    and adjusted to an **odd count** so each pixel's median has a true middle element (no
-    even-count averaging). The output pass **streams all survivors from disk**. Logged, not silent.
+  - **Capped** → sample = a **deterministic, evenly-strided** subset of exactly `maxSampleFrames`
+    (reduced to an **odd count** so each pixel's median has a true middle element), across the
+    *ordered* survivor list, **no RNG** (a given survivor set always yields the same sample). RAM is
+    the **hard bound** — the sample **never exceeds `maxSampleFrames`**; there is no floor that
+    overrides it. `maxSampleFrames` (= `maxSampleBytes / frameBytes`) MUST be ≥ 11, a config invariant
+    asserted at session start (raise `maxSampleBytes` for > ~50 MP sensors). The output pass
+    **streams all survivors from disk**. Logged, not silent.
   - **Honesty:** the capped case is a **sample-derived robust center + full-survivor clipped
     weighted mean** — NOT a full-set median. The center is an estimate from the sample; only the
     *output* (the clipped weighted mean) is over every survivor. Status/logs say so.
@@ -171,8 +179,10 @@ Two composable, pure functions (no I/O, no live/import knowledge):
 
 ### 4. Published-master swap + freshness — `SessionPipeline`
 - `publishedMaster: (image, coverage, survivorCount, freshnessKey)?` under a lock.
-- **`freshnessKey` is a real composite**, not "recent": `{ stackGeneration, sorted set of
-  survivor content-digests, userRejectGeneration, kappa/rejectionStrength }`. The broadcast/
+- **`freshnessKey` is a real composite**, not "recent": `{ stackGeneration, sorted array of survivor
+  `subIndex`es (the per-sub monotonic capture IDs — unique even for byte-identical subs, unlike a
+  content-digest set which would collapse duplicates), userRejectGeneration, kappa/rejectionStrength }`.
+  The broadcast/
   outputs and `end()` use the published master **only when its key equals the current one**,
   recomputed cheaply on read. So rejecting a sub, a reseed, or a κ change immediately
   invalidates a stale clean master containing the removed/altered sub.
@@ -209,7 +219,9 @@ Two composable, pure functions (no I/O, no live/import knowledge):
 - **Integration (acceptance bar, env-gated/skippable like `testSolvesRealM63Frame`):** drip the
   real M 51 set **including the trail sub** through the live pipeline, feature ON; assert the trail
   is **absent** from `master.fit` (pixel stats along the trail path == background, vs the online
-  master which keeps it) and SNR ≥ the online weighted mean.
+  master which keeps it) and SNR **does not regress**, measured **ROI-based** (a flat background ROI
+  away from the trail + galaxy): `globalSNR ≥ 0.9 · onlineSNR` (tolerance for the survivor-count
+  difference — not a strict global ≥).
 - **Regression:** feature OFF ⇒ byte-identical master to today (pinned). Online path + shutdown-
   drain tests unchanged and green. `end()` final-pass honors the bounded-drain timeout.
 - **Success =** shallow real stack shows no trail where online does; reject-a-sub immediately
