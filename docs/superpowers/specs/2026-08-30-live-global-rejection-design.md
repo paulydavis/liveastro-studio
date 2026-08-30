@@ -200,7 +200,8 @@ Two composable, pure functions (no I/O, no live/import knowledge):
 
 ### 5. Trigger — `SessionPipeline`
 - After each accepted sub (in `handleNative`, after the online commit), `refiner.noteChanged()`.
-  Also on a user reject/unreject and on reseed. The refiner coalesces: idle → start; running →
+  Also on a user reject/unreject, on reseed, and on a **config change** (`configureLiveRejection` —
+  κ/budget/enabled, including enable-ON mid-session). The refiner coalesces: idle → start; running →
   set a dirty flag so exactly one more pass runs after the current. Self-throttling; no timer.
 
 ### 6. UI + gating — `AppModel` + `CaptureSettingsView`
