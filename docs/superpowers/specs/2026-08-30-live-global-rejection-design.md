@@ -188,9 +188,12 @@ Two composable, pure functions (no I/O, no live/import knowledge):
   `subIndex`es (the per-sub monotonic capture IDs — unique even for byte-identical subs, unlike a
   content-digest set which would collapse duplicates), userRejectGeneration, kappa/rejectionStrength }`.
   The broadcast/
-  outputs and `end()` use the published master **only when its key equals the current one**,
-  recomputed cheaply on read. So rejecting a sub, a reseed, or a κ change immediately
-  invalidates a stale clean master containing the removed/altered sub.
+  outputs and `end()` use the published master **only when `liveRejectionActive` is true AND its key
+  equals the current one** (`FreshnessKey` does not encode `enabled`, so the separate
+  `liveRejectionActive` gate — lock-guarded, cleared on toggle-off — preserves feature-off parity).
+  So rejecting a sub, a reseed, a κ change, or **turning the feature off** immediately stops serving
+  a stale clean master; `end()` on the off/fallback path writes the online master with
+  `finalizationState()` metadata (byte-identical to today).
 - Broadcast/`latest.png`/`master.fit` prefer the published master when the key matches; else
   the online `currentStackAndCoverage()` (floor). The operator **preview always uses online**.
   Same crop + display pipeline for both.
