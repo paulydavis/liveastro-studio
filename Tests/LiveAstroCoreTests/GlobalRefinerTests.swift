@@ -604,4 +604,188 @@ final class GlobalRefinerTests: XCTestCase {
 
         source.stop()
     }
+
+    // MARK: - Task 8: trigger + self-throttle (background, off the online path)
+
+    /// A `FrameLoader` that signals `entered` on EVERY call (so the test can observe each pass
+    /// reaching the loader) but only BLOCKS on `release` for the literal first-ever call — every
+    /// subsequent call (including a later pass's) returns immediately. Models "a pass parked
+    /// mid-load" for exactly one interleaving window, while still being observable across passes.
+    private final class FirstCallGatedLoader: FrameLoader {
+        private let lock = NSLock()
+        private(set) var callCount = 0
+        private let entered: DispatchSemaphore
+        private let release: DispatchSemaphore
+        private let image: AstroImage
+        init(image: AstroImage, entered: DispatchSemaphore, release: DispatchSemaphore) {
+            self.image = image; self.entered = entered; self.release = release
+        }
+        func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
+            let isFirst: Bool = lock.withLock { callCount += 1; return callCount == 1 }
+            entered.signal()
+            if isFirst {
+                release.wait()
+            }
+            return image
+        }
+    }
+
+    /// A plain `FrameLoader` returning a constant image for any URL — no gating, for tests that
+    /// just need a background pass to complete quickly.
+    private final class ConstFrameLoader: FrameLoader {
+        private let image: AstroImage
+        init(image: AstroImage) { self.image = image }
+        func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage { image }
+    }
+
+    /// Registers `count` distinct, successfully-registering subs against a fresh reference through
+    /// a REAL native `.live` pipeline (small, monotonically increasing translations so every sub
+    /// registers against sub 1) and returns the pipeline once all `count` registrations have
+    /// landed. Caller must `source.stop()` when done.
+    private func pipelineWithRegisteredSubs(count: Int, sandbox: URL) throws
+        -> (pipeline: SessionPipeline, source: StubLiveSource) {
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        let profile = SessionProfile(targetName: "Trigger", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let frames = (0..<count).map { i in
+            stubFrame(dx: Double(i) * 0.1, dy: -Double(i) * 0.05, name: "trig\(i).fit",
+                     digest: "trig-digest-\(i)", timestamp: TimeInterval(i))
+        }
+        let source = StubLiveSource(sequence: frames)
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine,
+                                       profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        let regs = waitForRegistrations(pipeline, count: count, timeout: 30)
+        XCTAssertEqual(regs.count, count, "test precondition: all \(count) subs must register")
+        return (pipeline, source)
+    }
+
+    /// (a) Coalescing: firing `noteChanged()` 5× rapidly while a pass is in flight must run AT
+    /// MOST one pass concurrently and run EXACTLY one extra pass after the first completes — never
+    /// 5. The calling thread must never block (every `noteChanged()` call returns immediately, even
+    /// while a pass is parked behind a blocked loader).
+    func testNoteChangedCoalescesRapidFireIntoAtMostOneConcurrentPlusOneRerun() throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let loader = FirstCallGatedLoader(image: constImage(0.5), entered: entered, release: release)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+
+        let url = URL(fileURLWithPath: "/tmp/globalrefiner/trigger-coalesce.fit")
+        let reg = refinerReg(subIndex: 1, url: url)
+        let key = FreshnessKey(stackGeneration: 0, survivorSubIndices: [1], userRejectGeneration: 0, kappa: 3.0)
+        refiner.makeSnapshot = { PassSnapshot(survivors: [reg], currentGeneration: 0, key: key) }
+        refiner.minSubsProvider = { 1 }
+        refiner.maxSampleBytesProvider = { 10_000_000 }
+
+        let publishLock = NSLock()
+        var publishedCount = 0
+        let bothPublished = DispatchSemaphore(value: 0)
+        refiner.publish = { _, _ in
+            let count: Int = publishLock.withLock { publishedCount += 1; return publishedCount }
+            if count == 2 { bothPublished.signal() }
+        }
+
+        refiner.noteChanged()   // pass 1 starts, blocks on the loader's first call
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success, "pass 1 must reach the loader")
+
+        // Fire 4 more rapidly while pass 1 is in flight — each must return essentially instantly.
+        for _ in 0..<4 {
+            let callStart = Date()
+            refiner.noteChanged()
+            XCTAssertLessThan(Date().timeIntervalSince(callStart), 0.25,
+                              "noteChanged() must never block the calling thread")
+        }
+
+        // At most one pass concurrent: the loader has been entered exactly once so far.
+        XCTAssertEqual(loader.callCount, 1, "at most one pass may be in flight concurrently")
+
+        release.signal()   // let pass 1 finish
+        // The 4 coalesced calls must produce exactly ONE rerun, not 4 — pass 2 starts next.
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success, "exactly one coalesced pass must follow")
+        XCTAssertEqual(loader.callCount, 2)
+        release.signal()   // let pass 2 finish
+
+        XCTAssertEqual(bothPublished.wait(timeout: .now() + 2), .success, "both passes must complete")
+        XCTAssertEqual(publishedCount, 2, "5 rapid-fire notifications must coalesce into 2 total passes")
+        XCTAssertEqual(refiner.passesRun, 2)
+    }
+
+    /// (b) Parked-pass / stale-result race: a pass starts and blocks mid-load; while it's parked,
+    /// a user reject lands (`setUserRejected` + `noteUserRejectChanged`, mirroring the expected
+    /// Task 11 `AppModel.toggleReject` call pattern). The in-flight pass must publish under its
+    /// OWN (now stale) captured key — `publishedMasterIfCurrent()` must refuse to serve it — and
+    /// the dirty flag must trigger a fresh pass over the NEW (post-reject) survivor set.
+    func testParkedPassPublishesUnderStaleKeyAndDirtyFlagRerunsOverNewSurvivors() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try pipelineWithRegisteredSubs(count: 15, sandbox: sandbox)
+        defer { source.stop() }
+
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let loader = FirstCallGatedLoader(image: constImage(0.3), entered: entered, release: release)
+        pipeline.refinerLoaderOverride = loader
+
+        // enabledRose (OFF -> ON with 15 survivors already present) triggers pass 1 immediately.
+        pipeline.configureLiveRejection(enabled: true, kappa: 3.0, maxSampleBytes: 10_000_000)
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success, "pass 1 must start and reach the loader")
+
+        // Mid-pass: a user reject lands. This changes the survivor set AND bumps
+        // userRejectGeneration (twice — setUserRejected then noteUserRejectChanged, the expected
+        // Task 11 pairing) — both harmless per the noteUserRejectChanged doc.
+        pipeline.setUserRejected([2])
+        pipeline.noteUserRejectChanged()
+
+        release.signal()   // let the parked pass 1 finish and publish under its STALE captured key
+
+        // Pass 1's result must NOT be served as current — its key predates the reject.
+        let staleDeadline = Date().addingTimeInterval(2)
+        var sawStaleWindow = false
+        while Date() < staleDeadline {
+            if pipeline.publishedMasterIfCurrent() == nil { sawStaleWindow = true; break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        XCTAssertTrue(sawStaleWindow,
+                     "the parked pass's result, published under its stale captured key, " +
+                     "must never be served as current")
+
+        // The dirty flag must trigger a fresh pass over the NEW survivor set (14 subs, sub 2 excluded).
+        let freshDeadline = Date().addingTimeInterval(5)
+        var freshMaster: (image: AstroImage, coverage: [Float], survivorCount: Int)?
+        while Date() < freshDeadline {
+            if let m = pipeline.publishedMasterIfCurrent() { freshMaster = m; break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        let unwrapped = try XCTUnwrap(freshMaster, "a fresh pass must run over the new survivor set and publish")
+        XCTAssertEqual(unwrapped.survivorCount, 14, "the fresh pass must reflect the rejected sub's exclusion")
+    }
+
+    /// (c) OFF -> ON with survivors already present must trigger an immediate build — not wait for
+    /// the next sub/reject/reseed.
+    func testEnablingFeatureMidSessionWithSurvivorsPresentTriggersImmediateBuild() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try pipelineWithRegisteredSubs(count: 15, sandbox: sandbox)
+        defer { source.stop() }
+
+        // Feature-off parity: nothing published before enabling.
+        XCTAssertNil(pipeline.publishedMasterIfCurrent())
+
+        pipeline.refinerLoaderOverride = ConstFrameLoader(image: constImage(0.4))
+        pipeline.configureLiveRejection(enabled: true, kappa: 3.0, maxSampleBytes: 10_000_000)
+
+        let deadline = Date().addingTimeInterval(5)
+        var master: (image: AstroImage, coverage: [Float], survivorCount: Int)?
+        while Date() < deadline {
+            if let m = pipeline.publishedMasterIfCurrent() { master = m; break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        let unwrapped = try XCTUnwrap(master, "turning the feature ON with survivors present must build immediately")
+        XCTAssertEqual(unwrapped.survivorCount, 15, "no sub was rejected — all 15 survivors contribute")
+    }
 }

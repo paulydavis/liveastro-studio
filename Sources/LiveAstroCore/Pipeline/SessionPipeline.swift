@@ -252,6 +252,49 @@ public final class SessionPipeline {
         }
     }
 
+    // MARK: Task 8 invalidation hooks — trigger the background GlobalRefiner
+    //
+    // Each hook is a named mutation point: it (re)establishes the cached `_freshnessKey` under
+    // `regLock` if it hasn't already been done at the call site, THEN notifies the refiner
+    // OUTSIDE the lock (`noteChanged()` itself never blocks, but keeping the notify out of the
+    // lock avoids growing `regLock`'s critical section for no reason). `currentRefiner()` is nil
+    // until live rejection is first enabled (see `configureLiveRejection` below) — every hook is
+    // therefore a safe no-op for feature-OFF parity: no refiner activity, no published master.
+
+    /// The lazily-created background refiner, or nil before live rejection has ever been enabled
+    /// this session. Thread-safe.
+    private func currentRefiner() -> GlobalRefiner? { regLock.withLock { _globalRefiner } }
+
+    /// Called from `handleNative` POST-COMMIT, only when a `SubRegistration` was actually
+    /// appended (an accepted sub with a registration payload). The T7 sub-append block already
+    /// recomputes `_freshnessKey` there — this hook does NOT recompute again (would double the
+    /// work every single sub); it only notifies.
+    func noteSubAccepted() {
+        currentRefiner()?.noteChanged()
+    }
+
+    /// User-reject-set-change notification hook (Task 11's `AppModel.toggleReject` calls this,
+    /// not the refiner directly). Bumps `userRejectGeneration` and recomputes the cached key —
+    /// mirrors what `setUserRejected` already does for its own callers, so calling both back to
+    /// back (the expected Task 11 usage: `setUserRejected(ids)` then `noteUserRejectChanged()`)
+    /// double-bumps the generation. That's harmless: `userRejectGeneration` only needs to differ
+    /// from whatever a previously-stamped `FreshnessKey` recorded, not increment exactly once per
+    /// logical event.
+    func noteUserRejectChanged() {
+        regLock.withLock {
+            userRejectGeneration += 1
+            recomputeCachedFreshnessKeyLocked()
+        }
+        currentRefiner()?.noteChanged()
+    }
+
+    /// Reseed notification hook. `reseed()` itself already bumps the engine's generation and
+    /// recomputes the cached key (T7 review fix) before calling this — so this hook only
+    /// notifies, avoiding a double recompute.
+    func noteReseeded() {
+        currentRefiner()?.noteChanged()
+    }
+
     /// Subs of `currentGeneration`, minus any `subIndex` the user has flagged, in capture
     /// order. Locks `regLock` — do NOT call from a context already holding it (use
     /// `currentSurvivorsLocked` there instead, or it deadlocks the non-recursive NSLock).
@@ -293,6 +336,29 @@ public final class SessionPipeline {
     /// The background refiner's most recently published trail-free master, stamped with the
     /// `FreshnessKey` it was computed from. `internal` — Task 6/11 publish here directly.
     internal var publishedMaster: (image: AstroImage, coverage: [Float], survivorCount: Int, key: FreshnessKey)?   // guarded by regLock
+    /// RAM sample budget (bytes) the background refiner combines survivors with. NOT part of
+    /// `FreshnessKey` (unlike κ) — a budget-only change can't be detected via key comparison, so
+    /// `configureLiveRejection` clears `publishedMaster` explicitly when it changes (see below).
+    private var liveRejectionMaxSampleBytes: Int = GlobalRefiner.defaultMaxSampleBytes   // guarded by regLock
+    /// Quorum floor for the background refiner (both the materialized RAM sample and the final
+    /// survivor count) — same value as the Task 11 online gate. Not currently configurable via
+    /// `configureLiveRejection` (no brief-specified setter), so a plain constant.
+    private let liveRejectionMinSubs: Int = GlobalRefiner.defaultMinSubs
+    /// Task 8: the background refiner, OWNED by the pipeline and created LAZILY on the first
+    /// `configureLiveRejection(enabled: true, ...)` call — never before. This is the ownership/
+    /// lifetime choice that keeps feature-OFF parity trivially true: every Task 8 invalidation
+    /// hook (`noteSubAccepted`/`noteUserRejectChanged`/`noteReseeded`) calls
+    /// `currentRefiner()?.noteChanged()` UNCONDITIONALLY (no `liveRejectionActive` check) — if
+    /// live rejection has never been turned on this session, `_globalRefiner` is nil, so those
+    /// calls are no-ops: zero refiner queue activity, zero published master, byte-identical
+    /// output to today. (Holding a refiner for the whole session and gating its activity on
+    /// `liveRejectionActive` inside each hook would work too, but would need that check
+    /// duplicated at every call site instead of centralized in one nil check here.)
+    private var _globalRefiner: GlobalRefiner?   // guarded by regLock
+    /// Test seam: overrides the `FrameLoader` used when `_globalRefiner` is lazily created (nil =
+    /// production `ProductionFrameLoader`). Must be set BEFORE the first
+    /// `configureLiveRejection(enabled: true, ...)` call to take effect.
+    var refinerLoaderOverride: FrameLoader?
 
     /// Recompute `_freshnessKey` from the current generation/survivors/reject-generation/κ.
     /// Assumes the caller already holds `regLock` — calling `currentFreshnessKey()` (or any
@@ -309,23 +375,102 @@ public final class SessionPipeline {
     /// Task 8 snapshot) reads `_freshnessKey` directly instead of calling this.
     public func currentFreshnessKey() -> FreshnessKey { regLock.withLock { _freshnessKey } }
 
-    /// Live-rejection feature gate (Task 11 wires this from AppModel). Turning it OFF also
-    /// clears `publishedMaster` (belt-and-suspenders): `FreshnessKey` does not encode
-    /// enabled-ness, so without this an already-published master would otherwise still read as
-    /// "current" the instant the feature is re-enabled with nothing else changed.
-    public func configureLiveRejection(enabled: Bool) {
+    /// Live-rejection config gate (Task 11 wires this from AppModel) — the ONE config-change
+    /// invalidation path (brief §Task 8). Every parameter is optional and defaults to "leave
+    /// unchanged", so the Task 7 single-parameter call sites (`configureLiveRejection(enabled:)`,
+    /// `configureLiveRejection(kappa:)`) still compile and behave exactly as before against this
+    /// widened signature — no call-site adaptation needed.
+    ///
+    /// Under `regLock`: compute old-vs-new enabled/κ/budget, update the three stored fields,
+    /// recompute `_freshnessKey` (κ IS part of the key, so a κ change alone already invalidates
+    /// any published master via the key comparison), and explicitly CLEAR a now-stale
+    /// `publishedMaster` when the feature just went OFF or the budget changed — budget is
+    /// deliberately NOT part of `FreshnessKey` (unlike κ), so a budget-only change would otherwise
+    /// leave a stale master's key still matching. Lazily creates `_globalRefiner` the first time
+    /// `enabled` turns (or is passed) true. `shouldNotify` is computed UNDER the lock from
+    /// lock-guarded state — never read again after releasing — then the refiner is notified
+    /// OUTSIDE the lock. `enabledRose` (OFF→ON, survivors already present) is the key case: it
+    /// must trigger a build immediately, not wait for the next sub/reject/reseed.
+    public func configureLiveRejection(enabled: Bool? = nil, kappa: Float? = nil, maxSampleBytes: Int? = nil) {
+        var shouldNotify = false
+        var refinerToNotify: GlobalRefiner?
         regLock.withLock {
-            liveRejectionActive = enabled
-            if !enabled { publishedMaster = nil }
+            let oldEnabled = liveRejectionActive
+            let oldKappa = liveRejectionKappa
+            let oldBudget = liveRejectionMaxSampleBytes
+            let newEnabled = enabled ?? oldEnabled
+            let newKappa = kappa ?? oldKappa
+            let newBudget = maxSampleBytes ?? oldBudget
+
+            let enabledRose = !oldEnabled && newEnabled
+            let kappaChanged = newKappa != oldKappa
+            let budgetChanged = newBudget != oldBudget
+
+            liveRejectionActive = newEnabled
+            liveRejectionKappa = newKappa
+            liveRejectionMaxSampleBytes = newBudget
+            recomputeCachedFreshnessKeyLocked()
+            if !newEnabled || budgetChanged {
+                publishedMaster = nil   // belt-and-suspenders: not caught by the key comparison alone
+            }
+            if newEnabled, _globalRefiner == nil {
+                _globalRefiner = makeRefinerLocked()
+            }
+            shouldNotify = newEnabled && (enabledRose || kappaChanged || budgetChanged)
+            if shouldNotify { refinerToNotify = _globalRefiner }
         }
+        if shouldNotify { refinerToNotify?.noteChanged() }
     }
 
-    /// Sets the κ the background refiner should combine survivors with and recomputes the
-    /// cached freshness key — a κ change invalidates any master published under the old κ.
-    public func configureLiveRejection(kappa: Float) {
+    /// Builds a `GlobalRefiner` and wires its Task 8 closures back into the pipeline. Assumes the
+    /// caller already holds `regLock` (only ever called from inside `configureLiveRejection`) —
+    /// constructing the loader/closures here does not itself re-enter `regLock` or block.
+    private func makeRefinerLocked() -> GlobalRefiner {
+        let demosaic = engine?.demosaicMethod ?? .bilinear
+        let loader: FrameLoader = refinerLoaderOverride
+            ?? ProductionFrameLoader(calibrator: effectiveCalibrator, demosaic: demosaic)
+        let refiner = GlobalRefiner(loader: loader, onLog: { [weak self] msg in self?.onLog?(msg) })
+        refiner.makeSnapshot = { [weak self] in self?.makeRefinerSnapshot() }
+        refiner.publish = { [weak self] result, key in self?.publishRefineResult(result, key: key) }
+        refiner.kappaProvider = { [weak self] in self?.currentLiveRejectionKappa() ?? GlobalRefiner.defaultKappa }
+        refiner.maxSampleBytesProvider = { [weak self] in
+            self?.currentLiveRejectionMaxSampleBytes() ?? GlobalRefiner.defaultMaxSampleBytes
+        }
+        refiner.minSubsProvider = { [weak self] in self?.liveRejectionMinSubs ?? GlobalRefiner.defaultMinSubs }
+        return refiner
+    }
+
+    private func currentLiveRejectionKappa() -> Float { regLock.withLock { liveRejectionKappa } }
+    private func currentLiveRejectionMaxSampleBytes() -> Int { regLock.withLock { liveRejectionMaxSampleBytes } }
+
+    /// The `GlobalRefiner.makeSnapshot` seam — implements the stale-result race fix (brief
+    /// §"Stale-result race", exact order): (1) read the engine's CURRENT stack generation FIRST,
+    /// its own lock, released immediately — never hold `regLock` while touching the engine lock;
+    /// (2) under `regLock`, snapshot the survivors for that generation (non-locking variant — we
+    /// already hold the lock) and the CACHED `_freshnessKey` FIELD directly (never
+    /// `currentFreshnessKey()` — it re-acquires `regLock` and deadlocks); (3) release `regLock`,
+    /// then RE-READ the engine's generation — if it changed, a reseed raced the snapshot: discard
+    /// (return nil). The reseed that caused the race already called `noteReseeded()` →
+    /// `noteChanged()`, so `dirty` is set and a fresh pass follows.
+    private func makeRefinerSnapshot() -> PassSnapshot? {
+        guard let engine else { return nil }
+        let capturedGen = engine.currentStackGeneration
+        let (capturedSurvivors, capturedKey): ([SubRegistration], FreshnessKey) = regLock.withLock {
+            (currentSurvivorsLocked(currentGeneration: capturedGen), _freshnessKey)
+        }
+        guard engine.currentStackGeneration == capturedGen else { return nil }   // reseed raced the snapshot
+        return PassSnapshot(survivors: capturedSurvivors, currentGeneration: capturedGen, key: capturedKey)
+    }
+
+    /// The `GlobalRefiner.publish` seam — installs a completed pass's result stamped with the
+    /// SNAPSHOT's own key (never a freshly-read one — see `makeRefinerSnapshot` doc and the
+    /// stale-result race fix). If a reject/κ/reseed landed mid-pass, `_freshnessKey` has already
+    /// advanced past this `key`, so `publishedMasterIfCurrent()` correctly refuses to serve this
+    /// as current — the mutation that moved the key already triggered its own fresh pass.
+    private func publishRefineResult(_ result: RefineResult, key: FreshnessKey) {
         regLock.withLock {
-            liveRejectionKappa = kappa
-            recomputeCachedFreshnessKeyLocked()
+            publishedMaster = (image: result.image, coverage: result.coverage,
+                               survivorCount: result.survivorCount, key: key)
         }
     }
 
@@ -534,6 +679,10 @@ public final class SessionPipeline {
         // generation, so the recompute observes the POST-reseed generation.
         if result == .reseeded {
             regLock.withLock { recomputeCachedFreshnessKeyLocked() }
+            // Task 8: notify the background refiner AFTER the recompute above (this hook does not
+            // recompute again — reseed already did). A no-op when live rejection has never been
+            // enabled this session.
+            noteReseeded()
         }
         return result
     }
@@ -827,6 +976,11 @@ public final class SessionPipeline {
                     // on the first sub of a new reference) — refresh the cached freshness key.
                     recomputeCachedFreshnessKeyLocked()
                 }
+                // Task 8: notify the background refiner OUTSIDE regLock. The recompute above
+                // already refreshed `_freshnessKey` for this sub — noteSubAccepted() does NOT
+                // recompute again (would double the work every sub); it only notifies. A no-op
+                // when live rejection has never been enabled this session (currentRefiner() nil).
+                noteSubAccepted()
             }
             switch outcome {
             case .becameReference, .stacked:

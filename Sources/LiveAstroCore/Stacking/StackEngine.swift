@@ -161,6 +161,12 @@ public final class StackEngine {
     /// accessor there would re-enter the non-recursive NSLock and deadlock.
     private var currentStackGenerationLocked: Int { manualReseedCount + autoReseedCount }
 
+    /// The `DemosaicMethod` this engine was built with — a plain `let`, so no locking needed.
+    /// Task 8: `SessionPipeline` reads this once when lazily building the `GlobalRefiner`'s
+    /// production `FrameLoader`, so the refiner's `DisplayRGB.make` call matches the online
+    /// engine's debayer exactly (no drift between the online and refine domains).
+    public var demosaicMethod: DemosaicMethod { demosaic }
+
     /// seedMinStars: must comfortably exceed minMatches (8); 15 gives
     /// C(15,3)=455 triangles for reliable initial matching.
     public init(seedMinStars: Int = 15, minMatches: Int = 8, inlierTolerance: Double = 2.0,

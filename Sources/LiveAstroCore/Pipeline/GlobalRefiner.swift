@@ -69,6 +69,112 @@ public final class GlobalRefiner {
         self.onLog = onLog
     }
 
+    // MARK: - Task 8: self-throttling trigger, off the online path
+    //
+    // `noteChanged()` is the ONLY entry point the online consumer calls, and it must return
+    // immediately — it never blocks on I/O or on a pass in flight. Coalescing rule: idle → start
+    // exactly one pass; a pass already running → set `dirty` so exactly ONE more pass runs after
+    // the current one finishes (never N, however many times `noteChanged()` fires while busy).
+    // `runCoalescedPasses()` runs the idle→busy→(rerun-if-dirty) loop on `triggerQueue`, a
+    // dedicated serial queue distinct from `passLock`/`cancel()` above (which guard `refine`'s own
+    // internal cancellation, not this coalescing state) — a WHILE loop, not recursion, so N rapid
+    // `noteChanged()` calls can never grow the call stack.
+
+    /// Injected by the owner (`SessionPipeline`, Task 8) — builds a race-checked snapshot of the
+    /// current survivor set + generation + `FreshnessKey` for ONE pass. Returning nil DISCARDS the
+    /// pass with no `refine` call (e.g. a reseed raced the snapshot build) — the mutation that
+    /// caused the race is itself an invalidation hook that calls `noteChanged()`, so `dirty` is
+    /// already set and a fresh pass follows. Never set ⇒ `noteChanged()` is a safe no-op (matches
+    /// feature-OFF parity: the pipeline only wires this once live rejection is first enabled).
+    public var makeSnapshot: (() -> PassSnapshot?)?
+    /// Injected by the owner — installs a COMPLETED pass's result. Called with the snapshot's OWN
+    /// captured key, never a freshly-read one (the stale-result race fix: see `PassSnapshot` doc).
+    public var publish: ((RefineResult, FreshnessKey) -> Void)?
+    /// Injected config seams, read fresh at the START of every pass (so a κ/budget change that
+    /// lands between passes is picked up by the very next one). nil ⇒ the documented default.
+    public var kappaProvider: (() -> Float)?
+    public var maxSampleBytesProvider: (() -> Int)?
+    public var minSubsProvider: (() -> Int)?
+
+    public static let defaultKappa: Float = RejectionStrength.medium.kappa
+    public static let defaultMinSubs = 5
+    public static let defaultMaxSampleBytes = 6_000_000_000   // ~6 GB (spec §3 sample policy default)
+    /// Per-pass time budget for a BACKGROUND trigger pass (this file) — distinct from the Task 10
+    /// `end()`-triggered final pass, which uses its own `finalRefineBudget`. The design spec's
+    /// Global Constraints section does not pin a value for this trigger path (only the ~6 GB
+    /// sample-budget default and the 11-frame hard floor are specified), so this is a deliberately
+    /// chosen, named default: long enough for a deep real stack (dozens of 26 MP loads + warps +
+    /// leveling passes) to complete in one pass, short enough that a wedged/dead-share read can't
+    /// pin the trigger queue indefinitely — `refine`'s own between-sub deadline check (C3) aborts
+    /// at this bound and `noteChanged()`'s coalescing (via whatever invalidation fired meanwhile)
+    /// runs a fresh pass afterward regardless.
+    public static let defaultPassBudget: DispatchTimeInterval = .seconds(300)
+    public var passBudget: DispatchTimeInterval = GlobalRefiner.defaultPassBudget
+
+    private let triggerLock = NSLock()
+    private var isRunning = false
+    private var dirty = false
+    private let triggerQueue = DispatchQueue(label: "com.liveastro.globalrefiner.trigger")
+
+    /// Test-only observability: number of passes actually EXECUTED (i.e. `performOnePass` ran,
+    /// whether or not it produced/published a result) — distinguishes "coalesced away" from "ran".
+    private(set) var passesRun = 0
+
+    /// Notify the refiner that the survivor set (or config) may have changed. Coalesces: idle →
+    /// dispatches exactly one pass; a pass already running → marks `dirty` so exactly one more
+    /// pass follows. Always returns immediately — the actual pass runs on `triggerQueue`.
+    public func noteChanged() {
+        let shouldStart: Bool = triggerLock.withLock {
+            if isRunning {
+                dirty = true
+                return false
+            }
+            isRunning = true
+            return true
+        }
+        guard shouldStart else { return }
+        triggerQueue.async { [weak self] in self?.runCoalescedPasses() }
+    }
+
+    /// Runs on `triggerQueue`. A WHILE loop (not recursion) so any number of `noteChanged()` calls
+    /// that land while busy still produce at most one extra pass, with bounded stack depth.
+    private func runCoalescedPasses() {
+        while true {
+            performOnePass()
+            let runAgain: Bool = triggerLock.withLock {
+                if dirty {
+                    dirty = false
+                    return true
+                }
+                isRunning = false
+                return false
+            }
+            if !runAgain { break }
+        }
+    }
+
+    /// One background pass: snapshot → refine → publish. Any missing seam (no `makeSnapshot`, a
+    /// discarded/nil snapshot, or a `refine` that returns nil) is a silent no-op — the caller keeps
+    /// whatever master was already published; there is no partial/erroneous publish.
+    private func performOnePass() {
+        passesRun += 1
+        guard let snapshot = makeSnapshot?() else { return }
+        let kappa = kappaProvider?() ?? GlobalRefiner.defaultKappa
+        let minSubs = minSubsProvider?() ?? GlobalRefiner.defaultMinSubs
+        let maxSampleBytes = maxSampleBytesProvider?() ?? GlobalRefiner.defaultMaxSampleBytes
+        let deadline = DispatchTime.now() + passBudget
+        guard let result = refine(survivors: snapshot.survivors, currentGeneration: snapshot.currentGeneration,
+                                  kappa: kappa, minSubs: minSubs, maxSampleBytes: maxSampleBytes,
+                                  deadline: deadline, isCancelled: { false }) else { return }
+        // NEVER re-read the current freshness key here — publish under the SNAPSHOT's key (see
+        // the stale-result race doc on PassSnapshot/publish above). If a reject/κ/reseed landed
+        // mid-pass, the pipeline's live key has already advanced past `snapshot.key`, so
+        // `publishedMasterIfCurrent()` correctly refuses to serve this result as current, and the
+        // invalidation that moved the key already called `noteChanged()` (dirty ⇒ a fresh pass
+        // follows in the `while` loop above).
+        publish?(result, snapshot.key)
+    }
+
     /// Marks the pass CURRENTLY in flight (or about to start) as cancelled. See the `passLock`
     /// doc above for why a late call can't cancel a future pass.
     public func cancel() {
@@ -241,5 +347,28 @@ public struct RefineResult {
         self.coverage = coverage
         self.survivorCount = survivorCount
         self.skipped = skipped
+    }
+}
+
+/// Task 8: a race-checked, point-in-time snapshot of pipeline state for ONE background pass,
+/// built by the owner's `makeSnapshot` closure. **The stale-result race fix lives in how this is
+/// built, not in `GlobalRefiner` itself:** the owner must (1) read the engine's current stack
+/// generation FIRST (its own lock, released immediately), (2) under its registration lock, snapshot
+/// the survivors for that generation and the CACHED freshness-key field directly (never re-derive
+/// it — that would re-acquire a non-recursive lock and deadlock), (3) release that lock, then
+/// RE-READ the engine's generation — if it changed, return nil (a reseed raced the snapshot; the
+/// pipeline's own reseed hook already called `noteChanged()`, so `dirty` reruns it). `key` is
+/// stamped onto the eventual `RefineResult` at PUBLISH time UNCHANGED — never re-read at
+/// completion — so a mutation that lands mid-pass is caught by the stored key going stale, not by
+/// racing the publish itself.
+public struct PassSnapshot {
+    public let survivors: [SubRegistration]
+    public let currentGeneration: Int
+    public let key: FreshnessKey
+
+    public init(survivors: [SubRegistration], currentGeneration: Int, key: FreshnessKey) {
+        self.survivors = survivors
+        self.currentGeneration = currentGeneration
+        self.key = key
     }
 }
