@@ -359,6 +359,17 @@ public final class SessionPipeline {
     /// production `ProductionFrameLoader`). Must be set BEFORE the first
     /// `configureLiveRejection(enabled: true, ...)` call to take effect.
     var refinerLoaderOverride: FrameLoader?
+    /// Task 10: the time budget for the ONE synchronous final refiner pass `end()` runs when
+    /// live rejection is active but no published master is current at shutdown (e.g. the last
+    /// accepted sub's background pass hadn't finished/published yet). This is the ONLY bound on
+    /// that final pass — step 4 already cancelled any in-flight background pass, so nothing else
+    /// cancels it; `refine`'s own between-sub deadline check (C3) aborts at this bound and `end()`
+    /// falls back to the online master, so `end()` can never hang on a wedged/slow final pass.
+    /// Distinct from `GlobalRefiner.passBudget` (the background trigger's own, longer, budget) —
+    /// this one gates end() itself, so it defaults shorter: long enough for a modest stack the
+    /// background pass hasn't yet caught up on, short enough that shutdown still feels bounded.
+    /// Internal so tests can shrink it (hang-safety test, C3).
+    var finalRefineBudget: DispatchTimeInterval = .seconds(30)
 
     /// Recompute `_freshnessKey` from the current generation/survivors/reject-generation/κ.
     /// Assumes the caller already holds `regLock` — calling `currentFreshnessKey()` (or any
@@ -1383,8 +1394,32 @@ public final class SessionPipeline {
             // (display path uses additive+multiplicative; the saved master gets additive-only so
             // colour ratios stay physically calibratable). Crop happens BEFORE balance so balance
             // operates on the final spatial extent.
+            // Task 10: FREEZE every clean-master input before computing/choosing anything, so
+            // nothing that lands after this point (a late configureLiveRejection, a reject —
+            // reject is separately blocked once finalization begins, Task 11 P2-1) can alter the
+            // written master. Order matters: read the engine's generation FIRST, its own lock,
+            // released immediately, THEN snapshot the rest under regLock in ONE acquisition —
+            // never hold regLock while touching the engine lock. `frozenKey`/`capturedActive`/
+            // `frozenKappa`/`frozenBudget`/`frozenPublished` are direct field reads (never
+            // `currentFreshnessKey()`/`publishedMasterIfCurrent()`, which re-acquire regLock and
+            // would deadlock here since we already hold it).
             var finalization: SessionFinalizationFacts?
             if let eng = engine {
+                let frozenGen = eng.currentStackGeneration
+                let frozen: (survivors: [SubRegistration], key: FreshnessKey, active: Bool,
+                            kappa: Float, budget: Int,
+                            published: (image: AstroImage, coverage: [Float], survivorCount: Int, key: FreshnessKey)?)
+                frozen = regLock.withLock {
+                    (currentSurvivorsLocked(currentGeneration: frozenGen), _freshnessKey, liveRejectionActive,
+                     liveRejectionKappa, liveRejectionMaxSampleBytes, publishedMaster)
+                }
+
+                // Cancel any in-flight background refiner pass. Bounded: the running pass checks
+                // the cancellation flag BETWEEN subs (C3), so it unwinds on its own within one
+                // sub's load time — end() does not block waiting for it; the final pass below (if
+                // any) is bounded independently by its own deadline.
+                currentRefiner()?.cancel()
+
                 let final = try eng.finalizationState()
                 let outcome: MasterOutcome
                 switch final.stackState {
@@ -1392,26 +1427,53 @@ public final class SessionPipeline {
                     guard let master0 = final.image else {
                         throw StackEngine.FinalizationError.invariantBreach
                     }
-                    // Task 9: master.fit prefers the background refiner's clean published master
-                    // when it's still current — same freshness gate as broadcast/latest.png
-                    // (publishedMasterIfCurrent() itself refuses a stale/feature-off master). Its
-                    // survivorCount replaces the online frameCount for STACKCNT/TOTALEXP, since
-                    // that's the count that actually combined into the written pixels.
-                    let published = publishedMasterIfCurrent()
-                    let masterSource = published?.image ?? master0
-                    let masterCoverage = published?.coverage ?? final.coverage
-                    let masterFrameCount = published?.survivorCount ?? final.frameCount
-                    let master = cropToCoverage(masterSource, coverage: masterCoverage)   // crop BEFORE balance
-                    let balanced = neutralizeBackground
-                        ? AutoStretch.neutralizeBackgroundAdditive(master)
-                        : master
-                    let totalExp = Double(masterFrameCount) * profile.subExposureSeconds
-                    let masterData = FITSWriter.float32(
-                        width: balanced.width, height: balanced.height,
-                        channels: balanced.channels, pixels: balanced.pixels,
-                        metadata: sourceMetadata,
-                        stackCount: masterFrameCount,
-                        totalExposureSeconds: totalExp)
+                    // Choose the master using ONLY the frozen values above (never the live
+                    // liveRejectionActive/_freshnessKey/publishedMaster — those may have moved).
+                    var clean: (image: AstroImage, coverage: [Float], survivorCount: Int)?
+                    if frozen.active {
+                        if let pub = frozen.published, pub.key == frozen.key {
+                            // A background pass already published a master current as of the
+                            // freeze — use it, no final pass needed.
+                            clean = (pub.image, pub.coverage, pub.survivorCount)
+                        } else if let refiner = currentRefiner() {
+                            // No current published master — run ONE bounded final pass against the
+                            // FROZEN survivor set. The deadline alone bounds it (step 4 already
+                            // cancelled the background pass, so nothing else cancels this one); a
+                            // nil result (deadline/failure) falls back to the online master below.
+                            let result = refiner.refine(
+                                survivors: frozen.survivors, currentGeneration: frozenGen,
+                                kappa: frozen.kappa, minSubs: liveRejectionMinSubs,
+                                maxSampleBytes: frozen.budget,
+                                deadline: .now() + finalRefineBudget,
+                                isCancelled: { false })
+                            if let result {
+                                clean = (result.image, result.coverage, result.survivorCount)
+                            }
+                        }
+                    }
+                    // frozen.active == false → the clean path is skipped entirely (feature-off
+                    // parity fix): no publishedMaster use, no final refine — `clean` stays nil and
+                    // the online master below is written, byte-identical to today.
+
+                    // All output goes through the shared crop-to-coverage + additive-neutralize +
+                    // FITS-metadata path (RestackPlanning.encodeMaster) — same path a post-session
+                    // re-stack uses — so master.fit never diverges pixel-for-pixel between the two.
+                    let report: RestackReport
+                    if let clean {
+                        // CLEAN global result: STACKCNT/TOTALEXP reflect the count that actually
+                        // combined into the written pixels, not the online engine's frame count.
+                        report = RestackReport(master: clean.image, stackedCount: clean.survivorCount,
+                                               skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
+                                               coverage: clean.coverage)
+                    } else {
+                        // Online fallback / feature-off: EXACTLY today's counts, for byte parity.
+                        report = RestackReport(master: master0, stackedCount: final.frameCount,
+                                               skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
+                                               coverage: final.coverage)
+                    }
+                    let masterData = RestackPlanning.encodeMaster(
+                        report, neutralize: neutralizeBackground,
+                        metadata: sourceMetadata, subExposureSeconds: profile.subExposureSeconds)
                     try masterData.write(to: dir.appendingPathComponent("master.fit"))
                     outcome = .written
                 case .awaitingSeedAfterReseed:
