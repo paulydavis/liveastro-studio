@@ -1367,6 +1367,69 @@ public final class SessionPipeline {
         throw SessionPipelineError.shutdownTimeout
     }
 
+    /// D20: the clean-vs-online master-selection policy, extracted from `end()`'s `.active`
+    /// case (pure extraction — no behavior change). Chooses between the clean GLOBAL result
+    /// (a background pass already published one current as of the freeze, or one bounded
+    /// final pass run here against the frozen survivor set) and the online `master0`, and
+    /// builds the `RestackReport` either way; `end()` still does the `encodeMaster`/write.
+    ///
+    /// Must run using ONLY the frozen snapshot (`frozen`/`frozenGen`) taken by `end()` AFTER
+    /// stop/drain/freeze/cancel (never the live `liveRejectionActive`/`_freshnessKey`/
+    /// `publishedMaster`/`currentFreshnessKey()`/`publishedMasterIfCurrent()` — those may have
+    /// moved past the freeze). `frozen.active == false` skips the clean path entirely (feature-off
+    /// parity): no publishedMaster use, no final pass — the online master is written, byte-identical
+    /// to today. Not lock-guarded itself: it only touches the frozen locals passed in plus
+    /// `currentRefiner()` (which takes `regLock` internally, same as it did inline in `end()`).
+    private func selectMasterReport(
+        frozen: (survivors: [SubRegistration], key: FreshnessKey, active: Bool,
+                 kappa: Float, budget: Int, published: PublishedMaster?),
+        frozenGen: Int,
+        master0: AstroImage,
+        final: StackEngine.FinalizationState
+    ) -> RestackReport {
+        var clean: (image: AstroImage, coverage: [Float], survivorCount: Int)?
+        if frozen.active {
+            if let pub = frozen.published, pub.key == frozen.key {
+                // A background pass already published a master current as of the
+                // freeze — use it, no final pass needed.
+                clean = (pub.image, pub.coverage, pub.survivorCount)
+            } else if let refiner = currentRefiner() {
+                // No current published master — run ONE bounded final pass against the
+                // FROZEN survivor set. The deadline alone bounds it (step 4 already
+                // cancelled the background pass, so nothing else cancels this one); a
+                // nil result (deadline/failure) falls back to the online master below.
+                let result = refiner.refine(
+                    survivors: frozen.survivors, currentGeneration: frozenGen,
+                    kappa: frozen.kappa, minSubs: liveRejectionMinSubs,
+                    maxSampleBytes: frozen.budget,
+                    deadline: .now() + finalRefineBudget,
+                    isCancelled: { false })
+                if let result {
+                    clean = (result.image, result.coverage, result.survivorCount)
+                }
+            }
+        }
+        // frozen.active == false → the clean path is skipped entirely (feature-off
+        // parity fix): no publishedMaster use, no final refine — `clean` stays nil and
+        // the online master below is written, byte-identical to today.
+
+        // All output goes through the shared crop-to-coverage + additive-neutralize +
+        // FITS-metadata path (RestackPlanning.encodeMaster) — same path a post-session
+        // re-stack uses — so master.fit never diverges pixel-for-pixel between the two.
+        if let clean {
+            // CLEAN global result: STACKCNT/TOTALEXP reflect the count that actually
+            // combined into the written pixels, not the online engine's frame count.
+            return RestackReport(master: clean.image, stackedCount: clean.survivorCount,
+                                 skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
+                                 coverage: clean.coverage)
+        } else {
+            // Online fallback / feature-off: EXACTLY today's counts, for byte parity.
+            return RestackReport(master: master0, stackedCount: final.frameCount,
+                                 skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
+                                 coverage: final.coverage)
+        }
+    }
+
     /// Ends the session and renders replay.mp4. Synchronous — call off the main thread,
     /// and NEVER from inside one of this pipeline's callbacks (onUpdate / onLog /
     /// onRejected / onImportProgress): those are delivered synchronously on the
@@ -1488,50 +1551,8 @@ public final class SessionPipeline {
                     guard let master0 = final.image else {
                         throw StackEngine.FinalizationError.invariantBreach
                     }
-                    // Choose the master using ONLY the frozen values above (never the live
-                    // liveRejectionActive/_freshnessKey/publishedMaster — those may have moved).
-                    var clean: (image: AstroImage, coverage: [Float], survivorCount: Int)?
-                    if frozen.active {
-                        if let pub = frozen.published, pub.key == frozen.key {
-                            // A background pass already published a master current as of the
-                            // freeze — use it, no final pass needed.
-                            clean = (pub.image, pub.coverage, pub.survivorCount)
-                        } else if let refiner = currentRefiner() {
-                            // No current published master — run ONE bounded final pass against the
-                            // FROZEN survivor set. The deadline alone bounds it (step 4 already
-                            // cancelled the background pass, so nothing else cancels this one); a
-                            // nil result (deadline/failure) falls back to the online master below.
-                            let result = refiner.refine(
-                                survivors: frozen.survivors, currentGeneration: frozenGen,
-                                kappa: frozen.kappa, minSubs: liveRejectionMinSubs,
-                                maxSampleBytes: frozen.budget,
-                                deadline: .now() + finalRefineBudget,
-                                isCancelled: { false })
-                            if let result {
-                                clean = (result.image, result.coverage, result.survivorCount)
-                            }
-                        }
-                    }
-                    // frozen.active == false → the clean path is skipped entirely (feature-off
-                    // parity fix): no publishedMaster use, no final refine — `clean` stays nil and
-                    // the online master below is written, byte-identical to today.
-
-                    // All output goes through the shared crop-to-coverage + additive-neutralize +
-                    // FITS-metadata path (RestackPlanning.encodeMaster) — same path a post-session
-                    // re-stack uses — so master.fit never diverges pixel-for-pixel between the two.
-                    let report: RestackReport
-                    if let clean {
-                        // CLEAN global result: STACKCNT/TOTALEXP reflect the count that actually
-                        // combined into the written pixels, not the online engine's frame count.
-                        report = RestackReport(master: clean.image, stackedCount: clean.survivorCount,
-                                               skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
-                                               coverage: clean.coverage)
-                    } else {
-                        // Online fallback / feature-off: EXACTLY today's counts, for byte parity.
-                        report = RestackReport(master: master0, stackedCount: final.frameCount,
-                                               skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
-                                               coverage: final.coverage)
-                    }
+                    let report = selectMasterReport(frozen: frozen, frozenGen: frozenGen,
+                                                    master0: master0, final: final)
                     let masterData = RestackPlanning.encodeMaster(
                         report, neutralize: neutralizeBackground,
                         metadata: sourceMetadata, subExposureSeconds: profile.subExposureSeconds)
