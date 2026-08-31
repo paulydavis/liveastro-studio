@@ -764,6 +764,38 @@ public final class SessionPipeline {
         }
     }
 
+    /// BROADCAST/latest.png (Task 9, extracted D10): prefer the background refiner's clean
+    /// published master when it's still current (the T7 freshness gate — reject/κ/reseed/
+    /// feature-off all invalidate it inside `publishedMasterIfCurrent()` itself); otherwise fall
+    /// back to the SAME online source the caller already rendered for its preview, reusing that
+    /// render rather than paying the display pipeline twice on the common (no-clean-master) path.
+    /// `onlineMean`/`onlinePreviewCG` are the caller's already-cropped-to-coverage online mean and
+    /// its already-rendered preview image; `onlineFrameCount` is the engine's frame-count fallback
+    /// for `integrationFrames`. `downsampleLongEdge`, when non-nil, is applied to the
+    /// published-master branch exactly as the caller applied it to its own online branch — this is
+    /// the ONE asymmetry between the two call sites (renderSnapshot's import/live-preview render
+    /// downsamples to a long-edge preview; handleNative's live broadcast render stays full-res) and
+    /// is preserved by threading it through rather than being unified away. T9b: when the CLEAN
+    /// master is served, its depth is `survivorCount` (smaller than the online frame count after
+    /// rejections) — used so the overlay's integration time matches the displayed image; the
+    /// online-fallback branch is unchanged. The per-sub PREVIEW callers pass separately (onUpdate)
+    /// never consults `publishedMasterIfCurrent()` — it always renders from the online mean, exactly
+    /// as before this extraction.
+    private func resolveBroadcastRender(
+        onlineMean: AstroImage,
+        onlinePreviewCG: CGImage,
+        onlineFrameCount: Int,
+        downsampleLongEdge: Int?
+    ) throws -> (mean: AstroImage, cgImage: CGImage, integrationFrames: Int) {
+        guard let published = publishedMasterIfCurrent() else {
+            return (onlineMean, onlinePreviewCG, onlineFrameCount)
+        }
+        let broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
+        let displaySource = downsampleLongEdge.map { broadcastMean.downsampled(maxLongEdge: $0) } ?? broadcastMean
+        let broadcastCG = try displayCGImage(from: displaySource)
+        return (broadcastMean, broadcastCG, published.survivorCount)
+    }
+
     /// Renders + saves one snapshot from the current stack and pushes the preview. Shared by the
     /// throttled per-frame path and end()'s guaranteed final render. Sets lastRenderedAcceptedIndex.
     private func renderSnapshot(index: Int, sourceName: String, timestamp: Date, engine: StackEngine) {
@@ -774,29 +806,11 @@ public final class SessionPipeline {
             let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
             let previewCG = try displayCGImage(from: displaySource)
 
-            // BROADCAST/latest.png (Task 9): prefer the background refiner's clean published
-            // master when it's still current (the T7 freshness gate — reject/κ/reseed/feature-off
-            // all invalidate it inside publishedMasterIfCurrent() itself); otherwise this is the
-            // SAME online source as the preview above — reuse its render rather than paying the
-            // display pipeline twice on the common (no-clean-master) path. The per-sub PREVIEW
-            // (onUpdate below) never consults publishedMasterIfCurrent() — it always renders from
-            // the online mean, exactly as before this task.
-            let published = publishedMasterIfCurrent()
-            let broadcastCG: CGImage
-            let broadcastMean: AstroImage
-            // T9b: when the CLEAN master is served, its depth is `survivorCount` (smaller than
-            // the online frame count after rejections) — use it so the overlay's integration time
-            // matches the displayed image. The online-fallback branch is unchanged.
-            let integrationFrames: Int
-            if let published {
-                broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
-                broadcastCG = try displayCGImage(from: broadcastMean.downsampled(maxLongEdge: importPreviewLongEdge))
-                integrationFrames = published.survivorCount
-            } else {
-                broadcastMean = mean
-                broadcastCG = previewCG
-                integrationFrames = engine.stackFrameCount
-            }
+            // BROADCAST/latest.png: prefer the clean published master over the online mean, with
+            // the downsample applied to whichever is served (D10: see resolveBroadcastRender).
+            let (broadcastMean, broadcastCG, integrationFrames) = try resolveBroadcastRender(
+                onlineMean: mean, onlinePreviewCG: previewCG, onlineFrameCount: engine.stackFrameCount,
+                downsampleLongEdge: importPreviewLongEdge)
 
             let record = try recorder.save(
                 cgImage: broadcastCG, linear: broadcastMean, sourceFile: sourceName,
@@ -1084,29 +1098,12 @@ public final class SessionPipeline {
                 do {
                     let previewCG = try displayCGImage(from: mean)
 
-                    // BROADCAST/latest.png (Task 9): prefer the background refiner's clean
-                    // published master when it's still current, else this is the SAME online
-                    // source as the preview above — reuse its render rather than paying the
-                    // display pipeline twice on the common (no-clean-master) path. The per-sub
-                    // PREVIEW (onUpdate below) never consults publishedMasterIfCurrent() — it
-                    // always renders from the online mean, exactly as before this task.
-                    let published = publishedMasterIfCurrent()
-                    let broadcastCG: CGImage
-                    let broadcastMean: AstroImage
-                    // T9b: when the CLEAN master is served, its depth is `survivorCount` (smaller
-                    // than the online frame count after rejections) — use it so the overlay's
-                    // integration time matches the displayed image. The online-fallback branch is
-                    // unchanged.
-                    let integrationFrames: Int
-                    if let published {
-                        broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
-                        broadcastCG = try displayCGImage(from: broadcastMean)
-                        integrationFrames = published.survivorCount
-                    } else {
-                        broadcastMean = mean
-                        broadcastCG = previewCG
-                        integrationFrames = engine.stackFrameCount
-                    }
+                    // BROADCAST/latest.png: prefer the clean published master over the online
+                    // mean, full-resolution (live, unlike renderSnapshot's downsampled preview) —
+                    // D10: see resolveBroadcastRender.
+                    let (broadcastMean, broadcastCG, integrationFrames) = try resolveBroadcastRender(
+                        onlineMean: mean, onlinePreviewCG: previewCG, onlineFrameCount: engine.stackFrameCount,
+                        downsampleLongEdge: nil)
 
                     // Pass the raw un-neutralized mean as linear: stats stay raw for v1.1 cloud gate.
                     let record = try recorder.save(
