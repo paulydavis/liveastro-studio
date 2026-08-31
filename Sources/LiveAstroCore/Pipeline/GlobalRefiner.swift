@@ -54,6 +54,21 @@ public final class GlobalRefiner {
     /// (the online master is kept; never a partial publish).
     private struct AbortPass: Error {}
 
+    /// Cold-review fix (the M8 stall class, re-introduced): a heap-allocated, lock-guarded box
+    /// carrying `boundedLoad`'s result from its concurrent worker back to the waiter. The
+    /// `DispatchSemaphore` in `boundedLoad` already establishes happens-before ordering for the
+    /// success path (the worker `set`s before `signal()`; the waiter only `get()`s after a
+    /// successful `wait()`), but the box is guarded anyway so a late write from an abandoned
+    /// (timed-out) worker — which nothing reads — can never race a future reuse of the box (it
+    /// isn't reused; a fresh box is allocated per call, but the lock keeps this provably race-free
+    /// rather than relying solely on the semaphore's ordering).
+    private final class LoadResultBox {
+        private let lock = NSLock()
+        private var result: Result<AstroImage, Error>?
+        func set(_ value: Result<AstroImage, Error>) { lock.withLock { result = value } }
+        func get() -> Result<AstroImage, Error>? { lock.withLock { result } }
+    }
+
     private let loader: FrameLoader
     private let onLog: (String) -> Void
 
@@ -142,6 +157,33 @@ public final class GlobalRefiner {
     /// runs a fresh pass afterward regardless.
     public static let defaultPassBudget: DispatchTimeInterval = .seconds(300)
     public var passBudget: DispatchTimeInterval = GlobalRefiner.defaultPassBudget
+
+    /// Cold-review fix (the M8 watcher-stall class, re-introduced HERE): macOS cannot interrupt
+    /// an in-flight regular-file `read()` — `close()` does not unblock it, confirmed in
+    /// `docs/history/specs/2026-08-24-watcher-async-reads-design.md` for this exact bug class in
+    /// the live watcher. `refine`'s only liveness check (`stopRequested()`/`deadline` in
+    /// `loadWarp`) runs BETWEEN loads, never DURING one — so a single evicted-iCloud/dead-SMB
+    /// survivor's `Data(contentsOf:)` inside `ProductionFrameLoader` could wedge `refine` forever,
+    /// past every deadline: `SessionPipeline.end()`'s final pass would never return (master.fit
+    /// never written, "End Session" spins forever), and a wedged BACKGROUND pass would never let
+    /// `runCoalescedPasses` reset `isRunning`, permanently stalling the coalescer.
+    ///
+    /// `boundedLoad` (see `refine`) is the fix: it can't interrupt the read either, but it stops
+    /// WAITING on it — the blocking call runs on a shared concurrent `.utility` queue and the
+    /// caller bounds its WAIT with a `DispatchSemaphore` timeout of
+    /// `min(now + perSubLoadCap, passDeadline)`. `perSubLoadCap` is this bound: long enough that a
+    /// healthy 26 MP read off local disk or a reasonable network share (well under a second in
+    /// practice) never comes close to tripping it, short enough that one wedged file can't pin a
+    /// pass for more than this long before the pass moves on. Tune-able; tests shrink it (and, via
+    /// `SessionPipeline.refinerPerSubLoadCapOverride`, the pipeline's own refiner) to stay fast.
+    ///
+    /// On timeout, the abandoned worker's `read()` is NOT cancelled — it can't be (see above) — so
+    /// its `DispatchQueue.global(qos: .utility)` thread leaks until the kernel eventually returns
+    /// the call (SMB: on the order of minutes; an evicted-iCloud fileprovider: possibly never).
+    /// This is the same accepted, documented tradeoff the watcher fix landed on: true interruption
+    /// is impossible on macOS for a wedged regular-file read, so the achievable envelope is
+    /// bounding the WAIT, not the read.
+    var perSubLoadCap: DispatchTimeInterval = .seconds(20)
 
     private let triggerLock = NSLock()
     private var isRunning = false
@@ -239,15 +281,60 @@ public final class GlobalRefiner {
             if isCancelled() { return true }
             return passLock.withLock { cancelledPassId == thisPassId }
         }
+        // Bounds the WAIT on `loader.loadRegisteredInput`, not the read itself (uninterruptible
+        // on macOS — see the `perSubLoadCap` doc). Dispatches the blocking load to a shared
+        // concurrent `.utility` queue and waits with a semaphore timeout capped by BOTH
+        // `perSubLoadCap` and this pass's own `deadline`, so the bound composes with the existing
+        // per-pass budget instead of extending it. Returns:
+        //   - the image, on a successful load within the bound;
+        //   - throws the loader's own error, on a load failure within the bound (unchanged);
+        //   - throws `AbortPass`, if the wait timed out AND the overall `deadline` has been
+        //     reached (the pass-budget bound — same effect as today's between-loads check);
+        //   - returns nil, if the wait timed out but `deadline` has NOT been reached (only
+        //     `perSubLoadCap` elapsed) — a RECOVERABLE skip: this one sub is abandoned (its read
+        //     may still be wedged; the worker thread leaks — see `perSubLoadCap` doc) but the pass
+        //     continues with the remaining survivors, exactly like an ordinary load failure.
+        func boundedLoad(url: URL, expectedContentDigest: String?) throws -> AstroImage? {
+            let box = LoadResultBox()
+            let semaphore = DispatchSemaphore(value: 0)
+            let loaderRef = loader
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    let image = try loaderRef.loadRegisteredInput(url: url, expectedContentDigest: expectedContentDigest)
+                    box.set(.success(image))
+                } catch {
+                    box.set(.failure(error))
+                }
+                semaphore.signal()
+            }
+            let perLoadDeadline = min(DispatchTime.now() + perSubLoadCap, deadline)
+            if semaphore.wait(timeout: perLoadDeadline) == .success {
+                switch box.get() {
+                case .success(let image): return image
+                case .failure(let error): throw error
+                case nil: return nil   // unreachable (set() always precedes signal()); safe fallback
+                }
+            }
+            if DispatchTime.now() >= deadline { throw AbortPass() }   // pass-budget bound reached
+            return nil   // perSubLoadCap bound only — recoverable skip, budget remains
+        }
+
         // A load/digest failure RETURNS nil (recoverable — caller does skippedIds.insert).
         // Cancel/deadline THROWS AbortPass — unwinds the whole `refine` body below.
         func loadWarp(_ reg: SubRegistration) throws -> (image: AstroImage, mask: [Float])? {
             if stopRequested() || DispatchTime.now() >= deadline { throw AbortPass() }
             let rgb: AstroImage
             do {
-                rgb = try loader.loadRegisteredInput(url: reg.relayURL, expectedContentDigest: reg.contentDigest)
+                // Bounded wait: a wedged read can't block us past perSubLoadCap / the pass deadline.
+                guard let image = try boundedLoad(url: reg.relayURL,
+                                                  expectedContentDigest: reg.contentDigest) else {
+                    return nil   // perSubLoadCap-only timeout → recoverable skip (budget remains)
+                }
+                rgb = image
+            } catch is AbortPass {
+                throw AbortPass()   // pass deadline reached — propagate, do NOT swallow as a skip
             } catch {
-                return nil
+                return nil          // loader/digest failure → recoverable skip
             }
             let (warped, mask) = Warp.apply(rgb, transform: reg.transform.liftedToFullResolution())
             guard let leveling = reg.leveling else { return (warped, mask) }

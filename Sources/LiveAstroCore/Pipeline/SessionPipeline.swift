@@ -372,6 +372,12 @@ public final class SessionPipeline {
     /// background pass hasn't yet caught up on, short enough that shutdown still feels bounded.
     /// Internal so tests can shrink it (hang-safety test, C3).
     var finalRefineBudget: DispatchTimeInterval = .seconds(30)
+    /// Test seam (cold-review wedged-read fix): overrides `GlobalRefiner.perSubLoadCap` on the
+    /// lazily-created `_globalRefiner`, so a shutdown test can shrink the per-sub bounded-load
+    /// wait far below `finalRefineBudget` and still run fast. nil = leave `GlobalRefiner`'s own
+    /// default. Must be set BEFORE the first `configureLiveRejection(enabled: true, ...)` call
+    /// (same timing requirement as `refinerLoaderOverride`).
+    var refinerPerSubLoadCapOverride: DispatchTimeInterval?
 
     /// Recompute `_freshnessKey` from the current generation/survivors/reject-generation/κ.
     /// Assumes the caller already holds `regLock` — calling `currentFreshnessKey()` (or any
@@ -448,6 +454,7 @@ public final class SessionPipeline {
             ?? ProductionFrameLoader(calibratorProvider: { [weak self] in self?.effectiveCalibrator },
                                      demosaic: demosaic)
         let refiner = GlobalRefiner(loader: loader, onLog: { [weak self] msg in self?.onLog?(msg) })
+        if let cap = refinerPerSubLoadCapOverride { refiner.perSubLoadCap = cap }
         refiner.makeSnapshot = { [weak self] in self?.makeRefinerSnapshot() }
         refiner.publish = { [weak self] result, key in self?.publishRefineResult(result, key: key) }
         refiner.kappaProvider = { [weak self] in self?.currentLiveRejectionKappa() ?? GlobalRefiner.defaultKappa }

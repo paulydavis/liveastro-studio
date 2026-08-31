@@ -451,6 +451,67 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertEqual(loader.callCount, 0, "an already-past deadline must stop before the first load")
     }
 
+    /// A loader whose FIRST `loadRegisteredInput` call blocks forever on a semaphore the test
+    /// never signals during the test body — simulates a genuinely wedged read (dead SMB /
+    /// evicted-iCloud) per docs/history/specs/2026-08-24-watcher-async-reads-design.md: macOS
+    /// cannot interrupt an in-flight regular-file `read()`, so the ONLY fix is to stop WAITING
+    /// on it, not to cancel it. Later calls (if any were ever reached) succeed immediately.
+    private final class WedgedFirstCallFrameLoader: FrameLoader {
+        private let images: [URL: AstroImage]
+        private let wedge = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var _callCount = 0
+        var callCount: Int { lock.withLock { _callCount } }
+        init(images: [URL: AstroImage]) { self.images = images }
+        func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
+            let isFirst: Bool = lock.withLock { _callCount += 1; return _callCount == 1 }
+            if isFirst { wedge.wait() }   // never signalled by the test -> blocks forever
+            guard let img = images[url] else { throw StubLoadError.missing }
+            return img
+        }
+        /// Test hygiene only: release the permanently-parked worker thread after the assertion,
+        /// so the process doesn't accumulate a truly-immortal thread across the test suite.
+        func releaseWedge() { wedge.signal() }
+    }
+
+    /// THE regression this task exists to fix: a wedged read happens DURING a single `loadWarp`
+    /// call, not between two calls — the existing `testRefinePastDeadlineReturnsNilWithoutLoading`
+    /// only covers the pre-load deadline check, never a load that itself never returns. Before the
+    /// fix, `refine` blocks on `Data(contentsOf:)` (simulated here by the semaphore) forever,
+    /// regardless of `deadline`. After the fix, the bounded-load helper's `perSubLoadCap` (shrunk
+    /// here well below the pass `deadline`) caps the WAIT and `refine` returns nil, recoverably
+    /// skipping the wedged sub, well within wall-clock — this is the "budget remains" branch, not
+    /// the deadline-reached AbortPass branch (there are enough OTHER healthy survivors that the
+    /// pass could otherwise have used them, but since the wedged sub is index 0 / the reference
+    /// used for sizing, the skip still lets the pass fall through to the next successful load).
+    func testRefineSingleWedgedLoadDoesNotExceedDeadline() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-wedged-\(i).fit")
+            images[url] = constImage(0.5)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = WedgedFirstCallFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        refiner.perSubLoadCap = .milliseconds(200)   // shrunk so the test itself runs fast
+
+        let start = Date()
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 3,
+                                    maxSampleBytes: 10_000_000,
+                                    deadline: .now() + .seconds(30),   // budget NOT the binding constraint here
+                                    isCancelled: { false })
+        let elapsed = Date().timeIntervalSince(start)
+        loader.releaseWedge()   // let the permanently-parked worker thread exit (test hygiene)
+
+        XCTAssertLessThan(elapsed, 2.0,
+                          "refine must return within perSubLoadCap, not hang on a wedged read that " +
+                          "never returns — the pass deadline (30s) must never be the thing that bounds this")
+        let unwrapped = try XCTUnwrap(result, "4 healthy survivors remain after skipping the 1 wedged sub")
+        XCTAssertEqual(unwrapped.skipped, 1)
+        XCTAssertEqual(unwrapped.survivorCount, 4)
+    }
+
     /// The passId mechanism (step 7): a cancel() that lands before any pass has ever started
     /// records against passId 0 — it must not poison the FIRST real pass (passId 1).
     func testRefineCancelBeforeFirstPassDoesNotPoisonIt() throws {

@@ -817,6 +817,31 @@ final class SessionPipelineShutdownTests: XCTestCase {
         }
     }
 
+    /// Cold-review regression loader: every call blocks FOREVER on a shared gate — models a
+    /// genuinely wedged read (dead SMB / evicted-iCloud), per
+    /// docs/history/specs/2026-08-24-watcher-async-reads-design.md: macOS cannot interrupt an
+    /// in-flight regular-file `read()`, so this is NOT merely slow (like `T10SpyFrameLoader`'s
+    /// `sleepPerCall`, which the existing between-loads deadline check already bounds) — it never
+    /// returns at all unless released. Distinct from `GlobalRefinerTests.WedgedFirstCallFrameLoader`
+    /// (which wedges only the very first-ever call): here EVERY call wedges, so quorum genuinely
+    /// cannot be reached and the fallback-to-online path is exercised deterministically.
+    private final class T10WedgedFrameLoader: FrameLoader {
+        private let images: [URL: AstroImage]
+        private let gate = DispatchSemaphore(value: 0)
+        init(images: [URL: AstroImage] = [:]) { self.images = images }
+        func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
+            gate.wait()   // never signalled during the test body -> blocks forever
+            guard let img = images[url] else { throw NSError(domain: "t10wedged", code: 1) }
+            return img
+        }
+        /// Test hygiene only: release however many worker threads got leaked waiting on this gate
+        /// (the bounded-load fix abandons the WAIT after `perSubLoadCap` but the dispatched
+        /// closure itself stays blocked here forever, per the macOS uninterruptible-read
+        /// limitation) — signal generously so none of them linger permanently-parked in the test
+        /// process. Safe to over-signal (excess signals just leave the semaphore count positive).
+        func releaseAll(times: Int = 32) { for _ in 0..<times { gate.signal() } }
+    }
+
     /// Polls `subRegistrations()` until it reaches `count` entries or the deadline passes.
     private func t10WaitForRegistrations(_ pipeline: SessionPipeline, count: Int,
                                          timeout: TimeInterval = 5) -> [SubRegistration] {
@@ -997,5 +1022,50 @@ final class SessionPipelineShutdownTests: XCTestCase {
         let header = try FITSReader.readHeader(Data(contentsOf: masterURL))
         XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 6,
                       "a final pass that hits its deadline must fall back to the ONLINE master")
+    }
+
+    /// THE cold-review regression this task exists to fix (Manifestation A from the bug report):
+    /// unlike the hang-safety test above (a loader that's merely SLOW per call — bounded today by
+    /// the BETWEEN-loads deadline check), this loader's reads never return AT ALL. Before the fix,
+    /// `refine`'s only liveness check runs between loads, never during one, so `end()`'s final
+    /// pass would hang on the very first wedged read regardless of `finalRefineBudget` — "End
+    /// Session" spins forever, master.fit never written. After the fix, `GlobalRefiner`'s bounded
+    /// per-sub load wait (shrunk here via `refinerPerSubLoadCapOverride`, independent of and far
+    /// below `finalRefineBudget`) caps the WAIT on each read; every one of the 6 survivors' reads
+    /// times out, quorum can't be reached, `refine` returns nil, and `end()` falls back to writing
+    /// the ONLINE master — never hanging.
+    func testEndSessionWithWedgedSurvivorReadStillFinalizes() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, engine, regs) = try t10RegisterSixSubs(sandbox: sandbox)
+        defer { source.stop() }
+
+        var images: [URL: AstroImage] = [:]
+        for reg in regs { images[reg.relayURL] = t10ConstImage(0.1) }
+        let loader = T10WedgedFrameLoader(images: images)
+        pipeline.refinerLoaderOverride = loader
+        // finalRefineBudget stays generous (30s default) — it must NOT be the thing that bounds
+        // this test; perSubLoadCap is the bound under test, shrunk far below it.
+        pipeline.refinerPerSubLoadCapOverride = .milliseconds(100)
+
+        // enabledRose fires a background pass too (also on this wedged loader, also now bounded
+        // by the shrunk perSubLoadCap) — end() is called immediately regardless.
+        pipeline.configureLiveRejection(enabled: true, kappa: 3.0, maxSampleBytes: 10_000_000)
+
+        let t0 = Date()
+        let dir = try pipeline.end()
+        let elapsed = Date().timeIntervalSince(t0)
+        loader.releaseAll()   // test hygiene: let every leaked worker thread exit
+
+        XCTAssertLessThan(elapsed, 5.0,
+                          "end() must be bounded by perSubLoadCap even when reads never return at " +
+                          "all (genuinely wedged, not merely slow) — must not hang past finalRefineBudget")
+
+        XCTAssertEqual(engine.stackFrameCount, 6)
+        let masterURL = dir.appendingPathComponent("master.fit")
+        let header = try FITSReader.readHeader(Data(contentsOf: masterURL))
+        XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 6,
+                      "every survivor's read is permanently wedged -> quorum can never be reached " +
+                      "-> the final pass must fall back to writing the ONLINE master, not hang")
     }
 }
