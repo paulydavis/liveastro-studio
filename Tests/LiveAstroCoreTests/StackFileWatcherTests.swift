@@ -1950,9 +1950,23 @@ final class StackFileWatcherTests: XCTestCase {
 
         // The producer resumes and completes the file — well inside the 30 s budget.
         try full.write(to: url1)
-        try await Task.sleep(nanoseconds: 300_000_000)   // stability re-earned on real scans
-        clock.advance(seconds: 1)                        // ≥ quietPeriod, << budget → gates confirm
-        let got = await collector.waitForCount(2, timeout: 5)
+        // Outcome-based recovery, robust under load: DON'T assume a fixed wall-clock sleep lets the
+        // poll task observe url1's completed content before a single clock advance. Content reads are
+        // ASYNC (M8 reader queue), so a poll only SCHEDULES a read — the new digest lands later. Under
+        // full-suite CPU contention the read+stabilize lagged the fixed sleep, url1's stable-since was
+        // stamped only AFTER the advance, and — the ManualClock then frozen — it never cleared the
+        // quiet gate, so only _00002 emitted. Instead: nudge the budget clock in small steps (each ≥
+        // quietPeriod) while giving the async read+poll time, until BOTH files emit. Total advance is
+        // capped well under the 30 s blocking budget, so this can never trigger a write-off.
+        var got = false
+        let realDeadline = Date().addingTimeInterval(15)
+        var advancedSeconds = 0.0
+        while !got && Date() < realDeadline && advancedSeconds < 10 {
+            try await Task.sleep(nanoseconds: 20_000_000)   // let the async read + poll make progress
+            clock.advance(seconds: 0.2)                     // ≥ quietPeriod, << 30 s budget
+            advancedSeconds += 0.2
+            got = await collector.waitForCount(2, timeout: 0.05)
+        }
         XCTAssertTrue(got, "the recovered write emits — nothing was written off")
         let items = await collector.items
         XCTAssertEqual(items.map(\.url.lastPathComponent),
