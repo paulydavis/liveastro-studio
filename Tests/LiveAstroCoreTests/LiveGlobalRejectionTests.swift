@@ -328,6 +328,9 @@ final class LiveGlobalRejectionTests: XCTestCase {
                 annulus.append(onMaster.pixels[y * w + x])
             }
         }
+        XCTAssertFalse(annulus.isEmpty,
+                       "trail point too near a frame edge — background annulus is empty, so trail-removal " +
+                       "cannot be verified; part (a) must not silently pass on the SNR check alone")
         if !annulus.isEmpty {
             annulus.sort()
             let localBackground = annulus[annulus.count / 2]
@@ -350,11 +353,16 @@ final class LiveGlobalRejectionTests: XCTestCase {
         // (b) SNR ROI: a corner block, sized to avoid both the trail (>= 40px from it) and the
         // (typically centered, post-registration) galaxy core.
         let roiSize = max(20, min(w, h) / 10)
-        var corner = (x: 0, y: 0)
         let corners = [(0, 0), (w - roiSize, 0), (0, h - roiSize), (w - roiSize, h - roiSize)]
+        var chosenCorner: (x: Int, y: Int)? = nil
         for c in corners {
             let cx = c.0 + roiSize / 2, cy = c.1 + roiSize / 2
-            if abs(cx - tx) > 40 || abs(cy - ty) > 40 { corner = c; break }
+            if abs(cx - tx) > 40 || abs(cy - ty) > 40 { chosenCorner = (x: c.0, y: c.1); break }
+        }
+        guard let corner = chosenCorner else {
+            XCTFail("no corner ROI clears the >40px trail exclusion — refusing to fall back to a " +
+                    "possibly-contaminated (0,0) ROI for the SNR measurement")
+            return
         }
         func snr(_ img: FITSImage) -> Double {
             var vals: [Double] = []
