@@ -1042,7 +1042,7 @@ final class AppModel {
         let sampleFrameBytes = w * h * 16   // (3 RGB + 1 mask) channels × 4 bytes/component
         let budget = GlobalRefiner.defaultMaxSampleBytes
         let framesThatFit = budget / sampleFrameBytes
-        guard framesThatFit < 11 else { return }
+        guard framesThatFit < GlobalRefiner.minViableSampleFrames else { return }
         log.append("Live rejection: sample budget (~\(budget / 1_000_000_000) GB) only fits "
             + "\(framesThatFit) frame(s) at \(w)×\(h) — raise maxSampleBytes for sensors this large.")
     }

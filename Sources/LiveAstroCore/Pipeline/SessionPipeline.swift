@@ -683,11 +683,6 @@ public final class SessionPipeline {
             }
             guard source?.isFinite != true else { return .unavailableDuringImport }
             engine.reseed()
-            // Void any stored/in-flight solve so the new reference re-solves against its (fresh) stars.
-            // sourceMetadata is left as-is: reseed is a same-target re-establish (center unchanged), and
-            // it's owned by the serial frame-processing path — clearing it here would race that writer.
-            // (New-target metadata re-capture is out of 3a scope.)
-            invalidatePlateSolve()
             return .reseeded
         }
         // Task 7 review fix: a manual reseed is a FreshnessKey mutation point (generation change)
@@ -703,6 +698,17 @@ public final class SessionPipeline {
         // By this point engine.reseed() (inside the block above) has already bumped the engine's
         // generation, so the recompute observes the POST-reseed generation.
         if result == .reseeded {
+            // Void any stored/in-flight solve so the new reference re-solves against its (fresh)
+            // stars. sourceMetadata is left as-is: reseed is a same-target re-establish (center
+            // unchanged), and it's owned by the serial frame-processing path — clearing it here
+            // would race that writer. (New-target metadata re-capture is out of 3a scope.)
+            // Cold-review MINOR fix: moved OUTSIDE finalizationLock (matches the AUTO-reseed path
+            // below, which already calls this with no lock held) — invalidatePlateSolve() calls
+            // the user's onSolveStateChanged? closure, and calling out to a UI closure under a
+            // non-recursive lock is a latent self-deadlock trap (e.g. a re-entrant reseed() call
+            // from inside that closure). No other behavior change: this still only runs once, only
+            // on the .reseeded outcome, and engine.reseed() has already run by this point.
+            invalidatePlateSolve()
             regLock.withLock { recomputeCachedFreshnessKeyLocked() }
             // Task 8: notify the background refiner AFTER the recompute above (this hook does not
             // recompute again — reseed already did). A no-op when live rejection has never been
@@ -755,18 +761,24 @@ public final class SessionPipeline {
             let published = publishedMasterIfCurrent()
             let broadcastCG: CGImage
             let broadcastMean: AstroImage
+            // T9b: when the CLEAN master is served, its depth is `survivorCount` (smaller than
+            // the online frame count after rejections) — use it so the overlay's integration time
+            // matches the displayed image. The online-fallback branch is unchanged.
+            let integrationFrames: Int
             if let published {
                 broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
                 broadcastCG = try displayCGImage(from: broadcastMean.downsampled(maxLongEdge: importPreviewLongEdge))
+                integrationFrames = published.survivorCount
             } else {
                 broadcastMean = mean
                 broadcastCG = previewCG
+                integrationFrames = engine.stackFrameCount
             }
 
             let record = try recorder.save(
                 cgImage: broadcastCG, linear: broadcastMean, sourceFile: sourceName,
                 index: index, timestamp: timestamp,
-                estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
+                estimatedIntegrationSeconds: Double(integrationFrames) * profile.subExposureSeconds)
             try session.recordSnapshot(record)
             lastRenderedAcceptedIndex = index
             onUpdate?(previewCG, record)
@@ -1058,19 +1070,26 @@ public final class SessionPipeline {
                     let published = publishedMasterIfCurrent()
                     let broadcastCG: CGImage
                     let broadcastMean: AstroImage
+                    // T9b: when the CLEAN master is served, its depth is `survivorCount` (smaller
+                    // than the online frame count after rejections) — use it so the overlay's
+                    // integration time matches the displayed image. The online-fallback branch is
+                    // unchanged.
+                    let integrationFrames: Int
                     if let published {
                         broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
                         broadcastCG = try displayCGImage(from: broadcastMean)
+                        integrationFrames = published.survivorCount
                     } else {
                         broadcastMean = mean
                         broadcastCG = previewCG
+                        integrationFrames = engine.stackFrameCount
                     }
 
                     // Pass the raw un-neutralized mean as linear: stats stay raw for v1.1 cloud gate.
                     let record = try recorder.save(
                         cgImage: broadcastCG, linear: broadcastMean, sourceFile: frame.sourceName,
                         index: engine.acceptedCount, timestamp: frame.timestamp,
-                        estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
+                        estimatedIntegrationSeconds: Double(integrationFrames) * profile.subExposureSeconds)
                     try session.recordSnapshot(record)
                     onUpdate?(previewCG, record)
                 } catch {
@@ -1171,9 +1190,19 @@ public final class SessionPipeline {
         // Single locked read of image + coverage + frameCount so a frame commit or
         // reseed landing mid-snapshot can't tear the file (pixels from one stack state,
         // STACKCNT/TOTALEXP from another). Nil ⇒ no live stack yet ⇒ write nothing.
+        // NOTE: this always sources the ONLINE stack (`engine.masterSnapshotState()`), never the
+        // background refiner's clean/trail-rejected `publishedMaster` — even when live rejection
+        // is ON. This is a documented SCOPE gap, not a parity regression: a proper `end()` still
+        // writes the clean artifact via the frozen-facts path above; a synchronous refine on the
+        // idle-tick path was judged too risky (unbounded I/O on a timer). Logged below so the gap
+        // is discoverable from the session log rather than silent.
         guard let snap = engine.masterSnapshotState() else {
             onLog?("master snapshot skipped — no live stack")
             return false
+        }
+        if regLock.withLock({ liveRejectionActive }) {
+            onLog?("master snapshot: writing ONLINE stack (idle safeguard does not use the clean "
+                + "live-rejection master — the clean master.fit is written at End Session)")
         }
         let frameCount = snap.frameCount                              // STACKCNT source (same read as pixels)
         let master = cropToCoverage(snap.image, coverage: snap.coverage)   // crop BEFORE balance
@@ -1181,6 +1210,9 @@ public final class SessionPipeline {
             ? AutoStretch.neutralizeBackgroundAdditive(master)
             : master
         let totalExp = Double(frameCount) * profile.subExposureSeconds
+        // THEORETICAL: cross-thread read of sourceMetadata from the idle-safeguard tick; written
+        // once on first frame, safeguard fires only on 30s idle boundaries, so a torn read is
+        // vanishingly unlikely. Left un-locked to avoid burdening the hot consume path.
         let data = FITSWriter.float32(
             width: balanced.width, height: balanced.height,
             channels: balanced.channels, pixels: balanced.pixels,
@@ -1408,8 +1440,8 @@ public final class SessionPipeline {
             // reject is separately blocked once finalization begins, Task 11 P2-1) can alter the
             // written master. Order matters: read the engine's generation FIRST, its own lock,
             // released immediately, THEN snapshot the rest under regLock in ONE acquisition —
-            // never hold regLock while touching the engine lock. `frozenKey`/`capturedActive`/
-            // `frozenKappa`/`frozenBudget`/`frozenPublished` are direct field reads (never
+            // never hold regLock while touching the engine lock. `frozen.key`/`frozen.active`/
+            // `frozen.kappa`/`frozen.budget`/`frozen.published` are direct field reads (never
             // `currentFreshnessKey()`/`publishedMasterIfCurrent()`, which re-acquire regLock and
             // would deadlock here since we already hold it).
             var finalization: SessionFinalizationFacts?

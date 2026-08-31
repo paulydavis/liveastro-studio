@@ -25,4 +25,16 @@ final class SubRegistrationTests: XCTestCase {
         XCTAssertEqual(SubRegistration.sampleIndices(count: 10, maxSampleFrames: 0), [])   // cap 0 → empty, never [0]
         XCTAssertEqual(SubRegistration.sampleIndices(count: 0, maxSampleFrames: 20), [])   // no survivors → empty
     }
+
+    /// Cheap error-path coverage (cold/quality review item 14): a cap of exactly 1 (already odd,
+    /// `k <= 1`) reduces to the single first index.
+    func testSampleIndicesCapOfOneYieldsFirstIndexOnly() {
+        XCTAssertEqual(SubRegistration.sampleIndices(count: 10, maxSampleFrames: 1), [0])
+    }
+
+    /// Cheap error-path coverage (cold/quality review item 14): an EVEN cap of 2 reduces to odd 1
+    /// (`k -= 1` → `k <= 1`), landing on the same `[0]` result as a cap of 1.
+    func testSampleIndicesEvenCapOfTwoReducesToFirstIndexOnly() {
+        XCTAssertEqual(SubRegistration.sampleIndices(count: 10, maxSampleFrames: 2), [0])
+    }
 }

@@ -576,6 +576,54 @@ final class GlobalRefinerTests: XCTestCase {
                        "11 must be the true weighted mean (0.3), not black (0)")
     }
 
+    /// Cheap error-path coverage (cold/quality review item 15): every sub loads successfully but
+    /// with MISMATCHED dimensions across subs — `GlobalCombine.robustCenter` degrades to nil (its
+    /// own dims-mismatch guard), and `refine` must propagate that as nil rather than trapping on
+    /// an out-of-bounds pixel access downstream.
+    func testRefineReturnsNilOnDimensionMismatchedSample() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-dimsmismatch-\(i).fit")
+            // Alternate dimensions across subs (identity transform preserves warped dims) so the
+            // materialized sample is dimensionally inconsistent.
+            images[url] = i % 2 == 0 ? constImage(0.5, w: 4, h: 4) : constImage(0.5, w: 5, h: 5)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 3,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
+        XCTAssertNil(result, "a dimensionally-inconsistent sample must degrade to nil, not trap")
+    }
+
+    /// Cheap error-path coverage (cold/quality review items 4 + 15): every survivor's load fails —
+    /// `refine` returns nil (the empty-`loaded` / quorum-fail branch) AND fires the new
+    /// diagnostic `onLog` (item 4) so an operator can tell a stuck clean master apart from a
+    /// silent no-op.
+    func testRefineAllLoadsFailReturnsNilAndLogs() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        var urls: [URL] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-allfail-\(i).fit")
+            urls.append(url)
+            images[url] = constImage(0.5)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        loader.throwing = Set(urls)   // every survivor fails to load
+        var logs: [String] = []
+        let logLock = NSLock()
+        let refiner = GlobalRefiner(loader: loader, onLog: { msg in logLock.withLock { logs.append(msg) } })
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 3,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
+        XCTAssertNil(result, "no surviving subs could be loaded -> quorum fails -> nil")
+        let captured = logLock.withLock { logs }
+        XCTAssertTrue(captured.contains("live rejection: no surviving subs could be loaded this pass"),
+                     "the empty-loaded branch must log so an operator can diagnose a stuck clean master; got: \(captured)")
+    }
+
     // MARK: - Task 7: FreshnessKey + publishedMaster
 
     /// Step 1: a master published under the CURRENT `FreshnessKey` is returned; it goes stale

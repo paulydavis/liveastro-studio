@@ -961,7 +961,7 @@ final class SessionPipelineShutdownTests: XCTestCase {
     /// P2, feature-off parity: `liveRejectionActive == false` at end() must skip the clean path
     /// ENTIRELY — no additional refine/loader calls during end() itself — and write the ONLINE
     /// master. The feature is enabled-then-disabled (not left never-enabled) so `_globalRefiner`
-    /// genuinely exists at end() — proving the `capturedActive` gate itself does the work, not
+    /// genuinely exists at end() — proving the `frozen.active` gate itself does the work, not
     /// just an absent refiner having nothing to call.
     func testEndFeatureOffSkipsCleanPathEntirelyNoRefineCallsDuringEnd() throws {
         let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)

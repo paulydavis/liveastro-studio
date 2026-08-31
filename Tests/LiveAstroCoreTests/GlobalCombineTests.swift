@@ -32,6 +32,14 @@ final class GlobalCombineTests: XCTestCase {
         XCTAssertNil(GlobalCombine.robustCenter(sample: []))
     }
 
+    /// Cheap error-path coverage (cold/quality review item 13): a dims-mismatched frame in the
+    /// sample (different width) must degrade to nil, not trap/crash on an out-of-bounds index.
+    func testRobustCenterNilOnDimsMismatch() {
+        let a = img(2, 2, 1.0)
+        let b = img(3, 2, 1.0)   // different width
+        XCTAssertNil(GlobalCombine.robustCenter(sample: [a, b]))
+    }
+
     /// A pixel no sample frame covers must be reported as sample-UNCOVERED (false); a pixel every
     /// sample frame covers must be reported as sample-covered (true). 1×2 image: pixel 0 is masked
     /// out of every sample frame, pixel 1 is masked in.
@@ -150,5 +158,27 @@ extension GlobalCombineTests {
                        "sample-covered, all-clipped pixel must fall back to the robust center (3.0), " +
                        "not 0 and not NaN")
         XCTAssertFalse(out.image.pixels[0].isNaN)
+    }
+
+    /// Cheap error-path coverage (cold/quality review item 13): `scale.count != n` must degrade to
+    /// nil, not trap on an out-of-bounds `scale[idx]` read.
+    func testClippedWeightedMeanNilOnScaleCountMismatch() {
+        let center = img(1, 1, 3.0).0
+        let badScale: [Float] = [0.1, 0.2]   // wrong length (n == 1 here)
+        let frames = [wimg(1, 1, 3, weight: 1)]
+        let out = GlobalCombine.clippedWeightedMean(
+            frames: { AnyIterator(frames.map { (image: $0.0, mask: $0.1, weight: $0.2) }.makeIterator()) },
+            center: center, scale: badScale, sampleCovered: [true], kappa: 3.0)
+        XCTAssertNil(out)
+    }
+
+    /// Cheap error-path coverage (cold/quality review item 13): an empty `frames` iterator (no
+    /// frames ever produced) must degrade to nil (`any == false`), not emit a black/zero image.
+    func testClippedWeightedMeanNilOnEmptyFramesIterator() {
+        let center = img(1, 1, 3.0).0
+        let out = GlobalCombine.clippedWeightedMean(
+            frames: { AnyIterator<(image: AstroImage, mask: [Float], weight: Float)> { nil } },
+            center: center, scale: [0.1], sampleCovered: [true], kappa: 3.0)
+        XCTAssertNil(out)
     }
 }

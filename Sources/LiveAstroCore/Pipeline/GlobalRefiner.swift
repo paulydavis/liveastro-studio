@@ -146,6 +146,10 @@ public final class GlobalRefiner {
     public static let defaultKappa: Float = RejectionStrength.medium.kappa
     public static let defaultMinSubs = 5
     public static let defaultMaxSampleBytes = 6_000_000_000   // ~6 GB (spec §3 sample policy default)
+    /// Hard floor for the materialized RAM-sample size (spec §3 Global Constraints) — below this,
+    /// a robust median/MAD center is under-powered. Shared with `AppModel`'s advisory budget check
+    /// so the two never drift.
+    public static let minViableSampleFrames = 11
     /// Per-pass time budget for a BACKGROUND trigger pass (this file) — distinct from the Task 10
     /// `end()`-triggered final pass, which uses its own `finalRefineBudget`. The design spec's
     /// Global Constraints section does not pin a value for this trigger path (only the ~6 GB
@@ -263,9 +267,9 @@ public final class GlobalRefiner {
     ///   - minSubs: quorum floor, both for the materialized RAM sample and the final survivor
     ///     count (same value as the Task 11 online gate).
     ///   - maxSampleBytes: RAM budget for the robust-center sample; `maxSampleFrames` is derived
-    ///     from the first successfully-loaded frame's actual size. `maxSampleFrames < 11` is a
-    ///     HARD floor — the pass logs and returns nil (online master kept) rather than computing
-    ///     an under-powered robust center.
+    ///     from the first successfully-loaded frame's actual size. `maxSampleFrames < minViableSampleFrames`
+    ///     is a HARD floor — the pass logs and returns nil (online master kept) rather than
+    ///     computing an under-powered robust center.
     ///   - deadline / isCancelled: checked BETWEEN every per-sub load+warp (the minutes-long
     ///     part); the per-pixel CPU reduction inside `robustCenter`/`clippedWeightedMean` (~
     ///     seconds at 26MP) is not interruptible mid-loop — acceptable, the between-sub work
@@ -334,6 +338,7 @@ public final class GlobalRefiner {
             } catch is AbortPass {
                 throw AbortPass()   // pass deadline reached — propagate, do NOT swallow as a skip
             } catch {
+                onLog("live rejection: skipping sub \(reg.subIndex): \(error)")
                 return nil          // loader/digest failure → recoverable skip
             }
             let (warped, mask) = Warp.apply(rgb, transform: reg.transform.liftedToFullResolution())
@@ -353,7 +358,7 @@ public final class GlobalRefiner {
             // 1. Filter to the current generation by EXPLICIT equality — never majority.
             let inGen = survivors.filter { $0.stackGeneration == currentGeneration }
 
-            // 3. Sizing: walk inGen in order; the FIRST reg whose loadWarp succeeds gives dims.
+            // 2. Sizing: walk inGen in order; the FIRST reg whose loadWarp succeeds gives dims.
             var sampleFrameBytes: Int?
             for reg in inGen {
                 if let result = try loadWarp(reg) {
@@ -363,14 +368,18 @@ public final class GlobalRefiner {
                 }
                 skippedIds.insert(reg.subIndex)
             }
-            guard let sampleFrameBytes, sampleFrameBytes > 0 else { return nil }  // none loaded → quorum fails
+            guard let sampleFrameBytes, sampleFrameBytes > 0 else {
+                onLog("live rejection: no surviving subs could be loaded this pass")
+                return nil   // none loaded → quorum fails
+            }
             let maxSampleFrames = max(1, maxSampleBytes / sampleFrameBytes)
-            guard maxSampleFrames >= 11 else {
-                onLog("live rejection off: insufficient sample budget (\(maxSampleFrames) < 11 frames)")
+            guard maxSampleFrames >= GlobalRefiner.minViableSampleFrames else {
+                onLog("live rejection off: insufficient sample budget "
+                    + "(\(maxSampleFrames) < \(GlobalRefiner.minViableSampleFrames) frames)")
                 return nil
             }
 
-            // 4. Build the RAM sample (dimension-probe frame enters only if its index ∈ idxs).
+            // 3. Build the RAM sample (dimension-probe frame enters only if its index ∈ idxs).
             let idxs = SubRegistration.sampleIndices(count: inGen.count, maxSampleFrames: maxSampleFrames)
             var sample: [(image: AstroImage, mask: [Float])] = []
             for i in idxs {
@@ -394,7 +403,7 @@ public final class GlobalRefiner {
             guard let centerResult = GlobalCombine.robustCenter(sample: sample) else { return nil }
             let sampleCovered = centerResult.sampleCovered
 
-            // 5. Output — reuse under budget, stream when capped.
+            // 4. Output — reuse under budget, stream when capped.
             let combined: (image: AstroImage, coverage: [Float])?
             if inGen.count <= maxSampleFrames {
                 // Under budget: idxs == all indices, so `loaded` already holds every survivor
@@ -444,9 +453,11 @@ public final class GlobalRefiner {
             if aborted { return nil }
             guard let combined else { return nil }
 
-            // 6. Quorum over the WHOLE generation set (the frames that actually contributed —
+            // 5. Quorum over the WHOLE generation set (the frames that actually contributed —
             // what Task 10's STACKCNT/TOTALEXP use, not the pre-skip count).
             let contributing = inGen.count - skippedIds.count
+            // defense-in-depth: unreachable given the sample-quorum check above (sample.count >=
+            // minSubs) + loaded being monotonic across the pass, kept as a floor.
             guard contributing >= minSubs else { return nil }
             return RefineResult(image: combined.image, coverage: combined.coverage,
                                 survivorCount: contributing, skipped: skippedIds.count)

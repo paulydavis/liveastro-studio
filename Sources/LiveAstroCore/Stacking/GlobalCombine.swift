@@ -4,8 +4,6 @@ import Foundation
 /// No I/O, no knowledge of live/import/relay. Two composable pieces: a robust median/MAD CENTER
 /// estimated over a RAM sample, and a weighted clipped MEAN accumulated over all survivors.
 public enum GlobalCombine {
-    public enum CombineMethod { case clippedMean }   // future: case median (output)
-
     /// Per-pixel·channel median + MAD over `sample` (masked). `scale = 1.4826·MAD` (robust σ).
     /// `mask` length == width*height (shared across channels; >0 == in-bounds). Center/scale
     /// length == width*height*channels. `sampleCovered` length == width*height (one PLANE entry,
@@ -39,7 +37,7 @@ public enum GlobalCombine {
             center[idx] = med
             dbuf.removeAll(keepingCapacity: true)
             for v in vbuf { dbuf.append(abs(v - med)) }
-            scale[idx] = 1.4826 * median(&dbuf)
+            scale[idx] = madToSigma * median(&dbuf)
         }
         return (AstroImage(width: w, height: h, channels: c, pixels: center, sourceIsLinear: true),
                 scale, sampleCovered)
@@ -62,6 +60,9 @@ extension GlobalCombine {
     /// quantization); it bites only a truly-degenerate exactly-equal core. Pinned by a test that a
     /// near-flat set with sub-floor spread is fully KEPT.
     static let scaleFloor: Float = 1e-7
+
+    /// MAD→σ normal-consistency constant, 1/Φ⁻¹(0.75).
+    static let madToSigma: Float = 1.4826
 
     public static func clippedWeightedMean(
         frames: () -> AnyIterator<(image: AstroImage, mask: [Float], weight: Float)>,
