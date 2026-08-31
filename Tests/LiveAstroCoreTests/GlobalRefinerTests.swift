@@ -469,6 +469,52 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertNotNil(result, "a pre-emptive cancel() targeting passId 0 must not kill passId 1")
     }
 
+    /// Refiner-level regression for the cold-review Critical (black coverage-union border): shrink
+    /// the RAM sample well below the survivor count and arrange masks — via distinct
+    /// `SimilarityTransform`s, dither-like — so a corner pixel is covered by 4 of the 15 full-set
+    /// survivors but by NONE of the 11 sampled frames. Asserts the refiner's output at that pixel
+    /// is the true weighted mean (0.3), not black (0) from clipping against a phantom center=0.
+    func testRefineSampleUncoveredCornerPixelUsesFullSetMeanNotBlack() throws {
+        // 4x4x1 frames. Two transforms, lifted to full-res by `liftedToFullResolution()`:
+        //  - `covering` (half-res identity) lifts to full-res identity -> Warp.apply's mask is 1
+        //    at every pixel, including the (0,0) corner.
+        //  - `dithered` (half-res tx=ty=1.0) lifts to full-res tx=ty=2.0 -> the inverse maps (0,0)
+        //    to (-2,-2), OUT of bounds -> mask=0 at the corner (still covers most interior pixels).
+        let covering = SimilarityTransform.identity
+        let dithered = SimilarityTransform(scale: 1, rotation: 0, tx: 1.0, ty: 1.0)
+
+        // sampleIndices(count: 15, maxSampleFrames: 11) selects positions
+        // [0,1,2,4,5,7,8,9,11,12,14] (11, already odd) — pinned as a test precondition.
+        let sampleIdxs = Set(SubRegistration.sampleIndices(count: 15, maxSampleFrames: 11))
+        XCTAssertEqual(sampleIdxs, Set([0, 1, 2, 4, 5, 7, 8, 9, 11, 12, 14]), "test precondition")
+
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<15 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-corner-\(i).fit")
+            // Sample-selected positions get the DITHERED transform (corner NOT covered) so the
+            // robust-center sample never sees the corner pixel. Non-selected positions get the
+            // COVERING transform with a real value (0.3) — full-set-covered, sample-uncovered.
+            let sampled = sampleIdxs.contains(i)
+            images[url] = constImage(sampled ? 0.1 : 0.3, w: 4, h: 4)
+            regs.append(SubRegistration(subIndex: i + 1, contentDigest: nil, relayURL: url,
+                                        stackGeneration: 0, referenceIdentity: nil,
+                                        transform: sampled ? dithered : covering, effectiveScale: 1.0,
+                                        weight: 1.0, leveling: nil))
+        }
+        let loader = StubFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        // sampleFrameBytes for 4x4x1 = 16·4(pixels) + 16·4(mask) = 128; 128·11 = 1408 -> maxSampleFrames = 11.
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
+                                    maxSampleBytes: 1408, deadline: .distantFuture, isCancelled: { false })
+        let unwrapped = try XCTUnwrap(result)
+        XCTAssertEqual(refiner.lastMaterializedSampleCount, 11,
+                       "test precondition: the sample (11) must be smaller than the 15 survivors")
+        XCTAssertEqual(unwrapped.image.pixels[0], 0.3, accuracy: 1e-6,
+                       "a corner pixel covered by 4 full-set survivors but by none of the sampled " +
+                       "11 must be the true weighted mean (0.3), not black (0)")
+    }
+
     // MARK: - Task 7: FreshnessKey + publishedMaster
 
     /// Step 1: a master published under the CURRENT `FreshnessKey` is returned; it goes stale

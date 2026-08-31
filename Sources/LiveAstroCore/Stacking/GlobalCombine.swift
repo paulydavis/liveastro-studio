@@ -8,9 +8,13 @@ public enum GlobalCombine {
 
     /// Per-pixel·channel median + MAD over `sample` (masked). `scale = 1.4826·MAD` (robust σ).
     /// `mask` length == width*height (shared across channels; >0 == in-bounds). Center/scale
-    /// length == width*height*channels. nil if sample empty or a frame's dims disagree.
+    /// length == width*height*channels. `sampleCovered` length == width*height (one PLANE entry,
+    /// shared across channels like `mask`): true iff at least one sample frame's mask covers that
+    /// plane pixel — lets `clippedWeightedMean` distinguish "no robust center exists here" (must
+    /// not clip) from "a robust center exists but every full-set frame was clipped" (center
+    /// fallback is legitimate). nil if sample empty or a frame's dims disagree.
     public static func robustCenter(sample: [(image: AstroImage, mask: [Float])])
-        -> (center: AstroImage, scale: [Float])? {
+        -> (center: AstroImage, scale: [Float], sampleCovered: [Bool])? {
         guard let first = sample.first else { return nil }
         let w = first.image.width, h = first.image.height, c = first.image.channels
         let plane = w * h, n = plane * c
@@ -20,6 +24,10 @@ public enum GlobalCombine {
         }
         var center = [Float](repeating: 0, count: n)
         var scale = [Float](repeating: 0, count: n)
+        var sampleCovered = [Bool](repeating: false, count: plane)
+        for p in 0..<plane {
+            sampleCovered[p] = sample.contains { $0.mask[p] > 0 }
+        }
         var vbuf = [Float](); vbuf.reserveCapacity(sample.count)
         var dbuf = [Float](); dbuf.reserveCapacity(sample.count)
         for idx in 0..<n {
@@ -33,7 +41,8 @@ public enum GlobalCombine {
             for v in vbuf { dbuf.append(abs(v - med)) }
             scale[idx] = 1.4826 * median(&dbuf)
         }
-        return (AstroImage(width: w, height: h, channels: c, pixels: center, sourceIsLinear: true), scale)
+        return (AstroImage(width: w, height: h, channels: c, pixels: center, sourceIsLinear: true),
+                scale, sampleCovered)
     }
 
     /// In-place median (sorts the buffer). Even count → mean of the two middle elements.
@@ -56,11 +65,11 @@ extension GlobalCombine {
 
     public static func clippedWeightedMean(
         frames: () -> AnyIterator<(image: AstroImage, mask: [Float], weight: Float)>,
-        center: AstroImage, scale: [Float], kappa: Float
+        center: AstroImage, scale: [Float], sampleCovered: [Bool], kappa: Float
     ) -> (image: AstroImage, coverage: [Float])? {
         let w = center.width, h = center.height, c = center.channels
         let plane = w * h, n = plane * c
-        guard scale.count == n else { return nil }
+        guard scale.count == n, sampleCovered.count == plane else { return nil }
         var sumW = [Float](repeating: 0, count: n)
         var sumWV = [Float](repeating: 0, count: n)
         var coverage = [Float](repeating: 0, count: plane)   // per-pixel FRAME DEPTH (not binary)
@@ -73,6 +82,14 @@ extension GlobalCombine {
             for p in 0..<plane where f.mask[p] > 0 { coverage[p] += 1 }   // spatial depth per pixel
             for idx in 0..<n where f.mask[idx % plane] > 0 {
                 let v = f.image.pixels[idx]
+                // Sample-UNCOVERED pixel: no robust center/scale exists here (robustCenter left
+                // center=0/scale=0 for it) — clipping against that phantom center would reject
+                // every real value and fall back to black. Take the true weighted mean instead.
+                if !sampleCovered[idx % plane] {
+                    sumW[idx]  += f.weight
+                    sumWV[idx] += f.weight * v
+                    continue
+                }
                 // REAL floor as the clip denominator: a zero-MAD core (e.g. [1,1,1,1,9]) must still
                 // reject the 9. `if scale>floor` (the earlier form) wrongly ACCEPTED everything at MAD=0.
                 let sigma = max(scale[idx], scaleFloor)
@@ -85,7 +102,11 @@ extension GlobalCombine {
         var out = [Float](repeating: 0, count: n)
         for idx in 0..<n {
             if sumW[idx] > 0 { out[idx] = sumWV[idx] / sumW[idx] }
-            else if coverage[idx % plane] > 0 { out[idx] = center.pixels[idx] }  // covered but all clipped → center (no black speckle)
+            // Sample-covered but every full-set frame was clipped → the robust center is real and
+            // meaningful for this pixel; fall back to it (no black speckle). A sample-UNCOVERED
+            // pixel never reaches this branch with sumW==0 unless it truly had zero coverage
+            // (`any` frame at all) — its real values are always accumulated above, never clipped.
+            else if coverage[idx % plane] > 0 { out[idx] = center.pixels[idx] }
         }
         return (AstroImage(width: w, height: h, channels: c, pixels: out, sourceIsLinear: center.sourceIsLinear), coverage)
     }

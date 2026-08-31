@@ -305,6 +305,7 @@ public final class GlobalRefiner {
             passLock.withLock { _lastMaterializedSampleCount = sample.count }
 
             guard let centerResult = GlobalCombine.robustCenter(sample: sample) else { return nil }
+            let sampleCovered = centerResult.sampleCovered
 
             // 5. Output — reuse under budget, stream when capped.
             let combined: (image: AstroImage, coverage: [Float])?
@@ -317,7 +318,8 @@ public final class GlobalRefiner {
                 }
                 combined = GlobalCombine.clippedWeightedMean(
                     frames: { AnyIterator(framesArr.makeIterator()) },
-                    center: centerResult.center, scale: centerResult.scale, kappa: kappa)
+                    center: centerResult.center, scale: centerResult.scale,
+                    sampleCovered: sampleCovered, kappa: kappa)
             } else {
                 // Capped: stream fresh from the loader for subs not already cached from
                 // sizing/sample-build. Two hazards (P2-3): (a) a per-sub load failure must NOT
@@ -349,7 +351,8 @@ public final class GlobalRefiner {
                             return nil
                         }
                     },
-                    center: centerResult.center, scale: centerResult.scale, kappa: kappa)
+                    center: centerResult.center, scale: centerResult.scale,
+                    sampleCovered: sampleCovered, kappa: kappa)
             }
             if aborted { return nil }
             guard let combined else { return nil }

@@ -31,6 +31,23 @@ final class GlobalCombineTests: XCTestCase {
     func testRobustCenterNilOnEmpty() {
         XCTAssertNil(GlobalCombine.robustCenter(sample: []))
     }
+
+    /// A pixel no sample frame covers must be reported as sample-UNCOVERED (false); a pixel every
+    /// sample frame covers must be reported as sample-covered (true). 1×2 image: pixel 0 is masked
+    /// out of every sample frame, pixel 1 is masked in.
+    func testRobustCenterSampleCoveredReflectsPerPixelSampleCoverage() {
+        func maskedImg(_ v0: Float, _ v1: Float, mask0: Float, mask1: Float) -> (AstroImage, [Float]) {
+            (AstroImage(width: 2, height: 1, channels: 1, pixels: [v0, v1], sourceIsLinear: true),
+             [mask0, mask1])
+        }
+        let sample = [
+            maskedImg(0, 0.2, mask0: 0, mask1: 1),
+            maskedImg(0, 0.3, mask0: 0, mask1: 1),
+            maskedImg(0, 0.4, mask0: 0, mask1: 1),
+        ]
+        let out = GlobalCombine.robustCenter(sample: sample)!
+        XCTAssertEqual(out.sampleCovered, [false, true])
+    }
 }
 
 extension GlobalCombineTests {
@@ -48,7 +65,7 @@ extension GlobalCombineTests {
         let center = GlobalCombine.robustCenter(sample: frames.map { ($0.0, $0.1) })!  // center 1, MAD 0
         let out = GlobalCombine.clippedWeightedMean(
             frames: { AnyIterator(frames.map { (image: $0.0, mask: $0.1, weight: $0.2) }.makeIterator()) },
-            center: center.center, scale: center.scale, kappa: 3.0)!
+            center: center.center, scale: center.scale, sampleCovered: center.sampleCovered, kappa: 3.0)!
         // Zero-MAD core: sigma = max(0, scaleFloor); |9-1| = 8 ≫ 3·floor → trail rejected.
         // Mean of the four 1.0 survivors == 1.0 (NOT (4*1+9)/5 = 2.6).
         for p in out.image.pixels { XCTAssertEqual(p, 1.0, accuracy: 1e-6) }
@@ -61,7 +78,7 @@ extension GlobalCombineTests {
         let center = GlobalCombine.robustCenter(sample: frames.map { ($0.0, $0.1) })!  // median 3, MAD 1
         let out = GlobalCombine.clippedWeightedMean(
             frames: { AnyIterator(frames.map { (image: $0.0, mask: $0.1, weight: $0.2) }.makeIterator()) },
-            center: center.center, scale: center.scale, kappa: 5.0)!   // wide κ: keep both
+            center: center.center, scale: center.scale, sampleCovered: center.sampleCovered, kappa: 5.0)!   // wide κ: keep both
         XCTAssertEqual(out.image.pixels[0], 2.5, accuracy: 1e-6)
     }
 
@@ -76,12 +93,62 @@ extension GlobalCombineTests {
         for s in center.scale { XCTAssertEqual(s, 0.0, accuracy: 1e-9) }       // MAD == 0 → floor path exercised
         let out = GlobalCombine.clippedWeightedMean(
             frames: { AnyIterator(frames.map { (image: $0.0, mask: $0.1, weight: $0.2) }.makeIterator()) },
-            center: center.center, scale: center.scale, kappa: 3.0)!
+            center: center.center, scale: center.scale, sampleCovered: center.sampleCovered, kappa: 3.0)!
         for cov in out.coverage { XCTAssertEqual(cov, 3.0, accuracy: 1e-6) }   // depth = 3 frames covered (NOT survival)
         // Survival proof: if the jitter frame were CLIPPED, the mean would be EXACTLY 0.5; kept, it is
         // 0.5 + ~6.7e-8. Assert strictly > 0.5 so a scale-floor regression (over-rejecting the jitter)
         // FAILS — the loose accuracy:1e-6 alone would pass both clipped (0.5) and kept (~0.50000007).
         XCTAssertGreaterThan(out.image.pixels[0], 0.5)
         XCTAssertEqual(out.image.pixels[0], 0.5, accuracy: 1e-6)               // sanity: still ~0.5
+    }
+
+    /// THE BUG (cold-review Critical): a pixel covered by the full survivor set but by NO sample
+    /// frame has robustCenter's center/scale stay at their zero-init (`vbuf.isEmpty → continue`).
+    /// Before the fix, `clippedWeightedMean` clipped every real covering value against that
+    /// phantom center=0 (sigma floored to 1e-7) — every frame got rejected, `sumW == 0`, and the
+    /// line-88 fallback emitted `center.pixels[idx] == 0`: BLACK. The fix tracks per-pixel sample
+    /// coverage and skips clipping where no robust center exists, taking the true weighted mean.
+    func testUncoveredInSamplePixelUsesFullSetMeanNotBlack() {
+        func maskedImg(_ v: Float, mask: Float) -> (AstroImage, [Float]) {
+            (AstroImage(width: 1, height: 1, channels: 1, pixels: [v], sourceIsLinear: true), [mask])
+        }
+        // Sample: 3 frames, ALL masked OUT at the (only) pixel — uncovered in the sample.
+        let sample = [maskedImg(0, mask: 0), maskedImg(0, mask: 0), maskedImg(0, mask: 0)]
+        let center = GlobalCombine.robustCenter(sample: sample)!
+        XCTAssertEqual(center.center.pixels[0], 0, accuracy: 1e-6)   // zero-init, never touched
+        XCTAssertEqual(center.scale[0], 0, accuracy: 1e-6)           // zero-init, never touched
+        XCTAssertEqual(center.sampleCovered, [false], "precondition: pixel is uncovered by every sample frame")
+
+        // Full survivor set: 2 frames DO cover the pixel, with a real, non-zero value.
+        let fullSet = [maskedImg(0.30, mask: 1), maskedImg(0.30, mask: 1)]
+        let out = GlobalCombine.clippedWeightedMean(
+            frames: { AnyIterator(fullSet.map { (image: $0.0, mask: $0.1, weight: Float(1)) }.makeIterator()) },
+            center: center.center, scale: center.scale, sampleCovered: center.sampleCovered, kappa: 3.0)!
+        XCTAssertEqual(out.image.pixels[0], 0.30, accuracy: 1e-6,
+                       "sample-uncovered pixel must take the true full-set weighted mean (0.30), " +
+                       "not black (0) from clipping against a phantom center=0")
+    }
+
+    /// D5 gap: a pixel that IS sample-covered (so `robustCenter` computed a real, meaningful
+    /// center/scale), where every full-set frame legitimately deviates beyond `kappa·sigma`, must
+    /// still fall back to the center (the pre-existing, correct robust-fallback behavior) — the
+    /// fix must NOT disable clipping for sample-covered pixels, only sample-uncovered ones.
+    func testCoveredButAllClippedPixelFallsBackToCenter() {
+        // Sample establishes a real, tight center: {1,2,3,4,100} → median 3, MAD 1 (scale 1.4826).
+        let vals: [Float] = [1.0, 2.0, 3.0, 4.0, 100.0]
+        let sample = vals.map { img(1, 1, $0) }
+        let center = GlobalCombine.robustCenter(sample: sample)!
+        XCTAssertEqual(center.center.pixels[0], 3.0, accuracy: 1e-6)
+        XCTAssertEqual(center.sampleCovered, [true], "precondition: pixel IS covered by the sample")
+
+        // Full set: every frame is a gross outlier relative to center=3 → all clipped, sumW == 0.
+        let fullSet = [wimg(1, 1, 100, weight: 1), wimg(1, 1, 100, weight: 1)]
+        let out = GlobalCombine.clippedWeightedMean(
+            frames: { AnyIterator(fullSet.map { (image: $0.0, mask: $0.1, weight: $0.2) }.makeIterator()) },
+            center: center.center, scale: center.scale, sampleCovered: center.sampleCovered, kappa: 3.0)!
+        XCTAssertEqual(out.image.pixels[0], center.center.pixels[0], accuracy: 1e-6,
+                       "sample-covered, all-clipped pixel must fall back to the robust center (3.0), " +
+                       "not 0 and not NaN")
+        XCTAssertFalse(out.image.pixels[0].isNaN)
     }
 }
