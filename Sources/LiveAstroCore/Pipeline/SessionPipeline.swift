@@ -35,6 +35,26 @@ public struct FreshnessKey: Equatable {
     let kappa: Float
 }
 
+/// The background refiner's most recently published trail-free master (Task 6/7), stamped with
+/// the `FreshnessKey` it was computed from (D11: named replacement for the previously-anonymous
+/// 4-field tuple `(image:coverage:survivorCount:key:)` — no compiler check kept the tuple's
+/// shape in sync across its several call sites; this struct gives that a single definition).
+/// `Equatable` for the same test-assertion purpose the tuple served: `AstroImage` itself is not
+/// `Equatable` (its `pixels` array makes a full conformance expensive/undesirable), so equality
+/// here compares the scalar/key fields plus the image's dimensions rather than its pixel data.
+struct PublishedMaster: Equatable {
+    let image: AstroImage
+    let coverage: [Float]
+    let survivorCount: Int
+    let key: FreshnessKey
+
+    static func == (lhs: PublishedMaster, rhs: PublishedMaster) -> Bool {
+        lhs.coverage == rhs.coverage && lhs.survivorCount == rhs.survivorCount && lhs.key == rhs.key
+            && lhs.image.width == rhs.image.width && lhs.image.height == rhs.image.height
+            && lhs.image.channels == rhs.image.channels && lhs.image.sourceIsLinear == rhs.image.sourceIsLinear
+    }
+}
+
 /// Glue: watcher → loader → stretch → broadcast callback + snapshot + manifest (spec §5.1).
 /// Also supports native stacking mode: FrameSource → StackEngine → snapshot + manifest.
 /// UI-free so the end-to-end test and the app share the same wiring.
@@ -336,8 +356,11 @@ public final class SessionPipeline {
     private var _freshnessKey = FreshnessKey(stackGeneration: 0, survivorSubIndices: [],
                                              userRejectGeneration: 0, kappa: RejectionStrength.medium.kappa)
     /// The background refiner's most recently published trail-free master, stamped with the
-    /// `FreshnessKey` it was computed from. `internal` — Task 6/11 publish here directly.
-    internal var publishedMaster: (image: AstroImage, coverage: [Float], survivorCount: Int, key: FreshnessKey)?   // guarded by regLock
+    /// `FreshnessKey` it was computed from. `internal` — Task 6/11 publish here directly (and
+    /// tests construct/inspect it via `@testable import`, which requires `internal`+, not
+    /// `private` — a `private` property is invisible outside this file regardless of
+    /// `@testable`).
+    internal var publishedMaster: PublishedMaster?   // guarded by regLock
     /// RAM sample budget (bytes) the background refiner combines survivors with. NOT part of
     /// `FreshnessKey` (unlike κ) — a budget-only change can't be detected via key comparison, so
     /// `configureLiveRejection` clears `publishedMaster` explicitly when it changes (see below).
@@ -494,8 +517,8 @@ public final class SessionPipeline {
     /// as current — the mutation that moved the key already triggered its own fresh pass.
     private func publishRefineResult(_ result: RefineResult, key: FreshnessKey) {
         regLock.withLock {
-            publishedMaster = (image: result.image, coverage: result.coverage,
-                               survivorCount: result.survivorCount, key: key)
+            publishedMaster = PublishedMaster(image: result.image, coverage: result.coverage,
+                                              survivorCount: result.survivorCount, key: key)
         }
     }
 
@@ -506,7 +529,7 @@ public final class SessionPipeline {
     public func publishedMasterIfCurrent() -> (image: AstroImage, coverage: [Float], survivorCount: Int)? {
         regLock.withLock {
             guard liveRejectionActive, let pm = publishedMaster, pm.key == _freshnessKey else { return nil }
-            return (pm.image, pm.coverage, pm.survivorCount)
+            return (image: pm.image, coverage: pm.coverage, survivorCount: pm.survivorCount)
         }
     }
 
@@ -1449,7 +1472,7 @@ public final class SessionPipeline {
                 let frozenGen = eng.currentStackGeneration
                 let frozen: (survivors: [SubRegistration], key: FreshnessKey, active: Bool,
                             kappa: Float, budget: Int,
-                            published: (image: AstroImage, coverage: [Float], survivorCount: Int, key: FreshnessKey)?)
+                            published: PublishedMaster?)
                 frozen = regLock.withLock {
                     (currentSurvivorsLocked(currentGeneration: frozenGen), _freshnessKey, liveRejectionActive,
                      liveRejectionKappa, liveRejectionMaxSampleBytes, publishedMaster)

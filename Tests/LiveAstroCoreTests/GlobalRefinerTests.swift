@@ -730,7 +730,7 @@ final class GlobalRefinerTests: XCTestCase {
         let dummyMaster = constImage(0.42)
         func publishAtCurrentKey() {
             let key = pipeline.currentFreshnessKey()
-            pipeline.publishedMaster = (image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 3, key: key)
+            pipeline.publishedMaster = PublishedMaster(image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 3, key: key)
         }
 
         // 1. Publish at the CURRENT key -> served.
@@ -815,7 +815,7 @@ final class GlobalRefinerTests: XCTestCase {
 
         let dummyMaster = constImage(0.42)
         let key = pipeline.currentFreshnessKey()
-        pipeline.publishedMaster = (image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 3, key: key)
+        pipeline.publishedMaster = PublishedMaster(image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 3, key: key)
         XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
                         "precondition: a master published under the current key must be served")
 
@@ -893,7 +893,7 @@ final class GlobalRefinerTests: XCTestCase {
         // Publish a dummy master under the PRE-auto-reseed key.
         let dummyMaster = constImage(0.42)
         let preReseedKey = pipeline.currentFreshnessKey()
-        pipeline.publishedMaster = (image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 1, key: preReseedKey)
+        pipeline.publishedMaster = PublishedMaster(image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 1, key: preReseedKey)
         XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
                         "precondition: a master published under the current key must be served")
 
@@ -1164,7 +1164,7 @@ final class GlobalRefinerTests: XCTestCase {
         }
         let cleanMaster = constImage(0.42, w: onlineImage.width, h: onlineImage.height)
         let key = pipeline.currentFreshnessKey()
-        pipeline.publishedMaster = (
+        pipeline.publishedMaster = PublishedMaster(
             image: cleanMaster,
             coverage: onlineCoverage ?? [Float](repeating: 1, count: onlineImage.width * onlineImage.height),
             survivorCount: 3, key: key)
@@ -1277,7 +1277,7 @@ final class GlobalRefinerTests: XCTestCase {
             return XCTFail("expected an active online stack")
         }
         let staleButKeyMatchingMaster = constImage(0.42, w: onlineImage.width, h: onlineImage.height)
-        pipeline.publishedMaster = (
+        pipeline.publishedMaster = PublishedMaster(
             image: staleButKeyMatchingMaster,
             coverage: onlineCoverage ?? [Float](repeating: 1, count: onlineImage.width * onlineImage.height),
             survivorCount: 3, key: pipeline.currentFreshnessKey())
