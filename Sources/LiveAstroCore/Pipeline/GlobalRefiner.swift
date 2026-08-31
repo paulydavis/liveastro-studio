@@ -226,6 +226,17 @@ public final class GlobalRefiner {
     private let triggerLock = NSLock()
     private var isRunning = false
     private var dirty = false
+    /// F6 (cold-review minor): a TERMINAL flag distinct from per-pass `cancel()`. `cancel()` only
+    /// stamps the CURRENT pass id — `runCoalescedPasses` can still start pass K+1 with a fresh,
+    /// un-cancelled id, so `SessionPipeline.end()` calling `cancel()` alone does not stop the
+    /// background coalescer from spawning further passes while `end()` runs its own final pass
+    /// (see `selectMasterReport`'s direct `refine()` call). `quiesced`, once set, permanently
+    /// blocks `noteChanged()`/`runCoalescedPasses()` from starting or continuing ANY further
+    /// coalescer-driven pass — it does not affect `refine()` called directly (never consulted
+    /// there), so `end()`'s own final pass is unaffected. Guarded by `triggerLock`, same as
+    /// `isRunning`/`dirty`. There is no un-quiesce: the refiner is per-session (created lazily per
+    /// `configureLiveRejection(enabled:true)`), so a terminal quiesce at `end()` is fine.
+    private var quiesced = false
     private let triggerQueue = DispatchQueue(label: "com.liveastro.globalrefiner.trigger")
 
     /// Test-only observability: number of passes actually EXECUTED (i.e. `performOnePass` ran,
@@ -234,9 +245,11 @@ public final class GlobalRefiner {
 
     /// Notify the refiner that the survivor set (or config) may have changed. Coalesces: idle →
     /// dispatches exactly one pass; a pass already running → marks `dirty` so exactly one more
-    /// pass follows. Always returns immediately — the actual pass runs on `triggerQueue`.
+    /// pass follows. Always returns immediately — the actual pass runs on `triggerQueue`. A no-op,
+    /// starting nothing, once `quiesce()` has been called (F6).
     func noteChanged() {
         let shouldStart: Bool = triggerLock.withLock {
+            if quiesced { return false }
             if isRunning {
                 dirty = true
                 return false
@@ -254,6 +267,11 @@ public final class GlobalRefiner {
         while true {
             performOnePass()
             let runAgain: Bool = triggerLock.withLock {
+                if quiesced {
+                    dirty = false
+                    isRunning = false
+                    return false
+                }
                 if dirty {
                     dirty = false
                     return true
@@ -262,6 +280,22 @@ public final class GlobalRefiner {
                 return false
             }
             if !runAgain { break }
+        }
+    }
+
+    /// F6 (cold-review minor): stops the background coalescer from starting or continuing ANY
+    /// further pass — called at shutdown (`SessionPipeline.end()`), alongside (not instead of)
+    /// `cancel()`, so `end()` stops BOTH the in-flight background pass (`cancel()`) and any future
+    /// one the coalescer might otherwise still spawn while `end()` runs its own direct final
+    /// `refine()` call. Does not wait for an in-flight pass to unwind — `cancel()` (called
+    /// alongside this, at the same call site) is what makes that pass observe a stop request; this
+    /// method only gates future starts. Clears `dirty` so no queued rerun fires once the current
+    /// pass (if any) finishes. Never consulted by `refine()` itself — a DIRECT `refine()` call
+    /// (as `end()`'s final pass is) is entirely unaffected by `quiesce()`.
+    func quiesce() {
+        triggerLock.withLock {
+            quiesced = true
+            dirty = false
         }
     }
 
@@ -304,10 +338,14 @@ public final class GlobalRefiner {
     ///     from the first successfully-loaded frame's actual size. `maxSampleFrames < minViableSampleFrames`
     ///     is a HARD floor — the pass logs and returns nil (online master kept) rather than
     ///     computing an under-powered robust center.
-    ///   - deadline / isCancelled: checked BETWEEN every per-sub load+warp (the minutes-long
-    ///     part); the per-pixel CPU reduction inside `robustCenter`/`clippedWeightedMean` (~
-    ///     seconds at 26MP) is not interruptible mid-loop — acceptable, the between-sub work
-    ///     dominates the bound.
+    ///   - deadline / isCancelled: polled BETWEEN per-sub loads, AND each individual load's WAIT
+    ///     is itself bounded by `perSubLoadCap` (`boundedLoad`, below) — so this is NOT prompt,
+    ///     between-load interruption. A `cancel()`/deadline that lands WHILE a load is in flight
+    ///     isn't observed until that bounded wait returns, up to one `perSubLoadCap` (~20s)
+    ///     later — worst case, one in-flight load's wait plus the next between-load check. The
+    ///     per-pixel CPU reduction inside `robustCenter`/`clippedWeightedMean` (~ seconds at
+    ///     26MP) is not interruptible mid-loop either — acceptable, the load-wait latency already
+    ///     dominates the observation bound.
     func refine(survivors: [SubRegistration], currentGeneration: Int, kappa: Float,
                        minSubs: Int, maxSampleBytes: Int, deadline: DispatchTime,
                        isCancelled: @escaping () -> Bool) -> RefineResult? {

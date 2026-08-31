@@ -1542,7 +1542,18 @@ public final class SessionPipeline {
                 // the cancellation flag BETWEEN subs (C3), so it unwinds on its own within one
                 // sub's load time — end() does not block waiting for it; the final pass below (if
                 // any) is bounded independently by its own deadline.
+                //
+                // F6 (cold-review minor): `cancel()` alone only stamps the CURRENT pass — the
+                // background coalescer (`noteChanged`/`runCoalescedPasses`) can still start pass
+                // K+1 with a fresh, un-cancelled id while end() runs below. `quiesce()` is a
+                // separate, terminal stop: it blocks the coalescer from starting or continuing any
+                // FURTHER pass, without affecting the direct `refine()` call `selectMasterReport`
+                // makes below (quiesce is never consulted by `refine()` itself). Output was already
+                // safe either way (a stale background pass publishes under an old snapshot key that
+                // `publishedMasterIfCurrent` refuses) — this just stops wasted background work
+                // during shutdown.
                 currentRefiner()?.cancel()
+                currentRefiner()?.quiesce()
 
                 let final = try eng.finalizationState()
                 let outcome: MasterOutcome

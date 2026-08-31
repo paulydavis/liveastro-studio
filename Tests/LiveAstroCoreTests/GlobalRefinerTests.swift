@@ -1312,4 +1312,69 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertGreaterThan(stddev(master.pixels), 0.01,
                              "end()'s master.fit must fall back to the online master, not the uniform dummy")
     }
+
+    // MARK: - F6: quiesce() terminally stops the background coalescer, without affecting a direct refine() call
+
+    /// `quiesce()` must be a TERMINAL stop for the background coalescer: once called, `noteChanged()`
+    /// must start NO further pass, no matter how many times it fires afterward. This is the
+    /// property `cancel()` alone does NOT have — `cancel()` only flags whichever pass id is CURRENT
+    /// at the moment it's called, so a `noteChanged()` call after a bare `cancel()` would still
+    /// start a fresh, un-cancelled pass (the bug `quiesce()` fixes: `SessionPipeline.end()` calling
+    /// `cancel()` alone does not stop the coalescer from spawning further passes while `end()` runs
+    /// its own final pass).
+    func testQuiesceStopsNoteChangedFromStartingAnyFurtherPass() throws {
+        let loader = ConstFrameLoader(image: constImage(0.5))
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+
+        let url = URL(fileURLWithPath: "/tmp/globalrefiner/quiesce-coalescer.fit")
+        let reg = refinerReg(subIndex: 1, url: url)
+        let key = FreshnessKey(stackGeneration: 0, survivorSubIndices: [1], userRejectGeneration: 0, kappa: 3.0)
+        refiner.makeSnapshot = { PassSnapshot(survivors: [reg], currentGeneration: 0, key: key) }
+        refiner.minSubsProvider = { 1 }
+        refiner.maxSampleBytesProvider = { 10_000_000 }
+
+        var publishedCount = 0
+        refiner.publish = { _, _ in publishedCount += 1 }
+
+        refiner.quiesce()
+
+        // Fire noteChanged() several times — quiesce() must block every one of them from starting a
+        // pass, not merely suppress a rerun of one already in flight (that weaker behavior is what
+        // `dirty`/coalescing already gave us before this fix).
+        for _ in 0..<5 { refiner.noteChanged() }
+
+        // There is nothing to synchronize on if quiesce() works (no pass ever starts), so a brief
+        // sleep is the only way to assert this negative — long enough that a real pass against this
+        // trivial 1-sub/no-I/O snapshot would easily have started and published by then.
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(refiner.passesRun, 0, "quiesce() must stop noteChanged() from starting ANY pass")
+        XCTAssertEqual(publishedCount, 0, "no pass ran, so nothing should have published")
+    }
+
+    /// `quiesce()` gates ONLY the background coalescer (`noteChanged`/`runCoalescedPasses`) — a
+    /// DIRECT `refine(...)` call, exactly how `SessionPipeline.end()`'s `selectMasterReport` invokes
+    /// its own final pass, must still run to completion after `quiesce()`. This is what makes it
+    /// safe for `end()` to call `quiesce()` before running its own final pass: `quiesce()` is never
+    /// consulted inside `refine()` itself.
+    func testQuiesceDoesNotBlockADirectRefineCall() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/quiesce-direct-\(i).fit")
+            images[url] = constImage(0.6)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+
+        refiner.quiesce()
+
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
+        let unwrapped = try XCTUnwrap(result, "a direct refine() call must complete even after quiesce()")
+        XCTAssertEqual(unwrapped.survivorCount, 5)
+        XCTAssertEqual(unwrapped.skipped, 0)
+        XCTAssertEqual(loader.callCount, 5,
+                       "quiesce() must not skip/short-circuit any load in a direct refine() call")
+    }
 }
