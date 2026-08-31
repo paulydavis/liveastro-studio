@@ -975,13 +975,12 @@ final class AppModel {
     /// I3: whether the CURRENT source is a native `.live` relay writing to a LOCAL folder — the
     /// only source shape the background global-rejection pass can run against. The pipeline
     /// can't introspect its own `FrameSource` for locality, so this lives on `AppModel`, which
-    /// knows `sourceMode` and `watchFolder` directly. `.volumeIsLocalKey` is macOS's own
-    /// local-vs-network-mount distinction (SMB/AFP/NFS shares — the ASIAIR/NINA network case —
-    /// read false); an unresolvable key (folder deleted, permission issue) fails closed to
-    /// "not local" rather than silently enabling the feature.
+    /// knows `sourceMode` and `watchFolder` directly. The path-locality predicate itself (D9) is
+    /// extracted to `LiveRejectionGate.isLocalPath` — pure given a URL, unit-tested in
+    /// `LiveAstroCoreTests` — since `SourceMode` is an app-only type `LiveAstroCore` can't depend on.
     var sourceIsLocalLiveRelay: Bool {
         guard sourceMode == .nativeStack, let folder = watchFolder else { return false }
-        return (try? folder.resourceValues(forKeys: [.volumeIsLocalKey]).volumeIsLocal) ?? false
+        return LiveRejectionGate.isLocalPath(folder)
     }
 
     /// Proxy for the background refiner's survivor count, for the STATUS CAPTION only (the
@@ -1036,15 +1035,15 @@ final class AppModel {
     /// `GlobalRefiner`'s own first-refine hard check (Task 6), which knows the real frame size.
     /// Assumes the refiner's post-debayer working format (RGB warped image + a 1-channel mask,
     /// 4 bytes/component — see the design spec's sample-policy math), independent of the raw
-    /// FITS `channels` (mono cameras still warp/mask in this same shape).
+    /// FITS `channels` (mono cameras still warp/mask in this same shape). The threshold arithmetic
+    /// + message text (D9) are extracted to `LiveRejectionGate.sampleBudgetWarning`, pure and
+    /// unit-tested in `LiveAstroCoreTests`; this method keeps only the logging side-effect.
     private func advisoryCheckLiveRejectionBudget() {
         guard let meta = sessionSourceMetadata, let w = meta.width, let h = meta.height, w > 0, h > 0 else { return }
-        let sampleFrameBytes = w * h * 16   // (3 RGB + 1 mask) channels × 4 bytes/component
-        let budget = GlobalRefiner.defaultMaxSampleBytes
-        let framesThatFit = budget / sampleFrameBytes
-        guard framesThatFit < GlobalRefiner.minViableSampleFrames else { return }
-        log.append("Live rejection: sample budget (~\(budget / 1_000_000_000) GB) only fits "
-            + "\(framesThatFit) frame(s) at \(w)×\(h) — raise maxSampleBytes for sensors this large.")
+        guard let warning = LiveRejectionGate.sampleBudgetWarning(
+            maxSampleBytes: GlobalRefiner.defaultMaxSampleBytes, width: w, height: h,
+            minFrames: GlobalRefiner.minViableSampleFrames) else { return }
+        log.append(warning)
     }
 
     /// Flips the operator reject flag on the in-memory mirror for the sub with `index`.
