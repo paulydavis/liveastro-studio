@@ -7,7 +7,7 @@ import Foundation
 /// stat-inclusive `FileIdentity` check would spuriously fail on re-read (a Google-Drive
 /// mirror / SMB re-sync recreates a byte-identical file with a new inode/mtime — the
 /// re-stack P1b lesson). Tests inject a stub; `ProductionFrameLoader` below is the real impl.
-public protocol FrameLoader {
+protocol FrameLoader {
     func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage
 }
 
@@ -28,16 +28,16 @@ public protocol FrameLoader {
 /// load UNcalibrated frames — diverging from the online (calibrated) path. Reading
 /// `effectiveCalibrator` at pass time still satisfies I2 (it's the SAME stashed field, not a
 /// freshly-rebuilt calibrator), just read later, by which point subs exist and it's resolved.
-public struct ProductionFrameLoader: FrameLoader {
+struct ProductionFrameLoader: FrameLoader {
     private let calibratorProvider: () -> Calibrator?
     private let demosaic: DemosaicMethod
 
-    public init(calibratorProvider: @escaping () -> Calibrator?, demosaic: DemosaicMethod) {
+    init(calibratorProvider: @escaping () -> Calibrator?, demosaic: DemosaicMethod) {
         self.calibratorProvider = calibratorProvider
         self.demosaic = demosaic
     }
 
-    public func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
+    func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
         let raw = try FolderFrameSource.loadRawFrame(url: url, expectedDigest: expectedContentDigest)
         let calibrated = calibratorProvider()?.apply(raw) ?? raw
         return DisplayRGB.make(calibrated, demosaic: demosaic)
@@ -111,7 +111,7 @@ public final class GlobalRefiner {
         passLock.withLock { _lastMaterializedSampleCount }
     }
 
-    public init(loader: FrameLoader, onLog: @escaping (String) -> Void,
+    init(loader: FrameLoader, onLog: @escaping (String) -> Void,
                maxConcurrentLoads: Int = GlobalRefiner.defaultMaxConcurrentLoads) {
         self.loader = loader
         self.onLog = onLog
@@ -136,17 +136,17 @@ public final class GlobalRefiner {
     /// caused the race is itself an invalidation hook that calls `noteChanged()`, so `dirty` is
     /// already set and a fresh pass follows. Never set ⇒ `noteChanged()` is a safe no-op (matches
     /// feature-OFF parity: the pipeline only wires this once live rejection is first enabled).
-    public var makeSnapshot: (() -> PassSnapshot?)?
+    var makeSnapshot: (() -> PassSnapshot?)?
     /// Injected by the owner — installs a COMPLETED pass's result. Called with the snapshot's OWN
     /// captured key, never a freshly-read one (the stale-result race fix: see `PassSnapshot` doc).
-    public var publish: ((RefineResult, FreshnessKey) -> Void)?
+    var publish: ((RefineResult, FreshnessKey) -> Void)?
     /// Injected config seams, read fresh at the START of every pass (so a κ/budget change that
     /// lands between passes is picked up by the very next one). nil ⇒ the documented default.
-    public var kappaProvider: (() -> Float)?
-    public var maxSampleBytesProvider: (() -> Int)?
-    public var minSubsProvider: (() -> Int)?
+    var kappaProvider: (() -> Float)?
+    var maxSampleBytesProvider: (() -> Int)?
+    var minSubsProvider: (() -> Int)?
 
-    public static let defaultKappa: Float = RejectionStrength.medium.kappa
+    static let defaultKappa: Float = RejectionStrength.medium.kappa
     public static let defaultMinSubs = 5
     public static let defaultMaxSampleBytes = 6_000_000_000   // ~6 GB (spec §3 sample policy default)
     /// Hard floor for the materialized RAM-sample size (spec §3 Global Constraints) — below this,
@@ -162,8 +162,8 @@ public final class GlobalRefiner {
     /// pin the trigger queue indefinitely — `refine`'s own between-sub deadline check (C3) aborts
     /// at this bound and `noteChanged()`'s coalescing (via whatever invalidation fired meanwhile)
     /// runs a fresh pass afterward regardless.
-    public static let defaultPassBudget: DispatchTimeInterval = .seconds(300)
-    public var passBudget: DispatchTimeInterval = GlobalRefiner.defaultPassBudget
+    static let defaultPassBudget: DispatchTimeInterval = .seconds(300)
+    var passBudget: DispatchTimeInterval = GlobalRefiner.defaultPassBudget
 
     /// Cold-review fix (the M8 watcher-stall class, re-introduced HERE): macOS cannot interrupt
     /// an in-flight regular-file `read()` — `close()` does not unblock it, confirmed in
@@ -216,7 +216,7 @@ public final class GlobalRefiner {
     /// share, 6 is the hard cap on leaked workers/buffers — at most ~2.4 GB and 6 threads, ever,
     /// no matter how many passes run — after which the clean master quietly falls back to the
     /// online master. Bounded damage, the M8 philosophy.
-    public static let defaultMaxConcurrentLoads = 6
+    static let defaultMaxConcurrentLoads = 6
     /// Instance-settable so tests can shrink the pool without touching the `static let` default
     /// (tests inject a small pool + a controlled number of wedged loaders to prove the cap holds
     /// without needing hundreds of concurrent threads to observe it).
@@ -235,7 +235,7 @@ public final class GlobalRefiner {
     /// Notify the refiner that the survivor set (or config) may have changed. Coalesces: idle →
     /// dispatches exactly one pass; a pass already running → marks `dirty` so exactly one more
     /// pass follows. Always returns immediately — the actual pass runs on `triggerQueue`.
-    public func noteChanged() {
+    func noteChanged() {
         let shouldStart: Bool = triggerLock.withLock {
             if isRunning {
                 dirty = true
@@ -289,7 +289,7 @@ public final class GlobalRefiner {
 
     /// Marks the pass CURRENTLY in flight (or about to start) as cancelled. See the `passLock`
     /// doc above for why a late call can't cancel a future pass.
-    public func cancel() {
+    func cancel() {
         passLock.withLock { cancelledPassId = currentPassId }
     }
 
@@ -308,7 +308,7 @@ public final class GlobalRefiner {
     ///     part); the per-pixel CPU reduction inside `robustCenter`/`clippedWeightedMean` (~
     ///     seconds at 26MP) is not interruptible mid-loop — acceptable, the between-sub work
     ///     dominates the bound.
-    public func refine(survivors: [SubRegistration], currentGeneration: Int, kappa: Float,
+    func refine(survivors: [SubRegistration], currentGeneration: Int, kappa: Float,
                        minSubs: Int, maxSampleBytes: Int, deadline: DispatchTime,
                        isCancelled: @escaping () -> Bool) -> RefineResult? {
         let thisPassId: Int = passLock.withLock {
@@ -524,13 +524,13 @@ public final class GlobalRefiner {
     }
 }
 
-public struct RefineResult {
-    public let image: AstroImage
-    public let coverage: [Float]
-    public let survivorCount: Int
-    public let skipped: Int
+struct RefineResult {
+    let image: AstroImage
+    let coverage: [Float]
+    let survivorCount: Int
+    let skipped: Int
 
-    public init(image: AstroImage, coverage: [Float], survivorCount: Int, skipped: Int) {
+    init(image: AstroImage, coverage: [Float], survivorCount: Int, skipped: Int) {
         self.image = image
         self.coverage = coverage
         self.survivorCount = survivorCount
@@ -549,12 +549,12 @@ public struct RefineResult {
 /// stamped onto the eventual `RefineResult` at PUBLISH time UNCHANGED — never re-read at
 /// completion — so a mutation that lands mid-pass is caught by the stored key going stale, not by
 /// racing the publish itself.
-public struct PassSnapshot {
-    public let survivors: [SubRegistration]
-    public let currentGeneration: Int
-    public let key: FreshnessKey
+struct PassSnapshot {
+    let survivors: [SubRegistration]
+    let currentGeneration: Int
+    let key: FreshnessKey
 
-    public init(survivors: [SubRegistration], currentGeneration: Int, key: FreshnessKey) {
+    init(survivors: [SubRegistration], currentGeneration: Int, key: FreshnessKey) {
         self.survivors = survivors
         self.currentGeneration = currentGeneration
         self.key = key
