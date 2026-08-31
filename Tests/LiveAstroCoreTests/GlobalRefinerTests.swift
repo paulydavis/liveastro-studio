@@ -512,6 +512,74 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertEqual(unwrapped.survivorCount, 4)
     }
 
+    /// A loader whose EVERY call blocks (unlike `WedgedFirstCallFrameLoader`, which only wedges
+    /// the first) on a semaphore the test controls — simulates a PERSISTENTLY dead share, where
+    /// no read ever returns during the test body. Tracks the PEAK number of concurrently-blocked
+    /// calls under a lock (incremented on entry, decremented only once `releaseAll()` lets a
+    /// blocked call fall through) — the observable proxy for "how many abandoned loader workers
+    /// are simultaneously live," which is exactly what `loaderPool` bounds.
+    private final class AllWedgedFrameLoader: FrameLoader {
+        private let wedge = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var current = 0
+        private var _peak = 0
+        var peakConcurrent: Int { lock.withLock { _peak } }
+        func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
+            lock.withLock { current += 1; _peak = max(_peak, current) }
+            wedge.wait()   // not signalled until releaseAll() -> blocks for the whole test body
+            lock.withLock { current -= 1 }
+            throw StubLoadError.simulated
+        }
+        /// Test hygiene: release every permanently-parked worker thread after the assertions run
+        /// (called with a generous count so no wedged call is left blocked past the test).
+        func releaseAll(count: Int) { for _ in 0..<count { wedge.signal() } }
+    }
+
+    /// THE regression this task exists to fix: a wedged/dead-share read wasn't just tolerated by
+    /// `boundedLoad`'s per-load timeout — the ABANDONED worker leaked, still parked in `read()`,
+    /// holding a thread and a ~400MB frame buffer. Under a share that's PERSISTENTLY dead (every
+    /// load wedges, not just one), nothing before this fix bounded how many of those abandoned
+    /// workers could be concurrently live — a single pass over N survivors would leak N workers,
+    /// and the M8-class review proved this multiplies across passes toward thread exhaustion.
+    ///
+    /// Drives a pass over MORE survivors (12) than the (test-shrunk) `maxConcurrentLoads` (3),
+    /// every one of them permanently wedged, and asserts the loader's PEAK concurrently-blocked
+    /// call count never exceeds the pool size — proving `loaderPool` caps live workers rather
+    /// than merely bounding `refine()`'s own wall-clock return (which `perSubLoadCap` alone
+    /// already did, per `testRefineSingleWedgedLoadDoesNotExceedDeadline` above). Before the
+    /// fix, `peakConcurrent` reaches the full survivor count (12); after the fix, it's capped at
+    /// `maxConcurrentLoads` (3).
+    func testBoundedLoadPoolCapsConcurrentWedgedWorkers() throws {
+        let survivorCount = 12
+        var regs: [SubRegistration] = []
+        for i in 0..<survivorCount {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-pool-\(i).fit")
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = AllWedgedFrameLoader()
+        let poolSize = 3
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in }, maxConcurrentLoads: poolSize)
+        refiner.perSubLoadCap = .milliseconds(150)   // shrunk so the test itself runs fast
+
+        let start = Date()
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 3,
+                                    maxSampleBytes: 10_000_000,
+                                    deadline: .now() + .seconds(30),   // budget NOT the binding constraint here
+                                    isCancelled: { false })
+        let elapsed = Date().timeIntervalSince(start)
+        loader.releaseAll(count: survivorCount + poolSize)   // let every parked worker exit (test hygiene)
+
+        XCTAssertLessThan(elapsed, 5.0,
+                          "refine must return promptly even with every survivor wedged — the pool cap must not " +
+                          "turn into an unbounded serial wait")
+        XCTAssertNil(result, "every survivor is permanently wedged -> no quorum, refine returns nil (online " +
+                     "master kept, never a partial publish)")
+        XCTAssertLessThanOrEqual(loader.peakConcurrent, poolSize,
+                                 "loaderPool must cap the number of concurrently-live (wedged) workers at " +
+                                 "maxConcurrentLoads (\(poolSize)) regardless of survivor count (\(survivorCount)) " +
+                                 "— proving a dead share can leak at most K workers, not one per survivor")
+    }
+
     /// The passId mechanism (step 7): a cancel() that lands before any pass has ever started
     /// records against passId 0 — it must not poison the FIRST real pass (passId 1).
     func testRefineCancelBeforeFirstPassDoesNotPoisonIt() throws {

@@ -111,9 +111,12 @@ public final class GlobalRefiner {
         passLock.withLock { _lastMaterializedSampleCount }
     }
 
-    public init(loader: FrameLoader, onLog: @escaping (String) -> Void) {
+    public init(loader: FrameLoader, onLog: @escaping (String) -> Void,
+               maxConcurrentLoads: Int = GlobalRefiner.defaultMaxConcurrentLoads) {
         self.loader = loader
         self.onLog = onLog
+        self.maxConcurrentLoads = maxConcurrentLoads
+        self.loaderPool = DispatchSemaphore(value: maxConcurrentLoads)
     }
 
     // MARK: - Task 8: self-throttling trigger, off the online path
@@ -188,6 +191,37 @@ public final class GlobalRefiner {
     /// is impossible on macOS for a wedged regular-file read, so the achievable envelope is
     /// bounding the WAIT, not the read.
     var perSubLoadCap: DispatchTimeInterval = .seconds(20)
+
+    /// Cold-review fix (the leak-multiplies class, re-introduced yet again): `boundedLoad`
+    /// bounds the WAIT on a timed-out load but cannot cancel the underlying worker (macOS can't
+    /// interrupt an in-flight regular-file `read()` — see `perSubLoadCap` above), so a timed-out
+    /// worker is ABANDONED still blocked in `read()`, holding a ~400MB frame buffer and a
+    /// `.utility` thread. Under a PERSISTENTLY dead share this leak multiplies: every pass
+    /// re-attempts every survivor, leaking roughly `passBudget / perSubLoadCap` workers PER
+    /// PASS — over a multi-hour session this climbs toward the process-wide pthread ceiling
+    /// (~512), silently starving every other subsystem (the M8 stall class one layer out).
+    ///
+    /// The fix is a bounded pool: `loaderPool` caps the number of loader workers that may be
+    /// LIVE (dispatched-but-not-yet-returned) at once, regardless of how many have timed out and
+    /// been abandoned by their waiters. A wedged worker holds its pool slot until its `read()`
+    /// actually returns (the worker signals the pool itself, in a `defer`, on every exit path —
+    /// never the waiter, since the waiter has no way to know whether the worker is done). Once
+    /// `maxConcurrentLoads` workers are all wedged, further loads skip (pool-wait times out) and
+    /// the pass falls back to whatever it already has — degrading toward "keep the online
+    /// master" rather than exhausting the process.
+    ///
+    /// 6 is a modest, deliberately chosen value: on a healthy share every load completes in
+    /// milliseconds and signals the pool immediately, so 6 in-flight slots are never a
+    /// throughput bottleneck (loads are effectively serialized-fast, not queued). Under a dead
+    /// share, 6 is the hard cap on leaked workers/buffers — at most ~2.4 GB and 6 threads, ever,
+    /// no matter how many passes run — after which the clean master quietly falls back to the
+    /// online master. Bounded damage, the M8 philosophy.
+    public static let defaultMaxConcurrentLoads = 6
+    /// Instance-settable so tests can shrink the pool without touching the `static let` default
+    /// (tests inject a small pool + a controlled number of wedged loaders to prove the cap holds
+    /// without needing hundreds of concurrent threads to observe it).
+    let maxConcurrentLoads: Int
+    private let loaderPool: DispatchSemaphore
 
     private let triggerLock = NSLock()
     private var isRunning = false
@@ -299,10 +333,32 @@ public final class GlobalRefiner {
         //     may still be wedged; the worker thread leaks — see `perSubLoadCap` doc) but the pass
         //     continues with the remaining survivors, exactly like an ordinary load failure.
         func boundedLoad(url: URL, expectedContentDigest: String?) throws -> AstroImage? {
+            // Same absolute deadline governs BOTH the pool-slot wait below and the
+            // load-completion wait further down, so the total wait a caller can ever incur is
+            // bounded by `perLoadDeadline` once, not twice.
+            let perLoadDeadline = min(DispatchTime.now() + perSubLoadCap, deadline)
+
+            // Acquire a pool slot BEFORE dispatching a worker — this is what caps the number of
+            // concurrently-live (dispatched-but-not-returned) workers at `maxConcurrentLoads`,
+            // even when every prior worker is permanently wedged in `read()`. Only the worker
+            // itself ever signals this pool (see the `defer` below) — never here — because a
+            // timed-out wait has no way to know whether its worker is actually done; signalling
+            // from here would free a slot a still-blocked worker occupies, defeating the cap.
+            if loaderPool.wait(timeout: perLoadDeadline) != .success {
+                if DispatchTime.now() >= deadline { throw AbortPass() }   // pass-budget bound reached
+                return nil   // no worker slot free (share wedged) — recoverable skip, budget remains
+            }
+
             let box = LoadResultBox()
             let semaphore = DispatchSemaphore(value: 0)
             let loaderRef = loader
+            let pool = loaderPool
             DispatchQueue.global(qos: .utility).async {
+                // Releases the pool slot whenever THIS worker's read() actually returns — success,
+                // failure, or (for an abandoned/wedged worker) however long that eventually takes.
+                // This is the crux of the fix: a wedged worker holds its slot for its whole
+                // (possibly unbounded) lifetime, so at most `maxConcurrentLoads` can ever be live.
+                defer { pool.signal() }
                 do {
                     let image = try loaderRef.loadRegisteredInput(url: url, expectedContentDigest: expectedContentDigest)
                     box.set(.success(image))
@@ -311,7 +367,6 @@ public final class GlobalRefiner {
                 }
                 semaphore.signal()
             }
-            let perLoadDeadline = min(DispatchTime.now() + perSubLoadCap, deadline)
             if semaphore.wait(timeout: perLoadDeadline) == .success {
                 switch box.get() {
                 case .success(let image): return image
