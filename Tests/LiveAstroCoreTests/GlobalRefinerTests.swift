@@ -1369,6 +1369,93 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertNotNil(pipeline.publishedMasterIfCurrent())
     }
 
+    /// THE LIVE-SESSION STARVATION BUG, found by running a real 17-sub M51 session through the
+    /// GUI: a refine pass over 26 MP subs can take longer than the sub cadence, so by the time it
+    /// finishes another sub has landed and `survivorSubIndices` has grown. Under the original
+    /// exact-key rule the finished master then compared unequal and was thrown away — every time,
+    /// forever, at 100% CPU, with `latest.png` byte-identical to the online snapshot for the whole
+    /// session. A master over subs 1…N is not WRONG when sub N+1 lands, only shallower, so it must
+    /// still be served.
+    func testPublishedMasterIsStillServedAfterMoreSubsArrive() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "Starvation", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let source = StubLiveSource(sequence: [
+            stubFrame(dx: 0, dy: 0, name: "v1.fit", digest: "vd1", timestamp: 0),
+            stubFrame(dx: 1.0, dy: -0.5, name: "v2.fit", digest: "vd2", timestamp: 1),
+            stubFrame(dx: 1.6, dy: 0.3, name: "v3.fit", digest: "vd3", timestamp: 2)])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 3).count, 3)
+        pipeline.configureLiveRejection(enabled: true)
+
+        // A pass completes over the first 3 subs and publishes.
+        let keyOver3 = pipeline.currentFreshnessKey()
+        pipeline.publishedMaster = PublishedMaster(image: constImage(0.42), coverage: [1, 1, 1, 1],
+                                                   survivorCount: 3, key: keyOver3)
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(), "precondition: served while the set is unchanged")
+
+        // A 4th sub lands, exactly as it would mid-pass in a live session.
+        source.send(stubFrame(dx: 0.7, dy: 1.1, name: "v4.fit", digest: "vd4", timestamp: 3))
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 4).count, 4)
+        XCTAssertNotEqual(pipeline.currentFreshnessKey(), keyOver3, "the survivor set grew, so the key moved")
+
+        let served = try XCTUnwrap(pipeline.publishedMasterIfCurrent(),
+                                   "a 3-sub clean master must still be served after a 4th sub arrives — under the "
+                                   + "old exact-key rule this returned nil and the broadcast silently fell back to online")
+        XCTAssertEqual(served.survivorCount, 3, "and it honestly reports the depth it was built from")
+        XCTAssertEqual(pipeline.publishedMasterSurvivorCount(), 3)
+
+        // But a reject makes it WRONG, not merely shallow — it must stop being served.
+        pipeline.setUserRejected([2])
+        pipeline.noteUserRejectChanged()
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(),
+                     "a master containing a now-rejected sub must never be served")
+        XCTAssertNil(pipeline.publishedMasterSurvivorCount())
+    }
+
+    /// The other half of the same bug: the publish seam itself dropped a finished pass whose set
+    /// had merely grown, so nothing was ever stored to serve.
+    func testPublishSeamAcceptsAResultWhoseSurvivorSetMerelyGrew() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "PublishGrow", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let source = StubLiveSource(sequence: [
+            stubFrame(dx: 0, dy: 0, name: "w1.fit", digest: "wd1", timestamp: 0),
+            stubFrame(dx: 1.0, dy: -0.5, name: "w2.fit", digest: "wd2", timestamp: 1),
+            stubFrame(dx: 1.6, dy: 0.3, name: "w3.fit", digest: "wd3", timestamp: 2)])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 3).count, 3)
+        pipeline.configureLiveRejection(enabled: true)
+        let refiner = try XCTUnwrap(pipeline.refinerForTest())
+        let publish = try XCTUnwrap(refiner.publish)
+
+        let keySnapshottedByThePass = pipeline.currentFreshnessKey()
+        source.send(stubFrame(dx: 0.7, dy: 1.1, name: "w4.fit", digest: "wd4", timestamp: 3))
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 4).count, 4)
+
+        // The pass finishes now, holding the key from before that 4th sub.
+        publish(RefineResult(image: constImage(0.5), coverage: [Float](repeating: 1, count: 16),
+                             survivorCount: 3, skipped: 0), keySnapshottedByThePass)
+        XCTAssertNotNil(pipeline.publishedMaster,
+                        "a pass overtaken by a new sub must still store its result — dropping it is what "
+                        + "left a real session at 100% CPU with nothing ever published")
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent())
+    }
+
     /// Follow-on review P3: a QUICK OFF→ON must still reject the pass that was cancelled at OFF.
     /// `liveRejectionActive` is true again and nothing else in the key moved (same generation,
     /// survivors, rejects, κ, budget), so before the epoch the cancelled pass's key compared

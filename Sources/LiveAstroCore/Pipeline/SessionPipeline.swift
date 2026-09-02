@@ -47,6 +47,35 @@ public struct FreshnessKey: Equatable {
     /// pass cancelled during the per-pixel combine — which is not interruptible mid-loop — still
     /// runs to its publish call.) The epoch makes the pre-OFF key unequal to every later key.
     let liveRejectionEpoch: Int
+
+    /// Everything that makes a published master WRONG rather than merely SHALLOW. A reseed
+    /// (`stackGeneration`), a user reject (`userRejectGeneration`), a κ or sample-budget change,
+    /// or an enable-state transition (`liveRejectionEpoch`) each change what the master MEANS, so
+    /// one computed before any of them must never be served. `survivorSubIndices` is deliberately
+    /// NOT here — see `isServable(against:)`.
+    private var validityCore: [AnyHashable] {
+        [stackGeneration, userRejectGeneration, kappa, maxSampleBytes, liveRejectionEpoch]
+    }
+
+    /// Whether a master computed under `self` may still be served while the live state is
+    /// `current`.
+    ///
+    /// Exact key equality was the original rule, and it STARVES a live session: a refine pass over
+    /// 26 MP subs can take longer than the sub cadence, so by the time it finishes another sub has
+    /// landed, `survivorSubIndices` has grown, the key differs, and the finished result is thrown
+    /// away — repeatedly, at 100% CPU, with the broadcast silently serving the online master the
+    /// whole time. Observed on a real 17-sub M51 session: `latest.png` stayed byte-identical to the
+    /// online snapshot from the first sub to the last.
+    ///
+    /// A master built from subs 1…11 is not WRONG when sub 12 lands — it is one sub shallower and
+    /// still trail-free. So the validity fields must match exactly, and the master's survivor set
+    /// must be a SUBSET of the current one. Given equal validity fields that set can only have
+    /// GROWN (a sub leaves only via a reject or a generation change, and both live in
+    /// `validityCore`), so the subset test says precisely "only new subs arrived since".
+    func isServable(against current: FreshnessKey) -> Bool {
+        guard validityCore == current.validityCore else { return false }
+        return Set(survivorSubIndices).isSubset(of: Set(current.survivorSubIndices))
+    }
 }
 
 /// The background refiner's most recently published trail-free master (Task 6/7), stamped with
@@ -320,6 +349,18 @@ public final class SessionPipeline {
     /// all accepted records kept counting pre-reseed subs the refiner had already discarded.
     /// Reads the engine generation first (engine lock, released) and only then takes `regLock`
     /// — the established leaf ordering; never nests them.
+    /// Survivor count of the clean master that would be SERVED right now, or nil if none is
+    /// current. The caption needs this rather than `currentSurvivorCount()`: the two differ
+    /// exactly when a pass hasn't published yet, which is precisely the state the operator
+    /// otherwise cannot distinguish from a working one (the broadcast looks the same either way).
+    public func publishedMasterSurvivorCount() -> Int? {
+        regLock.withLock {
+            guard liveRejectionActive, let pm = publishedMaster,
+                  pm.key.isServable(against: _freshnessKey) else { return nil }
+            return pm.survivorCount
+        }
+    }
+
     public func currentSurvivorCount() -> Int {
         let gen = engine?.currentStackGeneration ?? 0
         return regLock.withLock { currentSurvivorsLocked(currentGeneration: gen).count }
@@ -598,7 +639,9 @@ public final class SessionPipeline {
     /// is dropped rather than stored-then-refused.
     private func publishRefineResult(_ result: RefineResult, key: FreshnessKey) {
         regLock.withLock {
-            guard liveRejectionActive, key == _freshnessKey else { return }
+            // Servable-not-identical (see FreshnessKey.isServable): subs that landed while this
+            // pass ran must NOT discard its result, or a live session never publishes at all.
+            guard liveRejectionActive, key.isServable(against: _freshnessKey) else { return }
             publishedMaster = PublishedMaster(image: result.image, coverage: result.coverage,
                                               survivorCount: result.survivorCount, key: key)
         }
@@ -611,7 +654,8 @@ public final class SessionPipeline {
     /// publish/mutation can't be observed torn.
     public func publishedMasterIfCurrent() -> (image: AstroImage, coverage: [Float], survivorCount: Int)? {
         regLock.withLock {
-            guard liveRejectionActive, let pm = publishedMaster, pm.key == _freshnessKey else { return nil }
+            guard liveRejectionActive, let pm = publishedMaster,
+                  pm.key.isServable(against: _freshnessKey) else { return nil }
             return (image: pm.image, coverage: pm.coverage, survivorCount: pm.survivorCount)
         }
     }
@@ -1472,7 +1516,7 @@ public final class SessionPipeline {
     ) -> RestackReport {
         var clean: (image: AstroImage, coverage: [Float], survivorCount: Int)?
         if frozen.active {
-            if let pub = frozen.published, pub.key == frozen.key {
+            if let pub = frozen.published, pub.key.isServable(against: frozen.key) {
                 // A background pass already published a master current as of the
                 // freeze — use it, no final pass needed.
                 clean = (pub.image, pub.coverage, pub.survivorCount)

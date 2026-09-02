@@ -5,10 +5,34 @@ import XCTest
 /// and the precedence order between them.
 final class LiveRejectionGateTests: XCTestCase {
 
-    func testActiveWhenLocalEnoughSubsAndOn() {
+    /// `.active` now means "a clean master EXISTS and is being served", so it reports the
+    /// PUBLISHED survivor count — which lags the registered count while a pass is in flight.
+    func testActiveWhenLocalEnoughSubsOnAndAMasterIsPublished() {
         let status = LiveRejectionGate.reason(sourceIsLocalLiveRelay: true, subCount: 12,
-                                               minSubs: 5, reseeding: false, enabled: true)
-        XCTAssertEqual(status, .active(subs: 12))
+                                               minSubs: 5, reseeding: false, enabled: true,
+                                               publishedSubs: 11)
+        XCTAssertEqual(status, .active(subs: 11),
+                       "the caption must report the master actually being served (11), not the 12 registered subs")
+    }
+
+    /// The state that was previously reported as `.active` and was a lie: eligible and past the
+    /// quorum, but no clean master published yet, so the outputs are still the online master.
+    /// A real 17-sub M51 session sat here the entire time while the caption claimed a clean master.
+    func testBuildingWhenEligibleButNothingPublishedYet() {
+        let status = LiveRejectionGate.reason(sourceIsLocalLiveRelay: true, subCount: 12,
+                                               minSubs: 5, reseeding: false, enabled: true,
+                                               publishedSubs: nil)
+        XCTAssertEqual(status, .building(subs: 12))
+    }
+
+    /// Ineligibility still outranks publication state — a stale master must never read as active.
+    func testOffOutranksAPublishedMaster() {
+        for (local, on, expected) in [(false, true, "network source"), (true, false, "turned off")] {
+            let status = LiveRejectionGate.reason(sourceIsLocalLiveRelay: local, subCount: 12,
+                                                   minSubs: 5, reseeding: false, enabled: on,
+                                                   publishedSubs: 11)
+            XCTAssertEqual(status, .off(reason: expected))
+        }
     }
 
     func testOffNetworkSource() {
