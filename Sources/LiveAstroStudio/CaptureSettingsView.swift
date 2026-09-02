@@ -147,6 +147,12 @@ struct CaptureSettingsView: View {
                         .disabled(model.isRunning || model.importer.isImporting)
                         .help("Higher = safer (rejects less); lower = more aggressive. Medium (κ=3) is the validated default.")
                     }
+                    VStack(alignment: .leading, spacing: 2) {
+                        helpToggle("Live trail rejection (broadcast master)", isOn: $model.liveTrailRejection,
+                                   help: "Runs a background whole-frame outlier pass so satellite/plane trails drop out of the broadcast master and end-of-session master.fit, distinct from the per-pixel σ-clip above. Only engages for a local native live relay with enough subs; safe to toggle mid-session.")
+                        Text(model.liveRejectionStatusText)
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Picker("Post-process", selection: $model.processorBackend) {
                         Text("None").tag(ProcessorBackend.none)
                         Text("GraXpert").tag(ProcessorBackend.graxpert)

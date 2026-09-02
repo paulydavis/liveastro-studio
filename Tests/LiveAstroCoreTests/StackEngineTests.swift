@@ -157,6 +157,63 @@ final class StackEngineTests: XCTestCase {
         XCTAssertGreaterThan(stack.stats[1].median, stack.stats[0].median)
     }
 
+    /// Mono starfield (no CFA/debayer) at `field` positions offset by (dx, dy). Used by the
+    /// registration-payload tests, which don't care about debayer/color — just ≥15 stars.
+    func starFrame(dx: Double, dy: Double, width: Int = 512, height: Int = 512,
+                   amp: Float = 0.8) -> AstroImage {
+        var px = [Float](repeating: 0.05, count: width * height)
+        for s in field {
+            let sx = s.x + dx, sy = s.y + dy
+            for y in max(0, Int(sy) - 8)...min(height - 1, Int(sy) + 8) {
+                for x in max(0, Int(sx) - 8)...min(width - 1, Int(sx) + 8) {
+                    let ddx = Double(x) - sx, ddy = Double(y) - sy
+                    px[y * width + x] += amp * Float(exp(-(ddx * ddx + ddy * ddy) / (2 * 3.0 * 3.0)))
+                }
+            }
+        }
+        return AstroImage(width: width, height: height, channels: 1, pixels: px, sourceIsLinear: true)
+    }
+
+    /// A RawFrame that seeds an engine (≥15 stars, untranslated field).
+    func seedRaw() -> RawFrame {
+        RawFrame(image: starFrame(dx: 0, dy: 0), bayerPattern: nil, bottomUp: false,
+                 timestamp: Date(timeIntervalSince1970: 0), sourceName: "seed.fit")
+    }
+
+    func testProcessDetailedSurfacesRegistrationForAcceptedSubs() throws {
+        let engine = StackEngine()
+        let ref = starFrame(dx: 0, dy: 0)      // helper producing a ≥15-star AstroImage
+        let r1 = engine.processDetailed(RawFrame(image: ref, bayerPattern: nil, bottomUp: false,
+                                                 timestamp: Date(timeIntervalSince1970: 0), sourceName: "ref.fit"))
+        XCTAssertEqual(r1.outcome, .becameReference)
+        let reg1 = try XCTUnwrap(r1.registration)
+        XCTAssertEqual(reg1.transform, .identity)
+        XCTAssertEqual(reg1.effectiveScale, 1.0, accuracy: 1e-6)
+        XCTAssertEqual(reg1.weight, 1.0, accuracy: 1e-6)
+        let gen = reg1.stackGeneration                       // reference's referenceIdentity == its own
+        // (in-memory test frames have nil identity; the grouping property is asserted below via reg2)
+
+        let sub = starFrame(dx: 1.0, dy: -0.5)
+        let r2 = engine.processDetailed(RawFrame(image: sub, bayerPattern: nil, bottomUp: false,
+                                                 timestamp: Date(timeIntervalSince1970: 1), sourceName: "s1.fit"))
+        XCTAssertEqual(r2.outcome, .stacked(frameCount: 2))
+        let reg2 = try XCTUnwrap(r2.registration)
+        XCTAssertNotEqual(reg2.transform, .identity)          // it moved
+        XCTAssertEqual(reg2.stackGeneration, gen)             // same generation as its reference
+        XCTAssertEqual(reg2.referenceIdentity, reg1.referenceIdentity)  // subs carry the reference's identity
+        XCTAssertEqual(reg2.weight, r2.weight, accuracy: 1e-6)
+    }
+
+    func testRejectedSubHasNoRegistration() {
+        let engine = StackEngine()
+        _ = engine.processDetailed(seedRaw())                 // seed
+        let bad = RawFrame(image: AstroImage(width: 64, height: 64, channels: 1,
+                           pixels: [Float](repeating: 0.05, count: 64*64), sourceIsLinear: true),
+                           bayerPattern: nil, bottomUp: false, timestamp: Date(), sourceName: "flat.fit")
+        let r = engine.processDetailed(bad)                    // too few stars → rejected
+        if case .rejected = r.outcome { XCTAssertNil(r.registration) } else { XCTFail("expected reject") }
+    }
+
     func testBottomUpFrameFlipped() {
         // Same field delivered bottom-up must land at flipped y in the stack
         let engine = StackEngine()

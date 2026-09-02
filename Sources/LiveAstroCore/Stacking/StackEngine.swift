@@ -21,6 +21,40 @@ public struct ProcessResult: Equatable {
     public let starCount: Int
     public let backgroundSigma: Float
     public let weight: Float
+    /// Per-sub registration payload (nil for a rejected sub), purely additive so an off-thread
+    /// background refiner can reuse each sub's transform/leveling/scale without re-registering.
+    public let registration: RegistrationPayload?
+
+    public init(outcome: StackOutcome, starCount: Int, backgroundSigma: Float, weight: Float,
+                registration: RegistrationPayload? = nil) {
+        self.outcome = outcome
+        self.starCount = starCount
+        self.backgroundSigma = backgroundSigma
+        self.weight = weight
+        self.registration = registration
+    }
+}
+
+/// Everything a later background refiner needs to reuse a sub's registration without
+/// re-running detection/matching. `stackGeneration` + `referenceIdentity` let the refiner
+/// group subs by which reference/reseed epoch produced them.
+public struct RegistrationPayload {
+    public let transform: SimilarityTransform
+    public let effectiveScale: Float
+    public let weight: Float
+    public let leveling: (sub: BackgroundExtraction.BackgroundModel, ref: BackgroundExtraction.BackgroundModel)?
+    public let stackGeneration: Int
+    public let referenceIdentity: FileIdentity?
+}
+
+extension RegistrationPayload: Equatable {
+    /// `leveling`'s tuple isn't Equatable for free (the models are large); identity of
+    /// presence is enough for the payload's equality, which exists only for test assertions.
+    public static func == (l: Self, r: Self) -> Bool {
+        l.transform == r.transform && l.effectiveScale == r.effectiveScale && l.weight == r.weight
+            && l.stackGeneration == r.stackGeneration && l.referenceIdentity == r.referenceIdentity
+            && (l.leveling == nil) == (r.leveling == nil)
+    }
 }
 
 /// Native stacking core (spec §4.2): registration on half-res superpixel luminance,
@@ -111,6 +145,27 @@ public final class StackEngine {
     public private(set) var autoReseedCount = 0
     private let autoReseedThreshold: Int
     private var consecutiveNoTransform = 0
+    /// The current generation's reference FileIdentity (nil for an in-memory/synthetic frame),
+    /// set when a frame becomes the reference. Stacked subs of that generation carry the SAME
+    /// value, so a consumer can group registration payloads by which reference produced them.
+    private var referenceIdentity: FileIdentity?
+
+    /// Generation key = manualReseedCount + autoReseedCount, both already mutated/read under
+    /// `lock`. LOCKING — for a background refiner reading this off the engine's own thread.
+    public var currentStackGeneration: Int {
+        lock.withLock { manualReseedCount + autoReseedCount }
+    }
+
+    /// Same generation key, NO lock. Used only when building a registration payload INSIDE
+    /// `processDetailedLocked` (already under `lock.withLock`) — calling the public locking
+    /// accessor there would re-enter the non-recursive NSLock and deadlock.
+    private var currentStackGenerationLocked: Int { manualReseedCount + autoReseedCount }
+
+    /// The `DemosaicMethod` this engine was built with — a plain `let`, so no locking needed.
+    /// Task 8: `SessionPipeline` reads this once when lazily building the `GlobalRefiner`'s
+    /// production `FrameLoader`, so the refiner's `DisplayRGB.make` call matches the online
+    /// engine's debayer exactly (no drift between the online and refine domains).
+    public var demosaicMethod: DemosaicMethod { demosaic }
 
     /// seedMinStars: must comfortably exceed minMatches (8); 15 gives
     /// C(15,3)=455 triangles for reliable initial matching.
@@ -142,6 +197,7 @@ public final class StackEngine {
             referenceChannels = nil
             weightBaseline = nil
             referenceBackgroundSamples = nil
+            referenceIdentity = nil
             rejection.reset()
             manualReseedCount += 1
             currentStackState = .awaitingSeedAfterReseed(
@@ -296,7 +352,10 @@ public final class StackEngine {
             acceptedCount += 1
             consecutiveNoTransform = 0
             currentStackState = .active
-            return ProcessResult(outcome: .becameReference, starCount: stars.count, backgroundSigma: sigma, weight: 1.0)
+            referenceIdentity = frame.identity          // the generation's shared reference identity
+            return ProcessResult(outcome: .becameReference, starCount: stars.count, backgroundSigma: sigma, weight: 1.0,
+                registration: RegistrationPayload(transform: .identity, effectiveScale: 1.0, weight: 1.0,
+                    leveling: nil, stackGeneration: currentStackGenerationLocked, referenceIdentity: frame.identity))
         }
 
         // 3 = TriangleMatcher minimum (one triangle); RANSAC's minMatches is
@@ -321,6 +380,7 @@ public final class StackEngine {
                 accumulator = nil
                 weightBaseline = nil
                 referenceBackgroundSamples = nil
+                referenceIdentity = nil
                 rejection.reset()   // else the new field's seed is sigma-clipped against the old field's stats
                 consecutiveNoTransform = 0
                 autoReseedCount += 1
@@ -365,7 +425,8 @@ public final class StackEngine {
         // Pass the same effectiveScale to apply so its internal guard and the weight can't disagree.
         var frame = warped
         var effectiveScale: Float = 1.0
-        if let pair = levelingModels(image: warped, mask: mask) {
+        let pair = levelingModels(image: warped, mask: mask)          // computed ONCE
+        if let pair {
             effectiveScale = GradientLeveler.scalingApplies(
                 subModel: pair.sub, refModel: pair.ref, channels: warped.channels) ? scale : 1.0
             frame = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref, scale: effectiveScale)
@@ -377,7 +438,10 @@ public final class StackEngine {
         acceptedCount += 1
         consecutiveNoTransform = 0
         return ProcessResult(outcome: .stacked(frameCount: accumulator.frameCount),
-                             starCount: stars.count, backgroundSigma: sigma, weight: appliedWeight)
+                             starCount: stars.count, backgroundSigma: sigma, weight: appliedWeight,
+                             registration: RegistrationPayload(transform: half, effectiveScale: effectiveScale,
+                                 weight: appliedWeight, leveling: pair,
+                                 stackGeneration: currentStackGenerationLocked, referenceIdentity: referenceIdentity))
     }
 
     /// Half-res superpixel luminance in DISPLAY orientation (flip rows if bottom-up).
@@ -407,32 +471,11 @@ public final class StackEngine {
     }
 
     /// Debayer in stored order (never flip the CFA), then flip rows to top-down display.
-    /// RawFrame contract: bayerPattern != nil implies channels == 1 (a violated
-    /// contract traps in Debayer.bilinear rather than silently mis-rendering).
+    /// Delegates to the shared `DisplayRGB.make` (Task 6) so the online engine and the
+    /// live-rejection `GlobalRefiner`'s production `FrameLoader` stay byte-identical —
+    /// one implementation, no drift.
     private func displayRGB(_ frame: RawFrame, minRows: Int = 64) -> AstroImage {
-        var rgb: AstroImage
-        if let pattern = frame.bayerPattern, frame.image.channels == 1 {
-            switch demosaic {
-            case .bilinear:
-                rgb = Debayer.bilinear(cfa: frame.image, pattern: pattern, minRows: minRows)
-            case .malvar:
-                rgb = Debayer.malvar(cfa: frame.image, pattern: pattern, minRows: minRows)
-            }
-        } else {
-            rgb = frame.image
-        }
-        guard frame.bottomUp else { return rgb }
-        let w = rgb.width, h = rgb.height, plane = w * h
-        var flipped = [Float](repeating: 0, count: rgb.pixels.count)
-        for c in 0..<rgb.channels {
-            for y in 0..<h {
-                let src = c * plane + (h - 1 - y) * w
-                let dst = c * plane + y * w
-                flipped.replaceSubrange(dst..<(dst + w), with: rgb.pixels[src..<(src + w)])
-            }
-        }
-        return AstroImage(width: w, height: h, channels: rgb.channels,
-                          pixels: flipped, sourceIsLinear: rgb.sourceIsLinear)
+        DisplayRGB.make(frame, demosaic: demosaic, minRows: minRows)
     }
 
     /// A frame that registered against the current reference; ready to warp+commit.

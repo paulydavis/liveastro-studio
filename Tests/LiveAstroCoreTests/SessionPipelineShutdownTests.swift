@@ -729,4 +729,343 @@ final class SessionPipelineShutdownTests: XCTestCase {
                        "a failed finalization barrier must outrank finite-import reseed refusal")
         wedged.signal()
     }
+
+    // MARK: - Task 10: end() writes the clean survivor-counted master with online fallback
+
+    /// A live (isFinite == false) source that yields a fixed sequence up front (buffered) and
+    /// finishes its stream on stop() — mirrors GlobalRefinerTests.StubLiveSource. Unlike
+    /// BacklogLiveSource (whose frames carry no `identity`/`sourceURL`, so they never append a
+    /// SubRegistration), every frame here is expected to carry both — required for the
+    /// registration cache the background refiner reproduces from.
+    final class T10StubLiveSource: FrameSource {
+        let frames: AsyncStream<RawFrame>
+        private let cont: AsyncStream<RawFrame>.Continuation
+        var isFinite: Bool { false }
+        var totalCount: Int? { nil }
+        init(sequence: [RawFrame]) {
+            var c: AsyncStream<RawFrame>.Continuation!
+            frames = AsyncStream(bufferingPolicy: .unbounded) { c = $0 }
+            cont = c
+            for f in sequence { cont.yield(f) }
+        }
+        func start() throws {}
+        func stop() { cont.finish() }
+    }
+
+    private func t10Identity(digest: String) -> FileIdentity {
+        FileIdentity(dev: 0, ino: 0, size: 0, mtimeSec: 0, mtimeNsec: 0, digest: digest)
+    }
+
+    /// A registration-eligible RawFrame (identity + sourceURL set) carrying the SAME star-field
+    /// image for every sub — every sub registers with (at worst) a near-identity transform
+    /// against the reference, and the very first sub's transform is EXACT identity by
+    /// construction (Task 5: "the reference frame... transform=identity").
+    private func t10Frame(name: String, digest: String, timestamp: TimeInterval, image: AstroImage) -> RawFrame {
+        RawFrame(image: image, bayerPattern: nil, bottomUp: false,
+                timestamp: Date(timeIntervalSince1970: timestamp), sourceName: name,
+                identity: t10Identity(digest: digest),
+                sourceURL: URL(fileURLWithPath: "/tmp/t10globalrefiner/\(name)"))
+    }
+
+    /// A flat 16x16 image with one elevated pixel roughly centered (8px margin on every side) —
+    /// large enough that any sub-pixel registration/warp residual can't smear the elevated pixel
+    /// out to the frame boundary (where mask/coverage cropping could hide whether it actually got
+    /// clipped by the robust combine, vs. merely cropped away).
+    private func t10TrailImage(base: Float, trail: Float, size: Int = 16) -> AstroImage {
+        var px = [Float](repeating: base, count: size * size)
+        px[(size / 2) * size + size / 2] = trail
+        return AstroImage(width: size, height: size, channels: 1, pixels: px, sourceIsLinear: true)
+    }
+
+    private func t10ConstImage(_ v: Float, size: Int = 16) -> AstroImage {
+        AstroImage(width: size, height: size, channels: 1,
+                  pixels: [Float](repeating: v, count: size * size), sourceIsLinear: true)
+    }
+
+    /// Records every call (spy) and can optionally: throw for specific URLs, sleep before
+    /// returning (simulates a slow per-sub reload), and PARK FOREVER on its very first-ever call
+    /// (across ALL passes sharing this loader instance) until `parkFirstCallOn` is signalled —
+    /// isolates an enabledRose-triggered BACKGROUND pass (which always reaches the loader first)
+    /// from a later FINAL pass driven directly by `end()`, so a test can prove the final pass
+    /// itself does the work, not a lucky pre-published background result.
+    private final class T10SpyFrameLoader: FrameLoader {
+        private let images: [URL: AstroImage]
+        private let throwing: Set<URL>
+        private let sleepPerCall: TimeInterval
+        private let parkFirstCallOn: DispatchSemaphore?
+        private let enteredSignal: DispatchSemaphore?
+        private let lock = NSLock()
+        private var _callCount = 0
+        var callCount: Int { lock.withLock { _callCount } }
+
+        init(images: [URL: AstroImage] = [:], throwing: Set<URL> = [], sleepPerCall: TimeInterval = 0,
+            parkFirstCallOn: DispatchSemaphore? = nil, enteredSignal: DispatchSemaphore? = nil) {
+            self.images = images; self.throwing = throwing; self.sleepPerCall = sleepPerCall
+            self.parkFirstCallOn = parkFirstCallOn; self.enteredSignal = enteredSignal
+        }
+
+        func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
+            let isFirst: Bool = lock.withLock { _callCount += 1; return _callCount == 1 }
+            if isFirst, let sem = parkFirstCallOn {
+                enteredSignal?.signal()
+                sem.wait()
+            }
+            if sleepPerCall > 0 { Thread.sleep(forTimeInterval: sleepPerCall) }
+            if throwing.contains(url) { throw NSError(domain: "t10loader", code: 1) }
+            guard let img = images[url] else { throw NSError(domain: "t10loader", code: 2) }
+            return img
+        }
+    }
+
+    /// Cold-review regression loader: every call blocks FOREVER on a shared gate — models a
+    /// genuinely wedged read (dead SMB / evicted-iCloud), per
+    /// docs/history/specs/2026-08-24-watcher-async-reads-design.md: macOS cannot interrupt an
+    /// in-flight regular-file `read()`, so this is NOT merely slow (like `T10SpyFrameLoader`'s
+    /// `sleepPerCall`, which the existing between-loads deadline check already bounds) — it never
+    /// returns at all unless released. Distinct from `GlobalRefinerTests.WedgedFirstCallFrameLoader`
+    /// (which wedges only the very first-ever call): here EVERY call wedges, so quorum genuinely
+    /// cannot be reached and the fallback-to-online path is exercised deterministically.
+    private final class T10WedgedFrameLoader: FrameLoader {
+        private let images: [URL: AstroImage]
+        private let gate = DispatchSemaphore(value: 0)
+        init(images: [URL: AstroImage] = [:]) { self.images = images }
+        func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
+            gate.wait()   // never signalled during the test body -> blocks forever
+            guard let img = images[url] else { throw NSError(domain: "t10wedged", code: 1) }
+            return img
+        }
+        /// Test hygiene only: release however many worker threads got leaked waiting on this gate
+        /// (the bounded-load fix abandons the WAIT after `perSubLoadCap` but the dispatched
+        /// closure itself stays blocked here forever, per the macOS uninterruptible-read
+        /// limitation) — signal generously so none of them linger permanently-parked in the test
+        /// process. Safe to over-signal (excess signals just leave the semaphore count positive).
+        func releaseAll(times: Int = 32) { for _ in 0..<times { gate.signal() } }
+    }
+
+    /// Polls `subRegistrations()` until it reaches `count` entries or the deadline passes.
+    private func t10WaitForRegistrations(_ pipeline: SessionPipeline, count: Int,
+                                         timeout: TimeInterval = 5) -> [SubRegistration] {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let regs = pipeline.subRegistrations()
+            if regs.count >= count { return regs }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        return pipeline.subRegistrations()
+    }
+
+    /// Drives 6 real subs (IDENTICAL star-field content, so every registration is at worst a
+    /// near-identity transform and the reference's is EXACT identity) through a real native
+    /// `.live` pipeline and returns the still-running pipeline/source/engine plus the 6
+    /// registrations in capture order. Caller owns `source.stop()`/`pipeline.end()`.
+    private func t10RegisterSixSubs(sandbox: URL) throws
+        -> (pipeline: SessionPipeline, source: T10StubLiveSource, engine: StackEngine, regs: [SubRegistration]) {
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        let profile = SessionProfile(targetName: "Task10", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let baseImage = seedFrame().image
+        let frames = (0..<6).map { i in
+            t10Frame(name: "t10sub\(i).fit", digest: "t10-digest-\(i)", timestamp: TimeInterval(i), image: baseImage)
+        }
+        let source = T10StubLiveSource(sequence: frames)
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine,
+                                       profile: profile, rootDirectory: sessions)
+        pipeline.rendersReplay = false   // these tests exercise the master write, not the replay render
+        try pipeline.start()
+        let regs = t10WaitForRegistrations(pipeline, count: 6)
+        XCTAssertEqual(regs.count, 6, "test precondition: all 6 subs must register")
+        XCTAssertEqual(regs[0].transform, .identity,
+                       "test precondition: the reference sub's transform is EXACT identity")
+        return (pipeline, source, engine, regs)
+    }
+
+    /// Step 1 (success path): feature ON, no published master current at end() (the
+    /// enabledRose-triggered background pass is parked mid-load and never completes) — end()'s
+    /// own FINAL synchronous refine pass must run, clip a trail only the multi-frame robust
+    /// combine can see, and write master.fit with STACKCNT == the refine result's survivor
+    /// count, which DIFFERS from the online engine's frame count (one sub always fails to
+    /// reload for the clean pass, proving STACKCNT tracks the refine count, not the online one).
+    func testEndFeatureOnRunsFinalRefinePassAndWritesCleanSurvivorCountedMaster() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, engine, regs) = try t10RegisterSixSubs(sandbox: sandbox)
+        defer { source.stop() }
+
+        var images: [URL: AstroImage] = [:]
+        for reg in regs { images[reg.relayURL] = t10ConstImage(0.1) }
+        images[regs[0].relayURL] = t10TrailImage(base: 0.1, trail: 0.9)   // reference sub carries the trail
+        let throwingURL = regs[3].relayURL                                // an arbitrary non-reference sub
+
+        let entered = DispatchSemaphore(value: 0)
+        let park = DispatchSemaphore(value: 0)
+        let loader = T10SpyFrameLoader(images: images, throwing: [throwingURL],
+                                       parkFirstCallOn: park, enteredSignal: entered)
+        pipeline.refinerLoaderOverride = loader
+
+        // enabledRose (OFF -> ON with 6 survivors already present) triggers an immediate
+        // background pass — its first load parks here forever, so it never publishes. end()'s
+        // own final synchronous pass (this task) must run and write the clean master instead.
+        pipeline.configureLiveRejection(enabled: true, kappa: 3.0, maxSampleBytes: 10_000_000)
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success,
+                       "precondition: the background pass must reach the loader (and park there)")
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(),
+                     "precondition: nothing published yet — the parked background pass never completes")
+
+        let dir = try pipeline.end()
+        park.signal()   // release the parked background pass so it can unwind (test hygiene)
+
+        XCTAssertEqual(engine.stackFrameCount, 6,
+                       "precondition: the ONLINE engine stacked all 6 — proves STACKCNT below deliberately differs from it")
+        let masterURL = dir.appendingPathComponent("master.fit")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: masterURL.path))
+        let header = try FITSReader.readHeader(Data(contentsOf: masterURL))
+        XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 5,
+                      "STACKCNT must be the refine result's survivor count (6 registered minus the " +
+                      "1 sub that always fails to reload), not the online engine's frame count (6)")
+
+        let master = try FITSReader.read(Data(contentsOf: masterURL))
+        XCTAssertLessThan(master.pixels.max() ?? 1, 0.5,
+                          "the trail-region pixel must read background — the robust combine must " +
+                          "clip it out, something the online per-frame winsorized engine (which " +
+                          "never reproduces a sub from disk) cannot do")
+    }
+
+    /// Fault path: the refiner returns nil on every attempt (every reload throws) — end() must
+    /// still write the ONLINE master (never throw, never leave master.fit missing).
+    func testEndRefinerAlwaysNilFallsBackToOnlineMaster() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, engine, regs) = try t10RegisterSixSubs(sandbox: sandbox)
+        defer { source.stop() }
+
+        let loader = T10SpyFrameLoader(throwing: Set(regs.map(\.relayURL)))   // every URL always fails
+        pipeline.refinerLoaderOverride = loader
+        pipeline.configureLiveRejection(enabled: true, kappa: 3.0, maxSampleBytes: 10_000_000)
+        // Let the enabledRose background pass run to completion (it also fails and publishes
+        // nothing) before ending, so end()'s own final pass is exercised deterministically.
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(), "precondition: nothing was ever published")
+
+        let dir = try pipeline.end()   // must not throw
+
+        XCTAssertEqual(engine.stackFrameCount, 6)
+        let masterURL = dir.appendingPathComponent("master.fit")
+        let header = try FITSReader.readHeader(Data(contentsOf: masterURL))
+        XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 6,
+                      "a refiner that always returns nil must fall back to the ONLINE master's frame count")
+    }
+
+    /// P2, feature-off parity: `liveRejectionActive == false` at end() must skip the clean path
+    /// ENTIRELY — no additional refine/loader calls during end() itself — and write the ONLINE
+    /// master. The feature is enabled-then-disabled (not left never-enabled) so `_globalRefiner`
+    /// genuinely exists at end() — proving the `frozen.active` gate itself does the work, not
+    /// just an absent refiner having nothing to call.
+    func testEndFeatureOffSkipsCleanPathEntirelyNoRefineCallsDuringEnd() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, engine, regs) = try t10RegisterSixSubs(sandbox: sandbox)
+        defer { source.stop() }
+
+        var images: [URL: AstroImage] = [:]
+        for reg in regs { images[reg.relayURL] = t10ConstImage(0.1) }
+        let loader = T10SpyFrameLoader(images: images)
+        pipeline.refinerLoaderOverride = loader
+        pipeline.configureLiveRejection(enabled: true, kappa: 3.0, maxSampleBytes: 10_000_000)
+        Thread.sleep(forTimeInterval: 0.3)   // let the background pass finish and publish
+        pipeline.configureLiveRejection(enabled: false)   // turn OFF before end()
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(), "feature off must hide the published master")
+
+        let callsBeforeEnd = loader.callCount
+        let dir = try pipeline.end()
+        XCTAssertEqual(loader.callCount, callsBeforeEnd,
+                       "a disabled feature must not run ANY refine pass at end() — zero additional loader calls")
+
+        XCTAssertEqual(engine.stackFrameCount, 6)
+        let masterURL = dir.appendingPathComponent("master.fit")
+        let header = try FITSReader.readHeader(Data(contentsOf: masterURL))
+        XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 6,
+                      "feature off at end() must write the ONLINE master")
+    }
+
+    /// C3, hang-safety: shrink `finalRefineBudget` and inject a refiner whose loader sleeps per
+    /// sub — end() must still return promptly (bounded by the budget, not the sleep total) and
+    /// fall back to the online master. Mirrors the shutdown-drain hang tests above.
+    func testEndFinalRefineHangSafetyBoundedByFinalRefineBudget() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, engine, regs) = try t10RegisterSixSubs(sandbox: sandbox)
+        defer { source.stop() }
+
+        var images: [URL: AstroImage] = [:]
+        for reg in regs { images[reg.relayURL] = t10ConstImage(0.1) }
+        // Each per-sub reload takes 100 ms — far longer than the shrunken 200 ms final budget,
+        // so the final pass can load at most ~2 subs before its deadline check aborts it.
+        let loader = T10SpyFrameLoader(images: images, sleepPerCall: 0.1)
+        pipeline.refinerLoaderOverride = loader
+        pipeline.finalRefineBudget = .milliseconds(200)
+
+        // enabledRose fires a background pass too, but end() is called immediately — it is the
+        // FINAL pass's own deadline that must bound end(), not a lucky pre-published result.
+        pipeline.configureLiveRejection(enabled: true, kappa: 3.0, maxSampleBytes: 10_000_000)
+
+        let t0 = Date()
+        let dir = try pipeline.end()
+        let elapsed = Date().timeIntervalSince(t0)
+        XCTAssertLessThan(elapsed, 2.0,
+                          "end() must be bounded by finalRefineBudget, not hang on a per-sub-slow refiner")
+
+        XCTAssertEqual(engine.stackFrameCount, 6)
+        let masterURL = dir.appendingPathComponent("master.fit")
+        let header = try FITSReader.readHeader(Data(contentsOf: masterURL))
+        XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 6,
+                      "a final pass that hits its deadline must fall back to the ONLINE master")
+    }
+
+    /// THE cold-review regression this task exists to fix (Manifestation A from the bug report):
+    /// unlike the hang-safety test above (a loader that's merely SLOW per call — bounded today by
+    /// the BETWEEN-loads deadline check), this loader's reads never return AT ALL. Before the fix,
+    /// `refine`'s only liveness check runs between loads, never during one, so `end()`'s final
+    /// pass would hang on the very first wedged read regardless of `finalRefineBudget` — "End
+    /// Session" spins forever, master.fit never written. After the fix, `GlobalRefiner`'s bounded
+    /// per-sub load wait (shrunk here via `refinerPerSubLoadCapOverride`, independent of and far
+    /// below `finalRefineBudget`) caps the WAIT on each read; every one of the 6 survivors' reads
+    /// times out, quorum can't be reached, `refine` returns nil, and `end()` falls back to writing
+    /// the ONLINE master — never hanging.
+    func testEndSessionWithWedgedSurvivorReadStillFinalizes() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, engine, regs) = try t10RegisterSixSubs(sandbox: sandbox)
+        defer { source.stop() }
+
+        var images: [URL: AstroImage] = [:]
+        for reg in regs { images[reg.relayURL] = t10ConstImage(0.1) }
+        let loader = T10WedgedFrameLoader(images: images)
+        pipeline.refinerLoaderOverride = loader
+        // finalRefineBudget stays generous (30s default) — it must NOT be the thing that bounds
+        // this test; perSubLoadCap is the bound under test, shrunk far below it.
+        pipeline.refinerPerSubLoadCapOverride = .milliseconds(100)
+
+        // enabledRose fires a background pass too (also on this wedged loader, also now bounded
+        // by the shrunk perSubLoadCap) — end() is called immediately regardless.
+        pipeline.configureLiveRejection(enabled: true, kappa: 3.0, maxSampleBytes: 10_000_000)
+
+        let t0 = Date()
+        let dir = try pipeline.end()
+        let elapsed = Date().timeIntervalSince(t0)
+        loader.releaseAll()   // test hygiene: let every leaked worker thread exit
+
+        XCTAssertLessThan(elapsed, 5.0,
+                          "end() must be bounded by perSubLoadCap even when reads never return at " +
+                          "all (genuinely wedged, not merely slow) — must not hang past finalRefineBudget")
+
+        XCTAssertEqual(engine.stackFrameCount, 6)
+        let masterURL = dir.appendingPathComponent("master.fit")
+        let header = try FITSReader.readHeader(Data(contentsOf: masterURL))
+        XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 6,
+                      "every survivor's read is permanently wedged -> quorum can never be reached " +
+                      "-> the final pass must fall back to writing the ONLINE master, not hang")
+    }
 }

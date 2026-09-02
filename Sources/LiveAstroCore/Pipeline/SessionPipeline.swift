@@ -22,6 +22,19 @@ final class NSLock_Flag {
     func set() { lock.lock(); value = true; lock.unlock() }
 }
 
+/// Composite freshness key for a background-refiner-published master (Task 7): identifies exactly
+/// which generation / survivor-set / user-reject-state / κ a published master was computed from.
+/// `publishedMasterIfCurrent()` invalidates the stored master the instant ANY of these change —
+/// a reseed, a user reject, or a κ change — so broadcast/end() never consume a stale trail-free
+/// master. `survivorSubIndices` is the SORTED list of survivor `subIndex`es (unique per sub —
+/// byte-identical subs stay distinct entries, never collapsed to a digest set).
+public struct FreshnessKey: Equatable {
+    let stackGeneration: Int
+    let survivorSubIndices: [Int]
+    let userRejectGeneration: Int
+    let kappa: Float
+}
+
 /// Glue: watcher → loader → stretch → broadcast callback + snapshot + manifest (spec §5.1).
 /// Also supports native stacking mode: FrameSource → StackEngine → snapshot + manifest.
 /// UI-free so the end-to-end test and the app share the same wiring.
@@ -211,6 +224,292 @@ public final class SessionPipeline {
         }
     }
 
+    // MARK: SubRegistration cache (Task 5)
+    //
+    // Thread-safe cache of per-sub registration payloads so a later background refiner
+    // (Task 6) can reuse each accepted sub's transform/leveling/scale without re-registering.
+    // Keyed by `subIndex` (== `processedCount`, the monotonic per-sub ID also used for
+    // SubFrameRecord.index) — an ARRAY in capture order, NOT a FileIdentity/digest dict, so
+    // byte-identical subs still produce distinct entries.
+    private let regLock = NSLock()
+    private var _subRegistrations: [SubRegistration] = []          // guarded by regLock
+    private var _userRejected: Set<Int> = []                       // guarded by regLock; subIndexes
+
+    /// Test seam: the captured registrations in capture order. Thread-safe.
+    func subRegistrations() -> [SubRegistration] {
+        regLock.withLock { _subRegistrations }
+    }
+
+    /// The pipeline's own reject set (subIndexes), distinct from AppModel's UI array —
+    /// AppModel pushes the flagged subIndexes here (Task 11). Bumps `userRejectGeneration`
+    /// (part of `FreshnessKey`) and recomputes the cached key so a previously-published
+    /// master immediately goes stale. Thread-safe. `public` so `AppModel.toggleReject`
+    /// (a separate module) can call it — Task 8 left this `internal`, callable only from
+    /// `@testable import` test code, which would not compile from `LiveAstroStudio`.
+    public func setUserRejected(_ ids: Set<Int>) {
+        regLock.withLock {
+            _userRejected = ids
+            userRejectGeneration += 1
+            recomputeCachedFreshnessKeyLocked()
+        }
+    }
+
+    // MARK: Task 8 invalidation hooks — trigger the background GlobalRefiner
+    //
+    // Each hook is a named mutation point: it (re)establishes the cached `_freshnessKey` under
+    // `regLock` if it hasn't already been done at the call site, THEN notifies the refiner
+    // OUTSIDE the lock (`noteChanged()` itself never blocks, but keeping the notify out of the
+    // lock avoids growing `regLock`'s critical section for no reason). `currentRefiner()` is nil
+    // until live rejection is first enabled (see `configureLiveRejection` below) — every hook is
+    // therefore a safe no-op for feature-OFF parity: no refiner activity, no published master.
+
+    /// The lazily-created background refiner, or nil before live rejection has ever been enabled
+    /// this session. Thread-safe.
+    private func currentRefiner() -> GlobalRefiner? { regLock.withLock { _globalRefiner } }
+
+    /// Called from `handleNative` POST-COMMIT, only when a `SubRegistration` was actually
+    /// appended (an accepted sub with a registration payload). The T7 sub-append block already
+    /// recomputes `_freshnessKey` there — this hook does NOT recompute again (would double the
+    /// work every single sub); it only notifies.
+    func noteSubAccepted() {
+        currentRefiner()?.noteChanged()
+    }
+
+    /// User-reject-set-change notification hook (Task 11's `AppModel.toggleReject` calls this,
+    /// not the refiner directly). Bumps `userRejectGeneration` and recomputes the cached key —
+    /// mirrors what `setUserRejected` already does for its own callers, so calling both back to
+    /// back (the expected Task 11 usage: `setUserRejected(ids)` then `noteUserRejectChanged()`)
+    /// double-bumps the generation. That's harmless: `userRejectGeneration` only needs to differ
+    /// from whatever a previously-stamped `FreshnessKey` recorded, not increment exactly once per
+    /// logical event. `public` for the same cross-module reason as `setUserRejected` above.
+    public func noteUserRejectChanged() {
+        regLock.withLock {
+            userRejectGeneration += 1
+            recomputeCachedFreshnessKeyLocked()
+        }
+        currentRefiner()?.noteChanged()
+    }
+
+    /// Reseed notification hook. `reseed()` itself already bumps the engine's generation and
+    /// recomputes the cached key (T7 review fix) before calling this — so this hook only
+    /// notifies, avoiding a double recompute.
+    func noteReseeded() {
+        currentRefiner()?.noteChanged()
+    }
+
+    /// Subs of `currentGeneration`, minus any `subIndex` the user has flagged, in capture
+    /// order. Locks `regLock` — do NOT call from a context already holding it (use
+    /// `currentSurvivorsLocked` there instead, or it deadlocks the non-recursive NSLock).
+    func currentSurvivors(currentGeneration: Int) -> [SubRegistration] {
+        regLock.withLock { currentSurvivorsLocked(currentGeneration: currentGeneration) }
+    }
+
+    /// Same as `currentSurvivors`, but assumes the caller already holds `regLock` (e.g. the
+    /// Task 8 snapshot). No locking — calling `currentSurvivors` instead here re-enters the
+    /// non-recursive NSLock and deadlocks.
+    func currentSurvivorsLocked(currentGeneration: Int) -> [SubRegistration] {
+        _subRegistrations.filter { $0.stackGeneration == currentGeneration && !_userRejected.contains($0.subIndex) }
+    }
+
+    // MARK: FreshnessKey + publishedMaster (Task 7)
+    //
+    // A later background refiner (Task 6, GlobalRefiner) recombines the current survivor set
+    // off the hot path and publishes a trail-free master here. Broadcast/end() must consume it
+    // ONLY while it is still current — not stale after a reseed, a user reject, or a κ change —
+    // AND only while the live-rejection feature is on. `FreshnessKey` is the composite identity
+    // that pins all of that; `_freshnessKey` is a CACHE (M1) refreshed at every mutation point
+    // so the per-render broadcast path (`currentFreshnessKey()`) never re-sorts N survivor ids.
+    private var userRejectGeneration: Int = 0                      // guarded by regLock; part of FreshnessKey
+    /// Live-rejection feature gate (Task 11 wires this from AppModel via `configureLiveRejection`).
+    /// Deliberately NOT encoded in `FreshnessKey` — see `publishedMasterIfCurrent`.
+    private var liveRejectionActive: Bool = false                  // guarded by regLock
+    /// κ (sigma-clip multiple) the background refiner combines survivors with — part of
+    /// `FreshnessKey` so a κ change invalidates any published master computed with the old κ.
+    /// Defaults to `RejectionStrength.medium.kappa`: the engine's own `RejectionMethod` is a
+    /// private, non-introspectable instance (no public κ accessor), so there is no single
+    /// "current engine value" to read at init; Task 11's `configureLiveRejection(kappa:)` sets
+    /// the real value from `SessionSettings.rejectionStrength.kappa` once AppModel wires it.
+    private var liveRejectionKappa: Float = RejectionStrength.medium.kappa   // guarded by regLock
+    /// Cached composite key (M1) — refreshed by `recomputeCachedFreshnessKeyLocked()` at every
+    /// mutation point (sub appended, `setUserRejected`, κ change, generation change). Given a
+    /// sensible pre-first-sub initial value so `currentFreshnessKey()` is well-defined from t=0.
+    private var _freshnessKey = FreshnessKey(stackGeneration: 0, survivorSubIndices: [],
+                                             userRejectGeneration: 0, kappa: RejectionStrength.medium.kappa)
+    /// The background refiner's most recently published trail-free master, stamped with the
+    /// `FreshnessKey` it was computed from. `internal` — Task 6/11 publish here directly.
+    internal var publishedMaster: (image: AstroImage, coverage: [Float], survivorCount: Int, key: FreshnessKey)?   // guarded by regLock
+    /// RAM sample budget (bytes) the background refiner combines survivors with. NOT part of
+    /// `FreshnessKey` (unlike κ) — a budget-only change can't be detected via key comparison, so
+    /// `configureLiveRejection` clears `publishedMaster` explicitly when it changes (see below).
+    private var liveRejectionMaxSampleBytes: Int = GlobalRefiner.defaultMaxSampleBytes   // guarded by regLock
+    /// Quorum floor for the background refiner (both the materialized RAM sample and the final
+    /// survivor count) — same value as the Task 11 online gate. Not currently configurable via
+    /// `configureLiveRejection` (no brief-specified setter), so a plain constant.
+    private let liveRejectionMinSubs: Int = GlobalRefiner.defaultMinSubs
+    /// Task 8: the background refiner, OWNED by the pipeline and created LAZILY on the first
+    /// `configureLiveRejection(enabled: true, ...)` call — never before. This is the ownership/
+    /// lifetime choice that keeps feature-OFF parity trivially true: every Task 8 invalidation
+    /// hook (`noteSubAccepted`/`noteUserRejectChanged`/`noteReseeded`) calls
+    /// `currentRefiner()?.noteChanged()` UNCONDITIONALLY (no `liveRejectionActive` check) — if
+    /// live rejection has never been turned on this session, `_globalRefiner` is nil, so those
+    /// calls are no-ops: zero refiner queue activity, zero published master, byte-identical
+    /// output to today. (Holding a refiner for the whole session and gating its activity on
+    /// `liveRejectionActive` inside each hook would work too, but would need that check
+    /// duplicated at every call site instead of centralized in one nil check here.)
+    private var _globalRefiner: GlobalRefiner?   // guarded by regLock
+    /// Test seam: overrides the `FrameLoader` used when `_globalRefiner` is lazily created (nil =
+    /// production `ProductionFrameLoader`). Must be set BEFORE the first
+    /// `configureLiveRejection(enabled: true, ...)` call to take effect.
+    var refinerLoaderOverride: FrameLoader?
+    /// Task 10: the time budget for the ONE synchronous final refiner pass `end()` runs when
+    /// live rejection is active but no published master is current at shutdown (e.g. the last
+    /// accepted sub's background pass hadn't finished/published yet). This is the ONLY bound on
+    /// that final pass — step 4 already cancelled any in-flight background pass, so nothing else
+    /// cancels it; `refine`'s own between-sub deadline check (C3) aborts at this bound and `end()`
+    /// falls back to the online master, so `end()` can never hang on a wedged/slow final pass.
+    /// Distinct from `GlobalRefiner.passBudget` (the background trigger's own, longer, budget) —
+    /// this one gates end() itself, so it defaults shorter: long enough for a modest stack the
+    /// background pass hasn't yet caught up on, short enough that shutdown still feels bounded.
+    /// Internal so tests can shrink it (hang-safety test, C3).
+    var finalRefineBudget: DispatchTimeInterval = .seconds(30)
+    /// Test seam (cold-review wedged-read fix): overrides `GlobalRefiner.perSubLoadCap` on the
+    /// lazily-created `_globalRefiner`, so a shutdown test can shrink the per-sub bounded-load
+    /// wait far below `finalRefineBudget` and still run fast. nil = leave `GlobalRefiner`'s own
+    /// default. Must be set BEFORE the first `configureLiveRejection(enabled: true, ...)` call
+    /// (same timing requirement as `refinerLoaderOverride`).
+    var refinerPerSubLoadCapOverride: DispatchTimeInterval?
+
+    /// Recompute `_freshnessKey` from the current generation/survivors/reject-generation/κ.
+    /// Assumes the caller already holds `regLock` — calling `currentFreshnessKey()` (or any
+    /// other locking accessor) from here re-enters the non-recursive NSLock and deadlocks.
+    private func recomputeCachedFreshnessKeyLocked() {
+        let gen = engine?.currentStackGeneration ?? 0
+        let survivors = currentSurvivorsLocked(currentGeneration: gen).map(\.subIndex).sorted()
+        _freshnessKey = FreshnessKey(stackGeneration: gen, survivorSubIndices: survivors,
+                                     userRejectGeneration: userRejectGeneration, kappa: liveRejectionKappa)
+    }
+
+    /// O(1) locked read of the cached key (M1) — the broadcast-preference path calls this once
+    /// per render instead of re-sorting N survivor ids. Code already holding `regLock` (e.g. the
+    /// Task 8 snapshot) reads `_freshnessKey` directly instead of calling this.
+    public func currentFreshnessKey() -> FreshnessKey { regLock.withLock { _freshnessKey } }
+
+    /// Live-rejection config gate (Task 11 wires this from AppModel) — the ONE config-change
+    /// invalidation path (brief §Task 8). Every parameter is optional and defaults to "leave
+    /// unchanged", so the Task 7 single-parameter call sites (`configureLiveRejection(enabled:)`,
+    /// `configureLiveRejection(kappa:)`) still compile and behave exactly as before against this
+    /// widened signature — no call-site adaptation needed.
+    ///
+    /// Under `regLock`: compute old-vs-new enabled/κ/budget, update the three stored fields,
+    /// recompute `_freshnessKey` (κ IS part of the key, so a κ change alone already invalidates
+    /// any published master via the key comparison), and explicitly CLEAR a now-stale
+    /// `publishedMaster` when the feature just went OFF or the budget changed — budget is
+    /// deliberately NOT part of `FreshnessKey` (unlike κ), so a budget-only change would otherwise
+    /// leave a stale master's key still matching. Lazily creates `_globalRefiner` the first time
+    /// `enabled` turns (or is passed) true. `shouldNotify` is computed UNDER the lock from
+    /// lock-guarded state — never read again after releasing — then the refiner is notified
+    /// OUTSIDE the lock. `enabledRose` (OFF→ON, survivors already present) is the key case: it
+    /// must trigger a build immediately, not wait for the next sub/reject/reseed.
+    public func configureLiveRejection(enabled: Bool? = nil, kappa: Float? = nil, maxSampleBytes: Int? = nil) {
+        var shouldNotify = false
+        var refinerToNotify: GlobalRefiner?
+        regLock.withLock {
+            let oldEnabled = liveRejectionActive
+            let oldKappa = liveRejectionKappa
+            let oldBudget = liveRejectionMaxSampleBytes
+            let newEnabled = enabled ?? oldEnabled
+            let newKappa = kappa ?? oldKappa
+            let newBudget = maxSampleBytes ?? oldBudget
+
+            let enabledRose = !oldEnabled && newEnabled
+            let kappaChanged = newKappa != oldKappa
+            let budgetChanged = newBudget != oldBudget
+
+            liveRejectionActive = newEnabled
+            liveRejectionKappa = newKappa
+            liveRejectionMaxSampleBytes = newBudget
+            recomputeCachedFreshnessKeyLocked()
+            if !newEnabled || budgetChanged {
+                publishedMaster = nil   // belt-and-suspenders: not caught by the key comparison alone
+            }
+            if newEnabled, _globalRefiner == nil {
+                _globalRefiner = makeRefinerLocked()
+            }
+            shouldNotify = newEnabled && (enabledRose || kappaChanged || budgetChanged)
+            if shouldNotify { refinerToNotify = _globalRefiner }
+        }
+        if shouldNotify { refinerToNotify?.noteChanged() }
+    }
+
+    /// Builds a `GlobalRefiner` and wires its Task 8 closures back into the pipeline. Assumes the
+    /// caller already holds `regLock` (only ever called from inside `configureLiveRejection`) —
+    /// constructing the loader/closures here does not itself re-enter `regLock` or block.
+    private func makeRefinerLocked() -> GlobalRefiner {
+        let demosaic = engine?.demosaicMethod ?? .bilinear
+        // T8 review fix: pass the calibrator LAZILY (a closure re-read at pass time), not baked
+        // in here at refiner-creation time — see ProductionFrameLoader's doc for why. `[weak
+        // self]` because the loader can outlive a single pipeline reference in principle; nil
+        // (uncalibrated) is the same safe fallback `effectiveCalibrator` itself uses elsewhere.
+        let loader: FrameLoader = refinerLoaderOverride
+            ?? ProductionFrameLoader(calibratorProvider: { [weak self] in self?.effectiveCalibrator },
+                                     demosaic: demosaic)
+        let refiner = GlobalRefiner(loader: loader, onLog: { [weak self] msg in self?.onLog?(msg) })
+        if let cap = refinerPerSubLoadCapOverride { refiner.perSubLoadCap = cap }
+        refiner.makeSnapshot = { [weak self] in self?.makeRefinerSnapshot() }
+        refiner.publish = { [weak self] result, key in self?.publishRefineResult(result, key: key) }
+        refiner.kappaProvider = { [weak self] in self?.currentLiveRejectionKappa() ?? GlobalRefiner.defaultKappa }
+        refiner.maxSampleBytesProvider = { [weak self] in
+            self?.currentLiveRejectionMaxSampleBytes() ?? GlobalRefiner.defaultMaxSampleBytes
+        }
+        refiner.minSubsProvider = { [weak self] in self?.liveRejectionMinSubs ?? GlobalRefiner.defaultMinSubs }
+        return refiner
+    }
+
+    private func currentLiveRejectionKappa() -> Float { regLock.withLock { liveRejectionKappa } }
+    private func currentLiveRejectionMaxSampleBytes() -> Int { regLock.withLock { liveRejectionMaxSampleBytes } }
+
+    /// The `GlobalRefiner.makeSnapshot` seam — implements the stale-result race fix (brief
+    /// §"Stale-result race", exact order): (1) read the engine's CURRENT stack generation FIRST,
+    /// its own lock, released immediately — never hold `regLock` while touching the engine lock;
+    /// (2) under `regLock`, snapshot the survivors for that generation (non-locking variant — we
+    /// already hold the lock) and the CACHED `_freshnessKey` FIELD directly (never
+    /// `currentFreshnessKey()` — it re-acquires `regLock` and deadlocks); (3) release `regLock`,
+    /// then RE-READ the engine's generation — if it changed, a reseed raced the snapshot: discard
+    /// (return nil). The reseed that caused the race already called `noteReseeded()` →
+    /// `noteChanged()`, so `dirty` is set and a fresh pass follows.
+    private func makeRefinerSnapshot() -> PassSnapshot? {
+        guard let engine else { return nil }
+        let capturedGen = engine.currentStackGeneration
+        let (capturedSurvivors, capturedKey): ([SubRegistration], FreshnessKey) = regLock.withLock {
+            (currentSurvivorsLocked(currentGeneration: capturedGen), _freshnessKey)
+        }
+        guard engine.currentStackGeneration == capturedGen else { return nil }   // reseed raced the snapshot
+        return PassSnapshot(survivors: capturedSurvivors, currentGeneration: capturedGen, key: capturedKey)
+    }
+
+    /// The `GlobalRefiner.publish` seam — installs a completed pass's result stamped with the
+    /// SNAPSHOT's own key (never a freshly-read one — see `makeRefinerSnapshot` doc and the
+    /// stale-result race fix). If a reject/κ/reseed landed mid-pass, `_freshnessKey` has already
+    /// advanced past this `key`, so `publishedMasterIfCurrent()` correctly refuses to serve this
+    /// as current — the mutation that moved the key already triggered its own fresh pass.
+    private func publishRefineResult(_ result: RefineResult, key: FreshnessKey) {
+        regLock.withLock {
+            publishedMaster = (image: result.image, coverage: result.coverage,
+                               survivorCount: result.survivorCount, key: key)
+        }
+    }
+
+    /// Returns the published master ONLY while the live-rejection feature is ON and its stored
+    /// key still equals the CURRENT freshness key — i.e. no reseed, user reject, or κ change has
+    /// landed since it was published. Both reads happen under one `regLock` acquisition so a
+    /// concurrent publish/mutation can't be observed torn.
+    public func publishedMasterIfCurrent() -> (image: AstroImage, coverage: [Float], survivorCount: Int)? {
+        regLock.withLock {
+            guard liveRejectionActive, let pm = publishedMaster, pm.key == _freshnessKey else { return nil }
+            return (pm.image, pm.coverage, pm.survivorCount)
+        }
+    }
+
     private let adjLock = NSLock()
     private var _displayAdjustments = DisplayAdjustments.neutral
     /// Display-path adjustments. Read once per render; lock-guarded because the
@@ -378,19 +677,45 @@ public final class SessionPipeline {
     @discardableResult
     public func reseed() -> ReseedResult {
         guard let engine else { return .notNative }
-        return finalizationLock.withLock {
+        let result = finalizationLock.withLock { () -> ReseedResult in
             guard !finalizationClaimed else {
                 return finalizationFailedAfterClaim ? .finalizationRetryPending : .finalizationInProgress
             }
             guard source?.isFinite != true else { return .unavailableDuringImport }
             engine.reseed()
-            // Void any stored/in-flight solve so the new reference re-solves against its (fresh) stars.
-            // sourceMetadata is left as-is: reseed is a same-target re-establish (center unchanged), and
-            // it's owned by the serial frame-processing path — clearing it here would race that writer.
-            // (New-target metadata re-capture is out of 3a scope.)
-            invalidatePlateSolve()
             return .reseeded
         }
+        // Task 7 review fix: a manual reseed is a FreshnessKey mutation point (generation change)
+        // just like a sub append / setUserRejected / kappa change — refresh the cached key so
+        // publishedMasterIfCurrent() stops serving the pre-reseed master immediately, without
+        // waiting for the next accepted frame to happen to refresh it. Done AFTER finalizationLock
+        // is released (not nested inside it) to match the only other path that nests locks around
+        // recomputeCachedFreshnessKeyLocked() — the sub-append path in handleNative, which takes
+        // ONLY regLock (recomputeCachedFreshnessKeyLocked reads engine.currentStackGeneration,
+        // which independently acquires+releases the engine's own `lock`; the engine never calls
+        // back into the pipeline, so regLock -> engine.lock is a one-way leaf edge, not a cycle).
+        // No other path holds engine.lock while waiting on regLock, so this ordering is safe.
+        // By this point engine.reseed() (inside the block above) has already bumped the engine's
+        // generation, so the recompute observes the POST-reseed generation.
+        if result == .reseeded {
+            // Void any stored/in-flight solve so the new reference re-solves against its (fresh)
+            // stars. sourceMetadata is left as-is: reseed is a same-target re-establish (center
+            // unchanged), and it's owned by the serial frame-processing path — clearing it here
+            // would race that writer. (New-target metadata re-capture is out of 3a scope.)
+            // Cold-review MINOR fix: moved OUTSIDE finalizationLock (matches the AUTO-reseed path
+            // below, which already calls this with no lock held) — invalidatePlateSolve() calls
+            // the user's onSolveStateChanged? closure, and calling out to a UI closure under a
+            // non-recursive lock is a latent self-deadlock trap (e.g. a re-entrant reseed() call
+            // from inside that closure). No other behavior change: this still only runs once, only
+            // on the .reseeded outcome, and engine.reseed() has already run by this point.
+            invalidatePlateSolve()
+            regLock.withLock { recomputeCachedFreshnessKeyLocked() }
+            // Task 8: notify the background refiner AFTER the recompute above (this hook does not
+            // recompute again — reseed already did). A no-op when live rejection has never been
+            // enabled this session.
+            noteReseeded()
+        }
+        return result
     }
 
     /// Cancel an in-progress import: stops feeding new frames; end() finalizes
@@ -420,18 +745,43 @@ public final class SessionPipeline {
     /// throttled per-frame path and end()'s guaranteed final render. Sets lastRenderedAcceptedIndex.
     private func renderSnapshot(index: Int, sourceName: String, timestamp: Date, engine: StackEngine) {
         guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }
-        let mean = cropToCoverage(mean0, coverage: coverage)   // display shows the covered region (like master.fit)
+        let mean = cropToCoverage(mean0, coverage: coverage)   // online — feeds the PREVIEW, unchanged (Task 9)
         guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
         do {
             let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
-            let cg = try displayCGImage(from: displaySource)
+            let previewCG = try displayCGImage(from: displaySource)
+
+            // BROADCAST/latest.png (Task 9): prefer the background refiner's clean published
+            // master when it's still current (the T7 freshness gate — reject/κ/reseed/feature-off
+            // all invalidate it inside publishedMasterIfCurrent() itself); otherwise this is the
+            // SAME online source as the preview above — reuse its render rather than paying the
+            // display pipeline twice on the common (no-clean-master) path. The per-sub PREVIEW
+            // (onUpdate below) never consults publishedMasterIfCurrent() — it always renders from
+            // the online mean, exactly as before this task.
+            let published = publishedMasterIfCurrent()
+            let broadcastCG: CGImage
+            let broadcastMean: AstroImage
+            // T9b: when the CLEAN master is served, its depth is `survivorCount` (smaller than
+            // the online frame count after rejections) — use it so the overlay's integration time
+            // matches the displayed image. The online-fallback branch is unchanged.
+            let integrationFrames: Int
+            if let published {
+                broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
+                broadcastCG = try displayCGImage(from: broadcastMean.downsampled(maxLongEdge: importPreviewLongEdge))
+                integrationFrames = published.survivorCount
+            } else {
+                broadcastMean = mean
+                broadcastCG = previewCG
+                integrationFrames = engine.stackFrameCount
+            }
+
             let record = try recorder.save(
-                cgImage: cg, linear: mean, sourceFile: sourceName,
+                cgImage: broadcastCG, linear: broadcastMean, sourceFile: sourceName,
                 index: index, timestamp: timestamp,
-                estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
+                estimatedIntegrationSeconds: Double(integrationFrames) * profile.subExposureSeconds)
             try session.recordSnapshot(record)
             lastRenderedAcceptedIndex = index
-            onUpdate?(cg, record)
+            onUpdate?(previewCG, record)
         } catch {
             onLog?("Skipped frame (\(sourceName)): \(error)")
         }
@@ -625,6 +975,18 @@ public final class SessionPipeline {
                 // can differ). MUST run before attemptPlateSolveIfNeeded below so this frame's attempt
                 // sees the reset state (manual reseed() does the same via invalidatePlateSolve()).
                 invalidatePlateSolve()
+                // T8 review fix: an auto-reseed is a FreshnessKey mutation point (generation change)
+                // exactly like manual reseed() (see reseed()'s matching block ~681-685) — refresh the
+                // cached key HERE so publishedMasterIfCurrent() immediately stops serving a master built
+                // from the just-discarded reference, instead of staying stale until the next accepted
+                // sub's .becameReference append happens to recompute it. Lock-safety: neither `regLock`
+                // nor the engine lock is held at this point — `engine.processDetailed` above already
+                // acquired+released the engine's own lock — so this matches reseed()'s established
+                // regLock -> engine.lock leaf-edge ordering with no new cycle. By this point
+                // engine.autoReseedCount has already been bumped (checked just above), so the recompute
+                // observes the POST-reseed generation.
+                regLock.withLock { recomputeCachedFreshnessKeyLocked() }
+                noteReseeded()
                 onLog?("Auto-reseeded — the reference frame didn't match; re-seeding on the next good sub. (Earlier subs that couldn't register stay rejected.)")
             }
             attemptPlateSolveIfNeeded(engine: engine)   // idempotent; no-op until a reference is seeded
@@ -668,23 +1030,68 @@ public final class SessionPipeline {
             } catch {
                 onLog?("Failed to record sub-frame stats for \(frame.sourceName): \(error)")
             }
+            // Task 5: capture the registration cache for a later background refiner. No URL
+            // (e.g. an in-memory/synthetic frame) skips ONLY the cache insertion — the rest of
+            // handleNative (online render/progress) must continue regardless.
+            if let reg = result.registration, let relayURL = frame.sourceURL {
+                regLock.withLock {
+                    _subRegistrations.append(SubRegistration(
+                        subIndex: processedCount, contentDigest: frame.identity?.digest, relayURL: relayURL,
+                        stackGeneration: reg.stackGeneration, referenceIdentity: reg.referenceIdentity,
+                        transform: reg.transform, effectiveScale: reg.effectiveScale,
+                        weight: reg.weight, leveling: reg.leveling))
+                    // Task 7: a sub append changes the survivor set (and possibly the generation,
+                    // on the first sub of a new reference) — refresh the cached freshness key.
+                    recomputeCachedFreshnessKeyLocked()
+                }
+                // Task 8: notify the background refiner OUTSIDE regLock. The recompute above
+                // already refreshed `_freshnessKey` for this sub — noteSubAccepted() does NOT
+                // recompute again (would double the work every sub); it only notifies. A no-op
+                // when live rejection has never been enabled this session (currentRefiner() nil).
+                noteSubAccepted()
+            }
             switch outcome {
             case .becameReference, .stacked:
                 guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }
-                let mean = cropToCoverage(mean0, coverage: coverage)   // display shows the covered region (like master.fit)
+                let mean = cropToCoverage(mean0, coverage: coverage)   // online — feeds the PREVIEW, unchanged (Task 9)
                 guard let recorder else {
                     onLog?("recorder missing — frame dropped (\(frame.sourceName))")
                     return
                 }
                 do {
-                    let cg = try displayCGImage(from: mean)
+                    let previewCG = try displayCGImage(from: mean)
+
+                    // BROADCAST/latest.png (Task 9): prefer the background refiner's clean
+                    // published master when it's still current, else this is the SAME online
+                    // source as the preview above — reuse its render rather than paying the
+                    // display pipeline twice on the common (no-clean-master) path. The per-sub
+                    // PREVIEW (onUpdate below) never consults publishedMasterIfCurrent() — it
+                    // always renders from the online mean, exactly as before this task.
+                    let published = publishedMasterIfCurrent()
+                    let broadcastCG: CGImage
+                    let broadcastMean: AstroImage
+                    // T9b: when the CLEAN master is served, its depth is `survivorCount` (smaller
+                    // than the online frame count after rejections) — use it so the overlay's
+                    // integration time matches the displayed image. The online-fallback branch is
+                    // unchanged.
+                    let integrationFrames: Int
+                    if let published {
+                        broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
+                        broadcastCG = try displayCGImage(from: broadcastMean)
+                        integrationFrames = published.survivorCount
+                    } else {
+                        broadcastMean = mean
+                        broadcastCG = previewCG
+                        integrationFrames = engine.stackFrameCount
+                    }
+
                     // Pass the raw un-neutralized mean as linear: stats stay raw for v1.1 cloud gate.
                     let record = try recorder.save(
-                        cgImage: cg, linear: mean, sourceFile: frame.sourceName,
+                        cgImage: broadcastCG, linear: broadcastMean, sourceFile: frame.sourceName,
                         index: engine.acceptedCount, timestamp: frame.timestamp,
-                        estimatedIntegrationSeconds: Double(engine.stackFrameCount) * profile.subExposureSeconds)
+                        estimatedIntegrationSeconds: Double(integrationFrames) * profile.subExposureSeconds)
                     try session.recordSnapshot(record)
-                    onUpdate?(cg, record)
+                    onUpdate?(previewCG, record)
                 } catch {
                     onLog?("Skipped frame (\(frame.sourceName)): \(error)")
                 }
@@ -783,9 +1190,19 @@ public final class SessionPipeline {
         // Single locked read of image + coverage + frameCount so a frame commit or
         // reseed landing mid-snapshot can't tear the file (pixels from one stack state,
         // STACKCNT/TOTALEXP from another). Nil ⇒ no live stack yet ⇒ write nothing.
+        // NOTE: this always sources the ONLINE stack (`engine.masterSnapshotState()`), never the
+        // background refiner's clean/trail-rejected `publishedMaster` — even when live rejection
+        // is ON. This is a documented SCOPE gap, not a parity regression: a proper `end()` still
+        // writes the clean artifact via the frozen-facts path above; a synchronous refine on the
+        // idle-tick path was judged too risky (unbounded I/O on a timer). Logged below so the gap
+        // is discoverable from the session log rather than silent.
         guard let snap = engine.masterSnapshotState() else {
             onLog?("master snapshot skipped — no live stack")
             return false
+        }
+        if regLock.withLock({ liveRejectionActive }) {
+            onLog?("master snapshot: writing ONLINE stack (idle safeguard does not use the clean "
+                + "live-rejection master — the clean master.fit is written at End Session)")
         }
         let frameCount = snap.frameCount                              // STACKCNT source (same read as pixels)
         let master = cropToCoverage(snap.image, coverage: snap.coverage)   // crop BEFORE balance
@@ -793,6 +1210,9 @@ public final class SessionPipeline {
             ? AutoStretch.neutralizeBackgroundAdditive(master)
             : master
         let totalExp = Double(frameCount) * profile.subExposureSeconds
+        // THEORETICAL: cross-thread read of sourceMetadata from the idle-safeguard tick; written
+        // once on first frame, safeguard fires only on 30s idle boundaries, so a torn read is
+        // vanishingly unlikely. Left un-locked to avoid burdening the hot consume path.
         let data = FITSWriter.float32(
             width: balanced.width, height: balanced.height,
             channels: balanced.channels, pixels: balanced.pixels,
@@ -1015,8 +1435,32 @@ public final class SessionPipeline {
             // (display path uses additive+multiplicative; the saved master gets additive-only so
             // colour ratios stay physically calibratable). Crop happens BEFORE balance so balance
             // operates on the final spatial extent.
+            // Task 10: FREEZE every clean-master input before computing/choosing anything, so
+            // nothing that lands after this point (a late configureLiveRejection, a reject —
+            // reject is separately blocked once finalization begins, Task 11 P2-1) can alter the
+            // written master. Order matters: read the engine's generation FIRST, its own lock,
+            // released immediately, THEN snapshot the rest under regLock in ONE acquisition —
+            // never hold regLock while touching the engine lock. `frozen.key`/`frozen.active`/
+            // `frozen.kappa`/`frozen.budget`/`frozen.published` are direct field reads (never
+            // `currentFreshnessKey()`/`publishedMasterIfCurrent()`, which re-acquire regLock and
+            // would deadlock here since we already hold it).
             var finalization: SessionFinalizationFacts?
             if let eng = engine {
+                let frozenGen = eng.currentStackGeneration
+                let frozen: (survivors: [SubRegistration], key: FreshnessKey, active: Bool,
+                            kappa: Float, budget: Int,
+                            published: (image: AstroImage, coverage: [Float], survivorCount: Int, key: FreshnessKey)?)
+                frozen = regLock.withLock {
+                    (currentSurvivorsLocked(currentGeneration: frozenGen), _freshnessKey, liveRejectionActive,
+                     liveRejectionKappa, liveRejectionMaxSampleBytes, publishedMaster)
+                }
+
+                // Cancel any in-flight background refiner pass. Bounded: the running pass checks
+                // the cancellation flag BETWEEN subs (C3), so it unwinds on its own within one
+                // sub's load time — end() does not block waiting for it; the final pass below (if
+                // any) is bounded independently by its own deadline.
+                currentRefiner()?.cancel()
+
                 let final = try eng.finalizationState()
                 let outcome: MasterOutcome
                 switch final.stackState {
@@ -1024,17 +1468,53 @@ public final class SessionPipeline {
                     guard let master0 = final.image else {
                         throw StackEngine.FinalizationError.invariantBreach
                     }
-                    let master = cropToCoverage(master0, coverage: final.coverage)   // crop BEFORE balance
-                    let balanced = neutralizeBackground
-                        ? AutoStretch.neutralizeBackgroundAdditive(master)
-                        : master
-                    let totalExp = Double(final.frameCount) * profile.subExposureSeconds
-                    let masterData = FITSWriter.float32(
-                        width: balanced.width, height: balanced.height,
-                        channels: balanced.channels, pixels: balanced.pixels,
-                        metadata: sourceMetadata,
-                        stackCount: final.frameCount,
-                        totalExposureSeconds: totalExp)
+                    // Choose the master using ONLY the frozen values above (never the live
+                    // liveRejectionActive/_freshnessKey/publishedMaster — those may have moved).
+                    var clean: (image: AstroImage, coverage: [Float], survivorCount: Int)?
+                    if frozen.active {
+                        if let pub = frozen.published, pub.key == frozen.key {
+                            // A background pass already published a master current as of the
+                            // freeze — use it, no final pass needed.
+                            clean = (pub.image, pub.coverage, pub.survivorCount)
+                        } else if let refiner = currentRefiner() {
+                            // No current published master — run ONE bounded final pass against the
+                            // FROZEN survivor set. The deadline alone bounds it (step 4 already
+                            // cancelled the background pass, so nothing else cancels this one); a
+                            // nil result (deadline/failure) falls back to the online master below.
+                            let result = refiner.refine(
+                                survivors: frozen.survivors, currentGeneration: frozenGen,
+                                kappa: frozen.kappa, minSubs: liveRejectionMinSubs,
+                                maxSampleBytes: frozen.budget,
+                                deadline: .now() + finalRefineBudget,
+                                isCancelled: { false })
+                            if let result {
+                                clean = (result.image, result.coverage, result.survivorCount)
+                            }
+                        }
+                    }
+                    // frozen.active == false → the clean path is skipped entirely (feature-off
+                    // parity fix): no publishedMaster use, no final refine — `clean` stays nil and
+                    // the online master below is written, byte-identical to today.
+
+                    // All output goes through the shared crop-to-coverage + additive-neutralize +
+                    // FITS-metadata path (RestackPlanning.encodeMaster) — same path a post-session
+                    // re-stack uses — so master.fit never diverges pixel-for-pixel between the two.
+                    let report: RestackReport
+                    if let clean {
+                        // CLEAN global result: STACKCNT/TOTALEXP reflect the count that actually
+                        // combined into the written pixels, not the online engine's frame count.
+                        report = RestackReport(master: clean.image, stackedCount: clean.survivorCount,
+                                               skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
+                                               coverage: clean.coverage)
+                    } else {
+                        // Online fallback / feature-off: EXACTLY today's counts, for byte parity.
+                        report = RestackReport(master: master0, stackedCount: final.frameCount,
+                                               skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
+                                               coverage: final.coverage)
+                    }
+                    let masterData = RestackPlanning.encodeMaster(
+                        report, neutralize: neutralizeBackground,
+                        metadata: sourceMetadata, subExposureSeconds: profile.subExposureSeconds)
                     try masterData.write(to: dir.appendingPathComponent("master.fit"))
                     outcome = .written
                 case .awaitingSeedAfterReseed:

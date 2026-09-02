@@ -14,14 +14,20 @@ public struct RawFrame {
     /// inode/mtime — and skip one whose bytes changed on disk since capture, rather than
     /// silently stacking different bytes. nil for frames not loaded from a file (in-memory/synthetic).
     public let identity: FileIdentity?
+    /// The on-disk URL this frame was read from, captured at load time. Threaded through so a
+    /// later background refiner (Task 6) can re-open the exact sub without reconstructing a path
+    /// from `sourceName` (fragile: basename collisions, folder replacement). nil default for
+    /// back-compat and for frames not loaded from a file (in-memory/synthetic).
+    public let sourceURL: URL?
 
     public init(image: AstroImage, bayerPattern: BayerPattern?, bottomUp: Bool,
                 timestamp: Date, sourceName: String, metadata: SourceMetadata? = nil,
-                identity: FileIdentity? = nil) {
+                identity: FileIdentity? = nil, sourceURL: URL? = nil) {
         self.image = image; self.bayerPattern = bayerPattern; self.bottomUp = bottomUp
         self.timestamp = timestamp; self.sourceName = sourceName
         self.metadata = metadata
         self.identity = identity
+        self.sourceURL = sourceURL
     }
 }
 
