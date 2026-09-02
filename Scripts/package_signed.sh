@@ -32,6 +32,11 @@ BUNDLE_NAME="LiveAstroStudio_LiveAstroStudio.bundle"
 ENTITLEMENTS="Scripts/LiveAstroStudio.entitlements"
 SCRATCH="/private/tmp/las-release-build"
 BUNDLE_ID="com.pauldavis.liveastrostudio"
+# Volume name for the DMG. Deliberately UNSPACED: with a space ("LiveAstro Studio") hdiutil
+# can fail while populating the mounted volume — "could not access /Volumes/LiveAstro Studio/
+# LiveAstroStudio.app - Operation not permitted" — under sandboxed/automated runs, which is why
+# DMG builds appeared "blocked" here for several releases. Unspaced builds reliably.
+VOLNAME="LiveAstroStudio"
 
 : "${DEVID:?Set DEVID to your 'Developer ID Application: Name (TEAMID)' identity. Run: security find-identity -v -p codesigning}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"   # empty = sign only, skip notarization
@@ -108,7 +113,7 @@ echo "== build DMG =="
 STAGING=$(mktemp -d)
 cp -R "$APP" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
-hdiutil create -volname "LiveAstro Studio" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
+hdiutil create -volname "$VOLNAME" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGING"
 echo "   wrote $DMG"
 
@@ -127,7 +132,7 @@ xcrun stapler staple "$APP"
 STAGING=$(mktemp -d)
 cp -R "$APP" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
-hdiutil create -volname "LiveAstro Studio" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
+hdiutil create -volname "$VOLNAME" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGING"
 xcrun stapler staple "$DMG"
 

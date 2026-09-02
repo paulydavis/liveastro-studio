@@ -10,6 +10,11 @@ VERSION="${1:-1.1.0}"
 APP=dist/LiveAstroStudio.app
 DMG="dist/LiveAstroStudio-$VERSION.dmg"
 BUNDLE_NAME="LiveAstroStudio_LiveAstroStudio.bundle"
+# Volume name for the DMG. Deliberately UNSPACED: with a space ("LiveAstro Studio") hdiutil
+# can fail while populating the mounted volume — "could not access /Volumes/LiveAstro Studio/
+# LiveAstroStudio.app - Operation not permitted" — under sandboxed/automated runs, which is why
+# DMG builds appeared "blocked" here for several releases. Unspaced builds reliably.
+VOLNAME="LiveAstroStudio"
 
 echo "== release build =="
 swift build -c release
@@ -44,6 +49,6 @@ echo "== create DMG =="
 STAGING=$(mktemp -d)
 cp -R "$APP" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
-hdiutil create -volname "LiveAstro Studio" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
+hdiutil create -volname "$VOLNAME" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGING"
 echo "done: $DMG"
