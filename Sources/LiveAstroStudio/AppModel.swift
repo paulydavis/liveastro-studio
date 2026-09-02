@@ -983,18 +983,13 @@ final class AppModel {
         return LiveRejectionGate.isLocalPath(folder)
     }
 
-    /// Proxy for the background refiner's survivor count, for the STATUS CAPTION only (the
-    /// refiner's own quorum check inside `GlobalRefiner.refine` is the actual gate — this is
-    /// purely so the operator sees an accurate "need ≥ N subs" / "active: N subs" line without
-    /// AppModel reaching into the pipeline's private `SubRegistration` cache). Accepted subs
-    /// minus whatever the operator has since flagged, mirroring `currentSurvivors` minus the
-    /// generation filter (AppModel doesn't track `stackGeneration`; a reseed already shows as
-    /// "reseeding" via the gate, and this count settles again once the new generation's subs
-    /// start landing).
-    /// Review P3: ask the pipeline for the CURRENT-generation survivor count (what the refiner
-    /// actually combines) instead of counting every accepted app record — after a reseed the
-    /// old-generation subs are no longer in the clean master, but they stayed in `subFrames`
-    /// and kept inflating the caption. No pipeline (no session) → 0.
+    /// The background refiner's survivor count, for the STATUS CAPTION only (the refiner's own
+    /// quorum check inside `GlobalRefiner.refine` is the actual gate — this exists purely so the
+    /// operator sees an accurate "need ≥ N subs" / "active: N subs" line). Sourced from
+    /// `SessionPipeline.currentSurvivorCount()`: the CURRENT stack generation's registered subs
+    /// minus the ones the operator has flagged — exactly the set the refiner combines, so the
+    /// caption can never count pre-reseed subs the clean master no longer contains. No pipeline
+    /// (no session yet) → 0.
     private var liveRejectionSubCount: Int {
         pipeline?.currentSurvivorCount() ?? 0
     }

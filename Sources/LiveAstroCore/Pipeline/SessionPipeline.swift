@@ -391,9 +391,11 @@ public final class SessionPipeline {
     /// `private` — a `private` property is invisible outside this file regardless of
     /// `@testable`).
     internal var publishedMaster: PublishedMaster?   // guarded by regLock
-    /// RAM sample budget (bytes) the background refiner combines survivors with. NOT part of
-    /// `FreshnessKey` (unlike κ) — a budget-only change can't be detected via key comparison, so
-    /// `configureLiveRejection` clears `publishedMaster` explicitly when it changes (see below).
+    /// RAM sample budget (bytes) the background refiner combines survivors with. Part of
+    /// `FreshnessKey` alongside κ (review P2), so a budget change invalidates any published
+    /// master via the key comparison — including one an in-flight pass publishes LATER under the
+    /// key it snapshotted before the change. `configureLiveRejection` additionally clears
+    /// `publishedMaster` on a budget change as belt-and-suspenders (see below).
     private var liveRejectionMaxSampleBytes: Int = GlobalRefiner.defaultMaxSampleBytes   // guarded by regLock
     /// Quorum floor for the background refiner (both the materialized RAM sample and the final
     /// survivor count) — same value as the Task 11 online gate. Not currently configurable via
@@ -471,6 +473,7 @@ public final class SessionPipeline {
     public func configureLiveRejection(enabled: Bool? = nil, kappa: Float? = nil, maxSampleBytes: Int? = nil) {
         var shouldNotify = false
         var refinerToNotify: GlobalRefiner?
+        var refinerToCancel: GlobalRefiner?
         regLock.withLock {
             let oldEnabled = liveRejectionActive
             let oldKappa = liveRejectionKappa
@@ -480,6 +483,7 @@ public final class SessionPipeline {
             let newBudget = maxSampleBytes ?? oldBudget
 
             let enabledRose = !oldEnabled && newEnabled
+            let enabledFell = oldEnabled && !newEnabled
             let kappaChanged = newKappa != oldKappa
             let budgetChanged = newBudget != oldBudget
 
@@ -488,14 +492,24 @@ public final class SessionPipeline {
             liveRejectionMaxSampleBytes = newBudget
             recomputeCachedFreshnessKeyLocked()
             if !newEnabled || budgetChanged {
-                publishedMaster = nil   // belt-and-suspenders: not caught by the key comparison alone
+                publishedMaster = nil   // belt-and-suspenders on top of the key: OFF is what the key can't express
             }
             if newEnabled, _globalRefiner == nil {
                 _globalRefiner = makeRefinerLocked()
             }
             shouldNotify = newEnabled && (enabledRose || kappaChanged || budgetChanged)
             if shouldNotify { refinerToNotify = _globalRefiner }
+            // Follow-on review P2: "off" must mean STOP WORKING NOW, not just "hide the output".
+            // Gating the hooks/snapshot stops FUTURE passes, but a pass that already captured its
+            // snapshot keeps loading/warping/combining until it naturally finishes — for minutes
+            // on real 26 MP data — after the user turned the feature off precisely because it was
+            // burning CPU/I/O. Cancel it: the pass observes the stop between loads (and within
+            // one bounded load), unwinds to nil, and never publishes.
+            if enabledFell { refinerToCancel = _globalRefiner }
         }
+        // Both outside regLock: cancel() takes only the refiner's passLock, noteChanged() only its
+        // triggerLock — neither needs (or may re-enter) regLock.
+        refinerToCancel?.cancel()
         if shouldNotify { refinerToNotify?.noteChanged() }
     }
 

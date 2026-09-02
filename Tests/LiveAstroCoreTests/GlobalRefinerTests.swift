@@ -1267,6 +1267,51 @@ final class GlobalRefinerTests: XCTestCase {
                        "after a reseed the old generation's subs are no longer survivors")
     }
 
+    /// Follow-on review P2: turning the feature OFF must cancel a pass that is ALREADY running,
+    /// not just gate future ones — a pass past its snapshot otherwise keeps loading/warping/
+    /// combining until it naturally finishes (minutes on real 26 MP data) after the user turned
+    /// the feature off because it was burning CPU/I/O; its publish was merely hidden. A gated
+    /// loader parks the enable-ON pass on its first load; disable; release: the pass must abort
+    /// at its next stop check — no further loads, no publish.
+    func testTurningLiveRejectionOffCancelsTheInFlightPass() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "OffCancels", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let source = StubLiveSource(sequence: [
+            stubFrame(dx: 0, dy: 0, name: "o1.fit", digest: "od1", timestamp: 0),
+            stubFrame(dx: 1.0, dy: -0.5, name: "o2.fit", digest: "od2", timestamp: 1),
+            stubFrame(dx: 1.6, dy: 0.3, name: "o3.fit", digest: "od3", timestamp: 2)])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 3).count, 3)
+
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let loader = FirstCallGatedLoader(image: constImage(0.5), entered: entered, release: release)
+        pipeline.refinerLoaderOverride = loader   // picked up when the refiner is created below
+
+        pipeline.configureLiveRejection(enabled: true)   // enable-ON pass starts, parks on the first load
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success, "the enable-ON pass must reach the loader")
+        let refiner = try XCTUnwrap(pipeline.refinerForTest())
+        XCTAssertEqual(refiner.passesRun, 1)
+
+        pipeline.configureLiveRejection(enabled: false)   // OFF while the pass is mid-flight
+        release.signal()                                  // let the parked load return
+        Thread.sleep(forTimeInterval: 0.5)                // the pass reaches its next stop check and unwinds
+
+        XCTAssertEqual(loader.callCount, 1,
+                       "the cancelled pass must not load any further sub — before the fix it went on to load all 3")
+        XCTAssertNil(pipeline.publishedMaster,
+                     "the cancelled pass must not publish — before the fix it completed and published under the old key")
+        XCTAssertEqual(refiner.passesRun, 1, "no rerun follows: nothing is dirty and the feature is off")
+    }
+
     /// (b) Parked-pass / stale-result race: a pass starts and blocks mid-load; while it's parked,
     /// a user reject lands (`setUserRejected` + `noteUserRejectChanged`, mirroring the expected
     /// Task 11 `AppModel.toggleReject` call pattern). The in-flight pass must publish under its
