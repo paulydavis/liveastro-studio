@@ -991,8 +991,12 @@ final class AppModel {
     /// generation filter (AppModel doesn't track `stackGeneration`; a reseed already shows as
     /// "reseeding" via the gate, and this count settles again once the new generation's subs
     /// start landing).
+    /// Review P3: ask the pipeline for the CURRENT-generation survivor count (what the refiner
+    /// actually combines) instead of counting every accepted app record — after a reseed the
+    /// old-generation subs are no longer in the clean master, but they stayed in `subFrames`
+    /// and kept inflating the caption. No pipeline (no session) → 0.
     private var liveRejectionSubCount: Int {
-        subFrames.filter { $0.outcome != .rejected && !$0.rejectedByUser }.count
+        pipeline?.currentSurvivorCount() ?? 0
     }
 
     /// The resolved live trail-rejection status for the CaptureSettingsView caption (Task 11).

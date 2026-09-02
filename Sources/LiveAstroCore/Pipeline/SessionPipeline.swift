@@ -25,14 +25,19 @@ final class NSLock_Flag {
 /// Composite freshness key for a background-refiner-published master (Task 7): identifies exactly
 /// which generation / survivor-set / user-reject-state / κ a published master was computed from.
 /// `publishedMasterIfCurrent()` invalidates the stored master the instant ANY of these change —
-/// a reseed, a user reject, or a κ change — so broadcast/end() never consume a stale trail-free
-/// master. `survivorSubIndices` is the SORTED list of survivor `subIndex`es (unique per sub —
-/// byte-identical subs stay distinct entries, never collapsed to a digest set).
+/// a reseed, a user reject, a κ change, or a sample-budget change — so broadcast/end() never
+/// consume a stale trail-free master. `survivorSubIndices` is the SORTED list of survivor
+/// `subIndex`es (unique per sub — byte-identical subs stay distinct entries, never collapsed to
+/// a digest set). `maxSampleBytes` is in the key (review P2) because clearing `publishedMaster`
+/// on a budget change was not enough: a pass already in flight snapshotted the OLD key, and
+/// with the budget absent from it that pass could publish a master computed under the old
+/// budget and have it read as "current" again.
 public struct FreshnessKey: Equatable {
     let stackGeneration: Int
     let survivorSubIndices: [Int]
     let userRejectGeneration: Int
     let kappa: Float
+    let maxSampleBytes: Int
 }
 
 /// The background refiner's most recently published trail-free master (Task 6/7), stamped with
@@ -287,12 +292,36 @@ public final class SessionPipeline {
     /// this session. Thread-safe.
     private func currentRefiner() -> GlobalRefiner? { regLock.withLock { _globalRefiner } }
 
+    /// Review P2/P3: the refiner to NOTIFY — nil while the feature is OFF, so the invalidation
+    /// hooks (`noteSubAccepted` / `noteUserRejectChanged` / `noteReseeded`) start no background
+    /// work once the user has turned live rejection off (the cache still updates; only the
+    /// trigger is suppressed). `configureLiveRejection` notifies through its own captured
+    /// reference when the feature turns ON, so enable-ON-mid-session still builds immediately.
+    private func activeRefiner() -> GlobalRefiner? {
+        regLock.withLock { liveRejectionActive ? _globalRefiner : nil }
+    }
+
+    /// Test seam (review P2/P3): the owned refiner regardless of enabled state, so a test can
+    /// observe `passesRun` and prove the invalidation hooks start NO pass while the feature is
+    /// off — and that enable-ON still does. Mirrors the other `...ForTest` seams; not for product code.
+    func refinerForTest() -> GlobalRefiner? { currentRefiner() }
+
+    /// Survivor count of the CURRENT stack generation, minus user-rejected subs — what the
+    /// refiner actually combines. For the operator caption (review P3): the app-side count of
+    /// all accepted records kept counting pre-reseed subs the refiner had already discarded.
+    /// Reads the engine generation first (engine lock, released) and only then takes `regLock`
+    /// — the established leaf ordering; never nests them.
+    public func currentSurvivorCount() -> Int {
+        let gen = engine?.currentStackGeneration ?? 0
+        return regLock.withLock { currentSurvivorsLocked(currentGeneration: gen).count }
+    }
+
     /// Called from `handleNative` POST-COMMIT, only when a `SubRegistration` was actually
     /// appended (an accepted sub with a registration payload). The T7 sub-append block already
     /// recomputes `_freshnessKey` there — this hook does NOT recompute again (would double the
     /// work every single sub); it only notifies.
     func noteSubAccepted() {
-        currentRefiner()?.noteChanged()
+        activeRefiner()?.noteChanged()
     }
 
     /// User-reject-set-change notification hook (Task 11's `AppModel.toggleReject` calls this,
@@ -307,14 +336,14 @@ public final class SessionPipeline {
             userRejectGeneration += 1
             recomputeCachedFreshnessKeyLocked()
         }
-        currentRefiner()?.noteChanged()
+        activeRefiner()?.noteChanged()
     }
 
     /// Reseed notification hook. `reseed()` itself already bumps the engine's generation and
     /// recomputes the cached key (T7 review fix) before calling this — so this hook only
     /// notifies, avoiding a double recompute.
     func noteReseeded() {
-        currentRefiner()?.noteChanged()
+        activeRefiner()?.noteChanged()
     }
 
     /// Subs of `currentGeneration`, minus any `subIndex` the user has flagged, in capture
@@ -354,7 +383,8 @@ public final class SessionPipeline {
     /// mutation point (sub appended, `setUserRejected`, κ change, generation change). Given a
     /// sensible pre-first-sub initial value so `currentFreshnessKey()` is well-defined from t=0.
     private var _freshnessKey = FreshnessKey(stackGeneration: 0, survivorSubIndices: [],
-                                             userRejectGeneration: 0, kappa: RejectionStrength.medium.kappa)
+                                             userRejectGeneration: 0, kappa: RejectionStrength.medium.kappa,
+                                             maxSampleBytes: GlobalRefiner.defaultMaxSampleBytes)
     /// The background refiner's most recently published trail-free master, stamped with the
     /// `FreshnessKey` it was computed from. `internal` — Task 6/11 publish here directly (and
     /// tests construct/inspect it via `@testable import`, which requires `internal`+, not
@@ -373,10 +403,13 @@ public final class SessionPipeline {
     /// `configureLiveRejection(enabled: true, ...)` call — never before. This is the ownership/
     /// lifetime choice that keeps feature-OFF parity trivially true: every Task 8 invalidation
     /// hook (`noteSubAccepted`/`noteUserRejectChanged`/`noteReseeded`) calls
-    /// `currentRefiner()?.noteChanged()` UNCONDITIONALLY (no `liveRejectionActive` check) — if
-    /// live rejection has never been turned on this session, `_globalRefiner` is nil, so those
-    /// calls are no-ops: zero refiner queue activity, zero published master, byte-identical
-    /// output to today. (Holding a refiner for the whole session and gating its activity on
+    /// `activeRefiner()?.noteChanged()` — if live rejection has never been turned on this
+    /// session, `_globalRefiner` is nil, so those calls are no-ops: zero refiner queue activity,
+    /// zero published master, byte-identical output to today. Review P2/P3 added the second
+    /// layer: `activeRefiner()` is ALSO nil while the feature is currently OFF, so a refiner
+    /// created earlier in the session does no hidden reload/warp/combine work after the user
+    /// turns the feature off (its output would have been hidden anyway; its CPU/I/O was not).
+    /// (Holding a refiner for the whole session and gating its activity on
     /// `liveRejectionActive` inside each hook would work too, but would need that check
     /// duplicated at every call site instead of centralized in one nil check here.)
     private var _globalRefiner: GlobalRefiner?   // guarded by regLock
@@ -409,7 +442,8 @@ public final class SessionPipeline {
         let gen = engine?.currentStackGeneration ?? 0
         let survivors = currentSurvivorsLocked(currentGeneration: gen).map(\.subIndex).sorted()
         _freshnessKey = FreshnessKey(stackGeneration: gen, survivorSubIndices: survivors,
-                                     userRejectGeneration: userRejectGeneration, kappa: liveRejectionKappa)
+                                     userRejectGeneration: userRejectGeneration, kappa: liveRejectionKappa,
+                                     maxSampleBytes: liveRejectionMaxSampleBytes)
     }
 
     /// O(1) locked read of the cached key (M1) — the broadcast-preference path calls this once
@@ -424,11 +458,12 @@ public final class SessionPipeline {
     /// widened signature — no call-site adaptation needed.
     ///
     /// Under `regLock`: compute old-vs-new enabled/κ/budget, update the three stored fields,
-    /// recompute `_freshnessKey` (κ IS part of the key, so a κ change alone already invalidates
-    /// any published master via the key comparison), and explicitly CLEAR a now-stale
-    /// `publishedMaster` when the feature just went OFF or the budget changed — budget is
-    /// deliberately NOT part of `FreshnessKey` (unlike κ), so a budget-only change would otherwise
-    /// leave a stale master's key still matching. Lazily creates `_globalRefiner` the first time
+    /// recompute `_freshnessKey` (κ AND the sample budget are both part of the key, so either
+    /// change alone already invalidates any published master via the key comparison — and,
+    /// review P2, also invalidates a master an in-flight pass publishes LATER under the key it
+    /// snapshotted before the change), and explicitly CLEAR a now-stale `publishedMaster` when
+    /// the feature just went OFF or the budget changed (belt-and-suspenders on top of the key —
+    /// the OFF case is what the key cannot express). Lazily creates `_globalRefiner` the first time
     /// `enabled` turns (or is passed) true. `shouldNotify` is computed UNDER the lock from
     /// lock-guarded state — never read again after releasing — then the refiner is notified
     /// OUTSIDE the lock. `enabledRose` (OFF→ON, survivors already present) is the key case: it
@@ -503,9 +538,15 @@ public final class SessionPipeline {
     private func makeRefinerSnapshot() -> PassSnapshot? {
         guard let engine else { return nil }
         let capturedGen = engine.currentStackGeneration
-        let (capturedSurvivors, capturedKey): ([SubRegistration], FreshnessKey) = regLock.withLock {
-            (currentSurvivorsLocked(currentGeneration: capturedGen), _freshnessKey)
+        let snap: ([SubRegistration], FreshnessKey)? = regLock.withLock {
+            // Review P2/P3: a pass that starts while the feature is OFF must do no work. Its output
+            // would be hidden by publishedMasterIfCurrent() anyway, but the reload/warp/combine
+            // CPU + I/O would still burn while the user believes the feature is off.
+            guard liveRejectionActive else { return nil }
+            return (currentSurvivorsLocked(currentGeneration: capturedGen), _freshnessKey)
         }
+        guard let snap else { return nil }
+        let (capturedSurvivors, capturedKey) = snap
         guard engine.currentStackGeneration == capturedGen else { return nil }   // reseed raced the snapshot
         return PassSnapshot(survivors: capturedSurvivors, currentGeneration: capturedGen, key: capturedKey)
     }

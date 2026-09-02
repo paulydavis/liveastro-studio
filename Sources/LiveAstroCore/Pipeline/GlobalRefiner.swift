@@ -111,6 +111,16 @@ public final class GlobalRefiner {
         passLock.withLock { _lastMaterializedSampleCount }
     }
 
+    /// Test-only observability seam (review P1): the number of frames RETAINED in `loaded` for
+    /// the most recently started pass — i.e. only the sizing/sample frames. In capped mode this
+    /// must stay at the sample size, never grow to the survivor count: retaining streamed output
+    /// frames re-accumulated every survivor in memory, defeating the RAM-bounded design.
+    /// `passLock`-guarded like its sibling above (two `refine()` calls can overlap).
+    private var _lastPeakRetainedFrames: Int?
+    var lastPeakRetainedFrames: Int? {
+        passLock.withLock { _lastPeakRetainedFrames }
+    }
+
     init(loader: FrameLoader, onLog: @escaping (String) -> Void,
                maxConcurrentLoads: Int = GlobalRefiner.defaultMaxConcurrentLoads) {
         self.loader = loader
@@ -265,6 +275,18 @@ public final class GlobalRefiner {
     /// that land while busy still produce at most one extra pass, with bounded stack depth.
     private func runCoalescedPasses() {
         while true {
+            // Review P3: check `quiesced` BEFORE every pass, including the first. A `quiesce()` that
+            // lands after `noteChanged()` queued this worker but before it started must not let
+            // the queued worker perform one pass anyway.
+            let mayRun: Bool = triggerLock.withLock {
+                if quiesced {
+                    dirty = false
+                    isRunning = false
+                    return false
+                }
+                return true
+            }
+            guard mayRun else { break }
             performOnePass()
             let runAgain: Bool = triggerLock.withLock {
                 if quiesced {
@@ -481,6 +503,7 @@ public final class GlobalRefiner {
                     sample.append(cached)
                 } else if let result = try loadWarp(reg) {
                     loaded[reg.subIndex] = result
+                    skippedIds.remove(reg.subIndex)   // review P2: failed during sizing, loaded now — it contributes
                     sample.append(result)
                 } else {
                     skippedIds.insert(reg.subIndex)
@@ -491,7 +514,12 @@ public final class GlobalRefiner {
             // reduction) — drop the last for a true per-pixel middle median, deterministically.
             if !sample.isEmpty, sample.count % 2 == 0 { sample.removeLast() }
             guard sample.count >= minSubs else { return nil }   // fail closed
-            passLock.withLock { _lastMaterializedSampleCount = sample.count }
+            passLock.withLock {
+                _lastMaterializedSampleCount = sample.count
+                // Review P1: `loaded` is complete here — only sizing/sample frames ever enter it.
+                // The capped output stream below must NOT add to it (see the stream iterator).
+                _lastPeakRetainedFrames = loaded.count
+            }
 
             guard let centerResult = GlobalCombine.robustCenter(sample: sample) else { return nil }
             let sampleCovered = centerResult.sampleCovered
@@ -528,7 +556,13 @@ public final class GlobalRefiner {
                                 }
                                 do {
                                     if let result = try loadWarp(reg) {
-                                        loaded[reg.subIndex] = result
+                                        // Review P1: capped mode is RAM-BOUNDED — a streamed frame is
+                                        // consumed exactly once by the combine and must NOT be retained.
+                                        // Only sizing/sample frames live in `loaded`; storing stream
+                                        // frames here re-accumulated every survivor in memory.
+                                        // Review P2: a sizing/sample-time transient failure that now
+                                        // loads DID contribute — un-skip it so survivorCount is honest.
+                                        skippedIds.remove(reg.subIndex)
                                         return (result.image, result.mask, reg.weight)
                                     }
                                     skippedIds.insert(reg.subIndex)   // recoverable — advance
