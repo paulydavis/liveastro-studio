@@ -1272,7 +1272,9 @@ final class GlobalRefinerTests: XCTestCase {
     /// combining until it naturally finishes (minutes on real 26 MP data) after the user turned
     /// the feature off because it was burning CPU/I/O; its publish was merely hidden. A gated
     /// loader parks the enable-ON pass on its first load; disable; release: the pass must abort
-    /// at its next stop check — no further loads, no publish.
+    /// at its next stop check — no further loads, no publish. Uses 5 subs (== defaultMinSubs) so
+    /// that, uncancelled, the pass clears quorum and genuinely publishes — with fewer, the
+    /// "must not publish" assertion would be vacuous (review P3).
     func testTurningLiveRejectionOffCancelsTheInFlightPass() throws {
         let sandbox = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1286,10 +1288,13 @@ final class GlobalRefinerTests: XCTestCase {
         let source = StubLiveSource(sequence: [
             stubFrame(dx: 0, dy: 0, name: "o1.fit", digest: "od1", timestamp: 0),
             stubFrame(dx: 1.0, dy: -0.5, name: "o2.fit", digest: "od2", timestamp: 1),
-            stubFrame(dx: 1.6, dy: 0.3, name: "o3.fit", digest: "od3", timestamp: 2)])
+            stubFrame(dx: 1.6, dy: 0.3, name: "o3.fit", digest: "od3", timestamp: 2),
+            stubFrame(dx: 0.7, dy: 1.1, name: "o4.fit", digest: "od4", timestamp: 3),
+            stubFrame(dx: -0.9, dy: 0.6, name: "o5.fit", digest: "od5", timestamp: 4)])
         let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
         try pipeline.start()
-        XCTAssertEqual(waitForRegistrations(pipeline, count: 3).count, 3)
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 5).count, 5,
+                       "all 5 must register: 5 == GlobalRefiner.defaultMinSubs, so an uncancelled pass clears quorum")
 
         let entered = DispatchSemaphore(value: 0)
         let release = DispatchSemaphore(value: 0)
@@ -1306,10 +1311,62 @@ final class GlobalRefinerTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.5)                // the pass reaches its next stop check and unwinds
 
         XCTAssertEqual(loader.callCount, 1,
-                       "the cancelled pass must not load any further sub — before the fix it went on to load all 3")
+                       "the cancelled pass must not load any further sub — before the fix it went on to load all 5")
         XCTAssertNil(pipeline.publishedMaster,
-                     "the cancelled pass must not publish — before the fix it completed and published under the old key")
+                     "the cancelled pass must not publish — before the fix it cleared quorum, completed, and published under the old key")
         XCTAssertEqual(refiner.passesRun, 1, "no rerun follows: nothing is dirty and the feature is off")
+    }
+
+    /// Follow-on review P3: the publish seam must store ONLY while the feature is on and the
+    /// snapshot key is still current. OFF clears `publishedMaster` under `regLock` but cancels
+    /// the in-flight pass outside it, so a pass already at its publish call can slip in between
+    /// and re-fill the slot while disabled — invisible now, but served on a quick re-enable if
+    /// nothing moved the key. The race itself is a scheduler interleaving; this drives the
+    /// publish seam directly at each interleaving's end state. (c) guards against the guard
+    /// being over-tight: a current, enabled publish must still land.
+    func testPublishSeamDropsResultsWhileOffOrUnderAStaleKey() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "PublishGuard", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let source = StubLiveSource(sequence: [
+            stubFrame(dx: 0, dy: 0, name: "g1.fit", digest: "gd1", timestamp: 0),
+            stubFrame(dx: 1.0, dy: -0.5, name: "g2.fit", digest: "gd2", timestamp: 1),
+            stubFrame(dx: 1.6, dy: 0.3, name: "g3.fit", digest: "gd3", timestamp: 2)])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 3).count, 3)
+
+        pipeline.configureLiveRejection(enabled: true)
+        let refiner = try XCTUnwrap(pipeline.refinerForTest())
+        let publish = try XCTUnwrap(refiner.publish, "the pipeline wires the refiner's publish seam")
+        let result = RefineResult(image: constImage(0.5), coverage: [Float](repeating: 1, count: 16),
+                                  survivorCount: 3, skipped: 0)
+
+        // (a) A pass whose snapshot key is current, arriving AFTER the feature was turned off.
+        let keyWhileOn = pipeline.currentFreshnessKey()
+        pipeline.configureLiveRejection(enabled: false)
+        publish(result, keyWhileOn)
+        XCTAssertNil(pipeline.publishedMaster, "a publish landing after OFF must be dropped — OFF clears the slot for good")
+
+        // (b) Feature on again, but the key has moved on (a reject) — a stale result on arrival.
+        pipeline.configureLiveRejection(enabled: true)
+        let keyBeforeReject = pipeline.currentFreshnessKey()
+        pipeline.setUserRejected([2])
+        pipeline.noteUserRejectChanged()
+        publish(result, keyBeforeReject)
+        XCTAssertNil(pipeline.publishedMaster, "a result under a key the state has moved past is dropped, not stored-then-refused")
+
+        // (c) Sanity: enabled and current — the guard must not be over-tight.
+        let currentKey = pipeline.currentFreshnessKey()
+        publish(result, currentKey)
+        XCTAssertNotNil(pipeline.publishedMaster, "an enabled, current publish must still land")
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent())
     }
 
     /// (b) Parked-pass / stale-result race: a pass starts and blocks mid-load; while it's parked,

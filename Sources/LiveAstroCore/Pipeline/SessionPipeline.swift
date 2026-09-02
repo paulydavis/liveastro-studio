@@ -567,11 +567,18 @@ public final class SessionPipeline {
 
     /// The `GlobalRefiner.publish` seam — installs a completed pass's result stamped with the
     /// SNAPSHOT's own key (never a freshly-read one — see `makeRefinerSnapshot` doc and the
-    /// stale-result race fix). If a reject/κ/reseed landed mid-pass, `_freshnessKey` has already
-    /// advanced past this `key`, so `publishedMasterIfCurrent()` correctly refuses to serve this
-    /// as current — the mutation that moved the key already triggered its own fresh pass.
+    /// stale-result race fix). Stores ONLY while the feature is on AND the key is still current
+    /// (follow-on review P3): turning the feature OFF clears `publishedMaster` under `regLock`
+    /// and cancels the in-flight pass OUTSIDE it, so a pass already at its publish call could
+    /// slip in between and re-fill the slot while disabled — hidden by
+    /// `publishedMasterIfCurrent()`, but it broke the "OFF clears publishedMaster" invariant and
+    /// could be served immediately on a quick re-enable if nothing had moved the key. Likewise a
+    /// result whose snapshot key a reject/κ/reseed/budget change has already moved past is stale
+    /// on arrival; the mutation that moved the key already triggered its own fresh pass, so it
+    /// is dropped rather than stored-then-refused.
     private func publishRefineResult(_ result: RefineResult, key: FreshnessKey) {
         regLock.withLock {
+            guard liveRejectionActive, key == _freshnessKey else { return }
             publishedMaster = PublishedMaster(image: result.image, coverage: result.coverage,
                                               survivorCount: result.survivorCount, key: key)
         }
