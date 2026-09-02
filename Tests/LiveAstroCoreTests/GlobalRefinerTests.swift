@@ -1022,7 +1022,7 @@ final class GlobalRefinerTests: XCTestCase {
         let url = URL(fileURLWithPath: "/tmp/globalrefiner/trigger-coalesce.fit")
         let reg = refinerReg(subIndex: 1, url: url)
         let key = FreshnessKey(stackGeneration: 0, survivorSubIndices: [1], userRejectGeneration: 0, kappa: 3.0,
-                               maxSampleBytes: 10_000_000)
+                               maxSampleBytes: 10_000_000, liveRejectionEpoch: 0)
         refiner.makeSnapshot = { PassSnapshot(survivors: [reg], currentGeneration: 0, key: key) }
         refiner.minSubsProvider = { 1 }
         refiner.maxSampleBytesProvider = { 10_000_000 }
@@ -1222,7 +1222,7 @@ final class GlobalRefinerTests: XCTestCase {
         let url = URL(fileURLWithPath: "/tmp/globalrefiner/quiesce-dirty.fit")
         let reg = refinerReg(subIndex: 1, url: url)
         let key = FreshnessKey(stackGeneration: 0, survivorSubIndices: [1], userRejectGeneration: 0, kappa: 3.0,
-                               maxSampleBytes: 10_000_000)
+                               maxSampleBytes: 10_000_000, liveRejectionEpoch: 0)
         refiner.makeSnapshot = { PassSnapshot(survivors: [reg], currentGeneration: 0, key: key) }
         refiner.minSubsProvider = { 1 }
         refiner.maxSampleBytesProvider = { 10_000_000 }
@@ -1369,12 +1369,124 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertNotNil(pipeline.publishedMasterIfCurrent())
     }
 
+    /// Follow-on review P3: a QUICK OFF→ON must still reject the pass that was cancelled at OFF.
+    /// `liveRejectionActive` is true again and nothing else in the key moved (same generation,
+    /// survivors, rejects, κ, budget), so before the epoch the cancelled pass's key compared
+    /// EQUAL and it stored its result — violating "OFF cancels this pass; re-enable starts a
+    /// fresh pass". Deterministic: drives the publish seam with the pre-OFF key after the toggle.
+    func testQuickOffOnRejectsThePassCancelledAtOff() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "Epoch", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let source = StubLiveSource(sequence: [
+            stubFrame(dx: 0, dy: 0, name: "e1.fit", digest: "ed1", timestamp: 0),
+            stubFrame(dx: 1.0, dy: -0.5, name: "e2.fit", digest: "ed2", timestamp: 1),
+            stubFrame(dx: 1.6, dy: 0.3, name: "e3.fit", digest: "ed3", timestamp: 2)])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 3).count, 3)
+
+        pipeline.configureLiveRejection(enabled: true)
+        let refiner = try XCTUnwrap(pipeline.refinerForTest())
+        let publish = try XCTUnwrap(refiner.publish)
+        let keyPassAStartedUnder = pipeline.currentFreshnessKey()   // what a pass in flight snapshotted
+
+        pipeline.configureLiveRejection(enabled: false)   // cancels pass A
+        pipeline.configureLiveRejection(enabled: true)    // ...and the user immediately re-enables
+
+        let afterToggle = pipeline.currentFreshnessKey()
+        XCTAssertEqual(afterToggle.liveRejectionEpoch, keyPassAStartedUnder.liveRejectionEpoch + 2,
+                       "each enable-state transition opens a new epoch (OFF then ON = +2)")
+        XCTAssertNotEqual(afterToggle, keyPassAStartedUnder,
+                          "the pre-OFF key must not compare equal after an OFF→ON cycle — before the epoch "
+                          + "nothing else in the key moved, so it did")
+
+        // Pass A finally reaches publish (it was cancelled during the uninterruptible combine).
+        let result = RefineResult(image: constImage(0.5), coverage: [Float](repeating: 1, count: 16),
+                                  survivorCount: 3, skipped: 0)
+        publish(result, keyPassAStartedUnder)
+        XCTAssertNil(pipeline.publishedMaster,
+                     "the pass cancelled at OFF must not store after a quick re-enable — re-enabling starts a "
+                     + "fresh pass, it does not adopt the cancelled one's result")
+
+        // The fresh post-re-enable pass still publishes normally.
+        publish(result, afterToggle)
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(), "a pass started after the re-enable must still land")
+    }
+
+    /// The same invariant end-to-end (review P3's "OFF→ON-before-release" shape): a real pass is
+    /// parked mid-flight on a gated loader, the user toggles OFF then straight back ON, and only
+    /// then does the parked load return. Two halves, BOTH required — asserting only the first
+    /// would pass a build that correctly blocks the cancelled pass but then never publishes at
+    /// all: (1) a fresh post-re-enable master MUST appear, and (2) it must carry the new epoch,
+    /// never the cancelled pass's.
+    func testOffThenOnBeforeTheParkedLoadReleasesNeverPublishesTheCancelledPass() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "EpochLive", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let source = StubLiveSource(sequence: [
+            stubFrame(dx: 0, dy: 0, name: "q1.fit", digest: "qd1", timestamp: 0),
+            stubFrame(dx: 1.0, dy: -0.5, name: "q2.fit", digest: "qd2", timestamp: 1),
+            stubFrame(dx: 1.6, dy: 0.3, name: "q3.fit", digest: "qd3", timestamp: 2),
+            stubFrame(dx: 0.7, dy: 1.1, name: "q4.fit", digest: "qd4", timestamp: 3),
+            stubFrame(dx: -0.9, dy: 0.6, name: "q5.fit", digest: "qd5", timestamp: 4)])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 5).count, 5)
+
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        pipeline.refinerLoaderOverride = FirstCallGatedLoader(image: constImage(0.5), entered: entered, release: release)
+
+        pipeline.configureLiveRejection(enabled: true)
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success, "pass A must reach the loader")
+        let cancelledEpoch = pipeline.currentFreshnessKey().liveRejectionEpoch
+
+        pipeline.configureLiveRejection(enabled: false)   // cancels pass A
+        pipeline.configureLiveRejection(enabled: true)    // quick re-enable, still before the release
+        release.signal()   // only now does pass A's parked load return; A unwinds, the re-enable's pass runs
+
+        // (1) A fresh master MUST appear — the re-enable starts a real pass over the 5 survivors
+        // (>= defaultMinSubs), so "nothing published" is a failure, not an acceptable outcome.
+        let deadline = Date().addingTimeInterval(10)
+        var fresh: PublishedMaster?
+        while Date() < deadline {
+            if let pm = pipeline.publishedMaster { fresh = pm; break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        let published = try XCTUnwrap(fresh,
+                                      "the re-enable must start a fresh pass that publishes — blocking the "
+                                      + "cancelled pass must not also suppress the new one")
+        // (2) ...and it must come from AFTER the re-enable, never the cancelled pass.
+        XCTAssertNotEqual(published.key.liveRejectionEpoch, cancelledEpoch,
+                          "only a pass started after the re-enable may publish — this master carries the "
+                          + "cancelled pass's epoch")
+        XCTAssertEqual(published.key, pipeline.currentFreshnessKey(), "and it must be current")
+        XCTAssertEqual(published.survivorCount, 5, "the fresh pass combines all 5 survivors")
+    }
+
     /// (b) Parked-pass / stale-result race: a pass starts and blocks mid-load; while it's parked,
     /// a user reject lands (`setUserRejected` + `noteUserRejectChanged`, mirroring the expected
-    /// Task 11 `AppModel.toggleReject` call pattern). The in-flight pass must publish under its
-    /// OWN (now stale) captured key — `publishedMasterIfCurrent()` must refuse to serve it — and
-    /// the dirty flag must trigger a fresh pass over the NEW (post-reject) survivor set.
-    func testParkedPassPublishesUnderStaleKeyAndDirtyFlagRerunsOverNewSurvivors() throws {
+    /// Task 11 `AppModel.toggleReject` call pattern). The in-flight pass finishes holding its OWN,
+    /// now-stale captured key, so its result is DROPPED at the publish seam — it never occupies
+    /// `publishedMaster` at all (the seam's `key == _freshnessKey` guard; the earlier design
+    /// stored it and let `publishedMasterIfCurrent()` refuse it, which is what this test's name
+    /// and comment used to describe). The dirty flag must then trigger a fresh pass over the NEW
+    /// (post-reject) survivor set. The drop itself is pinned deterministically by
+    /// `testPublishSeamDropsResultsWhileOffOrUnderAStaleKey`; here it is observed end-to-end.
+    func testParkedPassStaleResultIsDroppedAndDirtyFlagRerunsOverNewSurvivors() throws {
         let sandbox = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: sandbox) }
@@ -1389,25 +1501,18 @@ final class GlobalRefinerTests: XCTestCase {
         // enabledRose (OFF -> ON with 15 survivors already present) triggers pass 1 immediately.
         pipeline.configureLiveRejection(enabled: true, kappa: 3.0, maxSampleBytes: 10_000_000)
         XCTAssertEqual(entered.wait(timeout: .now() + 2), .success, "pass 1 must start and reach the loader")
+        // Pass 1 has snapshotted by now, so this is exactly the key it will try to publish under.
+        let staleKey = pipeline.currentFreshnessKey()
 
         // Mid-pass: a user reject lands. This changes the survivor set AND bumps
         // userRejectGeneration (twice — setUserRejected then noteUserRejectChanged, the expected
         // Task 11 pairing) — both harmless per the noteUserRejectChanged doc.
         pipeline.setUserRejected([2])
         pipeline.noteUserRejectChanged()
+        XCTAssertNotEqual(pipeline.currentFreshnessKey(), staleKey,
+                          "precondition: the reject moved the key, so pass 1's captured key is now stale")
 
-        release.signal()   // let the parked pass 1 finish and publish under its STALE captured key
-
-        // Pass 1's result must NOT be served as current — its key predates the reject.
-        let staleDeadline = Date().addingTimeInterval(2)
-        var sawStaleWindow = false
-        while Date() < staleDeadline {
-            if pipeline.publishedMasterIfCurrent() == nil { sawStaleWindow = true; break }
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-        XCTAssertTrue(sawStaleWindow,
-                     "the parked pass's result, published under its stale captured key, " +
-                     "must never be served as current")
+        release.signal()   // let the parked pass 1 finish; its stale-keyed result must be DROPPED
 
         // The dirty flag must trigger a fresh pass over the NEW survivor set (14 subs, sub 2 excluded).
         let freshDeadline = Date().addingTimeInterval(5)
@@ -1418,6 +1523,10 @@ final class GlobalRefinerTests: XCTestCase {
         }
         let unwrapped = try XCTUnwrap(freshMaster, "a fresh pass must run over the new survivor set and publish")
         XCTAssertEqual(unwrapped.survivorCount, 14, "the fresh pass must reflect the rejected sub's exclusion")
+        // And pass 1's stale result never occupied the slot on the way here — it was dropped at
+        // the seam, not stored-then-refused (the distinction this test's name once got wrong).
+        XCTAssertNotEqual(pipeline.publishedMaster?.key, staleKey,
+                          "the parked pass's stale-keyed result must never be stored in publishedMaster")
     }
 
     /// (c) OFF -> ON with survivors already present must trigger an immediate build — not wait for
@@ -1598,13 +1707,20 @@ final class GlobalRefinerTests: XCTestCase {
         pipeline.configureLiveRejection(enabled: false)
         XCTAssertNil(pipeline.publishedMasterIfCurrent(), "feature off must hide the published master")
         XCTAssertNil(pipeline.publishedMaster, "feature off must CLEAR publishedMaster (belt-and-suspenders)")
-        XCTAssertEqual(pipeline.currentFreshnessKey(), key,
-                       "test precondition: disabling alone must not change the freshness key — " +
-                       "the fallback below is driven by the feature gate, not a stale key")
+        // Review P3 changed this precondition: disabling now DOES move the key, because an
+        // enable-state transition bumps `liveRejectionEpoch` (it is what makes a pass cancelled
+        // at OFF unable to publish after a quick re-enable). That does not weaken what this test
+        // proves — the isolation below never relied on the key standing still; it republishes at
+        // whatever the CURRENT key is, so the refusal that follows can only come from the gate.
+        XCTAssertNotEqual(pipeline.currentFreshnessKey(), key,
+                          "disabling opens a new epoch, so the pre-disable key must no longer match")
+        XCTAssertEqual(pipeline.currentFreshnessKey().liveRejectionEpoch, key.liveRejectionEpoch + 1,
+                       "exactly one transition (ON->OFF) happened")
 
         // Defeat the belt-and-suspenders clear to isolate the `liveRejectionActive` gate itself:
-        // republish a dummy master at the (still-matching) key, simulating "the key would
-        // otherwise match" from the brief. `publishedMasterIfCurrent()` must still refuse it.
+        // republish a dummy master at the CURRENT (post-disable, therefore matching) key,
+        // simulating "the key would otherwise match" from the brief — so the only thing that can
+        // refuse it is the feature gate. `publishedMasterIfCurrent()` must still refuse it.
         guard let (onlineImage, onlineCoverage) = engine.currentStackAndCoverage() else {
             return XCTFail("expected an active online stack")
         }
@@ -1661,7 +1777,7 @@ final class GlobalRefinerTests: XCTestCase {
         let url = URL(fileURLWithPath: "/tmp/globalrefiner/quiesce-coalescer.fit")
         let reg = refinerReg(subIndex: 1, url: url)
         let key = FreshnessKey(stackGeneration: 0, survivorSubIndices: [1], userRejectGeneration: 0, kappa: 3.0,
-                               maxSampleBytes: 10_000_000)
+                               maxSampleBytes: 10_000_000, liveRejectionEpoch: 0)
         refiner.makeSnapshot = { PassSnapshot(survivors: [reg], currentGeneration: 0, key: key) }
         refiner.minSubsProvider = { 1 }
         refiner.maxSampleBytesProvider = { 10_000_000 }
