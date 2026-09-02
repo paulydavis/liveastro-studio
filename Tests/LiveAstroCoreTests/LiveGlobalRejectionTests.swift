@@ -256,40 +256,85 @@ final class LiveGlobalRejectionTests: XCTestCase {
 
     // MARK: - C. Env-gated real data (skippable)
 
-    /// Real M51 acceptance (mirrors PlateSolverTests.testSolvesRealM63Frame's gating): set
+    /// Real-data acceptance (mirrors PlateSolverTests.testSolvesRealM63Frame's gating): set
     /// LAS_TRAIL_FRAMES to a directory of real subs (incl. one with a satellite/plane trail) to
-    /// run. Drives the same directory through TWO finite import pipelines (feature ON / OFF),
-    /// then (a) locates the trail as the pixel where the two masters diverge most (the ONLY thing
-    /// this feature should change) and asserts the global (ON) master reads close to a robust
-    /// LOCAL background estimate there, and (b) computes SNR = mean/σ over a flat background ROI
-    /// (a corner block, chosen to avoid both the galaxy core and the detected trail location) for
-    /// both masters and requires globalSNR >= 0.9 * onlineSNR (tolerance for the survivor-count
-    /// difference, per the brief — not a strict >=).
+    /// run. Reads the subs ONCE into RawFrames and drives them through TWO **live** pipelines
+    /// (feature ON / OFF) via `T12StubLiveSource`, then (a) locates the trail as the pixel where
+    /// the two masters diverge most (the ONLY thing this feature should change) and asserts the
+    /// global (ON) master reads close to a robust LOCAL background estimate there, and (b)
+    /// computes SNR = mean/σ over a flat background ROI (a corner block, chosen to avoid both the
+    /// galaxy core and the detected trail location) for both masters and requires
+    /// globalSNR >= 0.9 * onlineSNR (tolerance for the survivor-count difference — not a strict >=).
+    ///
+    /// Why a LIVE source, not `FolderFrameSource(mode: .importOnce)` (the original form, which
+    /// validated nothing): the consume dispatch branches on `source.isFinite` — a finite import
+    /// source takes the parallel `BatchImporter` path, which never captures the SubRegistration
+    /// cache; only the live path (`handleNative`) does. Under import mode the refiner therefore had
+    /// nothing to reload ("no surviving subs could be loaded"), no clean master was ever built,
+    /// `end()` fell back to the online master, and ON == OFF byte-for-byte. Live rejection is a
+    /// live-stacking feature; this test must exercise its real path. Unlike the synthetic tests
+    /// (stub loader), the ON run here uses the PRODUCTION `FrameLoader`: the refiner re-reads
+    /// the real files from `sourceURL` and content-digest-verifies them.
+    ///
+    /// Needs an OPTIMIZED build for real 26 MP subs — unoptimized star detection/registration is
+    /// slow enough to trip the 120 s live-drain stall window. Run:
+    ///   LAS_TRAIL_FRAMES=<dir> swift test -c release --filter LiveGlobalRejectionTests/testRealM51TrailRemovalPreservesSNR
+    /// A debug build skips with that instruction instead of hanging.
     func testRealM51TrailRemovalPreservesSNR() throws {
         guard let dirPath = ProcessInfo.processInfo.environment["LAS_TRAIL_FRAMES"] else {
-            throw XCTSkip("set LAS_TRAIL_FRAMES to a directory of real M51 subs (incl. a trail sub) to run")
+            throw XCTSkip("set LAS_TRAIL_FRAMES to a directory of real subs (incl. a trail sub) to run")
         }
+        #if DEBUG
+        throw XCTSkip("real 26 MP subs need an optimized build (debug star detection/registration trips the "
+                      + "120 s drain window) — run: LAS_TRAIL_FRAMES=<dir> swift test -c release "
+                      + "--filter LiveGlobalRejectionTests/testRealM51TrailRemovalPreservesSNR")
+        #endif
         let dir = URL(fileURLWithPath: dirPath, isDirectory: true)
-        let subs = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        let subURLs = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension.lowercased() == "fit" }
-        guard subs.count >= 11 else {
+            .sorted { $0.lastPathComponent.compare($1.lastPathComponent, options: [.numeric]) == .orderedAscending }
+        guard subURLs.count >= 11 else {
             throw XCTSkip("LAS_TRAIL_FRAMES needs >= 11 subs to clear the live-rejection quorum")
         }
+        // Read once, replay twice. `loadRawFrame(url:)` sets BOTH `sourceURL` (the T5 cache-capture
+        // gate requires it) and the content `identity` (the production loader re-verifies its digest
+        // on reload) — exactly what a real live relay frame carries.
+        let frames = try subURLs.map { try FolderFrameSource.loadRawFrame(url: $0) }
 
         func run(featureOn: Bool, label: String) throws -> URL {
             let sandbox = FileManager.default.temporaryDirectory
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
             let sessions = sandbox.appendingPathComponent("sessions")
             try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
-            let source = FolderFrameSource(folder: dir, mode: .importOnce)
+            let source = T12StubLiveSource(sequence: frames)   // live (isFinite == false) → handleNative → cache captured
             let engine = StackEngine()
             let pipeline = SessionPipeline(nativeSource: source, engine: engine,
-                                           profile: t12Profile("M51-\(label)"), rootDirectory: sessions)
+                                           profile: t12Profile("real-\(label)"), rootDirectory: sessions)
             pipeline.rendersReplay = false
             if featureOn {
+                // Real 26 MP reload + warp + combine at end() can exceed the 30 s default; a too-short
+                // budget would silently fall back to the online master and mask a real failure.
+                pipeline.finalRefineBudget = .seconds(180)
                 pipeline.configureLiveRejection(enabled: true, kappa: 3.0, maxSampleBytes: 6_000_000_000)
             }
             try pipeline.start()
+            // Fail fast, never hang: every sub must register through the live path within the window
+            // (registration capture is unconditional, so this also proves the OFF run consumed all frames).
+            let regs = t12WaitForRegistrations(pipeline, count: frames.count, timeout: 180)
+            XCTAssertEqual(regs.count, frames.count,
+                           "[\(label)] all \(frames.count) real subs must register through the live path "
+                           + "(got \(regs.count)) — with fewer there is nothing to reject")
+            if featureOn {
+                // Require a CURRENT clean master BEFORE end(): this is the production FrameLoader
+                // re-reading + digest-verifying the real files and the refiner combining them.
+                let published = t12WaitForPublished(pipeline, timeout: 240)
+                XCTAssertNotNil(published, "the refiner must publish a current clean master over the real "
+                                + "subs (production loader reload + digest verify + combine) before end()")
+                if let published {
+                    XCTAssertEqual(published.survivorCount, frames.count,
+                                   "every real sub should survive into the clean master (none user-rejected)")
+                }
+            }
             let dir = try pipeline.end()
             return dir.appendingPathComponent("master.fit")
         }
@@ -305,19 +350,38 @@ final class LiveGlobalRejectionTests: XCTestCase {
         let w = onMaster.width, h = onMaster.height
         let plane = w * h
 
-        // (a) Locate the trail as the point of maximum ON/OFF divergence (channel 0 plane only —
-        // a trail affects luminance in every channel similarly, one plane is enough to localize it).
-        var bestIdx = 0
-        var bestDiff: Float = -1
-        for i in 0..<plane {
-            let d = abs(offMaster.pixels[i] - onMaster.pixels[i])
+        // (a) Locate the trail (channel 0 plane only — a trail affects luminance in every channel
+        // similarly, one plane is enough). The trail's signature is "OFF elevated where ON reads
+        // BACKGROUND": a single-frame outlier the online mean keeps (diluted) and the robust
+        // combine removes. A naive global argmax of |OFF - ON| lands on bright STAR CORES instead —
+        // a clipped mean and a winsorized online mean legitimately disagree there by more than a
+        // diluted trail — so restrict the search to near-background pixels of the clean master.
+        // Robust global background (median/MAD of the ON master), subsampled for speed.
+        var bgSample: [Float] = []
+        bgSample.reserveCapacity(plane / 8 + 1)
+        var si = 0
+        while si < plane { bgSample.append(onMaster.pixels[si]); si += 8 }
+        bgSample.sort()
+        let bgMedian = bgSample[bgSample.count / 2]
+        var bgDev = bgSample.map { abs($0 - bgMedian) }
+        bgDev.sort()
+        let bgSigma = max(1.4826 * bgDev[bgDev.count / 2], 1e-6)
+        let bgCeiling = bgMedian + 3 * bgSigma
+        var bestIdx = -1
+        var bestDiff: Float = 0
+        for i in 0..<plane where onMaster.pixels[i] <= bgCeiling {
+            let d = offMaster.pixels[i] - onMaster.pixels[i]
             if d > bestDiff { bestDiff = d; bestIdx = i }
         }
-        XCTAssertGreaterThan(bestDiff, 0, "the ON/OFF masters must differ somewhere if a real trail sub is present")
+        XCTAssertGreaterThan(bestDiff, 3 * bgSigma,
+                             "the online master must carry a single-frame artifact over background that the "
+                             + "clean master removed — largest OFF-ON over near-background pixels is only "
+                             + "\(bestDiff) vs background noise σ=\(bgSigma)")
+        guard bestIdx >= 0 else { XCTFail("no near-background pixel diverges between ON and OFF"); return }
         let tx = bestIdx % w, ty = bestIdx / w
 
-        // Robust local background around the trail point in the GLOBAL (ON) master: an annulus
-        // (15..30 px radius) excluding the immediate trail neighborhood.
+        // Robust LOCAL background + noise around the trail point in the GLOBAL (ON) master: an
+        // annulus (15..30 px radius) excluding the immediate trail neighborhood.
         var annulus: [Float] = []
         for dy in -30...30 {
             for dx in -30...30 {
@@ -334,20 +398,20 @@ final class LiveGlobalRejectionTests: XCTestCase {
         if !annulus.isEmpty {
             annulus.sort()
             let localBackground = annulus[annulus.count / 2]
-            let trailNeighborhoodMean: Float = {
-                var sum: Float = 0, count = 0
-                for dy in -1...1 {
-                    for dx in -1...1 {
-                        let x = tx + dx, y = ty + dy
-                        guard x >= 0, x < w, y >= 0, y < h else { continue }
-                        sum += onMaster.pixels[y * w + x]; count += 1
-                    }
-                }
-                return count > 0 ? sum / Float(count) : onMaster.pixels[bestIdx]
-            }()
-            XCTAssertEqual(trailNeighborhoodMean, localBackground, accuracy: max(0.05, localBackground * 0.25),
-                           "the global (feature-ON) master must read close to the local background at " +
-                           "the trail location — the trail must be removed, not merely diluted")
+            var localDev = annulus.map { abs($0 - localBackground) }
+            localDev.sort()
+            let localSigma = max(1.4826 * localDev[localDev.count / 2], 1e-6)
+            // Present online: the OFF master genuinely carried the artifact at this pixel.
+            XCTAssertGreaterThan(offMaster.pixels[bestIdx] - localBackground, 3 * localSigma,
+                                 "the online (feature-OFF) master must be elevated well above the local "
+                                 + "background at the trail (OFF=\(offMaster.pixels[bestIdx]), "
+                                 + "bg=\(localBackground), σ=\(localSigma)) — otherwise nothing was there to remove")
+            // Removed globally: the ON master reads background there to within the local noise —
+            // removed, not merely diluted (a diluted trail would still sit several σ above).
+            XCTAssertEqual(onMaster.pixels[bestIdx], localBackground, accuracy: 3 * localSigma,
+                           "the global (feature-ON) master must read the local background at the trail "
+                           + "location (ON=\(onMaster.pixels[bestIdx]), bg=\(localBackground), σ=\(localSigma)) "
+                           + "— the trail must be removed, not merely diluted")
         }
 
         // (b) SNR ROI: a corner block, sized to avoid both the trail (>= 40px from it) and the

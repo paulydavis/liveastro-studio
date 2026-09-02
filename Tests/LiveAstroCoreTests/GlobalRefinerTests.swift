@@ -219,6 +219,22 @@ final class GlobalRefinerTests: XCTestCase {
         }
     }
 
+    /// Throws on the FIRST call for each URL in `failOnce` and succeeds afterwards — a TRANSIENT
+    /// failure (a file mid-sync on a network share that is readable moments later). Distinct from
+    /// `StubFrameLoader.throwing`, which fails permanently.
+    private final class FailOnceLoader: FrameLoader {
+        private let images: [URL: AstroImage]
+        private var pending: Set<URL>
+        private(set) var callCount = 0
+        init(images: [URL: AstroImage], failOnce: Set<URL>) { self.images = images; self.pending = failOnce }
+        func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
+            callCount += 1
+            if pending.remove(url) != nil { throw StubLoadError.simulated }
+            guard let img = images[url] else { throw StubLoadError.missing }
+            return img
+        }
+    }
+
     private func constImage(_ v: Float, w: Int = 4, h: Int = 4) -> AstroImage {
         AstroImage(width: w, height: h, channels: 1, pixels: [Float](repeating: v, count: w * h), sourceIsLinear: true)
     }
@@ -507,9 +523,15 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertLessThan(elapsed, 2.0,
                           "refine must return within perSubLoadCap, not hang on a wedged read that " +
                           "never returns — the pass deadline (30s) must never be the thing that bounds this")
-        let unwrapped = try XCTUnwrap(result, "4 healthy survivors remain after skipping the 1 wedged sub")
-        XCTAssertEqual(unwrapped.skipped, 1)
-        XCTAssertEqual(unwrapped.survivorCount, 4)
+        // Review P2 changed the accounting here, correctly: the wedge is on the loader's FIRST call
+        // only (a transient), so the sub that timed out during sizing is retried by the sample build
+        // (all 5 are under budget), loads on that second call, and its frame IS in the combine — so
+        // it must be counted. The previous expectation (skipped 1 / survivorCount 4) documented the
+        // undercount the review flagged: 5 frames contributed, 4 were reported. The timing bound
+        // above is what this test exists for and is unchanged.
+        let unwrapped = try XCTUnwrap(result, "all 5 survivors contribute — the wedged sub loaded on retry")
+        XCTAssertEqual(unwrapped.skipped, 0)
+        XCTAssertEqual(unwrapped.survivorCount, 5)
     }
 
     /// A loader whose EVERY call blocks (unlike `WedgedFirstCallFrameLoader`, which only wedges
@@ -730,7 +752,7 @@ final class GlobalRefinerTests: XCTestCase {
         let dummyMaster = constImage(0.42)
         func publishAtCurrentKey() {
             let key = pipeline.currentFreshnessKey()
-            pipeline.publishedMaster = (image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 3, key: key)
+            pipeline.publishedMaster = PublishedMaster(image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 3, key: key)
         }
 
         // 1. Publish at the CURRENT key -> served.
@@ -815,7 +837,7 @@ final class GlobalRefinerTests: XCTestCase {
 
         let dummyMaster = constImage(0.42)
         let key = pipeline.currentFreshnessKey()
-        pipeline.publishedMaster = (image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 3, key: key)
+        pipeline.publishedMaster = PublishedMaster(image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 3, key: key)
         XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
                         "precondition: a master published under the current key must be served")
 
@@ -893,7 +915,7 @@ final class GlobalRefinerTests: XCTestCase {
         // Publish a dummy master under the PRE-auto-reseed key.
         let dummyMaster = constImage(0.42)
         let preReseedKey = pipeline.currentFreshnessKey()
-        pipeline.publishedMaster = (image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 1, key: preReseedKey)
+        pipeline.publishedMaster = PublishedMaster(image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 1, key: preReseedKey)
         XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
                         "precondition: a master published under the current key must be served")
 
@@ -999,7 +1021,8 @@ final class GlobalRefinerTests: XCTestCase {
 
         let url = URL(fileURLWithPath: "/tmp/globalrefiner/trigger-coalesce.fit")
         let reg = refinerReg(subIndex: 1, url: url)
-        let key = FreshnessKey(stackGeneration: 0, survivorSubIndices: [1], userRejectGeneration: 0, kappa: 3.0)
+        let key = FreshnessKey(stackGeneration: 0, survivorSubIndices: [1], userRejectGeneration: 0, kappa: 3.0,
+                               maxSampleBytes: 10_000_000)
         refiner.makeSnapshot = { PassSnapshot(survivors: [reg], currentGeneration: 0, key: key) }
         refiner.minSubsProvider = { 1 }
         refiner.maxSampleBytesProvider = { 10_000_000 }
@@ -1035,6 +1058,213 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertEqual(bothPublished.wait(timeout: .now() + 2), .success, "both passes must complete")
         XCTAssertEqual(publishedCount, 2, "5 rapid-fire notifications must coalesce into 2 total passes")
         XCTAssertEqual(refiner.passesRun, 2)
+    }
+
+    // MARK: - Large-review findings on refactor/live-global-rejection-followups (P1/P2/P3)
+
+    /// Review P1: capped mode must stay RAM-BOUNDED. The output stream consumes each non-sample
+    /// survivor exactly once and must NOT retain it; before the fix the stream iterator stored
+    /// every streamed frame into `loaded`, so a deep stack accumulated every survivor in memory —
+    /// defeating the whole sample-then-stream design. 30 survivors with an 11-frame budget: the
+    /// retained set must be the 11-frame RAM sample, never 30, and each survivor loads exactly once.
+    func testCappedPassRetainsOnlyTheSampleNeverEveryStreamedSurvivor() throws {
+        let n = 30
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<n {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/p1-retain-\(i).fit")
+            images[url] = constImage(0.5)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        // 4x4x1 -> sampleFrameBytes = 16·4 (pixels) + 16·4 (mask) = 128; 11·128 -> maxSampleFrames = 11
+        // (the hard floor), well under the 30 survivors -> capped, streamed output.
+        let result = try XCTUnwrap(refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 3,
+                                                  maxSampleBytes: 11 * 128, deadline: .distantFuture,
+                                                  isCancelled: { false }))
+        XCTAssertEqual(result.survivorCount, n)
+        XCTAssertEqual(result.skipped, 0)
+        let retained = try XCTUnwrap(refiner.lastPeakRetainedFrames)
+        XCTAssertEqual(retained, 11, "only the 11-frame RAM sample may be retained in memory")
+        XCTAssertLessThan(retained, n, "capped mode must never accumulate every survivor")
+        XCTAssertEqual(loader.callCount, n,
+                       "each survivor loads exactly once: sample frames are cached, stream frames read once and dropped")
+    }
+
+    /// Review P2: a sub that fails TRANSIENTLY during sizing/sample build but loads successfully
+    /// later DID contribute to the combine — it must not stay in `skippedIds`, or `survivorCount`
+    /// / `skipped` (and the STACKCNT/TOTALEXP metadata built from them) misreport what is in the
+    /// pixels. Both later-success paths are exercised: sub 1 fails once in sizing and is retried
+    /// by the sample build (index 0 is always sampled); sub 2 fails once in sizing and — index 1
+    /// is NOT in the 11-of-30 sample — is read successfully by the capped output stream.
+    func testTransientLoadFailureThatLaterSucceedsCountsAsContributor() throws {
+        let n = 30
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<n {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/p2-transient-\(i).fit")
+            images[url] = constImage(0.5)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        // sampleIndices(count: 30, maxSampleFrames: 11) = [0,2,5,8,11,14,17,20,23,26,29]: 0 sampled, 1 not.
+        let loader = FailOnceLoader(images: images, failOnce: [regs[0].relayURL, regs[1].relayURL])
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        let result = try XCTUnwrap(refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 3,
+                                                  maxSampleBytes: 11 * 128, deadline: .distantFuture,
+                                                  isCancelled: { false }))
+        XCTAssertEqual(result.skipped, 0, "both transiently-failed subs loaded on retry and contributed")
+        XCTAssertEqual(result.survivorCount, n)
+        XCTAssertEqual(loader.callCount, n + 2, "30 successful loads + exactly the 2 retried failures")
+    }
+
+    /// Review P2: the sample budget must be part of `FreshnessKey`. Clearing `publishedMaster` on
+    /// a budget change is not enough — a pass already in flight snapshotted the OLD key, and with
+    /// the budget absent from it that pass could publish LATER under the same key and read as
+    /// "current" again, carrying a master computed under the old budget. Simulate exactly that
+    /// late stale publish and require it to be refused.
+    func testSampleBudgetChangeInvalidatesEvenALateStalePublish() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "BudgetKey", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let source = StubLiveSource(sequence: [
+            stubFrame(dx: 0, dy: 0, name: "b1.fit", digest: "bd1", timestamp: 0),
+            stubFrame(dx: 1.0, dy: -0.5, name: "b2.fit", digest: "bd2", timestamp: 1),
+            stubFrame(dx: 1.6, dy: 0.3, name: "b3.fit", digest: "bd3", timestamp: 2)])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 3).count, 3)
+        pipeline.configureLiveRejection(enabled: true)
+
+        let oldKey = pipeline.currentFreshnessKey()
+        let dummy = constImage(0.42)
+        pipeline.publishedMaster = PublishedMaster(image: dummy, coverage: [1, 1, 1, 1], survivorCount: 3, key: oldKey)
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(), "precondition: current under the old budget")
+
+        pipeline.configureLiveRejection(maxSampleBytes: 123_456_789)
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(), "a budget change clears the published master")
+        let newKey = pipeline.currentFreshnessKey()
+        XCTAssertNotEqual(newKey, oldKey, "the sample budget is part of the freshness key")
+        XCTAssertEqual(newKey.maxSampleBytes, 123_456_789)
+
+        // The late stale publish: a pass that snapshotted `oldKey` before the change completes now.
+        pipeline.publishedMaster = PublishedMaster(image: dummy, coverage: [1, 1, 1, 1], survivorCount: 3, key: oldKey)
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(),
+                     "a master published under the pre-change key must NOT become current again — before the fix it did")
+    }
+
+    /// Review P2/P3: once a refiner exists, turning the feature OFF must stop the invalidation
+    /// hooks from starting background passes — the output was already hidden by
+    /// `publishedMasterIfCurrent()`, but the reload/warp/combine work kept burning CPU and I/O
+    /// while the user believed the feature was off. Enable-ON must still build immediately.
+    func testHooksStartNoPassWhileFeatureIsOffButEnableOnStillBuilds() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "HiddenWork", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let source = StubLiveSource(sequence: [
+            stubFrame(dx: 0, dy: 0, name: "h1.fit", digest: "hd1", timestamp: 0),
+            stubFrame(dx: 1.0, dy: -0.5, name: "h2.fit", digest: "hd2", timestamp: 1),
+            stubFrame(dx: 1.6, dy: 0.3, name: "h3.fit", digest: "hd3", timestamp: 2)])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 3).count, 3)
+
+        func passesReach(_ n: Int, _ refiner: GlobalRefiner, timeout: TimeInterval) -> Bool {
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                if refiner.passesRun >= n { return true }
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            return refiner.passesRun >= n
+        }
+
+        pipeline.configureLiveRejection(enabled: true)   // creates the refiner; enable-ON fires one pass
+        let refiner = try XCTUnwrap(pipeline.refinerForTest())
+        XCTAssertTrue(passesReach(1, refiner, timeout: 5), "enable-ON must build immediately")
+        Thread.sleep(forTimeInterval: 0.3)               // let that single pass settle
+        let before = refiner.passesRun
+
+        pipeline.configureLiveRejection(enabled: false)
+        pipeline.noteSubAccepted()
+        pipeline.noteUserRejectChanged()
+        pipeline.noteReseeded()
+        Thread.sleep(forTimeInterval: 0.4)
+        XCTAssertEqual(refiner.passesRun, before,
+                       "while the feature is OFF the hooks must start NO background pass (hidden CPU/I/O)")
+
+        pipeline.configureLiveRejection(enabled: true)   // OFF -> ON must build again
+        XCTAssertTrue(passesReach(before + 1, refiner, timeout: 5), "enable-ON mid-session must still trigger a build")
+    }
+
+    /// Review P3 (quiesce): `quiesce()` must defeat a rerun already requested (`dirty`) while a
+    /// pass is in flight — and, by checking `quiesced` before EVERY pass including the first, a
+    /// worker that `noteChanged()` queued but that had not started when `quiesce()` landed. That
+    /// second ordering is a genuine scheduler race and is not deterministically testable; this
+    /// pins the deterministic half: in-flight pass + pending dirty rerun + quiesce() → exactly
+    /// one pass ever runs.
+    func testQuiesceDefeatsAPendingDirtyRerun() throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let loader = FirstCallGatedLoader(image: constImage(0.5), entered: entered, release: release)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        let url = URL(fileURLWithPath: "/tmp/globalrefiner/quiesce-dirty.fit")
+        let reg = refinerReg(subIndex: 1, url: url)
+        let key = FreshnessKey(stackGeneration: 0, survivorSubIndices: [1], userRejectGeneration: 0, kappa: 3.0,
+                               maxSampleBytes: 10_000_000)
+        refiner.makeSnapshot = { PassSnapshot(survivors: [reg], currentGeneration: 0, key: key) }
+        refiner.minSubsProvider = { 1 }
+        refiner.maxSampleBytesProvider = { 10_000_000 }
+        refiner.publish = { _, _ in }
+
+        refiner.noteChanged()
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success, "pass 1 must reach the loader")
+        refiner.noteChanged()   // in flight -> requests a rerun (dirty)
+        refiner.quiesce()       // shutdown: must cancel that pending rerun
+        release.signal()        // let pass 1 finish
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(refiner.passesRun, 1, "the pending dirty rerun must not run after quiesce()")
+        XCTAssertEqual(loader.callCount, 1)
+    }
+
+    /// Review P3 (caption): `currentSurvivorCount()` reports the CURRENT-generation survivors
+    /// minus user-rejected subs — what the refiner actually combines — so the operator caption
+    /// cannot keep counting pre-reseed subs the clean master no longer contains.
+    func testCurrentSurvivorCountTracksGenerationAndUserRejects() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "SurvivorCount", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let source = StubLiveSource(sequence: [
+            stubFrame(dx: 0, dy: 0, name: "s1.fit", digest: "sd1", timestamp: 0),
+            stubFrame(dx: 1.0, dy: -0.5, name: "s2.fit", digest: "sd2", timestamp: 1),
+            stubFrame(dx: 1.6, dy: 0.3, name: "s3.fit", digest: "sd3", timestamp: 2)])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 3).count, 3)
+
+        XCTAssertEqual(pipeline.currentSurvivorCount(), 3)
+        pipeline.setUserRejected([2])
+        XCTAssertEqual(pipeline.currentSurvivorCount(), 2, "user-rejected subs are not survivors")
+        _ = pipeline.reseed()
+        XCTAssertEqual(pipeline.currentSurvivorCount(), 0,
+                       "after a reseed the old generation's subs are no longer survivors")
     }
 
     /// (b) Parked-pass / stale-result race: a pass starts and blocks mid-load; while it's parked,
@@ -1164,7 +1394,7 @@ final class GlobalRefinerTests: XCTestCase {
         }
         let cleanMaster = constImage(0.42, w: onlineImage.width, h: onlineImage.height)
         let key = pipeline.currentFreshnessKey()
-        pipeline.publishedMaster = (
+        pipeline.publishedMaster = PublishedMaster(
             image: cleanMaster,
             coverage: onlineCoverage ?? [Float](repeating: 1, count: onlineImage.width * onlineImage.height),
             survivorCount: 3, key: key)
@@ -1277,7 +1507,7 @@ final class GlobalRefinerTests: XCTestCase {
             return XCTFail("expected an active online stack")
         }
         let staleButKeyMatchingMaster = constImage(0.42, w: onlineImage.width, h: onlineImage.height)
-        pipeline.publishedMaster = (
+        pipeline.publishedMaster = PublishedMaster(
             image: staleButKeyMatchingMaster,
             coverage: onlineCoverage ?? [Float](repeating: 1, count: onlineImage.width * onlineImage.height),
             survivorCount: 3, key: pipeline.currentFreshnessKey())
@@ -1311,5 +1541,71 @@ final class GlobalRefinerTests: XCTestCase {
         let master = try FITSReader.read(Data(contentsOf: masterURL))
         XCTAssertGreaterThan(stddev(master.pixels), 0.01,
                              "end()'s master.fit must fall back to the online master, not the uniform dummy")
+    }
+
+    // MARK: - F6: quiesce() terminally stops the background coalescer, without affecting a direct refine() call
+
+    /// `quiesce()` must be a TERMINAL stop for the background coalescer: once called, `noteChanged()`
+    /// must start NO further pass, no matter how many times it fires afterward. This is the
+    /// property `cancel()` alone does NOT have — `cancel()` only flags whichever pass id is CURRENT
+    /// at the moment it's called, so a `noteChanged()` call after a bare `cancel()` would still
+    /// start a fresh, un-cancelled pass (the bug `quiesce()` fixes: `SessionPipeline.end()` calling
+    /// `cancel()` alone does not stop the coalescer from spawning further passes while `end()` runs
+    /// its own final pass).
+    func testQuiesceStopsNoteChangedFromStartingAnyFurtherPass() throws {
+        let loader = ConstFrameLoader(image: constImage(0.5))
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+
+        let url = URL(fileURLWithPath: "/tmp/globalrefiner/quiesce-coalescer.fit")
+        let reg = refinerReg(subIndex: 1, url: url)
+        let key = FreshnessKey(stackGeneration: 0, survivorSubIndices: [1], userRejectGeneration: 0, kappa: 3.0,
+                               maxSampleBytes: 10_000_000)
+        refiner.makeSnapshot = { PassSnapshot(survivors: [reg], currentGeneration: 0, key: key) }
+        refiner.minSubsProvider = { 1 }
+        refiner.maxSampleBytesProvider = { 10_000_000 }
+
+        var publishedCount = 0
+        refiner.publish = { _, _ in publishedCount += 1 }
+
+        refiner.quiesce()
+
+        // Fire noteChanged() several times — quiesce() must block every one of them from starting a
+        // pass, not merely suppress a rerun of one already in flight (that weaker behavior is what
+        // `dirty`/coalescing already gave us before this fix).
+        for _ in 0..<5 { refiner.noteChanged() }
+
+        // There is nothing to synchronize on if quiesce() works (no pass ever starts), so a brief
+        // sleep is the only way to assert this negative — long enough that a real pass against this
+        // trivial 1-sub/no-I/O snapshot would easily have started and published by then.
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(refiner.passesRun, 0, "quiesce() must stop noteChanged() from starting ANY pass")
+        XCTAssertEqual(publishedCount, 0, "no pass ran, so nothing should have published")
+    }
+
+    /// `quiesce()` gates ONLY the background coalescer (`noteChanged`/`runCoalescedPasses`) — a
+    /// DIRECT `refine(...)` call, exactly how `SessionPipeline.end()`'s `selectMasterReport` invokes
+    /// its own final pass, must still run to completion after `quiesce()`. This is what makes it
+    /// safe for `end()` to call `quiesce()` before running its own final pass: `quiesce()` is never
+    /// consulted inside `refine()` itself.
+    func testQuiesceDoesNotBlockADirectRefineCall() throws {
+        var images = [URL: AstroImage]()
+        var regs: [SubRegistration] = []
+        for i in 0..<5 {
+            let url = URL(fileURLWithPath: "/tmp/globalrefiner/quiesce-direct-\(i).fit")
+            images[url] = constImage(0.6)
+            regs.append(refinerReg(subIndex: i + 1, url: url))
+        }
+        let loader = StubFrameLoader(images: images)
+        let refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+
+        refiner.quiesce()
+
+        let result = refiner.refine(survivors: regs, currentGeneration: 0, kappa: 3.0, minSubs: 5,
+                                    maxSampleBytes: 10_000_000, deadline: .distantFuture, isCancelled: { false })
+        let unwrapped = try XCTUnwrap(result, "a direct refine() call must complete even after quiesce()")
+        XCTAssertEqual(unwrapped.survivorCount, 5)
+        XCTAssertEqual(unwrapped.skipped, 0)
+        XCTAssertEqual(loader.callCount, 5,
+                       "quiesce() must not skip/short-circuit any load in a direct refine() call")
     }
 }

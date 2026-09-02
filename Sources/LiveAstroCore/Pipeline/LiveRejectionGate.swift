@@ -27,4 +27,30 @@ public enum LiveRejectionGate {
         guard subCount >= minSubs else { return .off(reason: "need ≥ \(minSubs) subs") }
         return .active(subs: subCount)
     }
+
+    /// Whether `url` resolves to a LOCAL filesystem location (D9) — the path-locality half of
+    /// `AppModel.sourceIsLocalLiveRelay`. `.volumeIsLocalKey` is macOS's own local-vs-network-mount
+    /// distinction (SMB/AFP/NFS shares — the ASIAIR/NINA network case — read false); an
+    /// unresolvable key (folder deleted, permission issue, no such volume) fails closed to "not
+    /// local" rather than silently reporting local. The other half — "is this even a native-stack
+    /// session" — stays on `AppModel` since `SourceMode` is an app-only type `LiveAstroCore`
+    /// cannot depend on.
+    public static func isLocalPath(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.volumeIsLocalKey]).volumeIsLocal) ?? false
+    }
+
+    /// Pure form of Task 11 point 6's advisory sample-budget check (D9): whether `maxSampleBytes`
+    /// comfortably fits at least `minFrames` samples at `width`×`height`, and if not, the exact
+    /// warning message `AppModel.advisoryCheckLiveRejectionBudget` logs. Assumes the refiner's
+    /// post-debayer working format (RGB warped image + a 1-channel mask, 4 bytes/component — see
+    /// the design spec's sample-policy math), independent of the raw FITS `channels` (mono
+    /// cameras still warp/mask in this same shape). Returns `nil` when the budget fits >= minFrames.
+    public static func sampleBudgetWarning(maxSampleBytes: Int, width: Int, height: Int,
+                                            minFrames: Int) -> String? {
+        let sampleFrameBytes = width * height * 16   // (3 RGB + 1 mask) channels × 4 bytes/component
+        let framesThatFit = maxSampleBytes / sampleFrameBytes
+        guard framesThatFit < minFrames else { return nil }
+        return "Live rejection: sample budget (~\(maxSampleBytes / 1_000_000_000) GB) only fits "
+            + "\(framesThatFit) frame(s) at \(width)×\(height) — raise maxSampleBytes for sensors this large."
+    }
 }

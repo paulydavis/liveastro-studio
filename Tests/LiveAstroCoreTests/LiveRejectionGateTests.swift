@@ -64,4 +64,51 @@ final class LiveRejectionGateTests: XCTestCase {
                                                minSubs: 5, reseeding: true, enabled: true)
         XCTAssertEqual(status, .off(reason: "reseeding"))
     }
+
+    // MARK: - isLocalPath (D9: the path-locality half of AppModel.sourceIsLocalLiveRelay)
+
+    /// A real local directory (the process's own temp dir) resolves local.
+    func testIsLocalPathTrueForLocalDirectory() {
+        XCTAssertTrue(LiveRejectionGate.isLocalPath(FileManager.default.temporaryDirectory))
+    }
+
+    /// An unresolvable path (no such volume/file — stand-in for the network-mount case, which
+    /// isn't reproducible in a unit test without an actual SMB/AFP/NFS mount) fails CLOSED to
+    /// "not local," matching the doc comment's "unresolvable key ... fails closed" guarantee.
+    func testIsLocalPathFailsClosedForUnresolvablePath() {
+        let bogus = URL(fileURLWithPath: "/no-such-volume-\(UUID().uuidString)/watch")
+        XCTAssertFalse(LiveRejectionGate.isLocalPath(bogus))
+    }
+
+    // MARK: - sampleBudgetWarning (D9: the threshold arithmetic half of
+    // AppModel.advisoryCheckLiveRejectionBudget)
+
+    /// A sensor within the ~34 MP budget threshold (design spec: "6 GB fits ≥11 frames only up to
+    /// ~34 MP") fits comfortably — no warning. Real ASI2600MC-Air dims (6248×4176, ~26 MP).
+    func testSampleBudgetWarningNilWhenBudgetFits() {
+        let warning = LiveRejectionGate.sampleBudgetWarning(
+            maxSampleBytes: 6_000_000_000, width: 6248, height: 4176, minFrames: 11)
+        XCTAssertNil(warning)
+    }
+
+    /// A sensor well past the ~34 MP threshold (8000×6000 = 48 MP) doesn't fit 11 frames in a
+    /// 6 GB budget — verifies both the exact bytes/frame estimate (w·h·16, i.e. RGB + mask ×
+    /// 4 bytes/component: 8000×6000×16 = 768,000,000 B/frame → 6,000,000,000 / 768,000,000 = 7
+    /// frames) and the exact message text `AppModel` used to build inline.
+    func testSampleBudgetWarningWhenBudgetDoesNotFit() {
+        let warning = LiveRejectionGate.sampleBudgetWarning(
+            maxSampleBytes: 6_000_000_000, width: 8000, height: 6000, minFrames: 11)
+        XCTAssertEqual(warning, "Live rejection: sample budget (~6 GB) only fits 7 frame(s) "
+            + "at 8000×6000 — raise maxSampleBytes for sensors this large.")
+    }
+
+    /// Boundary: exactly enough frames (framesThatFit == minFrames) is NOT a warning — the
+    /// inline check was strict-less-than (`framesThatFit < minViableSampleFrames`), so an exact
+    /// match at the floor must still be nil.
+    func testSampleBudgetWarningNilAtExactMinFramesBoundary() {
+        // 1000x1000 -> sampleFrameBytes = 16,000,000; budget 160,000,000 -> framesThatFit == 10.
+        let warning = LiveRejectionGate.sampleBudgetWarning(
+            maxSampleBytes: 160_000_000, width: 1000, height: 1000, minFrames: 10)
+        XCTAssertNil(warning)
+    }
 }
