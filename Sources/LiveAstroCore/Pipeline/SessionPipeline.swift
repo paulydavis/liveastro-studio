@@ -38,6 +38,15 @@ public struct FreshnessKey: Equatable {
     let userRejectGeneration: Int
     let kappa: Float
     let maxSampleBytes: Int
+    /// Monotonic counter bumped on every live-rejection enable-state TRANSITION, so each
+    /// contiguous ON period has its own epoch (review P3). Without it the key is identical
+    /// before and after an OFF→ON cycle — nothing else in the key changes — so a pass cancelled
+    /// at OFF that reaches `publish` after a quick re-enable would satisfy both
+    /// `liveRejectionActive` and `key == _freshnessKey` and store its result, violating
+    /// "OFF cancels this pass; re-enable starts a fresh pass". (The window is real because a
+    /// pass cancelled during the per-pixel combine — which is not interruptible mid-loop — still
+    /// runs to its publish call.) The epoch makes the pre-OFF key unequal to every later key.
+    let liveRejectionEpoch: Int
 }
 
 /// The background refiner's most recently published trail-free master (Task 6/7), stamped with
@@ -384,7 +393,13 @@ public final class SessionPipeline {
     /// sensible pre-first-sub initial value so `currentFreshnessKey()` is well-defined from t=0.
     private var _freshnessKey = FreshnessKey(stackGeneration: 0, survivorSubIndices: [],
                                              userRejectGeneration: 0, kappa: RejectionStrength.medium.kappa,
-                                             maxSampleBytes: GlobalRefiner.defaultMaxSampleBytes)
+                                             maxSampleBytes: GlobalRefiner.defaultMaxSampleBytes,
+                                             liveRejectionEpoch: 0)
+
+    /// Bumped on every live-rejection enable-state transition and folded into `FreshnessKey`, so
+    /// each contiguous ON period is distinguishable from every earlier one — see the key's own
+    /// `liveRejectionEpoch` doc for the OFF→ON race it closes. Guarded by `regLock`.
+    private var liveRejectionEpoch: Int = 0
     /// The background refiner's most recently published trail-free master, stamped with the
     /// `FreshnessKey` it was computed from. `internal` — Task 6/11 publish here directly (and
     /// tests construct/inspect it via `@testable import`, which requires `internal`+, not
@@ -445,7 +460,8 @@ public final class SessionPipeline {
         let survivors = currentSurvivorsLocked(currentGeneration: gen).map(\.subIndex).sorted()
         _freshnessKey = FreshnessKey(stackGeneration: gen, survivorSubIndices: survivors,
                                      userRejectGeneration: userRejectGeneration, kappa: liveRejectionKappa,
-                                     maxSampleBytes: liveRejectionMaxSampleBytes)
+                                     maxSampleBytes: liveRejectionMaxSampleBytes,
+                                     liveRejectionEpoch: liveRejectionEpoch)
     }
 
     /// O(1) locked read of the cached key (M1) — the broadcast-preference path calls this once
@@ -490,6 +506,10 @@ public final class SessionPipeline {
             liveRejectionActive = newEnabled
             liveRejectionKappa = newKappa
             liveRejectionMaxSampleBytes = newBudget
+            // Review P3: a transition in EITHER direction opens a new epoch, so the key of the
+            // period being left can never equal the key of any later one. Bumped before the
+            // recompute below so the new key carries it.
+            if enabledRose || enabledFell { liveRejectionEpoch += 1 }
             recomputeCachedFreshnessKeyLocked()
             if !newEnabled || budgetChanged {
                 publishedMaster = nil   // belt-and-suspenders on top of the key: OFF is what the key can't express
@@ -585,9 +605,10 @@ public final class SessionPipeline {
     }
 
     /// Returns the published master ONLY while the live-rejection feature is ON and its stored
-    /// key still equals the CURRENT freshness key — i.e. no reseed, user reject, or κ change has
-    /// landed since it was published. Both reads happen under one `regLock` acquisition so a
-    /// concurrent publish/mutation can't be observed torn.
+    /// key still equals the CURRENT freshness key — i.e. none of a reseed, a user reject, a κ
+    /// change, a sample-budget change, or an enable-state transition (the epoch) has landed
+    /// since it was published. Both reads happen under one `regLock` acquisition so a concurrent
+    /// publish/mutation can't be observed torn.
     public func publishedMasterIfCurrent() -> (image: AstroImage, coverage: [Float], survivorCount: Int)? {
         regLock.withLock {
             guard liveRejectionActive, let pm = publishedMaster, pm.key == _freshnessKey else { return nil }
