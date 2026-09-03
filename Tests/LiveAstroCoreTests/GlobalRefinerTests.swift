@@ -1471,23 +1471,28 @@ final class GlobalRefinerTests: XCTestCase {
 
         // A 6th sub lands. The published master is now SHALLOW-but-servable: still correct for
         // the broadcast, but no longer the deepest master end() could write.
-        source.send(stubFrame(dx: 0.5, dy: -0.25, name: "trig5.fit", digest: "trig-digest-5", timestamp: 5))
-        XCTAssertEqual(waitForRegistrations(pipeline, count: 6, timeout: 30).count, 6)
-
-        // Stop the BACKGROUND path from ever installing a 6-sub master. Without this the test
-        // passes for the wrong reason: a background pass publishes its own 6-sub master first,
-        // end() then takes the exact-current branch, and the final-pass branch under test is never
-        // exercised — verified by reverting the fix and watching the test still pass.
+        // Stop the BACKGROUND path from ever installing a 6-sub master, BEFORE the 6th sub exists.
+        // Without this the test passes for the wrong reason: a background pass publishes its own
+        // 6-sub master, end() then takes the exact-current branch, and the final-pass branch under
+        // test is never exercised — verified by reverting the fix and watching it still pass.
         //
-        // quiesce()+cancel() alone are NOT enough: they gate future starts and flag the in-flight
-        // pass, but a pass already inside its (uninterruptible) combine still runs to its publish
-        // call. Detaching the publish seam is what actually closes the window. end()'s final pass
-        // is a DIRECT refine() call that returns its result rather than publishing, so it is
-        // unaffected — the only route to a 6-sub master here is the branch under test.
+        // Ordering is what makes this airtight, and race-free. `quiesce()` gates future pass
+        // STARTS under the refiner's own lock, so quiescing here — while only 5 subs exist — means
+        // the 6th sub's `noteChanged()` starts nothing, and no pass over 6 subs is ever created to
+        // reach `publish`. (Quiescing AFTER the 6th sub would be too late on both counts: a pass
+        // already inside its uninterruptible combine still runs to its publish call, and detaching
+        // the `publish` closure to stop it would be an unsynchronised write to a var the background
+        // pass may be reading.) A pass still in flight over the FIRST 5 subs is harmless: its
+        // snapshot key is the 5-sub one, so publishing it just reinstates the precondition.
+        //
+        // end()'s final pass is a DIRECT refine() call, explicitly unaffected by quiesce(), so it
+        // remains the only route to a 6-sub master here.
         let refiner = try XCTUnwrap(pipeline.refinerForTest())
         refiner.quiesce()
         refiner.cancel()
-        refiner.publish = { _, _ in }
+
+        source.send(stubFrame(dx: 0.5, dy: -0.25, name: "trig5.fit", digest: "trig-digest-5", timestamp: 5))
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 6, timeout: 30).count, 6)
         XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
                         "precondition: it is still SERVABLE — that is exactly what makes end() able to take the shortcut")
         XCTAssertEqual(pipeline.publishedMasterSurvivorCount(), 5,
