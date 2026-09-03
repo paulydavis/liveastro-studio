@@ -1420,6 +1420,92 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertNil(pipeline.publishedMasterSurvivorCount())
     }
 
+    /// Review P2 on the starvation fix: "servable if the survivor set merely grew" is right for the
+    /// live BROADCAST (a shallow clean master beats falling back to the un-rejected online one) but
+    /// wrong for `end()`. `master.fit` is the archival output, so end() must reach for full depth:
+    /// with a 5-sub master published and a 6th survivor in the frozen set, it must run the bounded
+    /// final pass over all 6 rather than writing the servable 5-sub master and silently discarding
+    /// a sub's integration. Pre-fix, `selectMasterReport` took the `isServable` branch and wrote
+    /// STACKCNT=5 while a 6th sub's integration was silently discarded.
+    ///
+    /// The injected loader returns a CONSTANT frame distinct from the published dummy, so the two
+    /// outcomes are separable by pixel value as well as by STACKCNT: 0.77 means the final pass ran,
+    /// 0.42 means the shallow published master was written.
+    func testEndRunsTheFinalPassRatherThanWritingAShallowServableMaster() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        // 5 subs, not 3: the final pass is subject to the same `minSubs` quorum as any other
+        // (GlobalRefiner.defaultMinSubs == 5), so a shallower set could never produce a clean
+        // master at all and the test would prove nothing about depth.
+        let (pipeline, source) = try pipelineWithRegisteredSubs(count: 5, sandbox: sandbox)
+        defer { source.stop() }
+        pipeline.rendersReplay = false   // exercise the master write, not the AVFoundation replay render
+        // Must be set BEFORE configureLiveRejection creates the refiner (the override's own doc
+        // states this timing requirement) — the stub frames' sourceURLs are not real files, so the
+        // production loader could never complete a final pass here.
+        pipeline.refinerLoaderOverride = ConstFrameLoader(image: constImage(0.77, w: 512, h: 512))
+        pipeline.configureLiveRejection(enabled: true)
+
+        // A pass published over the first 5 subs.
+        let keyOver5 = pipeline.currentFreshnessKey()
+        pipeline.publishedMaster = PublishedMaster(image: constImage(0.42, w: 512, h: 512),
+                                                   coverage: [Float](repeating: 1, count: 512 * 512),
+                                                   survivorCount: 5, key: keyOver5)
+
+        // A 6th sub lands. The published master is now SHALLOW-but-servable: still correct for
+        // the broadcast, but no longer the deepest master end() could write.
+        source.send(stubFrame(dx: 0.5, dy: -0.25, name: "trig5.fit", digest: "trig-digest-5", timestamp: 5))
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 6, timeout: 30).count, 6)
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
+                        "precondition: it is still SERVABLE — that is exactly what makes end() able to take the shortcut")
+        XCTAssertEqual(pipeline.publishedMasterSurvivorCount(), 5, "precondition: published depth is 5")
+
+        let replayDir = try pipeline.end()
+        let header = try FITSReader.readHeader(Data(contentsOf: replayDir.appendingPathComponent("master.fit")))
+        XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 6,
+                       "end() must refine over the frozen 6-sub survivor set, not write the servable 5-sub master")
+        let master = try FITSReader.read(Data(contentsOf: replayDir.appendingPathComponent("master.fit")))
+        let mean = master.pixels.reduce(0, +) / Float(master.pixels.count)
+        XCTAssertEqual(mean, 0.77, accuracy: 0.05,
+                       "master.fit must be the final pass's output (0.77), not the published dummy (0.42)")
+    }
+
+    /// The other half of the P2 fix: end() reaches for full depth FIRST, but if that final pass
+    /// cannot produce a master (deadline, or every load failing as here), a shallower CLEAN master
+    /// is still strictly better than the online one — which rejects nothing and would put the
+    /// trails back into `master.fit`. So the servable-but-shallow master remains the fallback,
+    /// reached only after full depth was actually attempted.
+    func testEndFallsBackToTheShallowCleanMasterWhenTheFinalPassCannotRun() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try pipelineWithRegisteredSubs(count: 5, sandbox: sandbox)
+        defer { source.stop() }
+        pipeline.rendersReplay = false
+        // Every load throws (no images registered), so the final pass drops below `minSubs` and
+        // returns nil — the deadline path is the same branch, exercised without the wall-clock wait.
+        pipeline.refinerLoaderOverride = FailOnceLoader(images: [:], failOnce: [])
+        pipeline.configureLiveRejection(enabled: true)
+
+        let keyOver5 = pipeline.currentFreshnessKey()
+        pipeline.publishedMaster = PublishedMaster(image: constImage(0.42, w: 512, h: 512),
+                                                   coverage: [Float](repeating: 1, count: 512 * 512),
+                                                   survivorCount: 5, key: keyOver5)
+        source.send(stubFrame(dx: 0.5, dy: -0.25, name: "trig5.fit", digest: "trig-digest-5", timestamp: 5))
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 6, timeout: 30).count, 6)
+
+        let replayDir = try pipeline.end()
+        let master = try FITSReader.read(Data(contentsOf: replayDir.appendingPathComponent("master.fit")))
+        let mean = master.pixels.reduce(0, +) / Float(master.pixels.count)
+        XCTAssertEqual(mean, 0.42, accuracy: 0.05,
+                       "with the final pass unable to run, master.fit must still be the CLEAN 5-sub master "
+                       + "(0.42) rather than dropping to the online star field, which rejects nothing")
+        let header = try FITSReader.readHeader(Data(contentsOf: replayDir.appendingPathComponent("master.fit")))
+        XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 5,
+                       "and it must report the depth it actually has, not the 6 it tried for")
+    }
+
     /// The other half of the same bug: the publish seam itself dropped a finished pass whose set
     /// had merely grown, so nothing was ever stored to serve.
     func testPublishSeamAcceptsAResultWhoseSurvivorSetMerelyGrew() throws {

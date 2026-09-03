@@ -24,9 +24,16 @@ final class NSLock_Flag {
 
 /// Composite freshness key for a background-refiner-published master (Task 7): identifies exactly
 /// which generation / survivor-set / user-reject-state / κ a published master was computed from.
-/// `publishedMasterIfCurrent()` invalidates the stored master the instant ANY of these change —
-/// a reseed, a user reject, a κ change, or a sample-budget change — so broadcast/end() never
-/// consume a stale trail-free master. `survivorSubIndices` is the SORTED list of survivor
+/// `publishedMasterIfCurrent()` invalidates the stored master the instant anything that changes
+/// what it MEANS changes — a reseed, a user reject, a κ change, a sample-budget change, or an
+/// enable-state transition — so broadcast/end() never consume a stale trail-free master. A
+/// GROWN survivor set is the deliberate exception: subs arriving during a pass make the
+/// published master merely SHALLOW, not wrong, and it keeps being served until the next pass
+/// publishes (see `isServable(against:)` — without this a busy session starves and never serves
+/// a clean master at all). `end()` does NOT settle for shallow: it prefers an exactly-current
+/// master, else runs the bounded final pass, and only falls back to a shallower servable master
+/// if that pass fails — `master.fit` is archival and must be the deepest available.
+/// `survivorSubIndices` is the SORTED list of survivor
 /// `subIndex`es (unique per sub — byte-identical subs stay distinct entries, never collapsed to
 /// a digest set). `maxSampleBytes` is in the key (review P2) because clearing `publishedMaster`
 /// on a budget change was not enough: a pass already in flight snapshotted the OLD key, and
@@ -344,11 +351,6 @@ public final class SessionPipeline {
     /// off — and that enable-ON still does. Mirrors the other `...ForTest` seams; not for product code.
     func refinerForTest() -> GlobalRefiner? { currentRefiner() }
 
-    /// Survivor count of the CURRENT stack generation, minus user-rejected subs — what the
-    /// refiner actually combines. For the operator caption (review P3): the app-side count of
-    /// all accepted records kept counting pre-reseed subs the refiner had already discarded.
-    /// Reads the engine generation first (engine lock, released) and only then takes `regLock`
-    /// — the established leaf ordering; never nests them.
     /// Survivor count of the clean master that would be SERVED right now, or nil if none is
     /// current. The caption needs this rather than `currentSurvivorCount()`: the two differ
     /// exactly when a pass hasn't published yet, which is precisely the state the operator
@@ -361,6 +363,11 @@ public final class SessionPipeline {
         }
     }
 
+    /// Survivor count of the CURRENT stack generation, minus user-rejected subs — what the
+    /// refiner actually combines. For the operator caption (review P3): the app-side count of
+    /// all accepted records kept counting pre-reseed subs the refiner had already discarded.
+    /// Reads the engine generation first (engine lock, released) and only then takes `regLock`
+    /// — the established leaf ordering; never nests them.
     public func currentSurvivorCount() -> Int {
         let gen = engine?.currentStackGeneration ?? 0
         return regLock.withLock { currentSurvivorsLocked(currentGeneration: gen).count }
@@ -1516,23 +1523,37 @@ public final class SessionPipeline {
     ) -> RestackReport {
         var clean: (image: AstroImage, coverage: [Float], survivorCount: Int)?
         if frozen.active {
-            if let pub = frozen.published, pub.key.isServable(against: frozen.key) {
-                // A background pass already published a master current as of the
-                // freeze — use it, no final pass needed.
+            if let pub = frozen.published, pub.key == frozen.key {
+                // A background pass already published a master computed over EXACTLY the
+                // frozen survivor set — nothing deeper is available, so no final pass.
                 clean = (pub.image, pub.coverage, pub.survivorCount)
-            } else if let refiner = currentRefiner() {
-                // No current published master — run ONE bounded final pass against the
-                // FROZEN survivor set. The deadline alone bounds it (step 4 already
-                // cancelled the background pass, so nothing else cancels this one); a
-                // nil result (deadline/failure) falls back to the online master below.
-                let result = refiner.refine(
-                    survivors: frozen.survivors, currentGeneration: frozenGen,
-                    kappa: frozen.kappa, minSubs: liveRejectionMinSubs,
-                    maxSampleBytes: frozen.budget,
-                    deadline: .now() + finalRefineBudget,
-                    isCancelled: { false })
-                if let result {
-                    clean = (result.image, result.coverage, result.survivorCount)
+            } else {
+                // Either nothing is published, or what is published is merely SHALLOW (subs
+                // arrived after it was computed — `isServable` keeps serving it to the live
+                // broadcast). end() must NOT settle for shallow: master.fit is the archival
+                // output, so run ONE bounded final pass against the FROZEN survivor set to
+                // get full depth. Serving a 5-sub master while a 6th survivor sits in the
+                // frozen set would write STACKCNT=5 and silently discard a sub's integration.
+                // The deadline alone bounds the pass (step 4 already cancelled the background
+                // pass, so nothing else cancels this one).
+                if let refiner = currentRefiner() {
+                    let result = refiner.refine(
+                        survivors: frozen.survivors, currentGeneration: frozenGen,
+                        kappa: frozen.kappa, minSubs: liveRejectionMinSubs,
+                        maxSampleBytes: frozen.budget,
+                        deadline: .now() + finalRefineBudget,
+                        isCancelled: { false })
+                    if let result {
+                        clean = (result.image, result.coverage, result.survivorCount)
+                    }
+                }
+                if clean == nil, let pub = frozen.published,
+                   pub.key.isServable(against: frozen.key) {
+                    // The final pass hit its deadline or failed. A shallower CLEAN master is
+                    // still strictly better than the online master (which rejects nothing), so
+                    // fall back to it rather than dropping to `master0` and losing trail
+                    // rejection entirely. Only reached when full depth was actually attempted.
+                    clean = (pub.image, pub.coverage, pub.survivorCount)
                 }
             }
         }
