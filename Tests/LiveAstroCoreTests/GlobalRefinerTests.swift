@@ -984,6 +984,21 @@ final class GlobalRefinerTests: XCTestCase {
         func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage { image }
     }
 
+    /// `ConstFrameLoader` that counts loads, so a test can prove a pass ACTUALLY RAN rather than
+    /// inferring it from its output — the output alone cannot distinguish "end() ran the final
+    /// pass" from "a background pass happened to publish the same depth first".
+    private final class CountingConstLoader: FrameLoader, @unchecked Sendable {
+        private let image: AstroImage
+        private let lock = NSLock()
+        private var count = 0
+        init(image: AstroImage) { self.image = image }
+        var loads: Int { lock.withLock { count } }
+        func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
+            lock.withLock { count += 1 }
+            return image
+        }
+    }
+
     /// Registers `count` distinct, successfully-registering subs against a fresh reference through
     /// a REAL native `.live` pipeline (small, monotonically increasing translations so every sub
     /// registers against sub 1) and returns the pipeline once all `count` registrations have
@@ -1444,7 +1459,8 @@ final class GlobalRefinerTests: XCTestCase {
         // Must be set BEFORE configureLiveRejection creates the refiner (the override's own doc
         // states this timing requirement) — the stub frames' sourceURLs are not real files, so the
         // production loader could never complete a final pass here.
-        pipeline.refinerLoaderOverride = ConstFrameLoader(image: constImage(0.77, w: 512, h: 512))
+        let loader = CountingConstLoader(image: constImage(0.77, w: 512, h: 512))
+        pipeline.refinerLoaderOverride = loader
         pipeline.configureLiveRejection(enabled: true)
 
         // A pass published over the first 5 subs.
@@ -1457,11 +1473,34 @@ final class GlobalRefinerTests: XCTestCase {
         // the broadcast, but no longer the deepest master end() could write.
         source.send(stubFrame(dx: 0.5, dy: -0.25, name: "trig5.fit", digest: "trig-digest-5", timestamp: 5))
         XCTAssertEqual(waitForRegistrations(pipeline, count: 6, timeout: 30).count, 6)
+
+        // Stop the BACKGROUND path from ever installing a 6-sub master. Without this the test
+        // passes for the wrong reason: a background pass publishes its own 6-sub master first,
+        // end() then takes the exact-current branch, and the final-pass branch under test is never
+        // exercised — verified by reverting the fix and watching the test still pass.
+        //
+        // quiesce()+cancel() alone are NOT enough: they gate future starts and flag the in-flight
+        // pass, but a pass already inside its (uninterruptible) combine still runs to its publish
+        // call. Detaching the publish seam is what actually closes the window. end()'s final pass
+        // is a DIRECT refine() call that returns its result rather than publishing, so it is
+        // unaffected — the only route to a 6-sub master here is the branch under test.
+        let refiner = try XCTUnwrap(pipeline.refinerForTest())
+        refiner.quiesce()
+        refiner.cancel()
+        refiner.publish = { _, _ in }
         XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
                         "precondition: it is still SERVABLE — that is exactly what makes end() able to take the shortcut")
-        XCTAssertEqual(pipeline.publishedMasterSurvivorCount(), 5, "precondition: published depth is 5")
+        XCTAssertEqual(pipeline.publishedMasterSurvivorCount(), 5,
+                       "precondition: the published master is still the SHALLOW 5-sub one, so the "
+                       + "exact-current branch cannot be what produces a 6-sub master below")
 
+        // Positive proof the final pass ran, independent of what it produced: it must LOAD the
+        // frozen survivors. The exact-current branch loads nothing.
+        let loadsBefore = loader.loads
         let replayDir = try pipeline.end()
+        XCTAssertGreaterThanOrEqual(loader.loads - loadsBefore, 6,
+                                    "end() must have loaded all 6 frozen survivors for the final pass — "
+                                    + "zero new loads would mean it reused a published master instead")
         let header = try FITSReader.readHeader(Data(contentsOf: replayDir.appendingPathComponent("master.fit")))
         XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 6,
                        "end() must refine over the frozen 6-sub survivor set, not write the servable 5-sub master")

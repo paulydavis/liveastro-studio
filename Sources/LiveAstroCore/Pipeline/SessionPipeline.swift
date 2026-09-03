@@ -1501,11 +1501,22 @@ public final class SessionPipeline {
         throw SessionPipelineError.shutdownTimeout
     }
 
-    /// D20: the clean-vs-online master-selection policy, extracted from `end()`'s `.active`
-    /// case (pure extraction — no behavior change). Chooses between the clean GLOBAL result
-    /// (a background pass already published one current as of the freeze, or one bounded
-    /// final pass run here against the frozen survivor set) and the online `master0`, and
-    /// builds the `RestackReport` either way; `end()` still does the `encodeMaster`/write.
+    /// D20: the clean-vs-online master-selection policy for shutdown, and the `RestackReport`
+    /// built from it; `end()` still does the `encodeMaster`/write. The policy, in order —
+    ///
+    ///   1. a published master computed over EXACTLY the frozen survivor set (nothing deeper
+    ///      exists, so no pass is worth running);
+    ///   2. otherwise ONE bounded final pass over the frozen survivor set — `master.fit` is
+    ///      archival, so end() reaches for full depth even when a shallower master is servable;
+    ///   3. otherwise a servable-but-SHALLOWER published master, if that pass could not run — a
+    ///      shallow CLEAN master still beats the online one, which rejects nothing;
+    ///   4. otherwise the online `master0`.
+    ///
+    /// Step 2 taking precedence over step 3 is a deliberate divergence from the live broadcast,
+    /// which serves any servable master (review P2): serving shallow keeps the broadcast clean
+    /// during a pass, but WRITING shallow would silently drop a sub's integration from the
+    /// archived master. (This method began as a pure extraction of `end()`'s `.active` case;
+    /// the ordering above is a real behavior change on top of that.)
     ///
     /// Must run using ONLY the frozen snapshot (`frozen`/`frozenGen`) taken by `end()` AFTER
     /// stop/drain/freeze/cancel (never the live `liveRejectionActive`/`_freshnessKey`/
