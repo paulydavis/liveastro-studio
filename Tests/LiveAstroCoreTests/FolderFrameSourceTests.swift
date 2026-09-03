@@ -160,7 +160,7 @@ final class FolderFrameSourceTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let a = try writeFITS(dir, name: "Light_a.fit", value: 0.1)
+        _ = try writeFITS(dir, name: "Light_a.fit", value: 0.1)
         _ = try writeFITS(dir, name: "Light_b.fit", value: 0.2)
 
         let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
@@ -169,25 +169,36 @@ final class FolderFrameSourceTests: XCTestCase {
         source.onLog = { logs.append($0) }
         let buffered = expectation(description: "2 light updates buffered")
         buffered.expectedFulfillmentCount = 2
-        source.liveSeams.onUpdateBuffered = { _ in buffered.fulfill() }
+        // The buffer order between two files that appear in the same poll is NOT
+        // deterministic (observed both ["Light_a","Light_b"] and the reverse), so the test
+        // corrupts whichever update was buffered FIRST rather than assuming it was a. Pinning
+        // a specific name let the test pass without exercising the skip at all: when b landed
+        // first, next() returned b because it was simply next in line, not because anything
+        // was rejected — and only the log assertion noticed.
+        let order = LogBox()   // thread-safe string collector; here it records buffer order
+        source.liveSeams.onUpdateBuffered = { order.append($0.url.lastPathComponent); buffered.fulfill() }
         try source.start()
         await fulfillment(of: [buffered], timeout: 15)
+        let buffers = order.all
+        XCTAssertEqual(buffers.count, 2, "both lights must buffer before the mismatch is staged")
+        let corrupted = try XCTUnwrap(buffers.first)
+        let survivor = try XCTUnwrap(buffers.last)
 
         // The file changes AFTER the watcher validated it, BEFORE the consumer pulls
         // (append one byte in place: same inode, new size/mtime — identity mismatch).
-        let fh = try FileHandle(forWritingTo: a)
+        let fh = try FileHandle(forWritingTo: dir.appendingPathComponent(corrupted))
         try fh.seekToEnd()
         try fh.write(contentsOf: Data([0xFF]))
         try fh.close()
 
         var it = source.frames.makeAsyncIterator()
         let got = await it.next()
-        XCTAssertEqual(got?.sourceName, "Light_b.fit",
+        XCTAssertEqual(got?.sourceName, survivor,
                        "the mismatching frame is skipped and the NEXT update delivered — " +
                        "a lost frame must never end a live stream")
         XCTAssertTrue(logs.all.contains(
-            "file changed between validation and read — skipping Light_a.fit"),
-            "the skip must appear honestly in the log — got \(logs.all)")
+            "file changed between validation and read — skipping \(corrupted)"),
+            "the skip must appear honestly in the log — got \(logs.all); buffered order was \(buffers)")
     }
 
     /// Cold1 M2 (red-first: pre-fix a second start() after stop() silently yielded into
@@ -280,7 +291,7 @@ final class FolderFrameSourceTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let a = try writeFITS(dir, name: "Light_a.fit", value: 0.1)
+        _ = try writeFITS(dir, name: "Light_a.fit", value: 0.1)
         _ = try writeFITS(dir, name: "Light_b.fit", value: 0.2)
 
         let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
