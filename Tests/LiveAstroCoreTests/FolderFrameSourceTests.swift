@@ -144,11 +144,20 @@ final class FolderFrameSourceTests: XCTestCase {
         XCTAssertEqual(source.liveDecodeCount, 0,
                        "no decode may happen while the consumer is parked — light items only")
         var it = source.frames.makeAsyncIterator()
-        let first = await it.next()
-        XCTAssertEqual(first?.sourceName, "Light_001.fit")
+        // Subs appearing in the SAME poll are not delivered in filename order (measured: 002
+        // ahead of 001 on 7 of 10 runs, at v3.6.0 too). Live delivery order is not load-bearing
+        // — every sub registers against the reference, and real capture interleaves anyway — so
+        // this test pins the property it is named for (one lazy decode per pull) and asserts
+        // only that each pulled frame is one of the subs, never a specific position.
+        let subs: Set<String> = ["Light_001.fit", "Light_002.fit", "Light_003.fit"]
+        let firstPull = await it.next()
+        let first = try XCTUnwrap(firstPull)
+        XCTAssertTrue(subs.contains(first.sourceName), "unexpected frame \(first.sourceName)")
         XCTAssertEqual(source.liveDecodeCount, 1, "exactly one decode per pull")
-        let second = await it.next()
-        XCTAssertEqual(second?.sourceName, "Light_002.fit")
+        let secondPull = await it.next()
+        let second = try XCTUnwrap(secondPull)
+        XCTAssertTrue(subs.contains(second.sourceName), "unexpected frame \(second.sourceName)")
+        XCTAssertNotEqual(second.sourceName, first.sourceName, "each pull advances to a new sub")
         XCTAssertEqual(source.liveDecodeCount, 2, "one frame in flight at a time")
     }
 
@@ -300,22 +309,30 @@ final class FolderFrameSourceTests: XCTestCase {
         source.onLog = { logs.append($0) }
         let buffered = expectation(description: "2 light updates buffered")
         buffered.expectedFulfillmentCount = 2
-        source.liveSeams.onUpdateBuffered = { _ in buffered.fulfill() }
+        // Buffer order between two files in the same poll is not deterministic, so delete
+        // whichever update landed FIRST — pinning a name lets the test pass without the drop
+        // ever happening (see testLiveMode_identityMismatchAtPull_skipsHonestly_deliversNext).
+        let order = LogBox()   // thread-safe string collector; here it records buffer order
+        source.liveSeams.onUpdateBuffered = { order.append($0.url.lastPathComponent); buffered.fulfill() }
         try source.start()
         await fulfillment(of: [buffered], timeout: 15)
+        let buffers = order.all
+        XCTAssertEqual(buffers.count, 2, "both lights must buffer before the drop is staged")
+        let dropped = try XCTUnwrap(buffers.first)
+        let survivor = try XCTUnwrap(buffers.last)
 
         // The file vanishes AFTER the watcher validated it, BEFORE the consumer pulls.
-        try FileManager.default.removeItem(at: a)
+        try FileManager.default.removeItem(at: dir.appendingPathComponent(dropped))
 
         var it = source.frames.makeAsyncIterator()
         let got = await it.next()
-        XCTAssertEqual(got?.sourceName, "Light_b.fit",
+        XCTAssertEqual(got?.sourceName, survivor,
                        "the vanished frame is skipped and the NEXT update delivered — " +
                        "a lost frame must never end a live stream")
-        let dropLines = logs.all.filter { $0.contains("Light_a.fit") }
+        let dropLines = logs.all.filter { $0.contains(dropped) }
         XCTAssertEqual(dropLines.count, 1,
                        "the drop must appear in the log exactly once, naming the file — got \(logs.all)")
-        XCTAssertTrue(dropLines.first?.contains("Skipped frame (Light_a.fit): ") == true,
+        XCTAssertTrue(dropLines.first?.contains("Skipped frame (\(dropped)): ") == true,
                       "the log must carry the open error as the reason — got \(dropLines)")
     }
 
@@ -328,20 +345,33 @@ final class FolderFrameSourceTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        // Sorts before Light_b.fit, so it is emitted (and pulled) first.
+        // Which file is corrupt is fixed at creation here, so this test cannot simply corrupt
+        // whichever update buffered first. Instead the two are staged SEQUENTIALLY — the
+        // garbage lands and is buffered before the valid FITS is written at all — because
+        // files appearing in the SAME poll do not buffer in name order (the old comment here
+        // claimed "sorts before Light_b.fit, so it is emitted first"; ["Light_b","Light_a"]
+        // was observed directly, which let this test pass without the drop ever happening).
         try Data("garbage that is neither PNG nor FITS".utf8)
             .write(to: dir.appendingPathComponent("Light_a.png"))
-        _ = try writeFITS(dir, name: "Light_b.fit", value: 0.2)
 
         let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
         defer { source.stop() }
         let logs = LogBox()
         source.onLog = { logs.append($0) }
-        let buffered = expectation(description: "2 light updates buffered")
-        buffered.expectedFulfillmentCount = 2
-        source.liveSeams.onUpdateBuffered = { _ in buffered.fulfill() }
+        let order = LogBox()   // thread-safe string collector; here it records buffer order
+        let garbageBuffered = expectation(description: "the garbage light buffers first")
+        let validBuffered = expectation(description: "the valid light buffers second")
+        source.liveSeams.onUpdateBuffered = {
+            let name = $0.url.lastPathComponent
+            order.append(name)
+            if name == "Light_a.png" { garbageBuffered.fulfill() } else { validBuffered.fulfill() }
+        }
         try source.start()
-        await fulfillment(of: [buffered], timeout: 15)
+        await fulfillment(of: [garbageBuffered], timeout: 15)
+        _ = try writeFITS(dir, name: "Light_b.fit", value: 0.2)
+        await fulfillment(of: [validBuffered], timeout: 15)
+        XCTAssertEqual(order.all, ["Light_a.png", "Light_b.fit"],
+                       "sequential staging must put the garbage frame first, else the skip is untested")
 
         var it = source.frames.makeAsyncIterator()
         let got = await it.next()
