@@ -4,7 +4,13 @@ import Foundation
 /// `.active` (a clean, trail-rejected master is being maintained, with the survivor count that
 /// went into it) or `.off` with a human-readable reason — never silently inactive.
 public enum LiveRejectionStatus: Equatable {
+    /// A clean master EXISTS and is being served, built from `subs` survivors.
     case active(subs: Int)
+    /// Enabled, eligible, and past the quorum — but no clean master has been published yet, so
+    /// the outputs are still the online master. Distinguished from `.active` because reporting
+    /// "Clean master: N subs" while none exists is a lie the operator can't see through: the
+    /// broadcast looks identical either way. `subs` is the survivor count a pass is working over.
+    case building(subs: Int)
     case off(reason: String)
 }
 
@@ -19,13 +25,18 @@ public enum LiveRejectionGate {
     /// sub count), then an in-progress reseed (the survivor set is momentarily being
     /// re-established, so a stale "need ≥ N subs" would be misleading), then the minimum-subs
     /// quorum, else active.
+    /// `publishedSubs` is the survivor count of the clean master ACTUALLY being served, or nil if
+    /// none is current. Passing it is what separates `.active` from `.building`: everything else
+    /// here describes eligibility, not whether a master exists.
     public static func reason(sourceIsLocalLiveRelay: Bool, subCount: Int, minSubs: Int,
-                               reseeding: Bool, enabled: Bool) -> LiveRejectionStatus {
+                               reseeding: Bool, enabled: Bool,
+                               publishedSubs: Int? = nil) -> LiveRejectionStatus {
         guard enabled else { return .off(reason: "turned off") }
         guard sourceIsLocalLiveRelay else { return .off(reason: "network source") }
         guard !reseeding else { return .off(reason: "reseeding") }
         guard subCount >= minSubs else { return .off(reason: "need ≥ \(minSubs) subs") }
-        return .active(subs: subCount)
+        guard let publishedSubs else { return .building(subs: subCount) }
+        return .active(subs: publishedSubs)
     }
 
     /// Whether `url` resolves to a LOCAL filesystem location (D9) — the path-locality half of

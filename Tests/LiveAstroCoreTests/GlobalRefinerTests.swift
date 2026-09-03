@@ -984,6 +984,21 @@ final class GlobalRefinerTests: XCTestCase {
         func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage { image }
     }
 
+    /// `ConstFrameLoader` that counts loads, so a test can prove a pass ACTUALLY RAN rather than
+    /// inferring it from its output — the output alone cannot distinguish "end() ran the final
+    /// pass" from "a background pass happened to publish the same depth first".
+    private final class CountingConstLoader: FrameLoader, @unchecked Sendable {
+        private let image: AstroImage
+        private let lock = NSLock()
+        private var count = 0
+        init(image: AstroImage) { self.image = image }
+        var loads: Int { lock.withLock { count } }
+        func loadRegisteredInput(url: URL, expectedContentDigest: String?) throws -> AstroImage {
+            lock.withLock { count += 1 }
+            return image
+        }
+    }
+
     /// Registers `count` distinct, successfully-registering subs against a fresh reference through
     /// a REAL native `.live` pipeline (small, monotonically increasing translations so every sub
     /// registers against sub 1) and returns the pipeline once all `count` registrations have
@@ -1366,6 +1381,208 @@ final class GlobalRefinerTests: XCTestCase {
         let currentKey = pipeline.currentFreshnessKey()
         publish(result, currentKey)
         XCTAssertNotNil(pipeline.publishedMaster, "an enabled, current publish must still land")
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent())
+    }
+
+    /// THE LIVE-SESSION STARVATION BUG, found by running a real 17-sub M51 session through the
+    /// GUI: a refine pass over 26 MP subs can take longer than the sub cadence, so by the time it
+    /// finishes another sub has landed and `survivorSubIndices` has grown. Under the original
+    /// exact-key rule the finished master then compared unequal and was thrown away — every time,
+    /// forever, at 100% CPU, with `latest.png` byte-identical to the online snapshot for the whole
+    /// session. A master over subs 1…N is not WRONG when sub N+1 lands, only shallower, so it must
+    /// still be served.
+    func testPublishedMasterIsStillServedAfterMoreSubsArrive() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "Starvation", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let source = StubLiveSource(sequence: [
+            stubFrame(dx: 0, dy: 0, name: "v1.fit", digest: "vd1", timestamp: 0),
+            stubFrame(dx: 1.0, dy: -0.5, name: "v2.fit", digest: "vd2", timestamp: 1),
+            stubFrame(dx: 1.6, dy: 0.3, name: "v3.fit", digest: "vd3", timestamp: 2)])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 3).count, 3)
+        pipeline.configureLiveRejection(enabled: true)
+
+        // A pass completes over the first 3 subs and publishes.
+        let keyOver3 = pipeline.currentFreshnessKey()
+        pipeline.publishedMaster = PublishedMaster(image: constImage(0.42), coverage: [1, 1, 1, 1],
+                                                   survivorCount: 3, key: keyOver3)
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(), "precondition: served while the set is unchanged")
+
+        // A 4th sub lands, exactly as it would mid-pass in a live session.
+        source.send(stubFrame(dx: 0.7, dy: 1.1, name: "v4.fit", digest: "vd4", timestamp: 3))
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 4).count, 4)
+        XCTAssertNotEqual(pipeline.currentFreshnessKey(), keyOver3, "the survivor set grew, so the key moved")
+
+        let served = try XCTUnwrap(pipeline.publishedMasterIfCurrent(),
+                                   "a 3-sub clean master must still be served after a 4th sub arrives — under the "
+                                   + "old exact-key rule this returned nil and the broadcast silently fell back to online")
+        XCTAssertEqual(served.survivorCount, 3, "and it honestly reports the depth it was built from")
+        XCTAssertEqual(pipeline.publishedMasterSurvivorCount(), 3)
+
+        // But a reject makes it WRONG, not merely shallow — it must stop being served.
+        pipeline.setUserRejected([2])
+        pipeline.noteUserRejectChanged()
+        XCTAssertNil(pipeline.publishedMasterIfCurrent(),
+                     "a master containing a now-rejected sub must never be served")
+        XCTAssertNil(pipeline.publishedMasterSurvivorCount())
+    }
+
+    /// Review P2 on the starvation fix: "servable if the survivor set merely grew" is right for the
+    /// live BROADCAST (a shallow clean master beats falling back to the un-rejected online one) but
+    /// wrong for `end()`. `master.fit` is the archival output, so end() must reach for full depth:
+    /// with a 5-sub master published and a 6th survivor in the frozen set, it must run the bounded
+    /// final pass over all 6 rather than writing the servable 5-sub master and silently discarding
+    /// a sub's integration. Pre-fix, `selectMasterReport` took the `isServable` branch and wrote
+    /// STACKCNT=5 while a 6th sub's integration was silently discarded.
+    ///
+    /// The injected loader returns a CONSTANT frame distinct from the published dummy, so the two
+    /// outcomes are separable by pixel value as well as by STACKCNT: 0.77 means the final pass ran,
+    /// 0.42 means the shallow published master was written.
+    func testEndRunsTheFinalPassRatherThanWritingAShallowServableMaster() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        // 5 subs, not 3: the final pass is subject to the same `minSubs` quorum as any other
+        // (GlobalRefiner.defaultMinSubs == 5), so a shallower set could never produce a clean
+        // master at all and the test would prove nothing about depth.
+        let (pipeline, source) = try pipelineWithRegisteredSubs(count: 5, sandbox: sandbox)
+        defer { source.stop() }
+        pipeline.rendersReplay = false   // exercise the master write, not the AVFoundation replay render
+        // Must be set BEFORE configureLiveRejection creates the refiner (the override's own doc
+        // states this timing requirement) — the stub frames' sourceURLs are not real files, so the
+        // production loader could never complete a final pass here.
+        let loader = CountingConstLoader(image: constImage(0.77, w: 512, h: 512))
+        pipeline.refinerLoaderOverride = loader
+        pipeline.configureLiveRejection(enabled: true)
+
+        // A pass published over the first 5 subs.
+        let keyOver5 = pipeline.currentFreshnessKey()
+        pipeline.publishedMaster = PublishedMaster(image: constImage(0.42, w: 512, h: 512),
+                                                   coverage: [Float](repeating: 1, count: 512 * 512),
+                                                   survivorCount: 5, key: keyOver5)
+
+        // A 6th sub lands. The published master is now SHALLOW-but-servable: still correct for
+        // the broadcast, but no longer the deepest master end() could write.
+        // Stop the BACKGROUND path from ever installing a 6-sub master, BEFORE the 6th sub exists.
+        // Without this the test passes for the wrong reason: a background pass publishes its own
+        // 6-sub master, end() then takes the exact-current branch, and the final-pass branch under
+        // test is never exercised — verified by reverting the fix and watching it still pass.
+        //
+        // Ordering is what makes this airtight, and race-free. `quiesce()` gates future pass
+        // STARTS under the refiner's own lock, so quiescing here — while only 5 subs exist — means
+        // the 6th sub's `noteChanged()` starts nothing, and no pass over 6 subs is ever created to
+        // reach `publish`. (Quiescing AFTER the 6th sub would be too late on both counts: a pass
+        // already inside its uninterruptible combine still runs to its publish call, and detaching
+        // the `publish` closure to stop it would be an unsynchronised write to a var the background
+        // pass may be reading.) A pass still in flight over the FIRST 5 subs is harmless: its
+        // snapshot key is the 5-sub one, so publishing it just reinstates the precondition.
+        //
+        // end()'s final pass is a DIRECT refine() call, explicitly unaffected by quiesce(), so it
+        // remains the only route to a 6-sub master here.
+        let refiner = try XCTUnwrap(pipeline.refinerForTest())
+        refiner.quiesce()
+        refiner.cancel()
+
+        source.send(stubFrame(dx: 0.5, dy: -0.25, name: "trig5.fit", digest: "trig-digest-5", timestamp: 5))
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 6, timeout: 30).count, 6)
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
+                        "precondition: it is still SERVABLE — that is exactly what makes end() able to take the shortcut")
+        XCTAssertEqual(pipeline.publishedMasterSurvivorCount(), 5,
+                       "precondition: the published master is still the SHALLOW 5-sub one, so the "
+                       + "exact-current branch cannot be what produces a 6-sub master below")
+
+        // Positive proof the final pass ran, independent of what it produced: it must LOAD the
+        // frozen survivors. The exact-current branch loads nothing.
+        let loadsBefore = loader.loads
+        let replayDir = try pipeline.end()
+        XCTAssertGreaterThanOrEqual(loader.loads - loadsBefore, 6,
+                                    "end() must have loaded all 6 frozen survivors for the final pass — "
+                                    + "zero new loads would mean it reused a published master instead")
+        let header = try FITSReader.readHeader(Data(contentsOf: replayDir.appendingPathComponent("master.fit")))
+        XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 6,
+                       "end() must refine over the frozen 6-sub survivor set, not write the servable 5-sub master")
+        let master = try FITSReader.read(Data(contentsOf: replayDir.appendingPathComponent("master.fit")))
+        let mean = master.pixels.reduce(0, +) / Float(master.pixels.count)
+        XCTAssertEqual(mean, 0.77, accuracy: 0.05,
+                       "master.fit must be the final pass's output (0.77), not the published dummy (0.42)")
+    }
+
+    /// The other half of the P2 fix: end() reaches for full depth FIRST, but if that final pass
+    /// cannot produce a master (deadline, or every load failing as here), a shallower CLEAN master
+    /// is still strictly better than the online one — which rejects nothing and would put the
+    /// trails back into `master.fit`. So the servable-but-shallow master remains the fallback,
+    /// reached only after full depth was actually attempted.
+    func testEndFallsBackToTheShallowCleanMasterWhenTheFinalPassCannotRun() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try pipelineWithRegisteredSubs(count: 5, sandbox: sandbox)
+        defer { source.stop() }
+        pipeline.rendersReplay = false
+        // Every load throws (no images registered), so the final pass drops below `minSubs` and
+        // returns nil — the deadline path is the same branch, exercised without the wall-clock wait.
+        pipeline.refinerLoaderOverride = FailOnceLoader(images: [:], failOnce: [])
+        pipeline.configureLiveRejection(enabled: true)
+
+        let keyOver5 = pipeline.currentFreshnessKey()
+        pipeline.publishedMaster = PublishedMaster(image: constImage(0.42, w: 512, h: 512),
+                                                   coverage: [Float](repeating: 1, count: 512 * 512),
+                                                   survivorCount: 5, key: keyOver5)
+        source.send(stubFrame(dx: 0.5, dy: -0.25, name: "trig5.fit", digest: "trig-digest-5", timestamp: 5))
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 6, timeout: 30).count, 6)
+
+        let replayDir = try pipeline.end()
+        let master = try FITSReader.read(Data(contentsOf: replayDir.appendingPathComponent("master.fit")))
+        let mean = master.pixels.reduce(0, +) / Float(master.pixels.count)
+        XCTAssertEqual(mean, 0.42, accuracy: 0.05,
+                       "with the final pass unable to run, master.fit must still be the CLEAN 5-sub master "
+                       + "(0.42) rather than dropping to the online star field, which rejects nothing")
+        let header = try FITSReader.readHeader(Data(contentsOf: replayDir.appendingPathComponent("master.fit")))
+        XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 5,
+                       "and it must report the depth it actually has, not the 6 it tried for")
+    }
+
+    /// The other half of the same bug: the publish seam itself dropped a finished pass whose set
+    /// had merely grown, so nothing was ever stored to serve.
+    func testPublishSeamAcceptsAResultWhoseSurvivorSetMerelyGrew() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let profile = SessionProfile(targetName: "PublishGrow", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine()
+        let source = StubLiveSource(sequence: [
+            stubFrame(dx: 0, dy: 0, name: "w1.fit", digest: "wd1", timestamp: 0),
+            stubFrame(dx: 1.0, dy: -0.5, name: "w2.fit", digest: "wd2", timestamp: 1),
+            stubFrame(dx: 1.6, dy: 0.3, name: "w3.fit", digest: "wd3", timestamp: 2)])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine, profile: profile, rootDirectory: sessions)
+        try pipeline.start()
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 3).count, 3)
+        pipeline.configureLiveRejection(enabled: true)
+        let refiner = try XCTUnwrap(pipeline.refinerForTest())
+        let publish = try XCTUnwrap(refiner.publish)
+
+        let keySnapshottedByThePass = pipeline.currentFreshnessKey()
+        source.send(stubFrame(dx: 0.7, dy: 1.1, name: "w4.fit", digest: "wd4", timestamp: 3))
+        XCTAssertEqual(waitForRegistrations(pipeline, count: 4).count, 4)
+
+        // The pass finishes now, holding the key from before that 4th sub.
+        publish(RefineResult(image: constImage(0.5), coverage: [Float](repeating: 1, count: 16),
+                             survivorCount: 3, skipped: 0), keySnapshottedByThePass)
+        XCTAssertNotNil(pipeline.publishedMaster,
+                        "a pass overtaken by a new sub must still store its result — dropping it is what "
+                        + "left a real session at 100% CPU with nothing ever published")
         XCTAssertNotNil(pipeline.publishedMasterIfCurrent())
     }
 

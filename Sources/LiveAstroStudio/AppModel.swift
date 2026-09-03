@@ -1002,14 +1002,19 @@ final class AppModel {
                                   reseeding: false,   // no live "reseed in progress" signal exists yet — reseed()
                                                        // is synchronous (bumps the generation and returns), so there
                                                        // is no AppModel-observable in-between window to report here.
-                                  enabled: liveTrailRejection)
+                                  enabled: liveTrailRejection,
+                                  // The clean master ACTUALLY being served, not the survivor count:
+                                  // nil until a pass publishes, which is what makes the caption say
+                                  // "building" instead of claiming a master the outputs don't have.
+                                  publishedSubs: pipeline?.publishedMasterSurvivorCount())
     }
 
     /// Human caption for `CaptureSettingsView`'s status line.
     var liveRejectionStatusText: String {
         switch liveRejectionStatus {
-        case .active(let subs): return "Clean master: \(subs) sub\(subs == 1 ? "" : "s")"
-        case .off(let reason):  return "Clean master off — \(reason)"
+        case .active(let subs):   return "Clean master: \(subs) sub\(subs == 1 ? "" : "s")"
+        case .building(let subs): return "Clean master: building over \(subs) subs…"
+        case .off(let reason):    return "Clean master off — \(reason)"
         }
     }
 

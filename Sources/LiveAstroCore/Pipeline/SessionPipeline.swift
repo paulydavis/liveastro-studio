@@ -24,9 +24,16 @@ final class NSLock_Flag {
 
 /// Composite freshness key for a background-refiner-published master (Task 7): identifies exactly
 /// which generation / survivor-set / user-reject-state / κ a published master was computed from.
-/// `publishedMasterIfCurrent()` invalidates the stored master the instant ANY of these change —
-/// a reseed, a user reject, a κ change, or a sample-budget change — so broadcast/end() never
-/// consume a stale trail-free master. `survivorSubIndices` is the SORTED list of survivor
+/// `publishedMasterIfCurrent()` invalidates the stored master the instant anything that changes
+/// what it MEANS changes — a reseed, a user reject, a κ change, a sample-budget change, or an
+/// enable-state transition — so broadcast/end() never consume a stale trail-free master. A
+/// GROWN survivor set is the deliberate exception: subs arriving during a pass make the
+/// published master merely SHALLOW, not wrong, and it keeps being served until the next pass
+/// publishes (see `isServable(against:)` — without this a busy session starves and never serves
+/// a clean master at all). `end()` does NOT settle for shallow: it prefers an exactly-current
+/// master, else runs the bounded final pass, and only falls back to a shallower servable master
+/// if that pass fails — `master.fit` is archival and must be the deepest available.
+/// `survivorSubIndices` is the SORTED list of survivor
 /// `subIndex`es (unique per sub — byte-identical subs stay distinct entries, never collapsed to
 /// a digest set). `maxSampleBytes` is in the key (review P2) because clearing `publishedMaster`
 /// on a budget change was not enough: a pass already in flight snapshotted the OLD key, and
@@ -47,6 +54,35 @@ public struct FreshnessKey: Equatable {
     /// pass cancelled during the per-pixel combine — which is not interruptible mid-loop — still
     /// runs to its publish call.) The epoch makes the pre-OFF key unequal to every later key.
     let liveRejectionEpoch: Int
+
+    /// Everything that makes a published master WRONG rather than merely SHALLOW. A reseed
+    /// (`stackGeneration`), a user reject (`userRejectGeneration`), a κ or sample-budget change,
+    /// or an enable-state transition (`liveRejectionEpoch`) each change what the master MEANS, so
+    /// one computed before any of them must never be served. `survivorSubIndices` is deliberately
+    /// NOT here — see `isServable(against:)`.
+    private var validityCore: [AnyHashable] {
+        [stackGeneration, userRejectGeneration, kappa, maxSampleBytes, liveRejectionEpoch]
+    }
+
+    /// Whether a master computed under `self` may still be served while the live state is
+    /// `current`.
+    ///
+    /// Exact key equality was the original rule, and it STARVES a live session: a refine pass over
+    /// 26 MP subs can take longer than the sub cadence, so by the time it finishes another sub has
+    /// landed, `survivorSubIndices` has grown, the key differs, and the finished result is thrown
+    /// away — repeatedly, at 100% CPU, with the broadcast silently serving the online master the
+    /// whole time. Observed on a real 17-sub M51 session: `latest.png` stayed byte-identical to the
+    /// online snapshot from the first sub to the last.
+    ///
+    /// A master built from subs 1…11 is not WRONG when sub 12 lands — it is one sub shallower and
+    /// still trail-free. So the validity fields must match exactly, and the master's survivor set
+    /// must be a SUBSET of the current one. Given equal validity fields that set can only have
+    /// GROWN (a sub leaves only via a reject or a generation change, and both live in
+    /// `validityCore`), so the subset test says precisely "only new subs arrived since".
+    func isServable(against current: FreshnessKey) -> Bool {
+        guard validityCore == current.validityCore else { return false }
+        return Set(survivorSubIndices).isSubset(of: Set(current.survivorSubIndices))
+    }
 }
 
 /// The background refiner's most recently published trail-free master (Task 6/7), stamped with
@@ -314,6 +350,18 @@ public final class SessionPipeline {
     /// observe `passesRun` and prove the invalidation hooks start NO pass while the feature is
     /// off — and that enable-ON still does. Mirrors the other `...ForTest` seams; not for product code.
     func refinerForTest() -> GlobalRefiner? { currentRefiner() }
+
+    /// Survivor count of the clean master that would be SERVED right now, or nil if none is
+    /// current. The caption needs this rather than `currentSurvivorCount()`: the two differ
+    /// exactly when a pass hasn't published yet, which is precisely the state the operator
+    /// otherwise cannot distinguish from a working one (the broadcast looks the same either way).
+    public func publishedMasterSurvivorCount() -> Int? {
+        regLock.withLock {
+            guard liveRejectionActive, let pm = publishedMaster,
+                  pm.key.isServable(against: _freshnessKey) else { return nil }
+            return pm.survivorCount
+        }
+    }
 
     /// Survivor count of the CURRENT stack generation, minus user-rejected subs — what the
     /// refiner actually combines. For the operator caption (review P3): the app-side count of
@@ -598,7 +646,9 @@ public final class SessionPipeline {
     /// is dropped rather than stored-then-refused.
     private func publishRefineResult(_ result: RefineResult, key: FreshnessKey) {
         regLock.withLock {
-            guard liveRejectionActive, key == _freshnessKey else { return }
+            // Servable-not-identical (see FreshnessKey.isServable): subs that landed while this
+            // pass ran must NOT discard its result, or a live session never publishes at all.
+            guard liveRejectionActive, key.isServable(against: _freshnessKey) else { return }
             publishedMaster = PublishedMaster(image: result.image, coverage: result.coverage,
                                               survivorCount: result.survivorCount, key: key)
         }
@@ -611,7 +661,8 @@ public final class SessionPipeline {
     /// publish/mutation can't be observed torn.
     public func publishedMasterIfCurrent() -> (image: AstroImage, coverage: [Float], survivorCount: Int)? {
         regLock.withLock {
-            guard liveRejectionActive, let pm = publishedMaster, pm.key == _freshnessKey else { return nil }
+            guard liveRejectionActive, let pm = publishedMaster,
+                  pm.key.isServable(against: _freshnessKey) else { return nil }
             return (image: pm.image, coverage: pm.coverage, survivorCount: pm.survivorCount)
         }
     }
@@ -1450,11 +1501,22 @@ public final class SessionPipeline {
         throw SessionPipelineError.shutdownTimeout
     }
 
-    /// D20: the clean-vs-online master-selection policy, extracted from `end()`'s `.active`
-    /// case (pure extraction — no behavior change). Chooses between the clean GLOBAL result
-    /// (a background pass already published one current as of the freeze, or one bounded
-    /// final pass run here against the frozen survivor set) and the online `master0`, and
-    /// builds the `RestackReport` either way; `end()` still does the `encodeMaster`/write.
+    /// D20: the clean-vs-online master-selection policy for shutdown, and the `RestackReport`
+    /// built from it; `end()` still does the `encodeMaster`/write. The policy, in order —
+    ///
+    ///   1. a published master computed over EXACTLY the frozen survivor set (nothing deeper
+    ///      exists, so no pass is worth running);
+    ///   2. otherwise ONE bounded final pass over the frozen survivor set — `master.fit` is
+    ///      archival, so end() reaches for full depth even when a shallower master is servable;
+    ///   3. otherwise a servable-but-SHALLOWER published master, if that pass could not run — a
+    ///      shallow CLEAN master still beats the online one, which rejects nothing;
+    ///   4. otherwise the online `master0`.
+    ///
+    /// Step 2 taking precedence over step 3 is a deliberate divergence from the live broadcast,
+    /// which serves any servable master (review P2): serving shallow keeps the broadcast clean
+    /// during a pass, but WRITING shallow would silently drop a sub's integration from the
+    /// archived master. (This method began as a pure extraction of `end()`'s `.active` case;
+    /// the ordering above is a real behavior change on top of that.)
     ///
     /// Must run using ONLY the frozen snapshot (`frozen`/`frozenGen`) taken by `end()` AFTER
     /// stop/drain/freeze/cancel (never the live `liveRejectionActive`/`_freshnessKey`/
@@ -1473,22 +1535,36 @@ public final class SessionPipeline {
         var clean: (image: AstroImage, coverage: [Float], survivorCount: Int)?
         if frozen.active {
             if let pub = frozen.published, pub.key == frozen.key {
-                // A background pass already published a master current as of the
-                // freeze — use it, no final pass needed.
+                // A background pass already published a master computed over EXACTLY the
+                // frozen survivor set — nothing deeper is available, so no final pass.
                 clean = (pub.image, pub.coverage, pub.survivorCount)
-            } else if let refiner = currentRefiner() {
-                // No current published master — run ONE bounded final pass against the
-                // FROZEN survivor set. The deadline alone bounds it (step 4 already
-                // cancelled the background pass, so nothing else cancels this one); a
-                // nil result (deadline/failure) falls back to the online master below.
-                let result = refiner.refine(
-                    survivors: frozen.survivors, currentGeneration: frozenGen,
-                    kappa: frozen.kappa, minSubs: liveRejectionMinSubs,
-                    maxSampleBytes: frozen.budget,
-                    deadline: .now() + finalRefineBudget,
-                    isCancelled: { false })
-                if let result {
-                    clean = (result.image, result.coverage, result.survivorCount)
+            } else {
+                // Either nothing is published, or what is published is merely SHALLOW (subs
+                // arrived after it was computed — `isServable` keeps serving it to the live
+                // broadcast). end() must NOT settle for shallow: master.fit is the archival
+                // output, so run ONE bounded final pass against the FROZEN survivor set to
+                // get full depth. Serving a 5-sub master while a 6th survivor sits in the
+                // frozen set would write STACKCNT=5 and silently discard a sub's integration.
+                // The deadline alone bounds the pass (step 4 already cancelled the background
+                // pass, so nothing else cancels this one).
+                if let refiner = currentRefiner() {
+                    let result = refiner.refine(
+                        survivors: frozen.survivors, currentGeneration: frozenGen,
+                        kappa: frozen.kappa, minSubs: liveRejectionMinSubs,
+                        maxSampleBytes: frozen.budget,
+                        deadline: .now() + finalRefineBudget,
+                        isCancelled: { false })
+                    if let result {
+                        clean = (result.image, result.coverage, result.survivorCount)
+                    }
+                }
+                if clean == nil, let pub = frozen.published,
+                   pub.key.isServable(against: frozen.key) {
+                    // The final pass hit its deadline or failed. A shallower CLEAN master is
+                    // still strictly better than the online master (which rejects nothing), so
+                    // fall back to it rather than dropping to `master0` and losing trail
+                    // rejection entirely. Only reached when full depth was actually attempted.
+                    clean = (pub.image, pub.coverage, pub.survivorCount)
                 }
             }
         }
