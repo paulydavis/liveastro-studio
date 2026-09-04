@@ -1463,7 +1463,11 @@ Run: `swift run LiveAstroStudio` (or launch the built `.app`), start an import o
 - [ ] **Step 5: Full suite**
 
 Run: `swift test 2>&1 | tail -5`
-Expected: `Test Suite 'All tests' passed`, 0 failures. Baseline was 1217 tests at v3.6.1; this plan adds roughly 17.
+Expected: `Test Suite 'All tests' passed`, 0 failures. Baseline is 1217 tests at v3.6.1. This
+plan defines 20 tests, one of which (`testAppModelOnlyPushesCommittedAdjustmentsToThePipeline`)
+REPLACES the existing source-text test rather than adding to it, so the expected total is
+**1236**. A different number means a test was silently dropped or duplicated — check before
+treating the run as green.
 
 - [ ] **Step 6: Commit**
 
