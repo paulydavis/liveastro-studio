@@ -150,6 +150,10 @@ be a data race.
 Adjustments remain deliberately absent from the key: the proxy is linear and pre-adjustment, so
 slider drags reuse it.
 
+The cache holds one slot PER SOURCE. Hold-to-compare alternates clean -> online -> clean, so a
+single-slot cache would evict and rebuild from the full-resolution stack on every press and every
+release — making the one interaction that must feel instant the most expensive in the panel.
+
 North-up needs no work: it is applied inside `displayCGImage` from `currentWCS`, so the
 preview inherits it.
 
@@ -185,6 +189,10 @@ were seeing the clean one, actively misrepresenting the thing the comparison exi
 
 ### UI (DisplaySettingsView)
 
+- Every control fires `refreshPreview()` from an `.onChange` on its own field, NOT from
+  `onEditingChanged`. The existing sliders use `{ editing in if !editing { ... } }`, which fires
+  only on RELEASE — that is why the app has no live feedback while dragging today, and reusing it
+  would give a preview panel that barely moves.
 - Preview PINNED at the top of the tab, controls scroll beneath — otherwise the DBE and
   denoise sliders push the preview off-screen exactly when in use.
 - Apply / Revert beside the preview, disabled while pending == committed.

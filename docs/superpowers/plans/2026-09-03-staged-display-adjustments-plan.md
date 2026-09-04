@@ -815,7 +815,7 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
     /// is being served; `.online` is the un-rejected running stack. The blink control swaps
     /// between them through the SAME adjustments, so the comparison isolates rejection rather
     /// than confounding it with a stretch difference.
-    public enum PreviewSource: Equatable {
+    public enum PreviewSource: Hashable {
         case clean
         case online
     }
@@ -836,7 +836,11 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
         case watcher(token: Int)
     }
     private let previewProxyLock = NSLock()
-    private var previewProxy: (key: PreviewProxyKey, image: AstroImage)?
+    /// One slot PER SOURCE, not a single slot. Hold-to-compare alternates clean -> online ->
+    /// clean, so a single slot would evict and rebuild from the full-resolution stack on every
+    /// press AND every release — the interaction that has to feel instant would be the most
+    /// expensive one in the panel.
+    private var previewProxies: [PreviewSource: (key: PreviewProxyKey, image: AstroImage)] = [:]
     /// Test seam: how many times the proxy has actually been rebuilt.
     private(set) var previewProxyBuildCountForTest = 0
 
@@ -902,7 +906,7 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
         }
         var proxy: AstroImage?
         previewProxyLock.lock()
-        if let cached = previewProxy, cached.key == key { proxy = cached.image }
+        if let cached = previewProxies[source], cached.key == key { proxy = cached.image }
         previewProxyLock.unlock()
 
         if proxy == nil {
@@ -926,7 +930,7 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
                     .downsampled(maxLongEdge: Self.previewLongEdge)
             }
             previewProxyLock.lock()
-            previewProxy = (key, built)
+            previewProxies[source] = (key, built)
             previewProxyBuildCountForTest += 1
             previewProxyLock.unlock()
             proxy = built
@@ -995,7 +999,8 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 ### Task 5: Wire `AppModel` to the staged model
 
 **Files:**
-- Modify: `Sources/LiveAstroStudio/AppModel.swift` — `:183` (property), `:531-552` (`applyDisplayAdjustments`), `:408`, `:487`, `:535`, `:784` (call sites)
+- Modify: `Sources/LiveAstroStudio/AppModel.swift` — `:183` (property), `:531-552` (`applyDisplayAdjustments`), `:408`, `:487`, `:535`, `:784` (call sites), `:921` (onUpdate), `:954` (onSolveStateChanged), `:1031` (configureLiveRejection), `:1071` (toggleReject)
+- Modify: `Sources/LiveAstroCore/Pipeline/SessionPipeline.swift` — Step 4d adds `onCleanMasterPublished` and fires it from `publishRefineResult` (`:647`)
 - Modify: `Tests/LiveAstroCoreTests/AppSourceRegressionTests.swift:45`
 
 **Interfaces:**
@@ -1205,17 +1210,23 @@ These are edits, not guidance; make each one:
    and `staged.revert()` — pending edits die with the session, and nothing from a finished
    session lingers on screen.
 
-5. Wire `pipeline.onSolveStateChanged` to `refreshPreview(force: true)`, with the same
-   main-actor hop. A MANUAL reseed changes the stack immediately and may not produce another
+5. Extend the EXISTING `pipeline.onSolveStateChanged` closure (`AppModel.swift:954`) — do not
+   assign a new one, or you silently drop the `solveAvailable` update it already performs and
+   the North-up toggle's gate stops working. A MANUAL reseed changes the stack immediately and may not produce another
    accepted frame for a while, so `onUpdate` alone can leave the panel showing the old stack;
    `onSolveStateChanged` already fires on that edge (`SessionPipeline.swift:211`, commented
    "negative edge: reseed/auto-reseed dropped the solve"). The same hook also covers solve
    ARRIVAL (`:265`), which matters because North-up rotation is applied inside `displayCGImage`
    — the preview's orientation changes the moment a solve lands.
 
+The merged closure:
+
 ```swift
         pipeline.onSolveStateChanged = { [weak self] in
-            Task { @MainActor in self?.refreshPreview(force: true) }
+            Task { @MainActor in
+                self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false   // existing behaviour
+                self?.refreshPreview(force: true)                              // added
+            }
         }
 ```
 
@@ -1268,7 +1279,37 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 
 - [ ] **Step 1: Rebind every Display Adjustments control to `staged.pending`**
 
-In `DisplaySettingsView.swift`, the `Section("Display Adjustments")` controls currently bind to `$model.displayAdjustments.*` (lines 31, 38, 45, 50, 58, 67, 77, 84). Rebind each to `$model.staged.pending.*`, and change each `onEditingChanged`/`onChange` handler to call `model.refreshPreview()` instead of `model.applyDisplayAdjustments()`. The `Section("Night vision")` controls are unrelated and must NOT change.
+In `DisplaySettingsView.swift`, the `Section("Display Adjustments")` controls currently bind to
+`$model.displayAdjustments.*` (lines 31, 38, 45, 50, 58, 67, 77, 84). Rebind each to
+`$model.staged.pending.*`. The `Section("Night vision")` controls are unrelated and must NOT change.
+
+**The existing handlers are NOT enough, and swapping them one-for-one would produce a preview
+that barely moves.** Every slider today reads:
+
+```swift
+                        Slider(value: $model.displayAdjustments.blackPoint, in: 0...0.2) { editing in
+                            if !editing { model.applyDisplayAdjustments() }
+                        }
+```
+
+`onEditingChanged` fires at drag START and drag END only, and the `if !editing` guard narrows
+that to the release alone — which is why the app has no live feedback while dragging today. A
+preview panel whose whole purpose is live feedback must update DURING the drag, so each control
+also needs an `.onChange` on its own field:
+
+```swift
+                        Slider(value: $model.staged.pending.blackPoint, in: 0...0.2)
+                            .onChange(of: model.staged.pending.blackPoint) { _, _ in
+                                model.refreshPreview()
+                            }
+                            .help("Darken the sky background. 0 = auto.")
+```
+
+Apply that shape to every control in the section — the three sliders (`blackPoint`,
+`midtoneStrength`, `saturation`), the DBE toggle and its two sliders (`bgScale`, `bgSmoothest`),
+`denoiseStrength`, and the `northUp` toggle. `refreshPreview()` is throttled (~12 fps), so a
+per-tick call is safe; the throttle is what that existing "so dragging stays smooth" comment was
+written for, and it is finally exercised.
 
 The **Reset button** at `DisplaySettingsView.swift:108` must also be rebound — it is the one
 control that would otherwise still write straight through. Its action becomes:
