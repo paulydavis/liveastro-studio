@@ -74,7 +74,12 @@ Revert: `pending = committed`.
    `renderCurrentDisplay(adjustments:)` commits as a side effect (`:1116`) and is retained
    only for the Apply path.
 3. **Downsampled proxy** — the preview renders from a cached, downsampled linear image, not
-   the 26MP stack. Cache invalidated when the stack updates.
+   the 26MP stack. Target the proxy's LONGEST EDGE at 1200 px (a 26MP 6236x4159 stack
+   downsamples ~5x to 1200x800), by integer box-averaging so sampling stays uniform and the
+   derived statistics hold; a stack already under 1200 px on its long edge is used as-is.
+   The cache key is (stack generation, processed sub count, source selector) — i.e. it is
+   invalidated by a new sub, a reseed, or switching between clean and online. Adjustments are
+   NOT in the key: the proxy is linear, pre-adjustment, so slider drags reuse it.
 4. **Source selector** for blink: `.clean` (`publishedMasterIfCurrent()`) or `.online`
    (`engine.currentStackAndCoverage()`), both cropped to coverage as the existing paths do,
    both rendered through the SAME pending adjustments so the comparison isolates rejection.
@@ -99,8 +104,11 @@ preview inherits it.
    committed path are byte-identical to pre-change output.
 2. **Staging invariant.** With pending != committed, `pipeline.displayAdjustments == committed`.
 3. **Preview honesty.** Assert the stretch parameters AutoStretch DERIVES (median, MADN) from
-   the downsampled proxy match those from the full frame within a tight bound. Deliberately
-   not a pixel comparison, which would need an arbitrary tolerance and prove little.
+   the downsampled proxy match those from the full frame to within 2% relative, on a real
+   stacked frame rather than a synthetic flat one (a constant image makes this test vacuous —
+   every statistic survives any sampling). Deliberately not a pixel comparison, which would
+   need an arbitrary tolerance and prove little. A box-average downsample should sit far
+   inside 2%; if it does not, the proxy sampling is wrong and the preview is lying.
 4. Apply commits + persists; Revert discards.
 5. Main view follows committed while pending differs.
 6. Blink renders both sources through identical adjustments.
