@@ -926,7 +926,7 @@ public final class SessionPipeline {
         }
         let broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
         let displaySource = downsampleLongEdge.map { broadcastMean.downsampled(maxLongEdge: $0) } ?? broadcastMean
-        let broadcastCG = try displayCGImage(from: displaySource)
+        let broadcastCG = try displayCGImage(from: displaySource, adjustments: displayAdjustments)
         return (broadcastMean, broadcastCG, published.survivorCount)
     }
 
@@ -938,7 +938,7 @@ public final class SessionPipeline {
         guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
         do {
             let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
-            let previewCG = try displayCGImage(from: displaySource)
+            let previewCG = try displayCGImage(from: displaySource, adjustments: displayAdjustments)
 
             // BROADCAST/latest.png: prefer the clean published master over the online mean, with
             // the downsample applied to whichever is served (D10: see resolveBroadcastRender).
@@ -1071,8 +1071,11 @@ public final class SessionPipeline {
 
     /// Shared display pipeline: optional background neutralization, then stretch
     /// if still linear, then pack to CGImage.
-    private func displayCGImage(from linear: AstroImage) throws -> CGImage {
-        let adj = displayAdjustments                         // single locked read
+    private func displayCGImage(from linear: AstroImage,
+                                adjustments adj: DisplayAdjustments) throws -> CGImage {
+        // (was: let adj = displayAdjustments — the caller now supplies it, so this function is
+        // a pure function of (image, adjustments) and can render UNCOMMITTED values for the
+        // staged preview without touching pipeline state.)
         // DBE first, on linear data. When on, it removes the per-channel spatial
         // background, so skip the additive neutralize (keep multiplicative WB).
         let flattened = adj.backgroundExtraction
@@ -1118,14 +1121,13 @@ public final class SessionPipeline {
         // doesn't snap the preview back to the ragged full-union frame.
         guard let (mean0, coverage) = engine?.currentStackAndCoverage() else { return nil }
         let mean = cropToCoverage(mean0, coverage: coverage)
-        return try? displayCGImage(from: mean)
+        return try? displayCGImage(from: mean, adjustments: adjustments)
     }
 
     /// Test seam: render an arbitrary image through the SAME path the broadcast uses.
     /// Exists so `DisplayRenderParityTests` can pin the committed output by hash.
     func renderForTest(_ image: AstroImage, adjustments: DisplayAdjustments) throws -> CGImage {
-        displayAdjustments = adjustments
-        return try displayCGImage(from: image)
+        try displayCGImage(from: image, adjustments: adjustments)
     }
 
     /// Processes one raw frame through the stack engine (native mode). Callback deliveries
@@ -1237,7 +1239,7 @@ public final class SessionPipeline {
                     return
                 }
                 do {
-                    let previewCG = try displayCGImage(from: mean)
+                    let previewCG = try displayCGImage(from: mean, adjustments: displayAdjustments)
 
                     // BROADCAST/latest.png: prefer the clean published master over the online
                     // mean, full-resolution (live, unlike renderSnapshot's downsampled preview) —
@@ -1280,7 +1282,7 @@ public final class SessionPipeline {
                 // digest) the watcher validated on ITS pinned descriptor, so a file replaced between
                 // the watcher's validation and this read is skipped, never parsed.
                 let linear = try ImageLoader.load(url: update.url, expectedIdentity: update.identity)
-                let cg = try displayCGImage(from: linear)
+                let cg = try displayCGImage(from: linear, adjustments: displayAdjustments)
                 let index = session.acceptedCount + 1
                 let record = try recorder.save(
                     cgImage: cg, linear: linear, sourceFile: update.url.lastPathComponent,
