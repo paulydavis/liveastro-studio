@@ -709,7 +709,7 @@ final class PreviewRenderTests: XCTestCase {
 
         XCTAssertNil(pipeline.renderPreview(source: .online, adjustments: .neutral),
                      "no frame seen yet — the panel shows its placeholder")
-        pipeline.noteWatcherFrame(PreviewTestSupport.starField(w: 2400, h: 1800), digest: "w1")
+        pipeline.noteWatcherFrame(PreviewTestSupport.starField(w: 2400, h: 1800))
         let cg = try XCTUnwrap(pipeline.renderPreview(source: .online, adjustments: .neutral),
                                "watcher mode must still preview, from the retained last frame")
         XCTAssertLessThanOrEqual(max(cg.width, cg.height), SessionPipeline.previewLongEdge)
@@ -792,7 +792,7 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
     private enum PreviewProxyKey: Equatable {
         case online(generation: Int, revision: Int)
         case clean(FreshnessKey)
-        case watcher(digest: String)
+        case watcher(token: Int)
     }
     private let previewProxyLock = NSLock()
     private var previewProxy: (key: PreviewProxyKey, image: AstroImage)?
@@ -817,11 +817,20 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
     /// engine — it loads and renders each incoming file (`:1276`) — so without this the preview
     /// would be permanently blank there, even though display adjustments apply exactly as they
     /// do natively. Retaining the DOWNSAMPLED image costs ~1 MP, not 26 MP.
+    /// Keyed by a monotonic TOKEN, not the file digest: `StackUpdate.identity` is
+    /// `FileIdentity?` and `FileIdentity.digest` is `String?` (`StackFileWatcher.swift:150,14`),
+    /// so a digest key would need a double unwrap and a fallback for the nil case. A token is
+    /// always correct and costs nothing here — the retained image is already downsampled at
+    /// ingest, so "rebuilding" the proxy is just handing back the stored image.
     private let lastPreviewLock = NSLock()
-    private var lastPreviewLinear: (digest: String, image: AstroImage)?
-    func noteWatcherFrame(_ linear: AstroImage, digest: String) {
+    private var watcherFrameToken = 0
+    private var lastPreviewLinear: (token: Int, image: AstroImage)?
+    func noteWatcherFrame(_ linear: AstroImage) {
         let small = linear.downsampled(maxLongEdge: Self.previewLongEdge)
-        lastPreviewLock.lock(); lastPreviewLinear = (digest, small); lastPreviewLock.unlock()
+        lastPreviewLock.lock()
+        watcherFrameToken += 1
+        lastPreviewLinear = (watcherFrameToken, small)
+        lastPreviewLock.unlock()
     }
 
     /// Renders the staged preview WITHOUT touching committed state — the property
@@ -843,10 +852,10 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
                               revision: currentPreviewStackRevision)
             } else {
                 lastPreviewLock.lock()
-                let digest = lastPreviewLinear?.digest
+                let token = lastPreviewLinear?.token
                 lastPreviewLock.unlock()
-                guard let digest else { return nil }      // watcher mode, no frame yet
-                key = .watcher(digest: digest)
+                guard let token else { return nil }       // watcher mode, no frame yet
+                key = .watcher(token: token)
             }
         }
         var proxy: AstroImage?
@@ -905,12 +914,17 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
 
 Then wire the two invalidation sources:
 
-- Call `bumpPreviewStackRevision()` immediately after EACH `processedCount += 1`
-  (`SessionPipeline.swift:890` and `:970`), so a new sub invalidates the `.online` proxy without
-  the preview ever reading the racy `processedCount`.
+- Call `bumpPreviewStackRevision()` immediately after EACH `processedCount += 1`. There are
+  **THREE** sites, not two: `SessionPipeline.swift:890`, `:970`, and **`:1164` — the NATIVE LIVE
+  path**, which is the primary mode. Miss that one and a live session's preview FREEZES:
+  `onUpdate` keeps firing and calling `refreshPreview`, but the key never moves so the cache
+  hands back the first proxy forever. Verify with
+  `grep -n "processedCount += 1" Sources/LiveAstroCore/Pipeline/SessionPipeline.swift` and
+  confirm every hit is followed by the bump.
 - In the watcher render path (`:1276`), after `let linear = try ImageLoader.load(...)`, call
-  `noteWatcherFrame(linear, digest: update.identity.digest)` so watcher mode has a preview
-  source at all.
+  `noteWatcherFrame(linear)` so watcher mode has a preview source at all. (It takes no digest:
+  `update.identity` is `FileIdentity?` and `.digest` is `String?`, so a digest key would need a
+  double unwrap plus a nil fallback — the monotonic token avoids both.)
 
 - [ ] **Step 4: Run tests**
 
@@ -1122,7 +1136,24 @@ These are edits, not guidance; make each one:
 
 1. In the `pipeline.onUpdate` closure (`AppModel.swift:921`), after `self?.latestImage = image`,
    add `self?.refreshPreview(force: true)` — a new sub changed the stack.
-2. Wire `pipeline.onCleanMasterPublished` (added in Step 4d) to `refreshPreview(force: true)`.
+2. Wire `pipeline.onCleanMasterPublished` (added in Step 4d) to `refreshPreview(force: true)`
+   — with the main-actor hop the other callbacks use (`AppModel.swift:923`), since this one
+   fires from the refiner's background pass:
+
+```swift
+        pipeline.onCleanMasterPublished = { [weak self] in
+            Task { @MainActor in self?.refreshPreview(force: true) }
+        }
+```
+
+2b. The callback covers the clean master APPEARING. It must also refresh when the clean master
+   DISAPPEARS, or the panel keeps showing a clean preview that is no longer being served. Two
+   call sites, both in `AppModel`:
+   - `toggleReject(index:)` (`AppModel.swift:1071`) — a user reject makes the published master
+     unservable immediately, so `previewSource` falls back to `.online`.
+   - wherever `configureLiveRejection(enabled:kappa:)` is called (`AppModel.swift:1031`) —
+     turning rejection off, or changing kappa, invalidates it the same way.
+   Both call `refreshPreview(force: true)` after the change lands.
    `liveRejectionStatus` (`AppModel.swift:998`) is a COMPUTED property with no change
    notification, so there is nothing to observe for a transition into `.active` — without a real
    callback the panel keeps showing the online master until a control is touched.
@@ -1157,7 +1188,9 @@ Expected: builds clean. Fix any remaining `displayAdjustments` references on `Ap
 - [ ] **Step 6: Commit**
 
 ```bash
-git add Sources/LiveAstroStudio/AppModel.swift Tests/LiveAstroCoreTests/AppSourceRegressionTests.swift
+git add Sources/LiveAstroStudio/AppModel.swift \
+        Sources/LiveAstroCore/Pipeline/SessionPipeline.swift \
+        Tests/LiveAstroCoreTests/AppSourceRegressionTests.swift
 git commit -m "feat: AppModel stages display adjustments instead of pushing every tick
 
 Sliders now move staged.pending and re-render the preview only; applyAdjustments()

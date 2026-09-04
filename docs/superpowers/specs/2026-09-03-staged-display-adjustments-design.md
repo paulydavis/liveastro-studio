@@ -134,10 +134,16 @@ The key must contain everything that changes the PIXELS, per source:
   a weaker key would serve a stale clean master — and the blink comparison would then be
   comparing against something that no longer exists.
 - `.online` → `(engine.currentStackGeneration, previewStackRevision)`.
-- watcher `.online` → the identity digest of the frame `lastPreviewLinear` came from.
+- watcher `.online` → a monotonic token bumped when a frame is retained. NOT the file digest:
+  `StackUpdate.identity` is `FileIdentity?` and `FileIdentity.digest` is `String?`
+  (`StackFileWatcher.swift:150,14`), so a digest key needs a double unwrap and a nil fallback,
+  while the token is always correct and costs nothing (the retained image is downsampled at
+  ingest, so a "rebuild" just hands back the stored image).
 
-`previewStackRevision` is a new lock-guarded monotonic counter bumped wherever the stack is
-committed. It exists because `processedCount` (`:164`) is a private var mutated on the consume
+`previewStackRevision` is a new lock-guarded monotonic counter bumped at ALL THREE
+`processedCount += 1` sites (`SessionPipeline.swift:890`, `:970`, `:1164`). The third is the
+NATIVE LIVE path — missing it freezes a live session's preview, since `onUpdate` keeps
+requesting refreshes while the key never moves. It exists because `processedCount` (`:164`) is a private var mutated on the consume
 task (`:890`, `:970`); reading it from a preview render — which runs on a detached task — would
 be a data race.
 
@@ -152,11 +158,14 @@ preview inherits it.
 The preview is pinned on screen, so anything that changes what it SHOULD show must refresh it,
 or it sits stale — at worst showing the previous session's stack until a control is touched.
 Refresh on: the `onUpdate` callback (a new sub changed the stack); session start once the
-pipeline is wired; and a new `onCleanMasterPublished` callback, fired by `publishRefineResult`
+pipeline is wired; a user reject and any live-rejection config change (both invalidate the
+published master immediately, so the preview must drop back to online rather than keep showing a
+clean master that is no longer served); and a new `onCleanMasterPublished` callback, fired by `publishRefineResult`
 (outside `regLock`) after it installs a servable master. That callback is required rather than
 cosmetic: `AppModel.liveRejectionStatus` is a COMPUTED property with no change notification, so
 there is no transition to observe and the panel would otherwise keep showing the online master
-after the first clean one publishes. Clear `previewImage`
+after the first clean one publishes. It fires from the refiner's background pass, so the
+`AppModel` side hops to the main actor the way the other callbacks do (`AppModel.swift:923`). Clear `previewImage`
 at session start and session end. Reseeds and source changes are covered by `onUpdate` plus the
 proxy cache key, which includes the stack generation.
 
