@@ -50,6 +50,15 @@ Denoise is the one genuinely local control and is the only thing a crop would se
 it is judged in the main view for v1. A crop remains possible later but requires splitting
 "derive transform from whole frame" from "apply transform to this region".
 
+## Pixel layout (non-negotiable)
+
+`AstroImage` is **planar / channel-major** — `AstroImage.swift:16`, and see `Denoiser.swift:78`
+indexing `sane[i], sane[plane + i], sane[2 * plane + i]`. Index as `c * plane + y * width + x`.
+Interleaved `(y * width + x) * channels + c` indexing silently scrambles colour, and — as caught
+in review — will do so INVISIBLY if a test helper repeats the same mistake, since the helper and
+the implementation then agree with each other. Preview tests therefore include a colour-plane
+sentinel that fails under interleaved indexing.
+
 ## Architecture
 
 ### State (LiveAstroCore: `StagedAdjustments`)
@@ -83,9 +92,13 @@ to the pipeline, persists, and refreshes the main view. `revert()` sets `pending
    `renderCurrentDisplay(adjustments:)` commits as a side effect (`:1116`) and is retained
    only for the Apply path.
 3. **Downsampled proxy** — the preview renders from a cached, downsampled linear image, not
-   the 26MP stack. Target the proxy's LONGEST EDGE at 1200 px (a 26MP 6236x4159 stack
-   downsamples ~5x to 1200x800), by integer box-averaging so sampling stays uniform and the
-   derived statistics hold; a stack already under 1200 px on its long edge is used as-is.
+   the 26MP stack. **Use the EXISTING `AstroImage.downsampled(maxLongEdge:)`**
+   (`AstroImage.swift:38`) at `SessionPipeline.previewLongEdge = 1200` (a 26MP 6236x4159 stack
+   lands ~1200x800). It is already area-averaging, planar-correct, covered by
+   `AstroImageDownsampleTests`, and already used by the render path at `SessionPipeline.swift:928`
+   and `:940` for exactly this purpose. **Correction, 2026-09-03:** an earlier draft of this spec
+   and its plan specified a NEW `PreviewProxy` component; that was reimplementing shipped code
+   and is deleted. Only the named constant and the honesty test below are new.
    The cache key is (stack generation, processed sub count, source selector) — i.e. it is
    invalidated by a new sub, a reseed, or switching between clean and online. Adjustments are
    NOT in the key: the proxy is linear, pre-adjustment, so slider drags reuse it.
@@ -96,6 +109,27 @@ to the pipeline, persists, and refreshes the main view. `revert()` sets `pending
 North-up needs no work: it is applied inside `displayCGImage` from `currentWCS`, so the
 preview inherits it.
 
+### Preview lifecycle
+
+The preview is pinned on screen, so anything that changes what it SHOULD show must refresh it,
+or it sits stale — at worst showing the previous session's stack until a control is touched.
+Refresh on: the `onUpdate` callback (a new sub changed the stack); session start once the
+pipeline is wired; and the transition of `liveRejectionStatus` to `.active`, when the first
+clean master publishes and the preview source flips from online to clean. Clear `previewImage`
+at session start and session end. Reseeds and source changes are covered by `onUpdate` plus the
+proxy cache key, which includes the stack generation.
+
+### Render ordering
+
+Preview renders run on detached tasks, so a slow earlier render can finish after a newer one and
+overwrite the preview with a stale image. Each request carries a monotonic stamp and only the
+newest may publish.
+
+Slider drags are throttled to ~12 fps, but DISCRETE actions — Revert, Reset, blink press and
+release, new frames, session boundaries — bypass the throttle. A swallowed blink release is the
+dangerous case: it would strand the panel on the online master while the operator believed they
+were seeing the clean one, actively misrepresenting the thing the comparison exists to show.
+
 ### UI (DisplaySettingsView)
 
 - Preview PINNED at the top of the tab, controls scroll beneath — otherwise the DBE and
@@ -105,6 +139,9 @@ preview inherits it.
   `LiveRejectionStatus` (`.off(reason:)` / `.building(subs:)` / `.active(subs:)`) from
   v3.6.0 — "turned off", "network source", "building over 7 subs…".
 - Placeholder before a stack exists.
+- **Reset** (`DisplaySettingsView.swift:108`) stages `.liveDefault` as a PENDING edit and
+  refreshes the preview. It must not write through to the broadcast, or it would be the single
+  control that bypasses staging.
 
 ## Testing
 
@@ -116,8 +153,10 @@ preview inherits it.
    the downsampled proxy match those from the full frame to within 2% relative, on a real
    stacked frame rather than a synthetic flat one (a constant image makes this test vacuous —
    every statistic survives any sampling). Deliberately not a pixel comparison, which would
-   need an arbitrary tolerance and prove little. A box-average downsample should sit far
-   inside 2%; if it does not, the proxy sampling is wrong and the preview is lying.
+   need an arbitrary tolerance and prove little. The existing area-averaging downsample should
+   sit far inside 2%; if it does not, the sampling is wrong and the preview is lying.
+   A colour-plane sentinel accompanies it: three channels of distinct constants must survive the
+   downsample separately, which fails under interleaved indexing.
 4. Apply commits + persists; Revert discards.
 5. Main view follows committed while pending differs.
 6. Blink renders both sources through identical adjustments.
