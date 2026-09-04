@@ -742,6 +742,11 @@ public final class SessionPipeline {
     /// passes don't run on all 26 MP. Defaults to the SnapshotRecorder cap; internal so tests
     /// can shrink it to keep the call-site test off a full-size frame.
     var importPreviewLongEdge = SnapshotRecorder.maxSnapshotLongEdge
+    /// Long edge the STAGED PREVIEW renders at. A 26 MP 6236x4159 stack lands ~1200x800, so a
+    /// slider drag re-renders ~1 MP instead of 26 MP. Downsampling (not cropping) is what keeps
+    /// the preview honest: it preserves both the statistics `AutoStretch` derives its transform
+    /// from and DBE's dimension-relative radius (`BackgroundExtraction.swift:281`).
+    static let previewLongEdge = 1200
     /// Import-only: render (mean→downsample→neutralize→snapshot→preview) on a cadence so ~`snapshotBudget`
     /// snapshots are produced instead of one per accepted frame (the 1.78 s/frame finalize is 82% of the
     /// serial import cost, and the replay keeps only maxKeyframes). Internal `var` = test seam. Live/watcher
