@@ -1121,6 +1121,13 @@ public final class SessionPipeline {
         return try? displayCGImage(from: mean)
     }
 
+    /// Test seam: render an arbitrary image through the SAME path the broadcast uses.
+    /// Exists so `DisplayRenderParityTests` can pin the committed output by hash.
+    func renderForTest(_ image: AstroImage, adjustments: DisplayAdjustments) throws -> CGImage {
+        displayAdjustments = adjustments
+        return try displayCGImage(from: image)
+    }
+
     /// Processes one raw frame through the stack engine (native mode). Callback deliveries
     /// inside are reentrancy-guarded (review10 item 4).
     private func handleNative(_ rawFrame: RawFrame, engine: StackEngine) {
