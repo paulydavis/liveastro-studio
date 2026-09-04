@@ -164,9 +164,11 @@ Add the two seams needed to call the render path from a test, WITHOUT changing r
         return try displayCGImage(from: image)
     }
 
-    /// Test seam: a pipeline with no source/engine, usable only for render-path tests.
+    /// Test seam: a minimal pipeline usable for render-path tests. `nativeSource` is
+    /// NON-OPTIONAL on this init (`SessionPipeline.swift:797`), so pass an empty stub source
+    /// rather than nil — `StubLiveSource(sequence: [])` never yields a frame, so nothing runs.
     static func forRenderTest() -> SessionPipeline {
-        SessionPipeline(nativeSource: nil, engine: StackEngine(),
+        SessionPipeline(nativeSource: StubLiveSource(sequence: []), engine: StackEngine(),
                         profile: SessionProfile(targetName: "RenderTest", telescope: "T", camera: "C",
                                                 mount: "M", filter: "F", locationLabel: "L", bortle: 5,
                                                 subExposureSeconds: 1, notes: ""),
@@ -174,8 +176,6 @@ Add the two seams needed to call the render path from a test, WITHOUT changing r
                             .appendingPathComponent(UUID().uuidString, isDirectory: true))
     }
 ```
-
-If `SessionPipeline.init` will not accept a nil source, use the smallest existing construction pattern from `Tests/LiveAstroCoreTests/GlobalRefinerTests.swift` (`StubLiveSource(sequence: [])`) instead — the point is a pipeline whose render path can be called, not a running session.
 
 Run: `swift test --filter DisplayRenderParityTests 2>&1 | grep -E "XCTAssertEqual failed|passed"`
 Expected: FAIL, reporting the ACTUAL hash. Copy that hash into `PLACEHOLDER_FILL_IN_STEP_2`.
@@ -188,7 +188,10 @@ Expected: PASS. This is the pre-refactor baseline — the test is now guarding r
 - [ ] **Step 4: Commit the baseline before touching the render path**
 
 ```bash
-git add Tests/LiveAstroCoreTests/DisplayRenderParityTests.swift Sources/LiveAstroCore/Pipeline/SessionPipeline.swift
+git add Tests/LiveAstroCoreTests/PreviewTestSupport.swift Tests/LiveAstroCoreTests/StubLiveSource.swift \
+        Tests/LiveAstroCoreTests/GlobalRefinerTests.swift \
+        Tests/LiveAstroCoreTests/DisplayRenderParityTests.swift \
+        Sources/LiveAstroCore/Pipeline/SessionPipeline.swift
 git commit -m "test: pin the committed display-render output by hash before parameterising it
 
 Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
@@ -623,6 +626,7 @@ final class PreviewRenderTests: XCTestCase {
 
         _ = pipeline.renderPreview(source: .online, adjustments: .neutral)
         let before = pipeline.previewProxyBuildCountForTest
+        let targetCount = pipeline.subRegistrations().count + 1
 
         source.send(RawFrame(image: PreviewTestSupport.starField(w: 2400, h: 1800),
                              bayerPattern: nil, bottomUp: false,
@@ -630,14 +634,66 @@ final class PreviewRenderTests: XCTestCase {
                              identity: FileIdentity(dev: 0, ino: 0, size: 0, mtimeSec: 0,
                                                     mtimeNsec: 0, digest: "pv9"),
                              sourceURL: URL(fileURLWithPath: "/tmp/preview/pv9.fit")))
+        // Capture the target BEFORE sending, or the count read may already include the new sub
+        // and the wait becomes a no-op that passes for the wrong reason.
         let deadline = Date().addingTimeInterval(20)
-        let target = pipeline.subRegistrations().count + 1
-        while pipeline.subRegistrations().count < target && Date() < deadline {
+        while pipeline.subRegistrations().count < targetCount && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.02)
         }
         _ = pipeline.renderPreview(source: .online, adjustments: .neutral)
         XCTAssertGreaterThan(pipeline.previewProxyBuildCountForTest, before,
                              "a new sub changes the stack, so the proxy must be rebuilt")
+    }
+
+    /// The case a (generation, sub count) key would MISS: a user reject produces a different
+    /// clean master while both of those stay put. A stale `.clean` proxy would make the blink
+    /// comparison compare against a master that no longer exists.
+    func testAUserRejectInvalidatesTheCleanProxy() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try PreviewRenderTests.runningPipeline(sandbox: sandbox)
+        defer { source.stop() }
+        pipeline.configureLiveRejection(enabled: true)
+
+        guard let (mean, coverage) = pipeline.engineForTest?.currentStackAndCoverage() else {
+            return XCTFail("expected a stack")
+        }
+        pipeline.publishedMaster = PublishedMaster(
+            image: mean, coverage: coverage ?? [Float](repeating: 1, count: mean.width * mean.height),
+            survivorCount: pipeline.subRegistrations().count, key: pipeline.currentFreshnessKey())
+        _ = pipeline.renderPreview(source: .clean, adjustments: .neutral)
+        let before = pipeline.previewProxyBuildCountForTest
+
+        // Same generation, same sub count — only the reject state moves.
+        pipeline.setUserRejected([1])
+        pipeline.noteUserRejectChanged()
+        _ = pipeline.renderPreview(source: .clean, adjustments: .neutral)
+
+        XCTAssertNotEqual(pipeline.previewProxyBuildCountForTest, before,
+                          "a user reject changes which master is served, so the clean proxy must not be reused")
+    }
+
+    /// Watcher / external-stacker mode has NO engine (SessionPipeline.swift:768 leaves it nil),
+    /// so without `lastPreviewLinear` the preview would be permanently blank there.
+    func testWatcherModeStillProducesAPreview() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let watch = sandbox.appendingPathComponent("watch", isDirectory: true)
+        try FileManager.default.createDirectory(at: watch, withIntermediateDirectories: true)
+        let pipeline = SessionPipeline(watchFolder: watch, profile:
+            SessionProfile(targetName: "Watch", telescope: "T", camera: "C", mount: "M",
+                           filter: "F", locationLabel: "L", bortle: 5,
+                           subExposureSeconds: 20, notes: ""),
+            rootDirectory: sandbox.appendingPathComponent("sessions"))
+
+        XCTAssertNil(pipeline.renderPreview(source: .online, adjustments: .neutral),
+                     "no frame seen yet — the panel shows its placeholder")
+        pipeline.noteWatcherFrame(PreviewTestSupport.starField(w: 2400, h: 1800), digest: "w1")
+        let cg = try XCTUnwrap(pipeline.renderPreview(source: .online, adjustments: .neutral),
+                               "watcher mode must still preview, from the retained last frame")
+        XCTAssertLessThanOrEqual(max(cg.width, cg.height), SessionPipeline.previewLongEdge)
     }
 
     /// With live rejection off there is no clean master, and the caller must be able to tell —
@@ -699,24 +755,55 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
     /// is being served; `.online` is the un-rejected running stack. The blink control swaps
     /// between them through the SAME adjustments, so the comparison isolates rejection rather
     /// than confounding it with a stretch difference.
-    public enum PreviewSource {
+    public enum PreviewSource: Equatable {
         case clean
         case online
     }
 
-    /// Cached preview proxy. Keyed on what changes the PIXELS — stack generation, processed
-    /// sub count, and which master is shown. Adjustments are deliberately absent: the proxy is
-    /// linear and pre-adjustment, so a slider drag reuses it and re-renders ~1 MP instead of
-    /// walking the 26 MP stack again.
-    private struct PreviewProxyKey: Equatable {
-        let generation: Int
-        let subCount: Int
-        let source: PreviewSource
+    /// Cached preview proxy, keyed on everything that changes the PIXELS — per source.
+    ///
+    /// `.clean` is keyed on the published master's FreshnessKey, NOT on generation/sub count: a
+    /// kappa change, a user reject, a budget change or an enable-state transition each produce a
+    /// different clean master while generation and count stay put, so a weaker key would serve a
+    /// STALE clean master — and the blink comparison would then be comparing against something
+    /// that no longer exists.
+    ///
+    /// Adjustments are deliberately absent from every case: the proxy is linear and
+    /// pre-adjustment, so a slider drag reuses it.
+    private enum PreviewProxyKey: Equatable {
+        case online(generation: Int, revision: Int)
+        case clean(FreshnessKey)
+        case watcher(digest: String)
     }
     private let previewProxyLock = NSLock()
     private var previewProxy: (key: PreviewProxyKey, image: AstroImage)?
     /// Test seam: how many times the proxy has actually been rebuilt.
     private(set) var previewProxyBuildCountForTest = 0
+
+    /// Monotonic stack revision for the preview cache key. `processedCount` (`:164`) is a
+    /// private var mutated on the consume task (`:890`, `:970`), so reading it from a preview
+    /// render — which runs on a detached task — would be a data race. Bump this under the lock
+    /// in the SAME two places `processedCount` is incremented.
+    private let previewRevLock = NSLock()
+    private var previewStackRevision = 0
+    private func bumpPreviewStackRevision() {
+        previewRevLock.lock(); previewStackRevision += 1; previewRevLock.unlock()
+    }
+    private var currentPreviewStackRevision: Int {
+        previewRevLock.lock(); defer { previewRevLock.unlock() }; return previewStackRevision
+    }
+
+    /// The most recent rendered linear image, ALREADY downsampled to `previewLongEdge`, with the
+    /// identity digest it came from. Watcher / external-stacker mode (init at `:768`) has NO
+    /// engine — it loads and renders each incoming file (`:1276`) — so without this the preview
+    /// would be permanently blank there, even though display adjustments apply exactly as they
+    /// do natively. Retaining the DOWNSAMPLED image costs ~1 MP, not 26 MP.
+    private let lastPreviewLock = NSLock()
+    private var lastPreviewLinear: (digest: String, image: AstroImage)?
+    func noteWatcherFrame(_ linear: AstroImage, digest: String) {
+        let small = linear.downsampled(maxLongEdge: Self.previewLongEdge)
+        lastPreviewLock.lock(); lastPreviewLinear = (digest, small); lastPreviewLock.unlock()
+    }
 
     /// Renders the staged preview WITHOUT touching committed state — the property
     /// `renderCurrentDisplay(adjustments:)` deliberately does not have (it commits, and is
@@ -724,25 +811,50 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
     /// show: no stack yet, or `.clean` with no published master.
     public func renderPreview(source: PreviewSource,
                               adjustments: DisplayAdjustments) -> CGImage? {
-        let key = PreviewProxyKey(generation: engine?.currentStackGeneration ?? 0,
-                                  subCount: processedCount,
-                                  source: source)
+        // Resolve the cache key FIRST — it decides what may be reused, and for `.clean` it is
+        // the FreshnessKey of the master actually being served.
+        let key: PreviewProxyKey
+        switch source {
+        case .clean:
+            guard let publishedKey = publishedMasterFreshnessKeyIfCurrent() else { return nil }
+            key = .clean(publishedKey)
+        case .online:
+            if let engine {
+                key = .online(generation: engine.currentStackGeneration,
+                              revision: currentPreviewStackRevision)
+            } else {
+                lastPreviewLock.lock()
+                let digest = lastPreviewLinear?.digest
+                lastPreviewLock.unlock()
+                guard let digest else { return nil }      // watcher mode, no frame yet
+                key = .watcher(digest: digest)
+            }
+        }
         var proxy: AstroImage?
         previewProxyLock.lock()
         if let cached = previewProxy, cached.key == key { proxy = cached.image }
         previewProxyLock.unlock()
 
         if proxy == nil {
-            let linear: AstroImage
+            let built: AstroImage
             switch source {
             case .online:
-                guard let (mean, coverage) = engine?.currentStackAndCoverage() else { return nil }
-                linear = cropToCoverage(mean, coverage: coverage)
+                if let engine, let (mean, coverage) = engine.currentStackAndCoverage() {
+                    built = cropToCoverage(mean, coverage: coverage)
+                        .downsampled(maxLongEdge: Self.previewLongEdge)
+                } else {
+                    // Watcher / external-stacker mode: already downsampled at ingest.
+                    lastPreviewLock.lock()
+                    let cached = lastPreviewLinear?.image
+                    lastPreviewLock.unlock()
+                    guard let cached else { return nil }
+                    built = cached
+                }
             case .clean:
                 guard let published = publishedMasterIfCurrent() else { return nil }
-                linear = cropToCoverage(published.image, coverage: published.coverage)
+                built = cropToCoverage(published.image, coverage: published.coverage)
+                    .downsampled(maxLongEdge: Self.previewLongEdge)
             }
-            let built = linear.downsampled(maxLongEdge: Self.previewLongEdge)
             previewProxyLock.lock()
             previewProxy = (key, built)
             previewProxyBuildCountForTest += 1
@@ -754,10 +866,37 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
     }
 ```
 
+- [ ] **Step 3b: Add the FreshnessKey accessor and wire the two counters**
+
+`renderPreview` above calls `publishedMasterFreshnessKeyIfCurrent()`. Add it beside
+`publishedMasterSurvivorCount()`, following the same lock discipline:
+
+```swift
+    /// The FreshnessKey of the clean master currently being SERVED, or nil if none is. The
+    /// preview proxy cache keys `.clean` on this so a kappa change or a user reject invalidates
+    /// it — generation and sub count would both miss those.
+    func publishedMasterFreshnessKeyIfCurrent() -> FreshnessKey? {
+        regLock.withLock {
+            guard liveRejectionActive, let pm = publishedMaster,
+                  pm.key.isServable(against: _freshnessKey) else { return nil }
+            return pm.key
+        }
+    }
+```
+
+Then wire the two invalidation sources:
+
+- Call `bumpPreviewStackRevision()` immediately after EACH `processedCount += 1`
+  (`SessionPipeline.swift:890` and `:970`), so a new sub invalidates the `.online` proxy without
+  the preview ever reading the racy `processedCount`.
+- In the watcher render path (`:1276`), after `let linear = try ImageLoader.load(...)`, call
+  `noteWatcherFrame(linear, digest: update.identity.digest)` so watcher mode has a preview
+  source at all.
+
 - [ ] **Step 4: Run tests**
 
 Run: `swift test --filter PreviewRenderTests`
-Expected: all four PASS.
+Expected: all six PASS.
 
 - [ ] **Step 5: Confirm the committed path is still untouched**
 
@@ -924,21 +1063,41 @@ Replace the body at `:531-552` with:
         refreshPreview(force: true)
     }
 
-    /// Preview lifecycle (finding 3). The pinned preview is always on screen, so anything that
-    /// changes what it SHOULD show has to refresh it — otherwise it sits stale, or worse shows
-    /// the previous session's stack until a control is touched.
-    /// Call `refreshPreview(force: true)` from:
-    ///   - the `pipeline.onUpdate` callback (`AppModel.swift:921`) — a new sub changed the stack;
-    ///   - session start, after the pipeline is wired, so the panel fills as soon as data exists;
-    ///   - whenever `liveRejectionStatus` transitions to `.active` — the first clean master has
-    ///     published, so `previewSource` flips from `.online` to `.clean`.
-    /// And clear it at session boundaries so nothing from a finished session lingers:
-    ///   - on session start (before any frame) and on session end: `previewImage = nil`.
-    /// A reseed or source change is covered by `onUpdate`, since both produce fresh frames, and
-    /// by the proxy cache key, which includes the stack generation.
 ```
 
 `saveSettings()` must persist `staged.committed` — update the settings read/write to use it wherever it referenced `displayAdjustments`.
+
+- [ ] **Step 4b: Wire the preview lifecycle (concrete call sites)**
+
+The preview is pinned on screen, so anything that changes what it SHOULD show must refresh it,
+or it sits stale — at worst showing the previous session's stack until a control is touched.
+These are edits, not guidance; make each one:
+
+1. In the `pipeline.onUpdate` closure (`AppModel.swift:921`), after `self?.latestImage = image`,
+   add `self?.refreshPreview(force: true)` — a new sub changed the stack.
+2. Where `liveRejectionStatus` is recomputed for the caption, compare against the previous value
+   and call `refreshPreview(force: true)` on any transition INTO `.active`: the first clean
+   master has just published, so `previewSource` flips from `.online` to `.clean` and the panel
+   would otherwise keep showing the online master.
+3. At session start, immediately after the pipeline is assigned: `previewImage = nil` first, then
+   `refreshPreview(force: true)` so the panel fills as soon as there is data.
+4. At session end (both the normal `end()` path and the error/rollback path): `previewImage = nil`
+   and `staged.revert()` — pending edits die with the session, and nothing from a finished
+   session lingers on screen.
+
+A reseed or source change needs no separate hook: both produce fresh frames through `onUpdate`,
+and the proxy cache key covers them (stack generation for `.online`, `FreshnessKey` for `.clean`).
+
+- [ ] **Step 4c: Verify the lifecycle by hand**
+
+`AppModel` has no test target, so these four are verified by running the app — do it, and record
+the result in the task report rather than assuming:
+
+- Start a session; the preview fills without touching a control.
+- Let a sub land; the preview updates on its own.
+- Turn live rejection on and wait for the first clean master; the preview switches to clean and
+  the blink control becomes enabled.
+- End the session; the preview clears and does not show the previous session's stack.
 
 - [ ] **Step 5: Run the regression test and build the app target**
 

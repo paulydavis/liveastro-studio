@@ -92,7 +92,7 @@ to the pipeline, persists, and refreshes the main view. `revert()` sets `pending
    `renderCurrentDisplay(adjustments:)` commits as a side effect (`:1116`) and is retained
    only for the Apply path.
 3. **Downsampled proxy** — the preview renders from a cached, downsampled linear image, not
-   the 26MP stack. **Use the EXISTING `AstroImage.downsampled(maxLongEdge:)`**
+   the 26MP stack (cache key below). **Use the EXISTING `AstroImage.downsampled(maxLongEdge:)`**
    (`AstroImage.swift:38`) at `SessionPipeline.previewLongEdge = 1200` (a 26MP 6236x4159 stack
    lands ~1200x800). It is already area-averaging, planar-correct, covered by
    `AstroImageDownsampleTests`, and already used by the render path at `SessionPipeline.swift:928`
@@ -102,9 +102,43 @@ to the pipeline, persists, and refreshes the main view. `revert()` sets `pending
    The cache key is (stack generation, processed sub count, source selector) — i.e. it is
    invalidated by a new sub, a reseed, or switching between clean and online. Adjustments are
    NOT in the key: the proxy is linear, pre-adjustment, so slider drags reuse it.
-4. **Source selector** for blink: `.clean` (`publishedMasterIfCurrent()`) or `.online`
-   (`engine.currentStackAndCoverage()`), both cropped to coverage as the existing paths do,
-   both rendered through the SAME pending adjustments so the comparison isolates rejection.
+4. **Source selector** for blink: `.clean` (`publishedMasterIfCurrent()`) or `.online`, both
+   cropped to coverage as the existing paths do, both rendered through the SAME pending
+   adjustments so the comparison isolates rejection.
+
+### Watcher / external-stacker mode has no engine
+
+`engine` is `private var engine: StackEngine?` (`SessionPipeline.swift:681`) and the WATCHER
+init (`:768`, Siril / ASIAIR / any external stacker) never sets it — that path loads each
+incoming file directly and renders it (`:1276`). So sourcing `.online` from
+`engine.currentStackAndCoverage()` would leave the preview permanently blank in watcher mode,
+even though display adjustments apply there exactly as they do natively.
+
+The pipeline therefore retains `lastPreviewLinear: AstroImage?` — the most recent rendered
+linear image, ALREADY downsampled to `previewLongEdge` at ingest so the retention costs ~1 MP,
+not 26 MP. `.online` resolves to the engine's stack when there is an engine, and to
+`lastPreviewLinear` otherwise. A watcher session with no frame yet still yields nil, which the
+panel shows as its placeholder.
+
+### Proxy cache key
+
+The key must contain everything that changes the PIXELS, per source:
+
+- `.clean` → the published master's **`FreshnessKey`** (`PublishedMaster.key`). Generation and
+  sub count are NOT sufficient: a kappa change, a user reject, a sample-budget change or an
+  enable-state transition all produce a different clean master while both of those stay put, so
+  a weaker key would serve a stale clean master — and the blink comparison would then be
+  comparing against something that no longer exists.
+- `.online` → `(engine.currentStackGeneration, previewStackRevision)`.
+- watcher `.online` → the identity digest of the frame `lastPreviewLinear` came from.
+
+`previewStackRevision` is a new lock-guarded monotonic counter bumped wherever the stack is
+committed. It exists because `processedCount` (`:164`) is a private var mutated on the consume
+task (`:890`, `:970`); reading it from a preview render — which runs on a detached task — would
+be a data race.
+
+Adjustments remain deliberately absent from the key: the proxy is linear and pre-adjustment, so
+slider drags reuse it.
 
 North-up needs no work: it is applied inside `displayCGImage` from `currentWCS`, so the
 preview inherits it.
