@@ -616,6 +616,47 @@ final class PreviewRenderTests: XCTestCase {
                        + "deliberately NOT part of the cache key, the proxy is linear and pre-adjustment")
     }
 
+    /// Pins the PER-SOURCE cache. The reuse test above only exercises one source, so a
+    /// single-slot cache would still pass it — and hold-to-compare is exactly the
+    /// clean -> online -> clean pattern a single slot handles worst, evicting and rebuilding
+    /// from the full-resolution stack on every press AND release. This fails on a single slot.
+    func testSwitchingSourceAndBackReusesEachProxy() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try PreviewRenderTests.runningPipeline(sandbox: sandbox)
+        defer { source.stop() }
+        pipeline.configureLiveRejection(enabled: true)
+
+        guard let (mean, coverage) = pipeline.engineForTest?.currentStackAndCoverage() else {
+            return XCTFail("expected a stack")
+        }
+        pipeline.publishedMaster = PublishedMaster(
+            image: mean,
+            coverage: coverage ?? [Float](repeating: 1, count: mean.width * mean.height),
+            survivorCount: pipeline.subRegistrations().count,
+            key: pipeline.currentFreshnessKey())
+
+        XCTAssertNotNil(pipeline.renderPreview(source: .clean, adjustments: .neutral))
+        let afterClean = pipeline.previewProxyBuildCountForTest
+
+        XCTAssertNotNil(pipeline.renderPreview(source: .online, adjustments: .neutral))
+        let afterOnline = pipeline.previewProxyBuildCountForTest
+        XCTAssertGreaterThan(afterOnline, afterClean,
+                             "a different source is a different proxy — it is built once")
+
+        // The blink release: back to clean. Its slot must still hold.
+        XCTAssertNotNil(pipeline.renderPreview(source: .clean, adjustments: .neutral))
+        XCTAssertEqual(pipeline.previewProxyBuildCountForTest, afterOnline,
+                       "returning to clean must REUSE its slot — a single-slot cache rebuilds here, "
+                       + "making every blink press and release the most expensive act in the panel")
+
+        // And the next press likewise.
+        XCTAssertNotNil(pipeline.renderPreview(source: .online, adjustments: .neutral))
+        XCTAssertEqual(pipeline.previewProxyBuildCountForTest, afterOnline,
+                       "and the online slot must still hold too")
+    }
+
     /// ...but a new sub must invalidate it, or the preview would freeze on the first stack.
     func testANewSubInvalidatesTheCachedProxy() throws {
         let sandbox = FileManager.default.temporaryDirectory
@@ -975,7 +1016,7 @@ Then wire the two invalidation sources:
 - [ ] **Step 4: Run tests**
 
 Run: `swift test --filter PreviewRenderTests`
-Expected: all nine PASS.
+Expected: all ten PASS.
 
 - [ ] **Step 5: Confirm the committed path is still untouched**
 
