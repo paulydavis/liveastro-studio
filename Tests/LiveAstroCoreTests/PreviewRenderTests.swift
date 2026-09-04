@@ -281,7 +281,19 @@ final class PreviewRenderTests: XCTestCase {
     /// LOCALLY on top of the same base field, at coordinates that stay outside the 320×240 crop
     /// `DisplayRenderParityTests` renders (so that pinned hash is provably untouched) and whose
     /// tiny pixel footprint doesn't move the median/MADN `PreviewDownsampleHonestyTests` checks.
+    /// Cached at the (2400, 1800, 3) default: every call site in this file uses the default
+    /// parameters, and this build is deterministic (no randomness, no external state), so
+    /// rebuilding it per-test bought nothing but ~34s/test of redundant pixel math across a
+    /// 345s/10-test suite (M10). Built once, lazily, on first use; a call with non-default
+    /// parameters still computes fresh rather than serving the wrong-shaped cached image.
+    private static let defaultRichStarField: AstroImage = computeRichStarField(w: 2400, h: 1800, channels: 3)
+
     static func richStarField(w: Int = 2400, h: Int = 1800, channels: Int = 3) -> AstroImage {
+        if w == 2400, h == 1800, channels == 3 { return defaultRichStarField }
+        return computeRichStarField(w: w, h: h, channels: channels)
+    }
+
+    private static func computeRichStarField(w: Int, h: Int, channels: Int) -> AstroImage {
         let base = PreviewTestSupport.starField(w: w, h: h, channels: channels)
         var px = base.pixels
         let plane = w * h

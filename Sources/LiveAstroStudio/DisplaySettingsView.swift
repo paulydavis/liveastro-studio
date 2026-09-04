@@ -184,7 +184,12 @@ struct DisplaySettingsView: View {
                         model.refreshPreview(force: true)     // discrete action — never throttle it away
                     }
                     .onEnded { _ in
-                        guard enabled else { return }
+                        // Must NOT gate on `enabled`: it derives from liveRejectionStatus, which can
+                        // flip to .building between press and release (a reject, a kappa change, a
+                        // reseed, a budget change, or the feature toggle). Gating the release on it
+                        // would swallow the release, strand blinkHeld true forever, and leave the
+                        // panel showing the un-rejected master under a "clean" label.
+                        guard model.blinkHeld else { return }
                         model.blinkHeld = false              // released: back to the clean one
                         model.refreshPreview(force: true)     // a swallowed release would strand the panel on online
                     }

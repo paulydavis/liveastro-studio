@@ -57,6 +57,8 @@ final class AppSourceRegressionTests: XCTestCase {
                        "pending adjustments must NEVER be pushed to the pipeline — that is the broadcast")
         XCTAssertFalse(appModel.contains("p.displayAdjustments = displayAdjustments"),
                        "the pre-staging direct push must be gone")
+        XCTAssertTrue(appModel.contains("p.displayAdjustments = staged.committed"),
+                      "a new SessionPipeline must receive the COMMITTED adjustments before it renders")
     }
 
     func testURLSessionOBSSocketOpenDelegateAndStateAreReusableAcrossReconnects() throws {

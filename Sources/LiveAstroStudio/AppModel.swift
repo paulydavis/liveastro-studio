@@ -542,6 +542,18 @@ final class AppModel {
     /// stale image — visible as the preview snapping back to a setting you already moved past.
     private var previewRenderSeq = 0
 
+    /// True while a coalesced trailing render (see refreshPreview) is scheduled but hasn't fired yet.
+    private var previewTrailingScheduled = false
+
+    /// Clears the preview and invalidates any in-flight render. Bumping the stamp is the point:
+    /// a detached render that started before the clear would otherwise pass the seq guard on
+    /// completion and put the old session's image back, where it would then be frozen because
+    /// `pipeline` is nil and every later refresh returns early.
+    private func clearPreview() {
+        previewRenderSeq &+= 1
+        previewImage = nil
+    }
+
     /// Called when a slider changes: re-render the PREVIEW only. Nothing reaches the pipeline
     /// here — that is what makes tuning mid-broadcast safe.
     ///
@@ -554,7 +566,19 @@ final class AppModel {
         guard let pipeline else { return }
         let now = Date()
         if !force {
-            guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else { return }
+            guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else {
+                // Coalesced trailing render: the LAST edit of a drag often lands inside the
+                // throttle window, and dropping it outright leaves the preview disagreeing with
+                // what Apply will publish.
+                guard !previewTrailingScheduled else { return }
+                previewTrailingScheduled = true
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 90_000_000)
+                    self?.previewTrailingScheduled = false
+                    self?.refreshPreview(force: true)
+                }
+                return
+            }
         }
         lastAdjustmentRender = now
         previewRenderSeq &+= 1
@@ -877,7 +901,7 @@ final class AppModel {
         do {
             try p.start()
             pipeline = p
-            previewImage = nil
+            clearPreview()
             refreshPreview(force: true)   // fill the panel as soon as there is data
             isRunning = true
             selectedTab = .live
@@ -1508,7 +1532,7 @@ final class AppModel {
                 self.pipeline = nil
                 // Pending edits die with the session, and nothing from a finished session
                 // lingers on screen.
-                self.previewImage = nil
+                self.clearPreview()
                 self.staged.revert()
                 self.sessionEnd = Date()
                 self.restackOfferPending = self.flaggedCount > 0
