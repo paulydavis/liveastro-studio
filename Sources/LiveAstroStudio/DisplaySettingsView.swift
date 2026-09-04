@@ -28,63 +28,63 @@ struct DisplaySettingsView: View {
                 Section("Display Adjustments") {
                     VStack(alignment: .leading) {
                         Text("Black point")
-                        Slider(value: $model.displayAdjustments.blackPoint, in: 0...0.2) { editing in
-                            if !editing { model.applyDisplayAdjustments() }
+                        Slider(value: $model.staged.pending.blackPoint, in: 0...0.2) { editing in
+                            if !editing { model.refreshPreview() }
                         }
                         .help("Darken the sky background. 0 = auto.")
                     }
                     VStack(alignment: .leading) {
                         Text("Stretch strength")
-                        Slider(value: $model.displayAdjustments.midtoneStrength, in: -1...1) { editing in
-                            if !editing { model.applyDisplayAdjustments() }
+                        Slider(value: $model.staged.pending.midtoneStrength, in: -1...1) { editing in
+                            if !editing { model.refreshPreview() }
                         }
                         .help("How aggressive the stretch is. 0 = auto.")
                     }
                     VStack(alignment: .leading) {
                         Text("Saturation")
-                        Slider(value: $model.displayAdjustments.saturation, in: 0...2) { editing in
-                            if !editing { model.applyDisplayAdjustments() }
+                        Slider(value: $model.staged.pending.saturation, in: 0...2) { editing in
+                            if !editing { model.refreshPreview() }
                         }
                         .help("Color intensity. 1 = unchanged.")
                     }
-                    helpToggle("Flatten background (DBE)", isOn: $model.displayAdjustments.backgroundExtraction,
+                    helpToggle("Flatten background (DBE)", isOn: $model.staged.pending.backgroundExtraction,
                                help: "Remove the light-pollution gradient so the sky darkens evenly. Off by default.")
-                        .onChange(of: model.displayAdjustments.backgroundExtraction) { _, _ in
-                            model.applyDisplayAdjustments()
+                        .onChange(of: model.staged.pending.backgroundExtraction) { _, _ in
+                            model.refreshPreview(force: true)
                         }
-                    if model.displayAdjustments.backgroundExtraction {
+                    if model.staged.pending.backgroundExtraction {
                         HStack {
                             Text("Scale").frame(width: 90, alignment: .leading)
-                            Slider(value: $model.displayAdjustments.bgScale, in: 1...15) { editing in
-                                if !editing { model.applyDisplayAdjustments() }
+                            Slider(value: $model.staged.pending.bgScale, in: 1...15) { editing in
+                                if !editing { model.refreshPreview() }
                             }
-                            Text(String(format: "%.1f%%", model.displayAdjustments.bgScale))
+                            Text(String(format: "%.1f%%", model.staged.pending.bgScale))
                                 .frame(width: 48, alignment: .trailing).monospacedDigit()
                         }
                         .help("Smoothing scale as % of image size — lower follows local/corner gradients, higher removes only broad gradients.")
                         HStack {
                             Text("Smoothest").frame(width: 90, alignment: .leading)
-                            Slider(value: $model.displayAdjustments.bgSmoothest, in: 0...3) { editing in
-                                if !editing { model.applyDisplayAdjustments() }
+                            Slider(value: $model.staged.pending.bgSmoothest, in: 0...3) { editing in
+                                if !editing { model.refreshPreview() }
                             }
-                            Text(String(format: "%.1f", model.displayAdjustments.bgSmoothest))
+                            Text(String(format: "%.1f", model.staged.pending.bgSmoothest))
                                 .frame(width: 48, alignment: .trailing).monospacedDigit()
                         }
                         .help("Extra blur on the background model — raise to remove residual blotchiness, lower to track non-smooth gradients.")
                     }
                     VStack(alignment: .leading) {
                         Text("Denoise")
-                        Slider(value: $model.displayAdjustments.denoiseStrength, in: 0...1) { editing in
-                            if !editing { model.applyDisplayAdjustments() }
+                        Slider(value: $model.staged.pending.denoiseStrength, in: 0...1) { editing in
+                            if !editing { model.refreshPreview() }
                         }
                         .help("Classic noise reduction — smooths background grain and color mottle on the displayed stack. 0 = off. master.fit is never modified.")
                     }
                     switch model.catalogState {
                     case .installed:
-                        helpToggle("North up", isOn: $model.displayAdjustments.northUp,
+                        helpToggle("North up", isOn: $model.staged.pending.northUp,
                                    help: "Rotate the view so celestial north is up (display only — master.fit stays native). Needs a plate solve; enabled once the reference frame is solved.")
-                            .onChange(of: model.displayAdjustments.northUp) { _, _ in
-                                model.applyDisplayAdjustments()
+                            .onChange(of: model.staged.pending.northUp) { _, _ in
+                                model.refreshPreview(force: true)
                             }
                             .disabled(!model.solveAvailable)
                     case .notInstalled:
@@ -106,10 +106,15 @@ struct DisplaySettingsView: View {
                     Text("Star catalog: Gaia DR3 (ESA/DPAC)")
                         .font(.caption2).foregroundStyle(.secondary)
                     Button("Reset") {
-                        model.displayAdjustments = .liveDefault
-                        model.applyDisplayAdjustments()
+                        model.resetAdjustments()
                     }
                     .help("Back to the recommended look (auto-stretch with background flattening on).")
+                    // NOTE: this panel is a minimal compile-time adaptation to the new staged
+                    // model (Task 5). It stages edits into `model.staged.pending` and re-renders
+                    // the preview via `refreshPreview`, but does not yet expose Apply/Revert or
+                    // the blink control, nor does it display `model.previewImage` — that UI
+                    // (staged/committed indicator, Apply/Revert buttons, blink press-and-hold,
+                    // preview image swap) is Task 6's job per the plan.
                 }
             }
             .formStyle(.grouped)

@@ -180,7 +180,18 @@ final class AppModel {
     var log: [String] = []
     var replayURL: URL?
     var processorBackend: ProcessorBackend = .none
-    var displayAdjustments = DisplayAdjustments.liveDefault
+    /// Committed vs pending display adjustments. Sliders bind to `staged.pending`; only
+    /// `applyAdjustments()` promotes it and pushes to the pipeline. See StagedAdjustments.
+    var staged = StagedAdjustments(committed: .liveDefault)
+    /// The staged preview image (pending adjustments, proxy-sized). Distinct from
+    /// `latestImage`, which stays on the COMMITTED render so the main view always shows what
+    /// the audience sees.
+    var previewImage: CGImage?
+    /// True only while the blink control is held down. NOT a stored source: defaulting a
+    /// source to `.clean` would blank the preview entirely whenever rejection is off (there
+    /// is no published master, so `renderPreview(source: .clean)` returns nil) — which is
+    /// every import session. `previewSource` below resolves it instead.
+    var blinkHeld = false
 
     /// Red night-vision tint of the *whole Mac display* (not just the astro image).
     /// In-memory only — defaults off each launch so the app never opens unexpectedly red.
@@ -350,7 +361,7 @@ final class AppModel {
             makeStackEngine: { [weak self] in MainActor.assumeIsolated { self!.makeStackEngine() } },
             currentCalibration: { [weak self] in MainActor.assumeIsolated { self!.calibration } },
             currentNeutralizeBackground: { [weak self] in MainActor.assumeIsolated { self?.neutralizeBackground ?? false } },
-            currentDisplayAdjustments: { [weak self] in MainActor.assumeIsolated { self?.displayAdjustments ?? .neutral } },
+            currentDisplayAdjustments: { [weak self] in MainActor.assumeIsolated { self?.staged.committed ?? .neutral } },
             currentFileNamePrefix: { [weak self] in MainActor.assumeIsolated { self?.fileNamePrefix ?? "" } },
             currentLiveAstroRoot: { [weak self] in MainActor.assumeIsolated { self!.liveAstroRoot } },
             currentProfile: { [weak self] in MainActor.assumeIsolated { self!.profile } },
@@ -405,7 +416,7 @@ final class AppModel {
             backgroundNormalizationEnabled: backgroundNormalizationEnabled,
             scaleNormalizationEnabled: scaleNormalizationEnabled,
             processorBackend: processorBackend,
-            displayAdjustments: displayAdjustments,
+            displayAdjustments: staged.committed,
             relayRetentionDays: liveSource.relayRetentionDays,
             demosaic: demosaic,
             idleSafeguardEnabled: idleSafeguardEnabled,
@@ -484,7 +495,7 @@ final class AppModel {
         processorBackend = s.processorBackend
         // Fresh install (no saved settings) starts with the recommended DBE-on look;
         // a returning user keeps whatever they last had.
-        displayAdjustments = SessionSettingsStore.exists(.standard) ? s.displayAdjustments : .liveDefault
+        staged = StagedAdjustments(committed: SessionSettingsStore.exists(.standard) ? s.displayAdjustments : .liveDefault)
         idleSafeguardEnabled = s.idleSafeguardEnabled
         idleSafeguardMinutes = s.idleSafeguardMinutes
         plannedStopEnabled = s.plannedStopEnabled
@@ -526,30 +537,79 @@ final class AppModel {
         }
     }
 
-    /// Called when a slider changes: persist, push adjustments to the pipeline so
-    /// the next frame's snapshot matches, and re-render the current stack off-main
-    /// (throttled to ~12 fps so dragging a 26MP stretch stays smooth).
-    func applyDisplayAdjustments() {
-        saveSettings()
+    /// Monotonic stamp for preview render requests. Renders run on detached tasks, so without
+    /// it a slow EARLIER render can finish after a newer one and overwrite the preview with a
+    /// stale image — visible as the preview snapping back to a setting you already moved past.
+    private var previewRenderSeq = 0
+
+    /// Called when a slider changes: re-render the PREVIEW only. Nothing reaches the pipeline
+    /// here — that is what makes tuning mid-broadcast safe.
+    ///
+    /// `force` bypasses the throttle. Slider drags are throttled to ~12 fps because they fire
+    /// continuously, but DISCRETE actions (Revert, Reset, blink press/release, a new frame, a
+    /// session boundary) must never be silently dropped for landing inside an 80 ms window —
+    /// a swallowed blink release would leave the panel showing the online master and quietly
+    /// misrepresent what rejection is doing.
+    func refreshPreview(force: Bool = false) {
         guard let pipeline else { return }
-        let adj = displayAdjustments
-        pipeline.displayAdjustments = adj
         let now = Date()
-        guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else {
-            return   // throttle re-render only; the pipeline state was already updated above
+        if !force {
+            guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else { return }
         }
         lastAdjustmentRender = now
+        previewRenderSeq &+= 1
+        let seq = previewRenderSeq
+        let adj = staged.pending
+        let source = previewSource
         Task.detached { [weak self] in
-            // Swift 6: rebind weak self to an immutable strong let up front — nested
-            // @Sendable closures may not reference a captured *var* (a weak binding).
-            // Lifetime extension is task-scoped (one-shot render); no retain cycle.
             guard let self else { return }
-            let cg = pipeline.renderCurrentDisplay(adjustments: adj)
+            let cg = pipeline.renderPreview(source: source, adjustments: adj)
+            await MainActor.run {
+                // Only the newest request may publish; a slower earlier render is discarded.
+                guard seq == self.previewRenderSeq else { return }
+                self.previewImage = cg
+            }
+        }
+    }
+
+    /// Which master the preview shows. Held → the un-rejected online master. Otherwise the
+    /// clean master when one is actually being served, else online — so the panel still shows
+    /// a picture when rejection is off, building, or unavailable, rather than going blank.
+    var previewSource: SessionPipeline.PreviewSource {
+        if blinkHeld { return .online }
+        return pipeline?.publishedMasterSurvivorCount() != nil ? .clean : .online
+    }
+
+    /// Promotes the pending adjustments to committed: pushes them to the pipeline (so the
+    /// broadcast, snapshots, latest.png and replay pick them up), persists them, and refreshes
+    /// the main view. This is the ONLY path by which a slider reaches the audience.
+    func applyAdjustments() {
+        let committed = staged.apply()
+        saveSettings()
+        guard let pipeline else { return }
+        pipeline.displayAdjustments = committed
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let cg = pipeline.renderCurrentDisplay(adjustments: committed)
             await MainActor.run {
                 guard let cg else { return }
                 self.latestImage = cg
             }
         }
+    }
+
+    /// Throws the pending edits away and puts the preview back on the committed look.
+    func revertAdjustments() {
+        staged.revert()
+        refreshPreview(force: true)
+    }
+
+    /// Restores the shipped defaults as a PENDING edit — Reset must not reach the broadcast on
+    /// its own, or it would be the one control that bypasses staging entirely. Apply commits it
+    /// like any other change.
+    func resetAdjustments() {
+        staged.pending = .liveDefault
+        refreshPreview(force: true)
     }
 
     private func makeStackEngine() -> StackEngine {
@@ -781,7 +841,7 @@ final class AppModel {
             sessionNeutralizeBackground = neutralizeBackground
             sessionSubExposureSeconds = profile.subExposureSeconds
         }
-        p.displayAdjustments = displayAdjustments
+        p.displayAdjustments = staged.committed
 
         acceptedCount = 0
         rejectedCount = 0
@@ -817,6 +877,8 @@ final class AppModel {
         do {
             try p.start()
             pipeline = p
+            previewImage = nil
+            refreshPreview(force: true)   // fill the panel as soon as there is data
             isRunning = true
             selectedTab = .live
             sessionStart = Date()
@@ -924,9 +986,15 @@ final class AppModel {
                 self?.latestImage = image
                 self?.latestRecord = record
                 self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false   // gate the North-up toggle
+                self?.refreshPreview(force: true)   // a new sub changed the stack
                 onAccepted?()
                 self?.log.append("✓ update \(record.index) — \(record.snapshotFile)")
             }
+        }
+        // Fires from the refiner's BACKGROUND pass when a clean master publishes — hop to the
+        // main actor like every other callback here before touching AppModel state.
+        pipeline.onCleanMasterPublished = { [weak self] in
+            Task { @MainActor in self?.refreshPreview(force: true) }
         }
         pipeline.onRejected = { [weak self] reason, name in
             onAnyFrame?()
@@ -950,9 +1018,16 @@ final class AppModel {
             }
         }
         // Solve state changes off the hot path and emits no display update — refresh the toggle gate on
-        // BOTH edges: a solve landing (enable) and a reseed/auto-reseed invalidating it (disable).
+        // BOTH edges: a solve landing (enable) and a reseed/auto-reseed invalidating it (disable). Also
+        // refresh the preview on both edges: a MANUAL reseed changes the stack immediately and may not
+        // produce another accepted frame for a while, so onUpdate alone can leave the panel showing the
+        // old stack; and North-up rotation is applied inside displayCGImage, so the preview's orientation
+        // changes the moment a solve lands.
         pipeline.onSolveStateChanged = { [weak self] in
-            Task { @MainActor in self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false }
+            Task { @MainActor in
+                self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false   // existing behaviour
+                self?.refreshPreview(force: true)                              // added
+            }
         }
         // Task 8a data plane: mirror each persisted sub onto the main actor for the Stats
         // UI. The pipeline already wrote the record to session.subFrames on its own
@@ -1029,6 +1104,9 @@ final class AppModel {
         guard let pipeline else { return }
         let enabled = liveTrailRejection && sourceIsLocalLiveRelay
         pipeline.configureLiveRejection(enabled: enabled, kappa: rejectionStrength.kappa)
+        // Turning rejection off, or changing kappa, invalidates whatever clean master was being
+        // served exactly like a reject does — refresh so the panel doesn't keep showing it.
+        refreshPreview(force: true)
     }
 
     /// Advisory-only budget check (Task 11 point 6): only runs when an expected frame size is
@@ -1078,6 +1156,9 @@ final class AppModel {
         let rejected = Set(subFrames.filter(\.rejectedByUser).map(\.index))
         pipeline?.setUserRejected(rejected)
         pipeline?.noteUserRejectChanged()
+        // A reject makes the currently-published clean master unservable immediately, so
+        // previewSource falls back to .online — refresh so the panel reflects that at once.
+        refreshPreview(force: true)
     }
 
     /// Clears the native-session-only stats/re-stack state at the START of an offline import
@@ -1425,6 +1506,10 @@ final class AppModel {
                 self.sessionCalibrator = p.effectiveCalibrator
                 self.sessionSourceMetadata = p.capturedSourceMetadata   // stamp re-stacked master.fit like the live one (Fix P1b)
                 self.pipeline = nil
+                // Pending edits die with the session, and nothing from a finished session
+                // lingers on screen.
+                self.previewImage = nil
+                self.staged.revert()
                 self.sessionEnd = Date()
                 self.restackOfferPending = self.flaggedCount > 0
                 // Common completion (success OR replay failure): only now stop

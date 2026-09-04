@@ -42,22 +42,21 @@ final class AppSourceRegressionTests: XCTestCase {
         )
     }
 
-    func testAppModelPushesDisplayAdjustmentsToPipelineIndependentOfRenderThrottle() throws {
+    /// AppModel cannot be unit-tested (LiveAstroStudio is an executableTarget with no test
+    /// target, Package.swift:12,18), so this remains a source-text check — but it now guards
+    /// the staging invariant instead of a line that no longer exists. The BEHAVIOUR is tested
+    /// properly in StagedAdjustmentsTests; this only pins that AppModel pushes the value
+    /// apply() returned, rather than pushing pending straight through.
+    func testAppModelOnlyPushesCommittedAdjustmentsToThePipeline() throws {
         let appModelURL = root.appendingPathComponent("Sources/LiveAstroStudio/AppModel.swift")
         let appModel = try String(contentsOf: appModelURL, encoding: .utf8)
 
-        XCTAssertTrue(
-            appModel.contains("p.displayAdjustments = displayAdjustments"),
-            "A new SessionPipeline must receive persisted display adjustments before it starts rendering frames."
-        )
-        XCTAssertTrue(
-            appModel.contains("pipeline.displayAdjustments = adj"),
-            "applyDisplayAdjustments must always push state into the pipeline; the throttle may skip only the expensive re-render."
-        )
-        XCTAssertFalse(
-            appModel.contains("guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else { return }"),
-            "The 80 ms throttle must not return before updating SessionPipeline.displayAdjustments."
-        )
+        XCTAssertTrue(appModel.contains("staged.apply()"),
+                      "committing must go through StagedAdjustments.apply()")
+        XCTAssertFalse(appModel.contains("pipeline.displayAdjustments = staged.pending"),
+                       "pending adjustments must NEVER be pushed to the pipeline — that is the broadcast")
+        XCTAssertFalse(appModel.contains("p.displayAdjustments = displayAdjustments"),
+                       "the pre-staging direct push must be gone")
     }
 
     func testURLSessionOBSSocketOpenDelegateAndStateAreReusableAcrossReconnects() throws {
@@ -131,8 +130,8 @@ final class AppSourceRegressionTests: XCTestCase {
             "ImportController needs display-adjustment access through AppSurface so Stack Previous Shoot snapshots/replays honor persisted stretch/saturation/DBE."
         )
         XCTAssertTrue(
-            appModel.contains("currentDisplayAdjustments: { [weak self] in MainActor.assumeIsolated { self?.displayAdjustments ?? .neutral } }"),
-            "AppModel must wire persisted display adjustments into the import surface."
+            appModel.contains("currentDisplayAdjustments: { [weak self] in MainActor.assumeIsolated { self?.staged.committed ?? .neutral } }"),
+            "AppModel must wire persisted (committed) display adjustments into the import surface — never the uncommitted staged.pending."
         )
         XCTAssertTrue(
             source.contains("importPipeline.displayAdjustments = surface.currentDisplayAdjustments?() ?? .neutral"),
