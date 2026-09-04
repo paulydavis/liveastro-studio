@@ -1233,7 +1233,7 @@ These are edits, not guidance; make each one:
 
 1. In the `pipeline.onUpdate` closure (`AppModel.swift:921`), after `self?.latestImage = image`,
    add `self?.refreshPreview(force: true)` — a new sub changed the stack.
-2. Wire `pipeline.onCleanMasterPublished` (added in Step 4d) to `refreshPreview(force: true)`
+2. Wire `pipeline.onCleanMasterPublished` (added in Task 4, already committed on this branch) to `refreshPreview(force: true)`
    — with the main-actor hop the other callbacks use (`AppModel.swift:923`), since this one
    fires from the refiner's background pass:
 
