@@ -101,7 +101,7 @@ to the pipeline, persists, and refreshes the main view. `revert()` sets `pending
    and is deleted. Only the named constant and the honesty test below are new.
    The cache key is per source (see "Proxy cache key" below) — clean keys on the published
    master's FreshnessKey, native online on (stack generation, previewStackRevision), watcher
-   online on the retained frame's identity digest. Adjustments are
+   online on a monotonic token bumped when a frame is retained. Adjustments are
    NOT in the key: the proxy is linear, pre-adjustment, so slider drags reuse it.
 4. **Source selector** for blink: `.clean` (`publishedMasterIfCurrent()`) or `.online`, both
    cropped to coverage as the existing paths do, both rendered through the SAME pending
@@ -166,8 +166,11 @@ cosmetic: `AppModel.liveRejectionStatus` is a COMPUTED property with no change n
 there is no transition to observe and the panel would otherwise keep showing the online master
 after the first clean one publishes. It fires from the refiner's background pass, so the
 `AppModel` side hops to the main actor the way the other callbacks do (`AppModel.swift:923`). Clear `previewImage`
-at session start and session end. Reseeds and source changes are covered by `onUpdate` plus the
-proxy cache key, which includes the stack generation.
+at session start and session end. Reseeds are NOT covered by `onUpdate`: a manual reseed changes the stack immediately and may
+not be followed by an accepted frame for some time, leaving the panel on the old stack. Refresh
+from `onSolveStateChanged`, which already fires on that edge (`SessionPipeline.swift:211`) and
+also on solve ARRIVAL (`:265`) — the latter matters because North-up is applied inside
+`displayCGImage`, so the preview's orientation changes when a solve lands.
 
 ### Render ordering
 

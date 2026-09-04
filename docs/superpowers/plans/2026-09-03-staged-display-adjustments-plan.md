@@ -17,7 +17,7 @@
 - Only `LiveAstroCore` is unit-testable — `LiveAstroStudio` is an `executableTarget` with no test target (`Package.swift:12,18`). Any logic that needs a real test belongs in `LiveAstroCore`.
 - Preview downsample: use the EXISTING `AstroImage.downsampled(maxLongEdge:)` (`AstroImage.swift:38`) at `SessionPipeline.previewLongEdge = 1200`. Do not write a new downsampler.
 - `AstroImage` is **planar (channel-major)** (`AstroImage.swift:16`): index as `c * plane + y * width + x`. Interleaved indexing silently scrambles colour.
-- Preview-proxy cache key, per source: clean → the published master's `FreshnessKey`; native online → `(stack generation, previewStackRevision)`; watcher online → the retained frame's identity digest. Adjustments are deliberately NOT in any of them — the proxy is linear and pre-adjustment, so slider drags reuse it.
+- Preview-proxy cache key, per source: clean → the published master's `FreshnessKey`; native online → `(stack generation, previewStackRevision)`; watcher online → a monotonic token bumped when a frame is retained (NOT the file digest: `StackUpdate.identity` and `FileIdentity.digest` are both optional). Adjustments are deliberately NOT in any of them — the proxy is linear and pre-adjustment, so slider drags reuse it.
 - Preview honesty bound: derived median and MADN within **2% relative** of the full frame, measured on a non-uniform (star-field) image.
 - Full test suite green before merge. Baseline at v3.6.1 is 1217 tests / 8 skipped / 0 failures.
 
@@ -715,6 +715,47 @@ final class PreviewRenderTests: XCTestCase {
         XCTAssertLessThanOrEqual(max(cg.width, cg.height), SessionPipeline.previewLongEdge)
     }
 
+    /// The callback is the ACTUAL fix for "a clean master appeared but the UI never knew", and
+    /// it lives in LiveAstroCore, so it gets a real test rather than a source-text grep. It must
+    /// fire when a publish is INSTALLED and stay silent when one is dropped — a notification for
+    /// a dropped publish would make the panel switch to a clean master that was never stored.
+    func testOnCleanMasterPublishedFiresOnlyWhenAPublishIsActuallyInstalled() throws {
+        final class Counter: @unchecked Sendable {
+            private let lock = NSLock(); private var n = 0
+            func bump() { lock.withLock { n += 1 } }
+            var count: Int { lock.withLock { n } }
+        }
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try PreviewRenderTests.runningPipeline(sandbox: sandbox)
+        defer { source.stop() }
+        pipeline.configureLiveRejection(enabled: true)
+
+        let fired = Counter()
+        pipeline.onCleanMasterPublished = { fired.bump() }
+        let refiner = try XCTUnwrap(pipeline.refinerForTest())
+        guard let (mean, coverage) = pipeline.engineForTest?.currentStackAndCoverage() else {
+            return XCTFail("expected a stack")
+        }
+        let cov = coverage ?? [Float](repeating: 1, count: mean.width * mean.height)
+        let key = pipeline.currentFreshnessKey()
+        let result = RefineResult(image: mean, coverage: cov,
+                                  survivorCount: pipeline.subRegistrations().count, skipped: 0)
+
+        refiner.publish?(result, key)
+        XCTAssertEqual(fired.count, 1, "a servable publish is installed, so the UI must be told")
+
+        // Now make that key unservable — a user reject changes what the master MEANS — and
+        // republish under it. publishRefineResult drops the result, so nothing may fire.
+        pipeline.setUserRejected([1])
+        pipeline.noteUserRejectChanged()
+        refiner.publish?(result, key)
+        XCTAssertEqual(fired.count, 1,
+                       "a dropped (unservable) publish stores nothing, so it must not notify — "
+                       + "otherwise the panel switches to a clean master that was never installed")
+    }
+
     /// With live rejection off there is no clean master, and the caller must be able to tell —
     /// the blink control's disabled state depends on it.
     func testCleanSourceReturnsNilWhenNoCleanMasterIsPublished() throws {
@@ -802,7 +843,8 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
     /// Monotonic stack revision for the preview cache key. `processedCount` (`:164`) is a
     /// private var mutated on the consume task (`:890`, `:970`), so reading it from a preview
     /// render — which runs on a detached task — would be a data race. Bump this under the lock
-    /// in the SAME two places `processedCount` is incremented.
+    /// at ALL THREE places `processedCount` is incremented (`:890`, `:970`, and `:1164` — the
+    /// native live path; missing that one freezes a live session's preview).
     private let previewRevLock = NSLock()
     private var previewStackRevision = 0
     private func bumpPreviewStackRevision() {
@@ -813,7 +855,7 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
     }
 
     /// The most recent rendered linear image, ALREADY downsampled to `previewLongEdge`, with the
-    /// identity digest it came from. Watcher / external-stacker mode (init at `:768`) has NO
+    /// monotonic token it was retained under. Watcher / external-stacker mode (init at `:768`) has NO
     /// engine — it loads and renders each incoming file (`:1276`) — so without this the preview
     /// would be permanently blank there, even though display adjustments apply exactly as they
     /// do natively. Retaining the DOWNSAMPLED image costs ~1 MP, not 26 MP.
@@ -929,7 +971,7 @@ Then wire the two invalidation sources:
 - [ ] **Step 4: Run tests**
 
 Run: `swift test --filter PreviewRenderTests`
-Expected: all six PASS.
+Expected: all nine PASS.
 
 - [ ] **Step 5: Confirm the committed path is still untouched**
 
@@ -1163,8 +1205,22 @@ These are edits, not guidance; make each one:
    and `staged.revert()` — pending edits die with the session, and nothing from a finished
    session lingers on screen.
 
-A reseed or source change needs no separate hook: both produce fresh frames through `onUpdate`,
-and the proxy cache key covers them (stack generation for `.online`, `FreshnessKey` for `.clean`).
+5. Wire `pipeline.onSolveStateChanged` to `refreshPreview(force: true)`, with the same
+   main-actor hop. A MANUAL reseed changes the stack immediately and may not produce another
+   accepted frame for a while, so `onUpdate` alone can leave the panel showing the old stack;
+   `onSolveStateChanged` already fires on that edge (`SessionPipeline.swift:211`, commented
+   "negative edge: reseed/auto-reseed dropped the solve"). The same hook also covers solve
+   ARRIVAL (`:265`), which matters because North-up rotation is applied inside `displayCGImage`
+   — the preview's orientation changes the moment a solve lands.
+
+```swift
+        pipeline.onSolveStateChanged = { [weak self] in
+            Task { @MainActor in self?.refreshPreview(force: true) }
+        }
+```
+
+Note this REPLACES the earlier claim that "a reseed needs no separate hook because onUpdate
+covers it" — it does not, when no frame follows the reseed promptly.
 
 - [ ] **Step 4c: Verify the lifecycle by hand**
 
