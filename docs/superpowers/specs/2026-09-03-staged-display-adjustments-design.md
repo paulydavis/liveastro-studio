@@ -52,18 +52,27 @@ it is judged in the main view for v1. A crop remains possible later but requires
 
 ## Architecture
 
-### State (AppModel)
+### State (LiveAstroCore: `StagedAdjustments`)
 
-- `committedAdjustments` — held by `SessionPipeline`; feeds broadcast, snapshots,
+**Amended 2026-09-03 during planning:** `LiveAstroStudio` is an `executableTarget` with NO
+test target (see `Package.swift:12,18`) — only `LiveAstroCore` is unit-testable. Putting this
+state in `AppModel` would make the staging invariant (test 2), the property the whole feature
+rests on, testable only by another source-text grep — the very debt this spec criticises. So
+the state machine is a pure value type in `LiveAstroCore`:
+`StagedAdjustments { committed, pending, hasPendingChanges, mutating apply() -> DisplayAdjustments, mutating revert() }`.
+`AppModel` owns one instance and forwards; all staging logic is unit-tested in
+`LiveAstroCoreTests`.
+
+- `committed` — held by `SessionPipeline`; feeds broadcast, snapshots,
   `latest.png`, replay, `master.fit`. Written ONLY by Apply. The only one persisted to
   `SessionSettingsStore`.
-- `pendingAdjustments` — bound to the sliders. Never reaches `SessionPipeline`, never
+- `pending` — bound to the sliders. Never reaches `SessionPipeline`, never
   persisted, discarded on session end.
 - `hasPendingChanges` = `pending != committed`, drives the panel's pending treatment and the
   enabled state of Apply/Revert.
 
-Apply: `committed = pending`; push to pipeline; persist; refresh main view.
-Revert: `pending = committed`.
+`apply()` sets `committed = pending` and RETURNS the new committed value; `AppModel` pushes it
+to the pipeline, persists, and refreshes the main view. `revert()` sets `pending = committed`.
 
 ### Render seam (SessionPipeline)
 
