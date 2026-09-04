@@ -15,8 +15,9 @@
 - Branch `feature/staged-display-adjustments`, from main @ v3.6.1. Never commit to, base on, or target `main`.
 - Commit trailer `Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j`. NO `Co-Authored-By` trailer.
 - Only `LiveAstroCore` is unit-testable — `LiveAstroStudio` is an `executableTarget` with no test target (`Package.swift:12,18`). Any logic that needs a real test belongs in `LiveAstroCore`.
-- Proxy: longest edge **1200 px**, integer **box-average** downsample; a stack already ≤1200 px on its long edge is used as-is.
-- Proxy cache key: `(stack generation, processed sub count, source selector)`. Adjustments are deliberately NOT in the key — the proxy is linear and pre-adjustment.
+- Preview downsample: use the EXISTING `AstroImage.downsampled(maxLongEdge:)` (`AstroImage.swift:38`) at `SessionPipeline.previewLongEdge = 1200`. Do not write a new downsampler.
+- `AstroImage` is **planar (channel-major)** (`AstroImage.swift:16`): index as `c * plane + y * width + x`. Interleaved indexing silently scrambles colour.
+- Preview-proxy cache key: `(stack generation, processed sub count, source selector)`. Adjustments are deliberately NOT in the key — the proxy is linear and pre-adjustment, so slider drags reuse it.
 - Preview honesty bound: derived median and MADN within **2% relative** of the full frame, measured on a non-uniform (star-field) image.
 - Full test suite green before merge. Baseline at v3.6.1 is 1217 tests / 8 skipped / 0 failures.
 
@@ -26,11 +27,93 @@
 
 **Files:**
 - Modify: `Sources/LiveAstroCore/Pipeline/SessionPipeline.swift:1074` (signature) and call sites at `:929`, `:941`, `:1121`, `:1233`, `:1276`
+- Create: `Tests/LiveAstroCoreTests/PreviewTestSupport.swift` (shared helpers used by Tasks 1, 2, 4)
 - Test: `Tests/LiveAstroCoreTests/DisplayRenderParityTests.swift` (create)
 
 **Interfaces:**
 - Produces: `private func displayCGImage(from linear: AstroImage, adjustments adj: DisplayAdjustments) throws -> CGImage`
 - Produces (test seam): `func renderForTest(_ image: AstroImage, adjustments: DisplayAdjustments) throws -> CGImage`
+
+- [ ] **Step 0: Create the shared test support file**
+
+Three later tasks need the same helpers, and `StubLiveSource` is currently NESTED inside
+`GlobalRefinerTests` (`GlobalRefinerTests.swift:12`), so a bare `StubLiveSource` will not
+compile from a new test file. Extract it once, here.
+
+Create `Tests/LiveAstroCoreTests/PreviewTestSupport.swift`:
+
+```swift
+import XCTest
+import CryptoKit
+@testable import LiveAstroCore
+
+/// Helpers shared by the preview/staging tests.
+///
+/// `AstroImage` is PLANAR (channel-major) — `AstroImage.swift:16`, and see `Denoiser.swift:78`
+/// indexing `sane[i], sane[plane + i], sane[2 * plane + i]`. Index as
+/// `c * plane + y * width + x`; interleaved indexing silently scrambles colour AND would make
+/// these helpers agree with a broken implementation, so the tests would pass while the code is
+/// wrong.
+enum PreviewTestSupport {
+
+    /// Non-uniform planar star field with a gradient. A CONSTANT image would let every
+    /// statistic survive any transformation, making the honesty tests vacuous.
+    static func starField(w: Int = 2400, h: Int = 1800, channels: Int = 3) -> AstroImage {
+        let plane = w * h
+        var px = [Float](repeating: 0, count: plane * channels)
+        for c in 0..<channels {
+            for y in 0..<h {
+                for x in 0..<w {
+                    let bg = 0.04 + 0.02 * Float(x) / Float(w)
+                    let grain = Float((x &* 7 &+ y &* 13) % 11) * 0.0008
+                    px[c * plane + y * w + x] = bg + grain + Float(c) * 0.005
+                }
+            }
+        }
+        for (sx, sy, amp) in [(520, 430, Float(0.8)), (1400, 1100, 0.5), (1900, 600, 0.65)] {
+            for dy in -8...8 {
+                for dx in -8...8 {
+                    let x = sx + dx, y = sy + dy
+                    guard x >= 0, x < w, y >= 0, y < h else { continue }
+                    let g = amp * exp(-Float(dx * dx + dy * dy) / 12.0)
+                    for c in 0..<channels { px[c * plane + y * w + x] += g }
+                }
+            }
+        }
+        return AstroImage(width: w, height: h, channels: channels, pixels: px, sourceIsLinear: true)
+    }
+
+    /// Planar luminance -> (median, MADN): the two values AutoStretch derives its transform from.
+    static func medianAndMADN(_ image: AstroImage) -> (Double, Double) {
+        let plane = image.width * image.height
+        var lum = [Float](repeating: 0, count: plane)
+        for c in 0..<image.channels {
+            for i in 0..<plane { lum[i] += image.pixels[c * plane + i] }
+        }
+        let inv = Float(image.channels)
+        for i in 0..<plane { lum[i] /= inv }
+        lum.sort()
+        let med = Double(lum[plane / 2])
+        var dev = lum.map { abs(Double($0) - med) }
+        dev.sort()
+        return (med, dev[plane / 2] * 1.4826)
+    }
+
+    static func sha256(_ cg: CGImage) -> String {
+        guard let data = cg.dataProvider?.data as Data? else { return "no-data" }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+}
+```
+
+Then MOVE `StubLiveSource` out of `GlobalRefinerTests` (it is declared at
+`GlobalRefinerTests.swift:12` as a nested `final class`) into its own file
+`Tests/LiveAstroCoreTests/StubLiveSource.swift` at file scope, unchanged apart from being
+top-level and `final class StubLiveSource: FrameSource`. Update `GlobalRefinerTests` references
+if the compiler asks.
+
+Run: `swift test --filter GlobalRefinerTests 2>&1 | grep -E "Executed [0-9]+ tests, with"`
+Expected: 44 tests, 0 failures — the extraction changed no behaviour.
 
 - [ ] **Step 1: Write the characterization test with a placeholder hash**
 
@@ -38,41 +121,12 @@ Create `Tests/LiveAstroCoreTests/DisplayRenderParityTests.swift`:
 
 ```swift
 import XCTest
-import CryptoKit
 @testable import LiveAstroCore
 
 /// The render path behind this test produces the broadcast, snapshots, latest.png and
 /// master.fit. A regression here is SILENT — it lands in recorded data, not in a crash — so
 /// the committed-path output is pinned by hash across the refactor that parameterises it.
 final class DisplayRenderParityTests: XCTestCase {
-
-    /// Non-uniform test image: a constant frame would make every statistic survive any
-    /// transformation, so this test (and the proxy test in Task 2) would pass vacuously.
-    static func starField(w: Int = 320, h: Int = 240) -> AstroImage {
-        var px = [Float](repeating: 0, count: w * h * 3)
-        for y in 0..<h {
-            for x in 0..<w {
-                let bg = 0.04 + 0.02 * Float(x) / Float(w)      // gradient, so DBE has work
-                for c in 0..<3 { px[(y * w + x) * 3 + c] = bg + Float((x &* 7 &+ y &* 13) % 11) * 0.0008 }
-            }
-        }
-        for (sx, sy, amp) in [(70, 60, Float(0.8)), (180, 150, 0.5), (250, 80, 0.65)] {
-            for dy in -6...6 {
-                for dx in -6...6 {
-                    let x = sx + dx, y = sy + dy
-                    guard x >= 0, x < w, y >= 0, y < h else { continue }
-                    let g = amp * exp(-Float(dx * dx + dy * dy) / 8.0)
-                    for c in 0..<3 { px[(y * w + x) * 3 + c] += g }
-                }
-            }
-        }
-        return AstroImage(width: w, height: h, channels: 3, pixels: px, sourceIsLinear: true)
-    }
-
-    static func sha256(_ cg: CGImage) -> String {
-        guard let data = cg.dataProvider?.data as Data? else { return "no-data" }
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
 
     /// The adjustment set under test exercises every stage: black point, midtone, saturation,
     /// DBE (with both its parameters) and denoise.
@@ -90,8 +144,9 @@ final class DisplayRenderParityTests: XCTestCase {
 
     func testCommittedRenderIsUnchangedByParameterisation() throws {
         let pipeline = SessionPipeline.forRenderTest()
-        let cg = try pipeline.renderForTest(Self.starField(), adjustments: Self.pinnedAdjustments)
-        XCTAssertEqual(Self.sha256(cg), "PLACEHOLDER_FILL_IN_STEP_2",
+        let cg = try pipeline.renderForTest(PreviewTestSupport.starField(w: 320, h: 240),
+                                            adjustments: Self.pinnedAdjustments)
+        XCTAssertEqual(PreviewTestSupport.sha256(cg), "PLACEHOLDER_FILL_IN_STEP_2",
                        "the committed render path must be byte-identical across the refactor")
     }
 }
@@ -195,166 +250,109 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 
 ---
 
-### Task 2: `PreviewProxy` — the downsample the preview renders from
+### Task 2: Preview downsample constant + proof it does not distort the stretch
 
 **Files:**
-- Create: `Sources/LiveAstroCore/Imaging/PreviewProxy.swift`
-- Test: `Tests/LiveAstroCoreTests/PreviewProxyTests.swift` (create)
+- Modify: `Sources/LiveAstroCore/Pipeline/SessionPipeline.swift` (add `previewLongEdge` constant)
+- Test: `Tests/LiveAstroCoreTests/PreviewDownsampleHonestyTests.swift` (create)
+- Consumes: `PreviewTestSupport` (Task 1 Step 0)
 
 **Interfaces:**
-- Produces: `public enum PreviewProxy { public static let longestEdge = 1200; public static func downsample(_ image: AstroImage) -> AstroImage }`
+- Consumes: `AstroImage.downsampled(maxLongEdge:)` — ALREADY EXISTS (`AstroImage.swift:38`)
+- Produces: `static let previewLongEdge = 1200` on `SessionPipeline`
 
-- [ ] **Step 1: Write the failing tests**
+**Do NOT write a new downsampler.** `AstroImage.downsampled(maxLongEdge:)` already does exactly
+this job: area-averaging, planar-correct, one O(pixels) pass, covered by
+`AstroImageDownsampleTests`, and already used by the render path at `SessionPipeline.swift:928`
+and `:940`. Its doc states its purpose is rendering the preview/display from a huge stacked
+frame. An earlier draft of this plan reimplemented it (with the WRONG pixel layout); that is
+deleted. This task adds only the named constant and the one property nothing currently proves.
 
-Create `Tests/LiveAstroCoreTests/PreviewProxyTests.swift`:
+**`AstroImage` is PLANAR (channel-major)** — `AstroImage.swift:16`, and see `Denoiser.swift:78`
+indexing `sane[i], sane[plane + i], sane[2 * plane + i]`. Index as `c * plane + y * width + x`.
+Interleaved `(y * w + x) * c` indexing is WRONG and will silently scramble colour.
+
+- [ ] **Step 1: Write the failing honesty test**
+
+Create `Tests/LiveAstroCoreTests/PreviewDownsampleHonestyTests.swift`:
 
 ```swift
 import XCTest
 @testable import LiveAstroCore
 
-final class PreviewProxyTests: XCTestCase {
+/// The staged preview renders from a downsample. `AutoStretch` derives its transform from the
+/// image's OWN median and MADN (`AutoStretch.swift:47-57`), so if downsampling moved those
+/// statistics the preview would show a different stretch than the broadcast — a preview that
+/// lies is worse than no preview. `AstroImageDownsampleTests` already covers the mechanics of
+/// the downsample; this covers the property the preview design rests on, which nothing did.
+final class PreviewDownsampleHonestyTests: XCTestCase {
 
-    /// THE test this design rests on. The preview renders from a downsample, but AutoStretch
-    /// derives its transform from the image's OWN median/MADN (AutoStretch.swift:47-57) — so if
-    /// downsampling shifted those statistics, the preview would show a different stretch than
-    /// the broadcast and would be lying to the operator. Measured on a NON-UNIFORM image: on a
-    /// constant frame every statistic survives any sampling and this test would prove nothing.
     func testDownsamplePreservesTheStatisticsAutoStretchDerives() {
-        let full = DisplayRenderParityTests.starField(w: 2400, h: 1800)
-        let proxy = PreviewProxy.downsample(full)
+        let full = PreviewTestSupport.starField()
+        let proxy = full.downsampled(maxLongEdge: SessionPipeline.previewLongEdge)
+        XCTAssertLessThanOrEqual(max(proxy.width, proxy.height), SessionPipeline.previewLongEdge)
 
-        let (mFull, dFull) = Self.medianAndMADN(full)
-        let (mProxy, dProxy) = Self.medianAndMADN(proxy)
-
+        let (mFull, dFull) = PreviewTestSupport.medianAndMADN(full)
+        let (mProxy, dProxy) = PreviewTestSupport.medianAndMADN(proxy)
         XCTAssertEqual(mProxy, mFull, accuracy: abs(mFull) * 0.02,
-                       "median must survive the proxy downsample within 2% — the stretch is derived from it")
+                       "median must survive the preview downsample within 2% — the stretch is derived from it")
         XCTAssertEqual(dProxy, dFull, accuracy: abs(dFull) * 0.02,
-                       "MADN must survive the proxy downsample within 2% — it sets the stretch slope")
+                       "MADN must survive the preview downsample within 2% — it sets the stretch slope")
     }
 
-    func testDownsampleTargetsTheLongestEdge() {
-        let landscape = PreviewProxy.downsample(DisplayRenderParityTests.starField(w: 2400, h: 1800))
-        XCTAssertEqual(max(landscape.width, landscape.height), 1200)
-        XCTAssertEqual(landscape.width, 1200)
-        XCTAssertEqual(landscape.height, 900, "aspect ratio must be preserved by an integer factor")
-    }
+    /// Sentinel against the planar/interleaved confusion that produced the earlier draft of
+    /// this plan: give each channel a distinct constant and prove the planes stay separate and
+    /// keep their values through the downsample. Interleaved indexing anywhere in the chain
+    /// smears the three constants together and this fails.
+    func testDownsampleKeepsColourPlanesSeparate() {
+        let w = 2400, h = 1800, plane = w * h
+        var px = [Float](repeating: 0, count: plane * 3)
+        for i in 0..<plane { px[i] = 0.10; px[plane + i] = 0.50; px[2 * plane + i] = 0.90 }
+        let img = AstroImage(width: w, height: h, channels: 3, pixels: px, sourceIsLinear: true)
 
-    /// A small stack must pass through untouched — downsampling it would throw away real
-    /// resolution for no speed benefit.
-    func testImageAlreadyWithinBudgetIsReturnedUnchanged() {
-        let small = DisplayRenderParityTests.starField(w: 800, h: 600)
-        let out = PreviewProxy.downsample(small)
-        XCTAssertEqual(out.width, 800)
-        XCTAssertEqual(out.height, 600)
-        XCTAssertEqual(out.pixels, small.pixels)
-    }
-
-    /// Box-average, not nearest-neighbour: a 2x2 block of known values must average.
-    func testDownsampleBoxAveragesRatherThanSampling() {
-        let w = 2400, h = 1800
-        var px = [Float](repeating: 0, count: w * h)
-        for i in 0..<(w * h) { px[i] = (i % 2 == 0) ? 0.0 : 1.0 }   // checkerboard by index
-        let img = AstroImage(width: w, height: h, channels: 1, pixels: px, sourceIsLinear: true)
-        let out = PreviewProxy.downsample(img)
-        let mean = out.pixels.reduce(0, +) / Float(out.pixels.count)
-        XCTAssertEqual(mean, 0.5, accuracy: 0.02,
-                       "box-averaging a 50/50 pattern yields ~0.5; nearest-neighbour would yield 0 or 1")
-    }
-
-    static func medianAndMADN(_ image: AstroImage) -> (Double, Double) {
-        let c = image.channels
-        var lum = [Float]()
-        lum.reserveCapacity(image.width * image.height)
-        for p in stride(from: 0, to: image.pixels.count, by: c) {
-            var s: Float = 0
-            for k in 0..<c { s += image.pixels[p + k] }
-            lum.append(s / Float(c))
+        let out = img.downsampled(maxLongEdge: SessionPipeline.previewLongEdge)
+        let outPlane = out.width * out.height
+        XCTAssertEqual(out.channels, 3)
+        for (c, expected) in [(0, Float(0.10)), (1, 0.50), (2, 0.90)] {
+            let mean = (0..<outPlane).reduce(Float(0)) { $0 + out.pixels[c * outPlane + $1] } / Float(outPlane)
+            XCTAssertEqual(mean, expected, accuracy: 0.001,
+                           "channel \(c) must keep its own value — planar layout, not interleaved")
         }
-        lum.sort()
-        let med = Double(lum[lum.count / 2])
-        var dev = lum.map { abs(Double($0) - med) }
-        dev.sort()
-        return (med, dev[dev.count / 2] * 1.4826)
     }
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [ ] **Step 2: Run to verify it fails**
 
-Run: `swift test --filter PreviewProxyTests`
-Expected: FAIL — "cannot find 'PreviewProxy' in scope".
+Run: `swift test --filter PreviewDownsampleHonestyTests`
+Expected: FAIL — `SessionPipeline.previewLongEdge` does not exist.
 
-- [ ] **Step 3: Implement `PreviewProxy`**
+- [ ] **Step 3: Add the constant**
 
-Create `Sources/LiveAstroCore/Imaging/PreviewProxy.swift`:
+In `SessionPipeline.swift`, beside the existing `importPreviewLongEdge`:
 
 ```swift
-import Foundation
-
-/// The linear image the staged preview renders from.
-///
-/// The preview must be FAST (a slider drag must not re-render a 26 MP stack) and HONEST (it
-/// must show the stretch the broadcast will get). Those pull in opposite directions, and the
-/// resolution is why the preview is a whole-frame downsample rather than a 1:1 crop:
-///
-/// - `AutoStretch` derives its transform from the image's own median and MADN
-///   (`AutoStretch.swift:47-57`). A CROP's statistics differ from the full frame, so a crop
-///   would render a different stretch than the broadcast. A uniform downsample preserves them.
-/// - `BackgroundExtraction.flattenMultiscale` uses `scaleRadius = (scale/100) * max(sw, sh)`
-///   (`BackgroundExtraction.swift:281`) — DBE's scale is RELATIVE to image dimensions, so a
-///   crop changes the physical radius while a downsample preserves it proportionally.
-///
-/// Box-averaging (not nearest-neighbour sampling) is what keeps the statistics faithful;
-/// `PreviewProxyTests` pins both properties.
-public enum PreviewProxy {
-    /// Target for the longest edge. A 26 MP 6236x4159 stack lands at 1200x800 (factor 5).
-    public static let longestEdge = 1200
-
-    public static func downsample(_ image: AstroImage) -> AstroImage {
-        let longest = max(image.width, image.height)
-        guard longest > longestEdge else { return image }
-        let factor = max(2, Int((Double(longest) / Double(longestEdge)).rounded(.up)))
-        let outW = image.width / factor, outH = image.height / factor
-        guard outW >= 1, outH >= 1 else { return image }
-
-        let c = image.channels
-        var out = [Float](repeating: 0, count: outW * outH * c)
-        let inv = Float(factor * factor)
-        image.pixels.withUnsafeBufferPointer { src in
-            for oy in 0..<outH {
-                for ox in 0..<outW {
-                    for k in 0..<c {
-                        var sum: Float = 0
-                        for by in 0..<factor {
-                            let row = (oy * factor + by) * image.width
-                            for bx in 0..<factor {
-                                sum += src[(row + ox * factor + bx) * c + k]
-                            }
-                        }
-                        out[(oy * outW + ox) * c + k] = sum / inv
-                    }
-                }
-            }
-        }
-        return AstroImage(width: outW, height: outH, channels: c, pixels: out,
-                          sourceIsLinear: image.sourceIsLinear)
-    }
-}
+    /// Long edge the STAGED PREVIEW renders at. A 26 MP 6236x4159 stack lands ~1200x800, so a
+    /// slider drag re-renders ~1 MP instead of 26 MP. Downsampling (not cropping) is what keeps
+    /// the preview honest: it preserves both the statistics `AutoStretch` derives its transform
+    /// from and DBE's dimension-relative radius (`BackgroundExtraction.swift:281`).
+    static let previewLongEdge = 1200
 ```
 
 - [ ] **Step 4: Run tests**
 
-Run: `swift test --filter PreviewProxyTests`
-Expected: all four PASS.
+Run: `swift test --filter "PreviewDownsampleHonestyTests|AstroImageDownsampleTests"`
+Expected: all PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Sources/LiveAstroCore/Imaging/PreviewProxy.swift Tests/LiveAstroCoreTests/PreviewProxyTests.swift
-git commit -m "feat: PreviewProxy box-average downsample for the staged preview
+git add Sources/LiveAstroCore/Pipeline/SessionPipeline.swift Tests/LiveAstroCoreTests/PreviewDownsampleHonestyTests.swift
+git commit -m "test: pin that the preview downsample preserves the derived stretch statistics
 
-Preserves the median/MADN AutoStretch derives its transform from, and DBE's
-dimension-relative radius — the two properties a 1:1 crop would have broken.
+Uses the existing AstroImage.downsampled(maxLongEdge:) rather than a new
+downsampler. Adds a planar-layout sentinel so interleaved indexing cannot creep
+into the preview path.
 
 Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 ```
@@ -529,7 +527,7 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 - Test: `Tests/LiveAstroCoreTests/PreviewRenderTests.swift` (create)
 
 **Interfaces:**
-- Consumes: `PreviewProxy.downsample(_:)` (Task 2), `displayCGImage(from:adjustments:)` (Task 1)
+- Consumes: `AstroImage.downsampled(maxLongEdge:)` + `SessionPipeline.previewLongEdge` (Task 2), `displayCGImage(from:adjustments:)` (Task 1), `PreviewTestSupport` and top-level `StubLiveSource` (Task 1 Step 0)
 - Produces: `public enum PreviewSource { case clean, online }` and `public func renderPreview(source: PreviewSource, adjustments: DisplayAdjustments) -> CGImage?`
 
 - [ ] **Step 1: Write the failing tests**
@@ -577,11 +575,11 @@ final class PreviewRenderTests: XCTestCase {
         var light = DisplayAdjustments.neutral; light.blackPoint = 0.15
         let a = try XCTUnwrap(pipeline.renderPreview(source: .online, adjustments: dark))
         let b = try XCTUnwrap(pipeline.renderPreview(source: .online, adjustments: light))
-        XCTAssertNotEqual(DisplayRenderParityTests.sha256(a), DisplayRenderParityTests.sha256(b),
+        XCTAssertNotEqual(PreviewTestSupport.sha256(a), PreviewTestSupport.sha256(b),
                           "different adjustments must produce a different preview")
     }
 
-    /// The preview renders from the proxy, so it is bounded by PreviewProxy.longestEdge.
+    /// The preview renders from the downsampled proxy, so it is bounded by previewLongEdge.
     func testPreviewIsRenderedFromTheDownsampledProxy() throws {
         let sandbox = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -590,7 +588,56 @@ final class PreviewRenderTests: XCTestCase {
         defer { source.stop() }
 
         let cg = try XCTUnwrap(pipeline.renderPreview(source: .online, adjustments: .neutral))
-        XCTAssertLessThanOrEqual(max(cg.width, cg.height), PreviewProxy.longestEdge)
+        XCTAssertLessThanOrEqual(max(cg.width, cg.height), SessionPipeline.previewLongEdge)
+    }
+
+    /// Finding 2: the spec requires a CACHED proxy. Without one, every slider tick walks the
+    /// full 26 MP stack to build the downsample, so the drag is still O(26 MP) and only the
+    /// final render got cheaper. Adjustment-only re-renders must reuse the proxy.
+    func testRepeatedPreviewRendersReuseTheCachedProxy() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try PreviewRenderTests.runningPipeline(sandbox: sandbox)
+        defer { source.stop() }
+
+        var a = DisplayAdjustments.neutral; a.blackPoint = 0.02
+        var b = DisplayAdjustments.neutral; b.blackPoint = 0.06
+        _ = pipeline.renderPreview(source: .online, adjustments: a)
+        let buildsAfterFirst = pipeline.previewProxyBuildCountForTest
+        _ = pipeline.renderPreview(source: .online, adjustments: b)
+        _ = pipeline.renderPreview(source: .online, adjustments: a)
+
+        XCTAssertEqual(pipeline.previewProxyBuildCountForTest, buildsAfterFirst,
+                       "changing only the adjustments must reuse the cached proxy — adjustments are "
+                       + "deliberately NOT part of the cache key, the proxy is linear and pre-adjustment")
+    }
+
+    /// ...but a new sub must invalidate it, or the preview would freeze on the first stack.
+    func testANewSubInvalidatesTheCachedProxy() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try PreviewRenderTests.runningPipeline(sandbox: sandbox)
+        defer { source.stop() }
+
+        _ = pipeline.renderPreview(source: .online, adjustments: .neutral)
+        let before = pipeline.previewProxyBuildCountForTest
+
+        source.send(RawFrame(image: PreviewTestSupport.starField(w: 2400, h: 1800),
+                             bayerPattern: nil, bottomUp: false,
+                             timestamp: Date(timeIntervalSince1970: 99), sourceName: "pv9.fit",
+                             identity: FileIdentity(dev: 0, ino: 0, size: 0, mtimeSec: 0,
+                                                    mtimeNsec: 0, digest: "pv9"),
+                             sourceURL: URL(fileURLWithPath: "/tmp/preview/pv9.fit")))
+        let deadline = Date().addingTimeInterval(20)
+        let target = pipeline.subRegistrations().count + 1
+        while pipeline.subRegistrations().count < target && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        _ = pipeline.renderPreview(source: .online, adjustments: .neutral)
+        XCTAssertGreaterThan(pipeline.previewProxyBuildCountForTest, before,
+                             "a new sub changes the stack, so the proxy must be rebuilt")
     }
 
     /// With live rejection off there is no clean master, and the caller must be able to tell —
@@ -606,9 +653,8 @@ final class PreviewRenderTests: XCTestCase {
                      "no published clean master means no clean preview")
     }
 
-    /// Reuses the established live-pipeline harness. Mirrors
-    /// `GlobalRefinerTests.pipelineWithRegisteredSubs`; if that helper is made internal,
-    /// call it directly instead of duplicating.
+    /// Reuses the established live-pipeline harness and the top-level `StubLiveSource`
+    /// extracted in Task 1 Step 0.
     static func runningPipeline(sandbox: URL) throws -> (SessionPipeline, StubLiveSource) {
         let sessions = sandbox.appendingPathComponent("sessions")
         try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
@@ -617,7 +663,7 @@ final class PreviewRenderTests: XCTestCase {
                                      subExposureSeconds: 20, notes: "")
         let engine = StackEngine()
         let frames = (0..<3).map { i in
-            RawFrame(image: DisplayRenderParityTests.starField(w: 2400, h: 1800),
+            RawFrame(image: PreviewTestSupport.starField(w: 2400, h: 1800),
                      bayerPattern: nil, bottomUp: false,
                      timestamp: Date(timeIntervalSince1970: TimeInterval(i)),
                      sourceName: "pv\(i).fit",
@@ -639,8 +685,6 @@ final class PreviewRenderTests: XCTestCase {
 }
 ```
 
-If `StubLiveSource` is `private` to `GlobalRefinerTests`, promote it to an internal helper file `Tests/LiveAstroCoreTests/StubLiveSource.swift` in this step rather than duplicating it.
-
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `swift test --filter PreviewRenderTests`
@@ -660,23 +704,53 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
         case online
     }
 
+    /// Cached preview proxy. Keyed on what changes the PIXELS — stack generation, processed
+    /// sub count, and which master is shown. Adjustments are deliberately absent: the proxy is
+    /// linear and pre-adjustment, so a slider drag reuses it and re-renders ~1 MP instead of
+    /// walking the 26 MP stack again.
+    private struct PreviewProxyKey: Equatable {
+        let generation: Int
+        let subCount: Int
+        let source: PreviewSource
+    }
+    private let previewProxyLock = NSLock()
+    private var previewProxy: (key: PreviewProxyKey, image: AstroImage)?
+    /// Test seam: how many times the proxy has actually been rebuilt.
+    private(set) var previewProxyBuildCountForTest = 0
+
     /// Renders the staged preview WITHOUT touching committed state — the property
     /// `renderCurrentDisplay(adjustments:)` deliberately does not have (it commits, and is
-    /// retained for the Apply path). Renders from `PreviewProxy` so a slider drag re-renders a
-    /// ~1200 px image rather than a 26 MP stack. Returns nil when the requested source has
-    /// nothing to show: no stack yet, or `.clean` with no published master.
+    /// retained for the Apply path). Returns nil when the requested source has nothing to
+    /// show: no stack yet, or `.clean` with no published master.
     public func renderPreview(source: PreviewSource,
                               adjustments: DisplayAdjustments) -> CGImage? {
-        let linear: AstroImage
-        switch source {
-        case .online:
-            guard let (mean, coverage) = engine?.currentStackAndCoverage() else { return nil }
-            linear = cropToCoverage(mean, coverage: coverage)
-        case .clean:
-            guard let published = publishedMasterIfCurrent() else { return nil }
-            linear = cropToCoverage(published.image, coverage: published.coverage)
+        let key = PreviewProxyKey(generation: engine?.currentStackGeneration ?? 0,
+                                  subCount: processedCount,
+                                  source: source)
+        var proxy: AstroImage?
+        previewProxyLock.lock()
+        if let cached = previewProxy, cached.key == key { proxy = cached.image }
+        previewProxyLock.unlock()
+
+        if proxy == nil {
+            let linear: AstroImage
+            switch source {
+            case .online:
+                guard let (mean, coverage) = engine?.currentStackAndCoverage() else { return nil }
+                linear = cropToCoverage(mean, coverage: coverage)
+            case .clean:
+                guard let published = publishedMasterIfCurrent() else { return nil }
+                linear = cropToCoverage(published.image, coverage: published.coverage)
+            }
+            let built = linear.downsampled(maxLongEdge: Self.previewLongEdge)
+            previewProxyLock.lock()
+            previewProxy = (key, built)
+            previewProxyBuildCountForTest += 1
+            previewProxyLock.unlock()
+            proxy = built
         }
-        return try? displayCGImage(from: PreviewProxy.downsample(linear), adjustments: adjustments)
+        guard let proxy else { return nil }
+        return try? displayCGImage(from: proxy, adjustments: adjustments)
     }
 ```
 
@@ -696,7 +770,7 @@ Expected: PASS, same golden hash.
 git add Sources/LiveAstroCore/Pipeline/SessionPipeline.swift Tests/LiveAstroCoreTests/PreviewRenderTests.swift
 git commit -m "feat: renderPreview renders uncommitted adjustments without mutating state
 
-Renders from the PreviewProxy downsample and can select the clean or online
+Renders from a cached downsampled proxy and can select the clean or online
 master, so the blink comparison runs both through identical adjustments.
 
 Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
@@ -775,20 +849,38 @@ Update the four other references so they read committed: `:408` and `:784` pass 
 Replace the body at `:531-552` with:
 
 ```swift
+    /// Monotonic stamp for preview render requests. Renders run on detached tasks, so without
+    /// it a slow EARLIER render can finish after a newer one and overwrite the preview with a
+    /// stale image — visible as the preview snapping back to a setting you already moved past.
+    private var previewRenderSeq = 0
+
     /// Called when a slider changes: re-render the PREVIEW only. Nothing reaches the pipeline
-    /// here — that is what makes tuning mid-broadcast safe. Throttled to ~12 fps; the render
-    /// is off-main and works on the proxy, so it is cheap even at 26 MP.
-    func refreshPreview() {
+    /// here — that is what makes tuning mid-broadcast safe.
+    ///
+    /// `force` bypasses the throttle. Slider drags are throttled to ~12 fps because they fire
+    /// continuously, but DISCRETE actions (Revert, Reset, blink press/release, a new frame, a
+    /// session boundary) must never be silently dropped for landing inside an 80 ms window —
+    /// a swallowed blink release would leave the panel showing the online master and quietly
+    /// misrepresent what rejection is doing.
+    func refreshPreview(force: Bool = false) {
         guard let pipeline else { return }
+        let now = Date()
+        if !force {
+            guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else { return }
+        }
+        lastAdjustmentRender = now
+        previewRenderSeq &+= 1
+        let seq = previewRenderSeq
         let adj = staged.pending
         let source = previewSource
-        let now = Date()
-        guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else { return }
-        lastAdjustmentRender = now
         Task.detached { [weak self] in
             guard let self else { return }
             let cg = pipeline.renderPreview(source: source, adjustments: adj)
-            await MainActor.run { self.previewImage = cg }
+            await MainActor.run {
+                // Only the newest request may publish; a slower earlier render is discarded.
+                guard seq == self.previewRenderSeq else { return }
+                self.previewImage = cg
+            }
         }
     }
 
@@ -821,8 +913,29 @@ Replace the body at `:531-552` with:
     /// Throws the pending edits away and puts the preview back on the committed look.
     func revertAdjustments() {
         staged.revert()
-        refreshPreview()
+        refreshPreview(force: true)
     }
+
+    /// Restores the shipped defaults as a PENDING edit — Reset must not reach the broadcast on
+    /// its own, or it would be the one control that bypasses staging entirely. Apply commits it
+    /// like any other change.
+    func resetAdjustments() {
+        staged.pending = .liveDefault
+        refreshPreview(force: true)
+    }
+
+    /// Preview lifecycle (finding 3). The pinned preview is always on screen, so anything that
+    /// changes what it SHOULD show has to refresh it — otherwise it sits stale, or worse shows
+    /// the previous session's stack until a control is touched.
+    /// Call `refreshPreview(force: true)` from:
+    ///   - the `pipeline.onUpdate` callback (`AppModel.swift:921`) — a new sub changed the stack;
+    ///   - session start, after the pipeline is wired, so the panel fills as soon as data exists;
+    ///   - whenever `liveRejectionStatus` transitions to `.active` — the first clean master has
+    ///     published, so `previewSource` flips from `.online` to `.clean`.
+    /// And clear it at session boundaries so nothing from a finished session lingers:
+    ///   - on session start (before any frame) and on session end: `previewImage = nil`.
+    /// A reseed or source change is covered by `onUpdate`, since both produce fresh frames, and
+    /// by the proxy cache key, which includes the stack generation.
 ```
 
 `saveSettings()` must persist `staged.committed` — update the settings read/write to use it wherever it referenced `displayAdjustments`.
@@ -861,6 +974,18 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 - [ ] **Step 1: Rebind every Display Adjustments control to `staged.pending`**
 
 In `DisplaySettingsView.swift`, the `Section("Display Adjustments")` controls currently bind to `$model.displayAdjustments.*` (lines 31, 38, 45, 50, 58, 67, 77, 84). Rebind each to `$model.staged.pending.*`, and change each `onEditingChanged`/`onChange` handler to call `model.refreshPreview()` instead of `model.applyDisplayAdjustments()`. The `Section("Night vision")` controls are unrelated and must NOT change.
+
+The **Reset button** at `DisplaySettingsView.swift:108` must also be rebound — it is the one
+control that would otherwise still write straight through. Its action becomes:
+
+```swift
+                    Button("Reset") { model.resetAdjustments() }
+```
+
+`resetAdjustments()` sets `staged.pending = .liveDefault` and force-refreshes the preview, so
+Reset behaves like every other edit: staged, visible in the preview, and committed only by
+Apply. Leaving it as an immediate write would make Reset the single slider that publishes to the
+broadcast without asking.
 
 - [ ] **Step 2: Pin the preview above the scrolling form**
 
@@ -939,12 +1064,12 @@ The blink button reuses `LiveRejectionStatus` (shipped in v3.6.0) so a disabled 
                     .onChanged { _ in
                         guard enabled, !model.blinkHeld else { return }
                         model.blinkHeld = true               // held: show the UN-rejected master
-                        model.refreshPreview()
+                        model.refreshPreview(force: true)     // discrete action — never throttle it away
                     }
                     .onEnded { _ in
                         guard enabled else { return }
                         model.blinkHeld = false              // released: back to the clean one
-                        model.refreshPreview()
+                        model.refreshPreview(force: true)     // a swallowed release would strand the panel on online
                     }
             )
             .help("Hold to see the same stretch WITHOUT trail rejection, so the difference is rejection alone.")
@@ -983,3 +1108,13 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 - **Task 1 is the risky one.** It touches the path producing `master.fit` and the broadcast. Do not proceed past Step 6 unless the golden hash is unchanged.
 - **Do not "improve" the preview into a 1:1 crop.** The spec explains at length why a crop misrepresents both `AutoStretch` (statistics-derived) and DBE (dimension-relative radius). That is a deliberate exclusion, not an oversight.
 - **`renderCurrentDisplay(adjustments:)` keeps its committing side effect.** It is now the Apply path only. Do not "clean it up" to match `renderPreview`.
+- **`AstroImage` is planar (channel-major).** `c * plane + y * width + x`. An earlier draft of
+  this plan used interleaved indexing in BOTH the implementation and its test helper, so the
+  tests would have passed while colour was scrambled. `PreviewTestSupport` and the colour-plane
+  sentinel in Task 2 exist to make that impossible to reintroduce.
+- **Do not reimplement the downsample.** `AstroImage.downsampled(maxLongEdge:)` already exists,
+  is planar-correct and area-averaging, and is already used by the render path. An earlier draft
+  of this plan rewrote it from scratch.
+- **Every discrete preview action forces past the throttle.** Revert, Reset, blink press and
+  release, new frames and session boundaries all call `refreshPreview(force: true)`; only
+  continuous slider drags are throttled.
