@@ -526,7 +526,7 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 ### Task 4: `renderPreview(source:adjustments:)` — non-mutating preview render
 
 **Files:**
-- Modify: `Sources/LiveAstroCore/Pipeline/SessionPipeline.swift` (add near `renderCurrentDisplay`, `:1115`)
+- Modify: `Sources/LiveAstroCore/Pipeline/SessionPipeline.swift` — `renderPreview` + cache near `renderCurrentDisplay` (`:1115`); `publishedMasterFreshnessKeyIfCurrent()` and `engineForTest` (Step 3b); `onCleanMasterPublished` + its firing in `publishRefineResult` (`:647`, Step 3c)
 - Test: `Tests/LiveAstroCoreTests/PreviewRenderTests.swift` (create)
 
 **Interfaces:**
@@ -999,6 +999,16 @@ In `SessionPipeline.swift`, immediately after `renderCurrentDisplay(adjustments:
     }
 ```
 
+Also add the engine test seam three of this task's tests read
+(`pipeline.engineForTest?.currentStackAndCoverage()`); it does not exist yet. Mirror the
+existing `refinerForTest()` seam — internal, not public, not for product code:
+
+```swift
+    /// Test seam: the owned engine, so a test can read the online stack directly. Mirrors
+    /// `refinerForTest()`; not for product code.
+    var engineForTest: StackEngine? { engine }
+```
+
 Then wire the two invalidation sources:
 
 - Call `bumpPreviewStackRevision()` immediately after EACH `processedCount += 1`. There are
@@ -1012,6 +1022,34 @@ Then wire the two invalidation sources:
   `noteWatcherFrame(linear)` so watcher mode has a preview source at all. (It takes no digest:
   `update.identity` is `FileIdentity?` and `.digest` is `String?`, so a digest key would need a
   double unwrap plus a nil fallback — the monotonic token avoids both.)
+
+- [ ] **Step 3c: Add the clean-master-published callback**
+
+In `SessionPipeline.swift`, beside the other callbacks (`onSolveStateChanged` is at `:204`):
+
+```swift
+    /// Fired after a refiner pass installs a SERVABLE clean master. The staged preview needs it
+    /// because `AppModel.liveRejectionStatus` is computed with no change notification, so there
+    /// is no transition to observe: without this the preview would keep showing the online
+    /// master after the first clean one publishes.
+    public var onCleanMasterPublished: (() -> Void)?
+```
+
+Fire it from `publishRefineResult` (`:647`) — OUTSIDE `regLock`, per this file's lock discipline
+(callbacks are never delivered while holding it):
+
+```swift
+    private func publishRefineResult(_ result: RefineResult, key: FreshnessKey) {
+        var published = false
+        regLock.withLock {
+            guard liveRejectionActive, key.isServable(against: _freshnessKey) else { return }
+            publishedMaster = PublishedMaster(image: result.image, coverage: result.coverage,
+                                              survivorCount: result.survivorCount, key: key)
+            published = true
+        }
+        if published { onCleanMasterPublished?() }
+    }
+```
 
 - [ ] **Step 4: Run tests**
 
@@ -1041,7 +1079,6 @@ Claude-Session: https://claude.ai/code/session_01DskXfU4g9ZkcDGHexnYB8j"
 
 **Files:**
 - Modify: `Sources/LiveAstroStudio/AppModel.swift` — `:183` (property), `:531-552` (`applyDisplayAdjustments`), `:408`, `:487`, `:535`, `:784` (call sites), `:921` (onUpdate), `:954` (onSolveStateChanged), `:1031` (configureLiveRejection), `:1071` (toggleReject)
-- Modify: `Sources/LiveAstroCore/Pipeline/SessionPipeline.swift` — Step 4d adds `onCleanMasterPublished` and fires it from `publishRefineResult` (`:647`)
 - Modify: `Tests/LiveAstroCoreTests/AppSourceRegressionTests.swift:45`
 
 **Interfaces:**
@@ -1188,34 +1225,6 @@ Replace the body at `:531-552` with:
 
 `saveSettings()` must persist `staged.committed` — update the settings read/write to use it wherever it referenced `displayAdjustments`.
 
-- [ ] **Step 4d: Add the clean-master-published callback**
-
-In `SessionPipeline.swift`, beside the other callbacks (`onSolveStateChanged` is at `:204`):
-
-```swift
-    /// Fired after a refiner pass installs a SERVABLE clean master. The staged preview needs it
-    /// because `AppModel.liveRejectionStatus` is computed with no change notification, so there
-    /// is no transition to observe: without this the preview would keep showing the online
-    /// master after the first clean one publishes.
-    public var onCleanMasterPublished: (() -> Void)?
-```
-
-Fire it from `publishRefineResult` (`:647`) — OUTSIDE `regLock`, per this file's lock discipline
-(callbacks are never delivered while holding it):
-
-```swift
-    private func publishRefineResult(_ result: RefineResult, key: FreshnessKey) {
-        var published = false
-        regLock.withLock {
-            guard liveRejectionActive, key.isServable(against: _freshnessKey) else { return }
-            publishedMaster = PublishedMaster(image: result.image, coverage: result.coverage,
-                                              survivorCount: result.survivorCount, key: key)
-            published = true
-        }
-        if published { onCleanMasterPublished?() }
-    }
-```
-
 - [ ] **Step 4b: Wire the preview lifecycle (concrete call sites)**
 
 The preview is pinned on screen, so anything that changes what it SHOULD show must refresh it,
@@ -1297,7 +1306,6 @@ Expected: builds clean. Fix any remaining `displayAdjustments` references on `Ap
 
 ```bash
 git add Sources/LiveAstroStudio/AppModel.swift \
-        Sources/LiveAstroCore/Pipeline/SessionPipeline.swift \
         Tests/LiveAstroCoreTests/AppSourceRegressionTests.swift
 git commit -m "feat: AppModel stages display adjustments instead of pushing every tick
 
