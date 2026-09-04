@@ -203,6 +203,12 @@ public final class SessionPipeline {
     /// own (the solve runs off the hot path; reseed just clears state). May fire on a background queue.
     public var onSolveStateChanged: (() -> Void)?
 
+    /// Fired after a refiner pass installs a SERVABLE clean master. The staged preview needs it
+    /// because `AppModel.liveRejectionStatus` is computed with no change notification, so there
+    /// is no transition to observe: without this the preview would keep showing the online
+    /// master after the first clean one publishes.
+    public var onCleanMasterPublished: (() -> Void)?
+
     /// Void the stored/in-flight solve and re-enable solving so the NEXT reference re-solves. Called
     /// on BOTH reseed paths — manual `reseed()` and the engine's internal auto-reseed. The generation
     /// bump discards any in-flight solve that lands after this point.
@@ -351,6 +357,10 @@ public final class SessionPipeline {
     /// off — and that enable-ON still does. Mirrors the other `...ForTest` seams; not for product code.
     func refinerForTest() -> GlobalRefiner? { currentRefiner() }
 
+    /// Test seam: the owned engine, so a test can read the online stack directly. Mirrors
+    /// `refinerForTest()`; not for product code.
+    var engineForTest: StackEngine? { engine }
+
     /// Survivor count of the clean master that would be SERVED right now, or nil if none is
     /// current. The caption needs this rather than `currentSurvivorCount()`: the two differ
     /// exactly when a pass hasn't published yet, which is precisely the state the operator
@@ -360,6 +370,17 @@ public final class SessionPipeline {
             guard liveRejectionActive, let pm = publishedMaster,
                   pm.key.isServable(against: _freshnessKey) else { return nil }
             return pm.survivorCount
+        }
+    }
+
+    /// The FreshnessKey of the clean master currently being SERVED, or nil if none is. The
+    /// preview proxy cache keys `.clean` on this so a kappa change or a user reject invalidates
+    /// it — generation and sub count would both miss those.
+    func publishedMasterFreshnessKeyIfCurrent() -> FreshnessKey? {
+        regLock.withLock {
+            guard liveRejectionActive, let pm = publishedMaster,
+                  pm.key.isServable(against: _freshnessKey) else { return nil }
+            return pm.key
         }
     }
 
@@ -645,13 +666,16 @@ public final class SessionPipeline {
     /// on arrival; the mutation that moved the key already triggered its own fresh pass, so it
     /// is dropped rather than stored-then-refused.
     private func publishRefineResult(_ result: RefineResult, key: FreshnessKey) {
+        var published = false
         regLock.withLock {
             // Servable-not-identical (see FreshnessKey.isServable): subs that landed while this
             // pass ran must NOT discard its result, or a live session never publishes at all.
             guard liveRejectionActive, key.isServable(against: _freshnessKey) else { return }
             publishedMaster = PublishedMaster(image: result.image, coverage: result.coverage,
                                               survivorCount: result.survivorCount, key: key)
+            published = true
         }
+        if published { onCleanMasterPublished?() }
     }
 
     /// Returns the published master ONLY while the live-rejection feature is ON and its stored
@@ -893,6 +917,7 @@ public final class SessionPipeline {
             if sourceMetadata == nil, let m = metadata { sourceMetadata = m }
             attemptPlateSolveIfNeeded(engine: engine)
             processedCount += 1
+            bumpPreviewStackRevision()
             lastCommitted = (sourceName, timestamp)       // remembered for end()'s guaranteed final render
             if shouldRenderImport(acceptedIndex: index) {
                 renderSnapshot(index: index, sourceName: sourceName, timestamp: timestamp, engine: engine)
@@ -973,6 +998,7 @@ public final class SessionPipeline {
         noteFrameProgress()   // cold1 I1: a finalized frame is drain progress
         withCallbackDelivery {
             processedCount += 1
+            bumpPreviewStackRevision()
             onRejected?(.noTransform, sourceName)
             onLog?("Rejected \(sourceName)")
             if let total = source?.totalCount {
@@ -1129,6 +1155,134 @@ public final class SessionPipeline {
         return try? displayCGImage(from: mean, adjustments: adjustments)
     }
 
+    /// Which master the staged preview shows. `.clean` is the trail-rejected master when one
+    /// is being served; `.online` is the un-rejected running stack. The blink control swaps
+    /// between them through the SAME adjustments, so the comparison isolates rejection rather
+    /// than confounding it with a stretch difference.
+    public enum PreviewSource: Hashable {
+        case clean
+        case online
+    }
+
+    /// Cached preview proxy, keyed on everything that changes the PIXELS — per source.
+    ///
+    /// `.clean` is keyed on the published master's FreshnessKey, NOT on generation/sub count: a
+    /// kappa change, a user reject, a budget change or an enable-state transition each produce a
+    /// different clean master while generation and count stay put, so a weaker key would serve a
+    /// STALE clean master — and the blink comparison would then be comparing against something
+    /// that no longer exists.
+    ///
+    /// Adjustments are deliberately absent from every case: the proxy is linear and
+    /// pre-adjustment, so a slider drag reuses it.
+    private enum PreviewProxyKey: Equatable {
+        case online(generation: Int, revision: Int)
+        case clean(FreshnessKey)
+        case watcher(token: Int)
+    }
+    private let previewProxyLock = NSLock()
+    /// One slot PER SOURCE, not a single slot. Hold-to-compare alternates clean -> online ->
+    /// clean, so a single slot would evict and rebuild from the full-resolution stack on every
+    /// press AND every release — the interaction that has to feel instant would be the most
+    /// expensive one in the panel.
+    private var previewProxies: [PreviewSource: (key: PreviewProxyKey, image: AstroImage)] = [:]
+    /// Test seam: how many times the proxy has actually been rebuilt.
+    private(set) var previewProxyBuildCountForTest = 0
+
+    /// Monotonic stack revision for the preview cache key. `processedCount` is a private var
+    /// mutated on the consume task, so reading it from a preview render — which runs on a
+    /// detached task — would be a data race. Bumped under the lock at ALL THREE places
+    /// `processedCount` is incremented, including the native live path; missing that one
+    /// freezes a live session's preview.
+    private let previewRevLock = NSLock()
+    private var previewStackRevision = 0
+    private func bumpPreviewStackRevision() {
+        previewRevLock.lock(); previewStackRevision += 1; previewRevLock.unlock()
+    }
+    private var currentPreviewStackRevision: Int {
+        previewRevLock.lock(); defer { previewRevLock.unlock() }; return previewStackRevision
+    }
+
+    /// The most recent rendered linear image, ALREADY downsampled to `previewLongEdge`, with the
+    /// monotonic token it was retained under. Watcher / external-stacker mode has NO engine — it
+    /// loads and renders each incoming file — so without this the preview would be permanently
+    /// blank there, even though display adjustments apply exactly as they do natively. Retaining
+    /// the DOWNSAMPLED image costs ~1 MP, not 26 MP.
+    /// Keyed by a monotonic TOKEN, not the file digest: `StackUpdate.identity` is
+    /// `FileIdentity?` and `FileIdentity.digest` is `String?`, so a digest key would need a
+    /// double unwrap and a fallback for the nil case. A token is always correct and costs
+    /// nothing here — the retained image is already downsampled at ingest, so "rebuilding" the
+    /// proxy is just handing back the stored image.
+    private let lastPreviewLock = NSLock()
+    private var watcherFrameToken = 0
+    private var lastPreviewLinear: (token: Int, image: AstroImage)?
+    func noteWatcherFrame(_ linear: AstroImage) {
+        let small = linear.downsampled(maxLongEdge: Self.previewLongEdge)
+        lastPreviewLock.lock()
+        watcherFrameToken += 1
+        lastPreviewLinear = (watcherFrameToken, small)
+        lastPreviewLock.unlock()
+    }
+
+    /// Renders the staged preview WITHOUT touching committed state — the property
+    /// `renderCurrentDisplay(adjustments:)` deliberately does not have (it commits, and is
+    /// retained for the Apply path). Returns nil when the requested source has nothing to
+    /// show: no stack yet, or `.clean` with no published master.
+    public func renderPreview(source: PreviewSource,
+                              adjustments: DisplayAdjustments) -> CGImage? {
+        // Resolve the cache key FIRST — it decides what may be reused, and for `.clean` it is
+        // the FreshnessKey of the master actually being served.
+        let key: PreviewProxyKey
+        switch source {
+        case .clean:
+            guard let publishedKey = publishedMasterFreshnessKeyIfCurrent() else { return nil }
+            key = .clean(publishedKey)
+        case .online:
+            if let engine {
+                key = .online(generation: engine.currentStackGeneration,
+                              revision: currentPreviewStackRevision)
+            } else {
+                lastPreviewLock.lock()
+                let token = lastPreviewLinear?.token
+                lastPreviewLock.unlock()
+                guard let token else { return nil }       // watcher mode, no frame yet
+                key = .watcher(token: token)
+            }
+        }
+        var proxy: AstroImage?
+        previewProxyLock.lock()
+        if let cached = previewProxies[source], cached.key == key { proxy = cached.image }
+        previewProxyLock.unlock()
+
+        if proxy == nil {
+            let built: AstroImage
+            switch source {
+            case .online:
+                if let engine, let (mean, coverage) = engine.currentStackAndCoverage() {
+                    built = cropToCoverage(mean, coverage: coverage)
+                        .downsampled(maxLongEdge: Self.previewLongEdge)
+                } else {
+                    // Watcher / external-stacker mode: already downsampled at ingest.
+                    lastPreviewLock.lock()
+                    let cached = lastPreviewLinear?.image
+                    lastPreviewLock.unlock()
+                    guard let cached else { return nil }
+                    built = cached
+                }
+            case .clean:
+                guard let published = publishedMasterIfCurrent() else { return nil }
+                built = cropToCoverage(published.image, coverage: published.coverage)
+                    .downsampled(maxLongEdge: Self.previewLongEdge)
+            }
+            previewProxyLock.lock()
+            previewProxies[source] = (key, built)
+            previewProxyBuildCountForTest += 1
+            previewProxyLock.unlock()
+            proxy = built
+        }
+        guard let proxy else { return nil }
+        return try? displayCGImage(from: proxy, adjustments: adjustments)
+    }
+
     /// Test seam: render an arbitrary image through the SAME path the broadcast uses.
     /// Exists so `DisplayRenderParityTests` can pin the committed output by hash.
     func renderForTest(_ image: AstroImage, adjustments: DisplayAdjustments) throws -> CGImage {
@@ -1176,6 +1330,7 @@ public final class SessionPipeline {
             }
             attemptPlateSolveIfNeeded(engine: engine)   // idempotent; no-op until a reference is seeded
             processedCount += 1
+            bumpPreviewStackRevision()
             // A frame the engine has finalized (accepted OR rejected) is drain progress for the
             // progress-aware live drain in end() — ticked HERE, before the snapshot-render guards
             // below (which can early-return on a nil coverage/recorder), so an accepted frame whose
@@ -1287,6 +1442,7 @@ public final class SessionPipeline {
                 // digest) the watcher validated on ITS pinned descriptor, so a file replaced between
                 // the watcher's validation and this read is skipped, never parsed.
                 let linear = try ImageLoader.load(url: update.url, expectedIdentity: update.identity)
+                noteWatcherFrame(linear)
                 let cg = try displayCGImage(from: linear, adjustments: displayAdjustments)
                 let index = session.acceptedCount + 1
                 let record = try recorder.save(
