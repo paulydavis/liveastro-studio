@@ -17,7 +17,7 @@
 - Only `LiveAstroCore` is unit-testable — `LiveAstroStudio` is an `executableTarget` with no test target (`Package.swift:12,18`). Any logic that needs a real test belongs in `LiveAstroCore`.
 - Preview downsample: use the EXISTING `AstroImage.downsampled(maxLongEdge:)` (`AstroImage.swift:38`) at `SessionPipeline.previewLongEdge = 1200`. Do not write a new downsampler.
 - `AstroImage` is **planar (channel-major)** (`AstroImage.swift:16`): index as `c * plane + y * width + x`. Interleaved indexing silently scrambles colour.
-- Preview-proxy cache key: `(stack generation, processed sub count, source selector)`. Adjustments are deliberately NOT in the key — the proxy is linear and pre-adjustment, so slider drags reuse it.
+- Preview-proxy cache key, per source: clean → the published master's `FreshnessKey`; native online → `(stack generation, previewStackRevision)`; watcher online → the retained frame's identity digest. Adjustments are deliberately NOT in any of them — the proxy is linear and pre-adjustment, so slider drags reuse it.
 - Preview honesty bound: derived median and MADN within **2% relative** of the full frame, measured on a non-uniform (star-field) image.
 - Full test suite green before merge. Baseline at v3.6.1 is 1217 tests / 8 skipped / 0 failures.
 
@@ -645,10 +645,15 @@ final class PreviewRenderTests: XCTestCase {
                              "a new sub changes the stack, so the proxy must be rebuilt")
     }
 
-    /// The case a (generation, sub count) key would MISS: a user reject produces a different
-    /// clean master while both of those stay put. A stale `.clean` proxy would make the blink
-    /// comparison compare against a master that no longer exists.
-    func testAUserRejectInvalidatesTheCleanProxy() throws {
+    /// The case a (generation, sub count) key would MISS: a user reject changes which master is
+    /// servable while both of those stay put.
+    ///
+    /// The correct behaviour is NOT "rebuild the proxy" — it is "serve nothing". A reject makes
+    /// the published master WRONG (it contains a now-rejected sub), so `isServable` fails and
+    /// `publishedMasterFreshnessKeyIfCurrent()` returns nil: the clean preview must go away
+    /// entirely until a NEW master publishes. Serving a rebuilt-but-stale clean master would
+    /// make the blink comparison compare against a master that no longer exists.
+    func testAUserRejectStopsServingTheCleanPreviewUntilANewMasterPublishes() throws {
         let sandbox = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: sandbox) }
@@ -659,19 +664,33 @@ final class PreviewRenderTests: XCTestCase {
         guard let (mean, coverage) = pipeline.engineForTest?.currentStackAndCoverage() else {
             return XCTFail("expected a stack")
         }
+        let cov = coverage ?? [Float](repeating: 1, count: mean.width * mean.height)
         pipeline.publishedMaster = PublishedMaster(
-            image: mean, coverage: coverage ?? [Float](repeating: 1, count: mean.width * mean.height),
-            survivorCount: pipeline.subRegistrations().count, key: pipeline.currentFreshnessKey())
-        _ = pipeline.renderPreview(source: .clean, adjustments: .neutral)
-        let before = pipeline.previewProxyBuildCountForTest
+            image: mean, coverage: cov,
+            survivorCount: pipeline.subRegistrations().count,
+            key: pipeline.currentFreshnessKey())
+
+        XCTAssertNotNil(pipeline.renderPreview(source: .clean, adjustments: .neutral),
+                        "precondition: a current clean master IS previewable")
+        let buildsBefore = pipeline.previewProxyBuildCountForTest
 
         // Same generation, same sub count — only the reject state moves.
         pipeline.setUserRejected([1])
         pipeline.noteUserRejectChanged()
-        _ = pipeline.renderPreview(source: .clean, adjustments: .neutral)
 
-        XCTAssertNotEqual(pipeline.previewProxyBuildCountForTest, before,
-                          "a user reject changes which master is served, so the clean proxy must not be reused")
+        XCTAssertNil(pipeline.renderPreview(source: .clean, adjustments: .neutral),
+                     "a master containing a now-rejected sub must not be previewed at all")
+        XCTAssertEqual(pipeline.previewProxyBuildCountForTest, buildsBefore,
+                       "and nothing is rebuilt while there is nothing servable to build from")
+
+        // A fresh pass publishes at the NEW key; the clean preview returns and is rebuilt.
+        pipeline.publishedMaster = PublishedMaster(
+            image: mean, coverage: cov,
+            survivorCount: pipeline.subRegistrations().count - 1,
+            key: pipeline.currentFreshnessKey())
+        XCTAssertNotNil(pipeline.renderPreview(source: .clean, adjustments: .neutral))
+        XCTAssertGreaterThan(pipeline.previewProxyBuildCountForTest, buildsBefore,
+                             "the new master carries a different FreshnessKey, so the proxy is rebuilt")
     }
 
     /// Watcher / external-stacker mode has NO engine (SessionPipeline.swift:768 leaves it nil),
@@ -1067,6 +1086,34 @@ Replace the body at `:531-552` with:
 
 `saveSettings()` must persist `staged.committed` — update the settings read/write to use it wherever it referenced `displayAdjustments`.
 
+- [ ] **Step 4d: Add the clean-master-published callback**
+
+In `SessionPipeline.swift`, beside the other callbacks (`onSolveStateChanged` is at `:204`):
+
+```swift
+    /// Fired after a refiner pass installs a SERVABLE clean master. The staged preview needs it
+    /// because `AppModel.liveRejectionStatus` is computed with no change notification, so there
+    /// is no transition to observe: without this the preview would keep showing the online
+    /// master after the first clean one publishes.
+    public var onCleanMasterPublished: (() -> Void)?
+```
+
+Fire it from `publishRefineResult` (`:647`) — OUTSIDE `regLock`, per this file's lock discipline
+(callbacks are never delivered while holding it):
+
+```swift
+    private func publishRefineResult(_ result: RefineResult, key: FreshnessKey) {
+        var published = false
+        regLock.withLock {
+            guard liveRejectionActive, key.isServable(against: _freshnessKey) else { return }
+            publishedMaster = PublishedMaster(image: result.image, coverage: result.coverage,
+                                              survivorCount: result.survivorCount, key: key)
+            published = true
+        }
+        if published { onCleanMasterPublished?() }
+    }
+```
+
 - [ ] **Step 4b: Wire the preview lifecycle (concrete call sites)**
 
 The preview is pinned on screen, so anything that changes what it SHOULD show must refresh it,
@@ -1075,10 +1122,10 @@ These are edits, not guidance; make each one:
 
 1. In the `pipeline.onUpdate` closure (`AppModel.swift:921`), after `self?.latestImage = image`,
    add `self?.refreshPreview(force: true)` — a new sub changed the stack.
-2. Where `liveRejectionStatus` is recomputed for the caption, compare against the previous value
-   and call `refreshPreview(force: true)` on any transition INTO `.active`: the first clean
-   master has just published, so `previewSource` flips from `.online` to `.clean` and the panel
-   would otherwise keep showing the online master.
+2. Wire `pipeline.onCleanMasterPublished` (added in Step 4d) to `refreshPreview(force: true)`.
+   `liveRejectionStatus` (`AppModel.swift:998`) is a COMPUTED property with no change
+   notification, so there is nothing to observe for a transition into `.active` — without a real
+   callback the panel keeps showing the online master until a control is touched.
 3. At session start, immediately after the pipeline is assigned: `previewImage = nil` first, then
    `refreshPreview(force: true)` so the panel fills as soon as there is data.
 4. At session end (both the normal `end()` path and the error/rollback path): `previewImage = nil`

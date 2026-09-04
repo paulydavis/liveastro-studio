@@ -99,8 +99,9 @@ to the pipeline, persists, and refreshes the main view. `revert()` sets `pending
    and `:940` for exactly this purpose. **Correction, 2026-09-03:** an earlier draft of this spec
    and its plan specified a NEW `PreviewProxy` component; that was reimplementing shipped code
    and is deleted. Only the named constant and the honesty test below are new.
-   The cache key is (stack generation, processed sub count, source selector) — i.e. it is
-   invalidated by a new sub, a reseed, or switching between clean and online. Adjustments are
+   The cache key is per source (see "Proxy cache key" below) — clean keys on the published
+   master's FreshnessKey, native online on (stack generation, previewStackRevision), watcher
+   online on the retained frame's identity digest. Adjustments are
    NOT in the key: the proxy is linear, pre-adjustment, so slider drags reuse it.
 4. **Source selector** for blink: `.clean` (`publishedMasterIfCurrent()`) or `.online`, both
    cropped to coverage as the existing paths do, both rendered through the SAME pending
@@ -124,7 +125,10 @@ panel shows as its placeholder.
 
 The key must contain everything that changes the PIXELS, per source:
 
-- `.clean` → the published master's **`FreshnessKey`** (`PublishedMaster.key`). Generation and
+- `.clean` → the published master's **`FreshnessKey`** (`PublishedMaster.key`). Note the
+  behaviour this produces when the key goes stale: `publishedMasterFreshnessKeyIfCurrent()`
+  returns nil, so the clean preview DISAPPEARS until a new master publishes — it is never
+  rebuilt from the old one. Generation and
   sub count are NOT sufficient: a kappa change, a user reject, a sample-budget change or an
   enable-state transition all produce a different clean master while both of those stay put, so
   a weaker key would serve a stale clean master — and the blink comparison would then be
@@ -148,8 +152,11 @@ preview inherits it.
 The preview is pinned on screen, so anything that changes what it SHOULD show must refresh it,
 or it sits stale — at worst showing the previous session's stack until a control is touched.
 Refresh on: the `onUpdate` callback (a new sub changed the stack); session start once the
-pipeline is wired; and the transition of `liveRejectionStatus` to `.active`, when the first
-clean master publishes and the preview source flips from online to clean. Clear `previewImage`
+pipeline is wired; and a new `onCleanMasterPublished` callback, fired by `publishRefineResult`
+(outside `regLock`) after it installs a servable master. That callback is required rather than
+cosmetic: `AppModel.liveRejectionStatus` is a COMPUTED property with no change notification, so
+there is no transition to observe and the panel would otherwise keep showing the online master
+after the first clean one publishes. Clear `previewImage`
 at session start and session end. Reseeds and source changes are covered by `onUpdate` plus the
 proxy cache key, which includes the stack generation.
 
