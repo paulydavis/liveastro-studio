@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fixed live trail rejection in the detached OBS broadcast window. It previously displayed
+  the operator's online stack even when a clean master was being saved to `latest.png`.
+  The captured window now receives the resolved broadcast image and matching integration
+  depth; the embedded operator pane keeps the online preview.
+- Clean-master publication, rejection changes, reseed, and display adjustments now refresh
+  the window between incoming subs. Session end displays the final selected master, and
+  stale deliveries cannot replace a newer frame or another session's image.
+
 ## 3.2.3 — 2026-08-17
 
 - **Batch import of full-size (26 MP) subs is ~2× faster** — a 60-sub import drops from

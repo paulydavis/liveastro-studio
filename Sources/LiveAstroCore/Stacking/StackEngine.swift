@@ -283,6 +283,16 @@ public final class StackEngine {
         }
     }
 
+    /// Pixel provenance is one atomic read: a reseed cannot stamp old pixels with its new
+    /// generation, and integration depth cannot describe a different accumulator revision.
+    func displaySnapshot() -> (image: AstroImage, coverage: [Float]?, count: Int, generation: Int)? {
+        lock.withLock {
+            guard let accumulator else { return nil }
+            return (accumulator.mean(), accumulator.coverage(), accumulator.frameCount,
+                    currentStackGenerationLocked)
+        }
+    }
+
     /// The reference frame's detected stars + dimensions for plate-solving (sub-project 3a). nil until
     /// a reference is seeded. Coordinates are HALF-RES — star detection runs on the half-res luminance
     /// (`halfResLuminance`), so the reported size is the full-res `referenceSize` halved (exactly `hw`,

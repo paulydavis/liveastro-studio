@@ -124,6 +124,17 @@ Calibration files can be configured before import. If you cancel an import, fram
 
 LiveAstro streams through OBS Studio. OBS captures the LiveAstro broadcast window and sends it to YouTube or another streaming service.
 
+The detached window uses the same resolved broadcast image passed to the snapshot recorder:
+a current clean master when live trail rejection is available, otherwise the online stack.
+The embedded operator pane retains the online preview. Their integration captions describe
+the respective displayed images, which can have different sub counts while refinement catches up.
+
+Between incoming subs, clean-master publication, rejection changes, display adjustments, and
+reseed re-resolve the window immediately. After reseed clears the stack, the window waits for
+a new reference instead of presenting the discarded stack as live. On session end it holds
+the final selected image. The monitor file `latest.png` remains the most recently saved
+snapshot; OBS Window Capture reads the window, not that file.
+
 ### One-time OBS setup
 
 1. In OBS, open **Tools → WebSocket Server Settings**.
