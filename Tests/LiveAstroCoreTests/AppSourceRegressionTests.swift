@@ -210,4 +210,42 @@ final class AppSourceRegressionTests: XCTestCase {
             "The Live-tab countdown must use the SAME shared anchor as the driver, or display and firing disagree.")
     }
 
+    /// Correctness-wave defect 1: `applyAdjustments()` dispatches its main-view re-render on a
+    /// detached task exactly like `refreshPreview` does for the preview — but previously with NO
+    /// sequence guard, and calling `renderCurrentDisplay(adjustments:)`, which WRITES
+    /// `displayAdjustments` on the pipeline as a side effect (the Apply path, by design). Apply A
+    /// then Apply B in quick succession could let A's slower detached render finish after B's and
+    /// re-commit A's (stale) adjustments over B's — persisted state and `staged.committed` would
+    /// say B while the pipeline (and therefore the broadcast, snapshots and replay) used A.
+    /// AppModel has no test target (Package.swift), so this stays a source-text check; the
+    /// BEHAVIOUR that no stale render can revert a newer commit is now structural too — Apply's
+    /// commit (`pipeline.displayAdjustments = committed`) is synchronous and main-actor-ordered,
+    /// and the detached render only ever produces `latestImage`, gated by `applyRenderSeq`.
+    /// NOTE: `applyRenderSeq` only orders Apply against Apply — a new accepted frame's `onUpdate`
+    /// render, or a session boundary, is not covered by this stamp and can still race a pending
+    /// Apply render. That gap is intentionally left open for now (see AppModel.applyAdjustments).
+    func testApplyAdjustmentsGuardsItsDetachedRenderWithAMonotonicStamp() throws {
+        let appModel = try String(contentsOf: root.appendingPathComponent("Sources/LiveAstroStudio/AppModel.swift"), encoding: .utf8)
+
+        XCTAssertTrue(appModel.contains("private var applyRenderSeq = 0"),
+            "applyAdjustments needs its OWN monotonic stamp, mirroring previewRenderSeq — sharing " +
+            "that one would let a preview render's completion and an Apply's race under one counter.")
+        XCTAssertTrue(appModel.contains("applyRenderSeq &+= 1"),
+            "the stamp must be bumped before the detached render is dispatched.")
+        XCTAssertTrue(appModel.contains("guard seq == self.applyRenderSeq, let cg else { return }"),
+            "the detached render's completion must check the stamp is still current before publishing " +
+            "latestImage — an older Apply must never overwrite a newer one's committed image.")
+        XCTAssertFalse(appModel.contains("pipeline.renderCurrentDisplay(adjustments: committed)"),
+            "Apply must no longer call renderCurrentDisplay from the detached task — it always renders " +
+            "the online stack and commits displayAdjustments as a side effect, which is now redundant " +
+            "and, pre-fix, was the un-guarded write that could revert a newer Apply (correctness-wave defect 1).")
+        XCTAssertTrue(appModel.contains("pipeline.renderSelectedSource(.online, adjustments: committed)"),
+            "Apply must render .online explicitly, matching the pipeline's contract that the main " +
+            "view stays online (see testBroadcastRendersPublishedMasterWhilePreviewStaysOnline) — " +
+            "NOT the preview's clean/online choice, or the main view would visibly alternate between " +
+            "clean-on-Apply and online-on-the-next-frame.")
+        XCTAssertTrue(appModel.contains("pipeline.displayAdjustments = committed"),
+            "the commit itself must stay synchronous on the main actor, not moved into the detached task.")
+    }
+
 }

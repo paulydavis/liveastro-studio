@@ -216,6 +216,42 @@ final class PreviewRenderTests: XCTestCase {
         XCTAssertLessThanOrEqual(max(cg.width, cg.height), SessionPipeline.previewLongEdge)
     }
 
+    /// Correctness-wave defect: `renderCurrentDisplay(adjustments:)` always renders
+    /// `engine.currentStack()` — in watcher/external-stacker mode there is no engine, so Apply
+    /// silently produced nothing. `renderSelectedSource(.online, ...)` is what Apply now calls
+    /// instead (still the ONLINE source, matching the broadcast's contract — see
+    /// `testBroadcastRendersPublishedMasterWhilePreviewStaysOnline`), and it must render the
+    /// retained last watcher frame too, and — unlike the preview — at FULL resolution, since
+    /// the main view is not downsampled.
+    func testRenderSelectedSourceProducesAFullResolutionImageInWatcherMode() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let watch = sandbox.appendingPathComponent("watch", isDirectory: true)
+        try FileManager.default.createDirectory(at: watch, withIntermediateDirectories: true)
+        let pipeline = SessionPipeline(watchFolder: watch, profile:
+            SessionProfile(targetName: "Watch", telescope: "T", camera: "C", mount: "M",
+                           filter: "F", locationLabel: "L", bortle: 5,
+                           subExposureSeconds: 20, notes: ""),
+            rootDirectory: sandbox.appendingPathComponent("sessions"))
+
+        XCTAssertNil(pipeline.renderSelectedSource(.online, adjustments: .neutral),
+                     "no frame seen yet — nothing to render")
+        XCTAssertNil(pipeline.renderCurrentDisplay(adjustments: .neutral),
+                     "renderCurrentDisplay has no engine to read in watcher mode — this is the bug " +
+                     "renderSelectedSource exists to route around, not a call site to replace it with")
+
+        pipeline.noteWatcherFrame(PreviewTestSupport.starField(w: 2400, h: 1800))
+
+        XCTAssertNil(pipeline.renderCurrentDisplay(adjustments: .neutral),
+                     "renderCurrentDisplay must STILL produce nothing here — Apply no longer calls it")
+        let cg = try XCTUnwrap(pipeline.renderSelectedSource(.online, adjustments: .neutral),
+                               "Apply must render the retained last watcher frame, not nothing")
+        XCTAssertGreaterThan(max(cg.width, cg.height), SessionPipeline.previewLongEdge,
+                             "the main view is full resolution — unlike the preview, this must not be " +
+                             "capped at previewLongEdge")
+    }
+
     /// The callback is the ACTUAL fix for "a clean master appeared but the UI never knew", and
     /// it lives in LiveAstroCore, so it gets a real test rather than a source-text grep. It must
     /// fire when a publish is INSTALLED and stay silent when one is dropped — a notification for

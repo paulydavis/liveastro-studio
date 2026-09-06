@@ -884,6 +884,16 @@ public final class SessionPipeline {
         // By this point engine.reseed() (inside the block above) has already bumped the engine's
         // generation, so the recompute observes the POST-reseed generation.
         if result == .reseeded {
+            // Correctness-wave defect 3: recompute the freshness key FIRST, before
+            // invalidatePlateSolve() fires onSolveStateChanged. onSolveStateChanged is a public
+            // callback (AppModel hops it onto the main actor and calls refreshPreview) — it runs
+            // async, on a different thread, with no synchronization back to this one, so calling
+            // it before the recompute let that render observe the PRE-reseed freshness key and
+            // serve the clean master this reseed has just invalidated, with nothing later
+            // guaranteed to correct it (the triggering frame is itself rejected). Recomputing
+            // first means publishedMasterIfCurrent() already refuses the stale master by the time
+            // any callback can act on it.
+            regLock.withLock { recomputeCachedFreshnessKeyLocked() }
             // Void any stored/in-flight solve so the new reference re-solves against its (fresh)
             // stars. sourceMetadata is left as-is: reseed is a same-target re-establish (center
             // unchanged), and it's owned by the serial frame-processing path — clearing it here
@@ -895,7 +905,6 @@ public final class SessionPipeline {
             // from inside that closure). No other behavior change: this still only runs once, only
             // on the .reseeded outcome, and engine.reseed() has already run by this point.
             invalidatePlateSolve()
-            regLock.withLock { recomputeCachedFreshnessKeyLocked() }
             // Task 8: notify the background refiner AFTER the recompute above (this hook does not
             // recompute again — reseed already did). A no-op when live rejection has never been
             // enabled this session.
@@ -1202,25 +1211,60 @@ public final class SessionPipeline {
         previewRevLock.lock(); defer { previewRevLock.unlock() }; return previewStackRevision
     }
 
-    /// The most recent rendered linear image, ALREADY downsampled to `previewLongEdge`, with the
-    /// monotonic token it was retained under. Watcher / external-stacker mode has NO engine — it
-    /// loads and renders each incoming file — so without this the preview would be permanently
-    /// blank there, even though display adjustments apply exactly as they do natively. Retaining
-    /// the DOWNSAMPLED image costs ~1 MP, not 26 MP.
+    /// The most recent rendered linear image, at FULL resolution, with the monotonic token it
+    /// was retained under. Watcher / external-stacker mode has NO engine — it loads and renders
+    /// each incoming file — so without this neither the preview nor Apply would have anything
+    /// to render from there, even though display adjustments apply exactly as they do natively.
+    /// Kept at full resolution (not pre-downsampled) so `renderSelectedSource(.online, ...)` (the
+    /// Apply path's watcher-mode fallback — correctness-wave fix) can render the main view at
+    /// full resolution too, not just the preview's downsampled proxy; `renderPreview` downsamples
+    /// its own copy on demand below, and only pays that cost once per incoming frame (the cache
+    /// keyed on `token` absorbs repeats).
     /// Keyed by a monotonic TOKEN, not the file digest: `StackUpdate.identity` is
     /// `FileIdentity?` and `FileIdentity.digest` is `String?`, so a digest key would need a
-    /// double unwrap and a fallback for the nil case. A token is always correct and costs
-    /// nothing here — the retained image is already downsampled at ingest, so "rebuilding" the
-    /// proxy is just handing back the stored image.
+    /// double unwrap and a fallback for the nil case.
     private let lastPreviewLock = NSLock()
     private var watcherFrameToken = 0
     private var lastPreviewLinear: (token: Int, image: AstroImage)?
     func noteWatcherFrame(_ linear: AstroImage) {
-        let small = linear.downsampled(maxLongEdge: Self.previewLongEdge)
         lastPreviewLock.lock()
         watcherFrameToken += 1
-        lastPreviewLinear = (watcherFrameToken, small)
+        lastPreviewLinear = (watcherFrameToken, linear)
         lastPreviewLock.unlock()
+    }
+
+    /// Full-resolution image (and coverage mask) that `PreviewSource.online` currently resolves
+    /// to: `engine.currentStackAndCoverage()` in native/import mode, or the retained last frame
+    /// in watcher/external-stacker mode (full-weight coverage — `handle()` doesn't crop watcher
+    /// frames either, so this makes the `cropToCoverage` below a no-op for them). nil means
+    /// nothing to render yet (no stack, or no watcher frame seen yet).
+    private func onlineSourceFullRes() -> (image: AstroImage, coverage: [Float]?)? {
+        if let engine, let (mean, coverage) = engine.currentStackAndCoverage() {
+            return (mean, coverage)
+        }
+        lastPreviewLock.lock()
+        let cached = lastPreviewLinear?.image
+        lastPreviewLock.unlock()
+        guard let cached else { return nil }
+        return (cached, nil)   // watcher frames arrive already coverage-cropped by the external stacker
+    }
+
+    /// Full-resolution image (and coverage) `source` resolves to right now: `.clean` is the
+    /// published clean master when one is servable, `.online` is `onlineSourceFullRes()` above.
+    /// Shared by `renderPreview` (which downsamples the result and DOES choose between `.clean`
+    /// and `.online`) and `renderSelectedSource` (Apply's full-resolution counterpart). Apply
+    /// itself always calls `renderSelectedSource(.online, ...)` — the pipeline's contract keeps
+    /// the main view ONLINE, matching the per-frame broadcast render (see
+    /// `testBroadcastRendersPublishedMasterWhilePreviewStaysOnline`) — so in practice only the
+    /// `.online` branch here is reached from Apply; `.clean` exists for `renderPreview`'s use.
+    private func selectedSourceFullRes(_ source: PreviewSource) -> (image: AstroImage, coverage: [Float]?)? {
+        switch source {
+        case .clean:
+            guard let published = publishedMasterIfCurrent() else { return nil }
+            return (published.image, published.coverage)
+        case .online:
+            return onlineSourceFullRes()
+        }
     }
 
     /// Renders the staged preview WITHOUT touching committed state — the property
@@ -1254,25 +1298,9 @@ public final class SessionPipeline {
         previewProxyLock.unlock()
 
         if proxy == nil {
-            let built: AstroImage
-            switch source {
-            case .online:
-                if let engine, let (mean, coverage) = engine.currentStackAndCoverage() {
-                    built = cropToCoverage(mean, coverage: coverage)
-                        .downsampled(maxLongEdge: Self.previewLongEdge)
-                } else {
-                    // Watcher / external-stacker mode: already downsampled at ingest.
-                    lastPreviewLock.lock()
-                    let cached = lastPreviewLinear?.image
-                    lastPreviewLock.unlock()
-                    guard let cached else { return nil }
-                    built = cached
-                }
-            case .clean:
-                guard let published = publishedMasterIfCurrent() else { return nil }
-                built = cropToCoverage(published.image, coverage: published.coverage)
-                    .downsampled(maxLongEdge: Self.previewLongEdge)
-            }
+            guard let (image, coverage) = selectedSourceFullRes(source) else { return nil }
+            let built = cropToCoverage(image, coverage: coverage)
+                .downsampled(maxLongEdge: Self.previewLongEdge)
             previewProxyLock.lock()
             previewProxies[source] = (key, built)
             previewProxyBuildCountForTest += 1
@@ -1281,6 +1309,24 @@ public final class SessionPipeline {
         }
         guard let proxy else { return nil }
         return try? displayCGImage(from: proxy, adjustments: adjustments)
+    }
+
+    /// Renders `source` at FULL resolution — the Apply-path counterpart to `renderPreview`,
+    /// which renders the same sources downsampled. Apply always calls this with `.online`: the
+    /// pipeline's contract keeps the main view ONLINE (matching the per-frame broadcast render;
+    /// see `testBroadcastRendersPublishedMasterWhilePreviewStaysOnline`), so this exists mainly
+    /// to fix a real gap in `renderCurrentDisplay(adjustments:)` — it always reads
+    /// `engine.currentStack()`, which is nil in watcher/external-stacker mode (no engine there),
+    /// so Apply produced no image at all there; this falls back to the retained last watcher
+    /// frame instead. Deliberately has NO committing side effect (unlike
+    /// `renderCurrentDisplay(adjustments:)`, which callers use when they need
+    /// `displayAdjustments` written as well); returns nil when the requested source has nothing
+    /// to render.
+    public func renderSelectedSource(_ source: PreviewSource,
+                                     adjustments: DisplayAdjustments) -> CGImage? {
+        guard let (image, coverage) = selectedSourceFullRes(source) else { return nil }
+        let cropped = cropToCoverage(image, coverage: coverage)
+        return try? displayCGImage(from: cropped, adjustments: adjustments)
     }
 
     /// Test seam: render an arbitrary image through the SAME path the broadcast uses.
@@ -1309,13 +1355,8 @@ public final class SessionPipeline {
             let outcome = result.outcome
             if engine.autoReseedCount != lastAutoReseedCount {
                 lastAutoReseedCount = engine.autoReseedCount
-                // The engine dropped its reference and will re-seed on the next good sub — void the
-                // stale WCS and re-enable solving so the NEW reference plate-solves (its center/rotation
-                // can differ). MUST run before attemptPlateSolveIfNeeded below so this frame's attempt
-                // sees the reset state (manual reseed() does the same via invalidatePlateSolve()).
-                invalidatePlateSolve()
                 // T8 review fix: an auto-reseed is a FreshnessKey mutation point (generation change)
-                // exactly like manual reseed() (see reseed()'s matching block ~681-685) — refresh the
+                // exactly like manual reseed() (see reseed()'s matching block) — refresh the
                 // cached key HERE so publishedMasterIfCurrent() immediately stops serving a master built
                 // from the just-discarded reference, instead of staying stale until the next accepted
                 // sub's .becameReference append happens to recompute it. Lock-safety: neither `regLock`
@@ -1324,7 +1365,23 @@ public final class SessionPipeline {
                 // regLock -> engine.lock leaf-edge ordering with no new cycle. By this point
                 // engine.autoReseedCount has already been bumped (checked just above), so the recompute
                 // observes the POST-reseed generation.
+                //
+                // Correctness-wave defect 3: this recompute MUST run BEFORE invalidatePlateSolve()
+                // below, not after. invalidatePlateSolve() fires the public onSolveStateChanged
+                // callback, which AppModel hops onto the main actor to call refreshPreview() —
+                // asynchronously, on a different thread, with no synchronization back to this
+                // (serial consume) thread. With the old order (invalidate, then recompute), that
+                // async render could run before the recompute landed and serve the clean master
+                // this reseed just invalidated — and since the triggering frame is itself
+                // rejected, nothing later was guaranteed to correct it, leaving a stale master on
+                // screen indefinitely. Recomputing first closes the window: by the time the
+                // callback can act, publishedMasterIfCurrent() already refuses the stale master.
                 regLock.withLock { recomputeCachedFreshnessKeyLocked() }
+                // The engine dropped its reference and will re-seed on the next good sub — void the
+                // stale WCS and re-enable solving so the NEW reference plate-solves (its center/rotation
+                // can differ). MUST run before attemptPlateSolveIfNeeded below so this frame's attempt
+                // sees the reset state (manual reseed() does the same via invalidatePlateSolve()).
+                invalidatePlateSolve()
                 noteReseeded()
                 onLog?("Auto-reseeded — the reference frame didn't match; re-seeding on the next good sub. (Earlier subs that couldn't register stay rejected.)")
             }

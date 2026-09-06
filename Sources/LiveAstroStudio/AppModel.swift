@@ -542,6 +542,14 @@ final class AppModel {
     /// stale image — visible as the preview snapping back to a setting you already moved past.
     private var previewRenderSeq = 0
 
+    /// Monotonic stamp for Apply's main-view render — the same problem `previewRenderSeq` solves
+    /// for the preview, but for the committed path (correctness-wave defect 1). Apply A then
+    /// Apply B in quick succession both dispatch a detached render; without this stamp a slower
+    /// A can finish after B and publish A's image over B's, even though B is what was actually
+    /// committed — the broadcast/snapshots/replay would then disagree with what the operator
+    /// just applied. Captured before dispatch, checked on completion, mirroring `previewRenderSeq`.
+    private var applyRenderSeq = 0
+
     /// True while a coalesced trailing render (see refreshPreview) is scheduled but hasn't fired yet.
     private var previewTrailingScheduled = false
 
@@ -611,12 +619,31 @@ final class AppModel {
         let committed = staged.apply()
         saveSettings()
         guard let pipeline else { return }
+        // The commit itself is synchronous and main-actor-ordered — unlike the detached render
+        // below, two quick Applies can never race writing this, so it needs no seq guard.
         pipeline.displayAdjustments = committed
+        applyRenderSeq &+= 1
+        let seq = applyRenderSeq
+        // The pipeline's contract deliberately keeps the per-frame main view ONLINE (see
+        // `testBroadcastRendersPublishedMasterWhilePreviewStaysOnline`) — Apply must render
+        // `.online` too, not the clean master the preview may currently be showing, or the main
+        // view would visibly alternate (clean on Apply, online again on the very next accepted
+        // frame). `renderSelectedSource(.online, ...)` still fixes the watcher-mode gap
+        // `renderCurrentDisplay` had (no engine there, so it always returned nil) via its
+        // retained-last-frame fallback, and has no committing side effect of its own — the
+        // commit above already did that job, so it stays intact even if this render is later
+        // discarded as stale.
         Task.detached { [weak self] in
             guard let self else { return }
-            let cg = pipeline.renderCurrentDisplay(adjustments: committed)
+            let cg = pipeline.renderSelectedSource(.online, adjustments: committed)
             await MainActor.run {
-                guard let cg else { return }
+                // Only the newest Apply's render may publish — an older, slower Apply finishing
+                // later must never overwrite a newer commit's image. NOTE: this guard is
+                // INCOMPLETE — it only orders Apply against Apply. A new accepted frame's
+                // `onUpdate` render, or a session boundary, can still race this detached render
+                // and be overwritten by a late-arriving stale image; that is a separate,
+                // still-open gap, not fixed by this stamp.
+                guard seq == self.applyRenderSeq, let cg else { return }
                 self.latestImage = cg
             }
         }
