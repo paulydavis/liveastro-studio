@@ -55,6 +55,13 @@ swift run LiveAstroStudio
 7. Click **Go Live** if OBS automation is configured, or start streaming manually in OBS.
 8. Click **End Session** when finished. LiveAstro writes the session folder under `~/Documents/LiveAstro/`.
 
+With live trail rejection enabled, the detached broadcast window shows the current clean
+master when one is available. The embedded operator pane shows the online stack so you can
+inspect incoming data. Each view's integration caption reflects its own image depth.
+The broadcast window refreshes when a clean master publishes or becomes invalid, even
+between subs. `latest.png` updates when a snapshot is saved; it is not the source of the
+Window Capture workflow above.
+
 ## OBS Automation
 
 LiveAstro can control OBS through the OBS WebSocket server.

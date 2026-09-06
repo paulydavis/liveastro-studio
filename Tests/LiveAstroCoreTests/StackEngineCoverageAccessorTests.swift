@@ -26,4 +26,20 @@ final class StackEngineCoverageAccessorTests: XCTestCase {
         XCTAssertEqual(image.width, 160); XCTAssertEqual(image.height, 120)
         XCTAssertEqual(coverage?.count, 160 * 120, "coverage map is width*height")
     }
+
+    func testDisplaySnapshotKeepsItsOriginalGenerationAfterReseed() throws {
+        let engine = StackEngine()
+        XCTAssertNil(engine.displaySnapshot())
+        XCTAssertTrue(engine.seedReference(starFrame(160, 120), minRows: .max))
+        let before = try XCTUnwrap(engine.displaySnapshot())
+        XCTAssertEqual(before.count, 1)
+        XCTAssertEqual(before.generation, 0)
+        engine.reseed()
+        XCTAssertNil(engine.displaySnapshot())
+        XCTAssertTrue(engine.seedReference(starFrame(160, 120), minRows: .max))
+        let after = try XCTUnwrap(engine.displaySnapshot())
+        XCTAssertEqual(after.generation, 1)
+        XCTAssertEqual(after.count, 1)
+        XCTAssertEqual(before.generation, 0, "retained pre-reseed pixels must retain their old generation")
+    }
 }

@@ -19,6 +19,48 @@ final class EndToEndTests: XCTestCase {
     }
 
     /// Fake Siril: rewrites live_stack.fit N times (partial write, pause, complete),
+    func testWatcherDeliversBroadcastAndRefreshesWithoutAnotherFile() throws {
+        let pipeline = SessionPipeline(watchFolder: watchDir,
+            profile: SessionProfile(targetName: "Watcher delivery", subExposureSeconds: 20),
+            rootDirectory: rootDir)
+        pipeline.rendersReplay = false
+        let frame = expectation(description: "watcher paired frame")
+        let edited = expectation(description: "watcher adjustment refresh")
+        let lock = NSLock()
+        var first: DisplayDelivery?
+        var changed: DisplayDelivery?
+        pipeline.onDisplayUpdate = { update in
+            if update.record != nil {
+                lock.withLock { first = update }
+                frame.fulfill()
+            } else if update.broadcastImage != nil {
+                let firstRefresh = lock.withLock { () -> Bool in
+                    guard changed == nil else { return false }
+                    changed = update
+                    return true
+                }
+                if firstRefresh { edited.fulfill() }
+            }
+        }
+        try pipeline.start()
+        let pixels = (0..<4096).map { Float($0 % 64) / 1000 + 0.05 }
+        try FITSWriter.float32(width: 64, height: 64, channels: 1, pixels: pixels)
+            .write(to: watchDir.appendingPathComponent("live_stack.fit"))
+        wait(for: [frame], timeout: 10)
+        var adjustments = DisplayAdjustments.neutral
+        adjustments.blackPoint = 0.15
+        pipeline.displayAdjustments = adjustments
+        wait(for: [edited], timeout: 5)
+        let initial = try XCTUnwrap(lock.withLock { first })
+        let updated = try XCTUnwrap(lock.withLock { changed })
+        XCTAssertNil(initial.cleanMasterSubCount)
+        XCTAssertEqual(initial.previewImage?.dataProvider?.data as Data?, initial.broadcastImage?.dataProvider?.data as Data?)
+        XCTAssertNotEqual(initial.broadcastImage?.dataProvider?.data as Data?, updated.broadcastImage?.dataProvider?.data as Data?)
+        XCTAssertEqual(pipeline.session.acceptedCount, 1, "a display refresh must not create snapshots")
+        _ = try pipeline.end()
+    }
+
+    /// Fake Siril: rewrites live_stack.fit N times (partial write, pause, complete),
     /// waiting for the pipeline to accept each update before the next rewrite.
     func testFullSession() throws {
         let profile = SessionProfile(targetName: "Test Nebula", telescope: "Test APO",

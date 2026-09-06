@@ -114,6 +114,91 @@ public final class SessionPipeline {
     /// end() from inside this callback — it throws `.reentrantEnd` (end() must drain the
     /// very task delivering the callback). Signal out and call end() from another context.
     public var onUpdate: ((CGImage, SnapshotRecord) -> Void)?
+    /// Paired operator/broadcast delivery, including transitions between accepted frames.
+    /// Like onUpdate, callbacks must not synchronously call end().
+    public var onDisplayUpdate: ((DisplayDelivery) -> Void)?
+    private let displayRenderLock = NSRecursiveLock()
+    private let displayRevisionLock = NSLock()
+    private var displayRevision: UInt64 = 0
+    private var displayFinished = false
+    private let displayQueue = DispatchQueue(label: "com.liveastro.display-transitions")
+    // Guarded by displayRenderLock. Retain linear data for watcher re-renders too.
+    private var displayOnline: (image: AstroImage, count: Int, cap: Int?, generation: Int?)?
+    private struct DisplayRenderContext {
+        let adjustments: DisplayAdjustments
+        let wcs: WCS?
+    }
+    private func displayContext() -> DisplayRenderContext {
+        DisplayRenderContext(adjustments: displayAdjustments, wcs: currentWCS)
+    }
+
+    public func isCurrentDisplay(_ update: DisplayDelivery) -> Bool {
+        displayRevisionLock.withLock { update.revision == displayRevision }
+    }
+
+    private func nextDisplayRevision() -> UInt64 {
+        displayRevisionLock.withLock { displayRevision &+= 1; return displayRevision }
+    }
+
+    /// Coalesces non-frame mutations. Revision advances before dispatch, invalidating a render
+    /// already in flight; the serial worker resolves the newest source and committed settings.
+    public func refreshDisplay() {
+        let requested = displayRevisionLock.withLock { () -> UInt64? in
+            guard !displayFinished else { return nil }
+            displayRevision &+= 1
+            return displayRevision
+        }
+        guard let revision = requested else { return }
+        displayQueue.async { [weak self] in
+            guard let self else { return }
+            self.displayRenderLock.lock()
+            defer { self.displayRenderLock.unlock() }
+            guard self.displayRevisionLock.withLock({ !self.displayFinished && revision == self.displayRevision }) else { return }
+            self.withCallbackDelivery { self.renderDisplayTransition(revision: revision) }
+        }
+    }
+
+    private func deliverDisplay(revision: UInt64, preview: CGImage?, broadcast: CGImage?,
+                                cleanCount: Int?, count: Int, record: SnapshotRecord? = nil) {
+        let update = DisplayDelivery(revision: revision, previewImage: preview,
+                                     broadcastImage: broadcast, cleanMasterSubCount: cleanCount,
+                                     integrationSeconds: Double(count) * profile.subExposureSeconds,
+                                     previewIntegrationSeconds: preview == nil ? 0 : Double(displayOnline?.count ?? count) * profile.subExposureSeconds,
+                                     subExposureSeconds: profile.subExposureSeconds,
+                                     record: record)
+        guard isCurrentDisplay(update) else { return }
+        onDisplayUpdate?(update)
+    }
+
+    private func renderDisplayTransition(revision: UInt64,
+        finalBroadcast: (image: AstroImage, count: Int, cleanCount: Int?)? = nil,
+        context: DisplayRenderContext? = nil) {
+        guard let online = displayOnline,
+              online.generation == nil || online.generation == engine?.currentStackGeneration else {
+            deliverDisplay(revision: revision, preview: nil, broadcast: nil, cleanCount: nil, count: 0)
+            return
+        }
+        do {
+            let context = context ?? displayContext()
+            let small = online.cap.map { online.image.downsampled(maxLongEdge: $0) } ?? online.image
+            let preview = try displayCGImage(from: small, context: context)
+            if let finalBroadcast {
+                let image = online.cap.map { finalBroadcast.image.downsampled(maxLongEdge: $0) } ?? finalBroadcast.image
+                let broadcast = try displayCGImage(from: image, context: context)
+                deliverDisplay(revision: revision, preview: preview, broadcast: broadcast,
+                               cleanCount: finalBroadcast.cleanCount, count: finalBroadcast.count)
+                return
+            }
+            let resolved = try resolveBroadcastRender(onlineMean: online.image, onlinePreviewCG: preview,
+                onlineFrameCount: online.count, downsampleLongEdge: online.cap, context: context)
+            deliverDisplay(revision: revision, preview: preview, broadcast: resolved.cgImage,
+                           cleanCount: resolved.cleanCount, count: resolved.integrationFrames)
+        } catch {
+            onLog?("Display refresh failed: \(error)")
+            // Do not keep claiming a clean image after its source has been invalidated.
+            deliverDisplay(revision: revision, preview: nil, broadcast: nil, cleanCount: nil, count: 0)
+        }
+    }
     /// May be delivered synchronously on the frame-consumer task — same reentrancy rule as
     /// `onUpdate`: end() from inside throws `.reentrantEnd`.
     public var onLog: ((String) -> Void)?
@@ -209,6 +294,7 @@ public final class SessionPipeline {
     private func invalidatePlateSolve() {
         plateSolveLock.withLock { solvedWCS = nil; solveAttempted = false; solveGeneration += 1 }
         onSolveStateChanged?()   // negative edge: reseed/auto-reseed dropped the solve — refresh the gate
+        refreshDisplay()
     }
 
     /// Re-read the installed catalog (call after a catalog download completes) and void any prior solve
@@ -262,7 +348,7 @@ public final class SessionPipeline {
                 self.solvedWCS = wcs; return true
             }
             // Notify OUTSIDE the lock so the UI can enable the North-up toggle the moment the solve lands.
-            if stored { self.onSolveStateChanged?() }
+            if stored { self.onSolveStateChanged?(); self.refreshDisplay() }
         }
     }
 
@@ -322,6 +408,7 @@ public final class SessionPipeline {
             userRejectGeneration += 1
             recomputeCachedFreshnessKeyLocked()
         }
+        refreshDisplay()
     }
 
     // MARK: Task 8 invalidation hooks — trigger the background GlobalRefiner
@@ -394,6 +481,7 @@ public final class SessionPipeline {
             recomputeCachedFreshnessKeyLocked()
         }
         activeRefiner()?.noteChanged()
+        refreshDisplay()
     }
 
     /// Reseed notification hook. `reseed()` itself already bumps the engine's generation and
@@ -401,6 +489,7 @@ public final class SessionPipeline {
     /// notifies, avoiding a double recompute.
     func noteReseeded() {
         activeRefiner()?.noteChanged()
+        refreshDisplay()
     }
 
     /// Subs of `currentGeneration`, minus any `subIndex` the user has flagged, in capture
@@ -579,6 +668,7 @@ public final class SessionPipeline {
         // triggerLock — neither needs (or may re-enter) regLock.
         refinerToCancel?.cancel()
         if shouldNotify { refinerToNotify?.noteChanged() }
+        refreshDisplay()
     }
 
     /// Builds a `GlobalRefiner` and wires its Task 8 closures back into the pipeline. Assumes the
@@ -645,13 +735,15 @@ public final class SessionPipeline {
     /// on arrival; the mutation that moved the key already triggered its own fresh pass, so it
     /// is dropped rather than stored-then-refused.
     private func publishRefineResult(_ result: RefineResult, key: FreshnessKey) {
-        regLock.withLock {
+        let installed = regLock.withLock { () -> Bool in
             // Servable-not-identical (see FreshnessKey.isServable): subs that landed while this
             // pass ran must NOT discard its result, or a live session never publishes at all.
-            guard liveRejectionActive, key.isServable(against: _freshnessKey) else { return }
+            guard liveRejectionActive, key.isServable(against: _freshnessKey) else { return false }
             publishedMaster = PublishedMaster(image: result.image, coverage: result.coverage,
                                               survivorCount: result.survivorCount, key: key)
+            return true
         }
+        if installed { refreshDisplay() }
     }
 
     /// Returns the published master ONLY while the live-rejection feature is ON and its stored
@@ -673,7 +765,10 @@ public final class SessionPipeline {
     /// frame loop and the live re-render access it from different threads.
     public var displayAdjustments: DisplayAdjustments {
         get { adjLock.lock(); defer { adjLock.unlock() }; return _displayAdjustments }
-        set { adjLock.lock(); _displayAdjustments = newValue; adjLock.unlock() }
+        set {
+            adjLock.lock(); _displayAdjustments = newValue; adjLock.unlock()
+            refreshDisplay()
+        }
     }
 
     private let watcher: StackFileWatcher?
@@ -919,32 +1014,41 @@ public final class SessionPipeline {
         onlineMean: AstroImage,
         onlinePreviewCG: CGImage,
         onlineFrameCount: Int,
-        downsampleLongEdge: Int?
-    ) throws -> (mean: AstroImage, cgImage: CGImage, integrationFrames: Int) {
+        downsampleLongEdge: Int?, context: DisplayRenderContext? = nil
+    ) throws -> (mean: AstroImage, cgImage: CGImage, integrationFrames: Int, cleanCount: Int?) {
         guard let published = publishedMasterIfCurrent() else {
-            return (onlineMean, onlinePreviewCG, onlineFrameCount)
+            return (onlineMean, onlinePreviewCG, onlineFrameCount, nil)
         }
         let broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
         let displaySource = downsampleLongEdge.map { broadcastMean.downsampled(maxLongEdge: $0) } ?? broadcastMean
-        let broadcastCG = try displayCGImage(from: displaySource)
-        return (broadcastMean, broadcastCG, published.survivorCount)
+        let broadcastCG = try displayCGImage(from: displaySource, context: context)
+        return (broadcastMean, broadcastCG, published.survivorCount, published.survivorCount)
     }
 
     /// Renders + saves one snapshot from the current stack and pushes the preview. Shared by the
     /// throttled per-frame path and end()'s guaranteed final render. Sets lastRenderedAcceptedIndex.
     private func renderSnapshot(index: Int, sourceName: String, timestamp: Date, engine: StackEngine) {
-        guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }
+        displayRenderLock.lock()
+        defer { displayRenderLock.unlock() }
+        let revision = nextDisplayRevision()
+        let context = displayContext()
+        guard let (mean0, coverage, frameCount, generation) = engine.displaySnapshot() else {
+            displayOnline = nil
+            deliverDisplay(revision: revision, preview: nil, broadcast: nil, cleanCount: nil, count: 0)
+            return
+        }
         let mean = cropToCoverage(mean0, coverage: coverage)   // online — feeds the PREVIEW, unchanged (Task 9)
+        displayOnline = (mean, frameCount, importPreviewLongEdge, generation)
         guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
         do {
             let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
-            let previewCG = try displayCGImage(from: displaySource)
+            let previewCG = try displayCGImage(from: displaySource, context: context)
 
             // BROADCAST/latest.png: prefer the clean published master over the online mean, with
             // the downsample applied to whichever is served (D10: see resolveBroadcastRender).
-            let (broadcastMean, broadcastCG, integrationFrames) = try resolveBroadcastRender(
-                onlineMean: mean, onlinePreviewCG: previewCG, onlineFrameCount: engine.stackFrameCount,
-                downsampleLongEdge: importPreviewLongEdge)
+            let (broadcastMean, broadcastCG, integrationFrames, cleanCount) = try resolveBroadcastRender(
+                onlineMean: mean, onlinePreviewCG: previewCG, onlineFrameCount: frameCount,
+                downsampleLongEdge: importPreviewLongEdge, context: context)
 
             let record = try recorder.save(
                 cgImage: broadcastCG, linear: broadcastMean, sourceFile: sourceName,
@@ -952,6 +1056,8 @@ public final class SessionPipeline {
                 estimatedIntegrationSeconds: Double(integrationFrames) * profile.subExposureSeconds)
             try session.recordSnapshot(record)
             lastRenderedAcceptedIndex = index
+            deliverDisplay(revision: revision, preview: previewCG, broadcast: broadcastCG,
+                           cleanCount: cleanCount, count: integrationFrames, record: record)
             onUpdate?(previewCG, record)
         } catch {
             onLog?("Skipped frame (\(sourceName)): \(error)")
@@ -1071,8 +1177,9 @@ public final class SessionPipeline {
 
     /// Shared display pipeline: optional background neutralization, then stretch
     /// if still linear, then pack to CGImage.
-    private func displayCGImage(from linear: AstroImage) throws -> CGImage {
-        let adj = displayAdjustments                         // single locked read
+    private func displayCGImage(from linear: AstroImage, context: DisplayRenderContext? = nil) throws -> CGImage {
+        let context = context ?? displayContext()
+        let adj = context.adjustments
         // DBE first, on linear data. When on, it removes the per-channel spatial
         // background, so skip the additive neutralize (keep multiplicative WB).
         let flattened = adj.backgroundExtraction
@@ -1103,7 +1210,7 @@ public final class SessionPipeline {
         // North-up (3b): rotate the DISPLAY only, when toggled on AND a solve is available. Applied here
         // so broadcast, latest.png, snapshots and replay all inherit it; master.fit stays native. No-op
         // (return cg) when the toggle is off or nothing is solved.
-        if adj.northUp, let wcs = currentWCS {
+        if adj.northUp, let wcs = context.wcs {
             return NorthUpRotation.apply(cg, wcs: wcs, autoZoom: true)
         }
         return cg
@@ -1223,21 +1330,30 @@ public final class SessionPipeline {
             }
             switch outcome {
             case .becameReference, .stacked:
-                guard let (mean0, coverage) = engine.currentStackAndCoverage() else { return }
+                displayRenderLock.lock()
+                defer { displayRenderLock.unlock() }
+                let revision = nextDisplayRevision()
+                let context = displayContext()
+                guard let (mean0, coverage, frameCount, generation) = engine.displaySnapshot() else {
+                    displayOnline = nil
+                    deliverDisplay(revision: revision, preview: nil, broadcast: nil, cleanCount: nil, count: 0)
+                    return
+                }
                 let mean = cropToCoverage(mean0, coverage: coverage)   // online — feeds the PREVIEW, unchanged (Task 9)
+                displayOnline = (mean, frameCount, nil, generation)
                 guard let recorder else {
                     onLog?("recorder missing — frame dropped (\(frame.sourceName))")
                     return
                 }
                 do {
-                    let previewCG = try displayCGImage(from: mean)
+                    let previewCG = try displayCGImage(from: mean, context: context)
 
                     // BROADCAST/latest.png: prefer the clean published master over the online
                     // mean, full-resolution (live, unlike renderSnapshot's downsampled preview) —
                     // D10: see resolveBroadcastRender.
-                    let (broadcastMean, broadcastCG, integrationFrames) = try resolveBroadcastRender(
-                        onlineMean: mean, onlinePreviewCG: previewCG, onlineFrameCount: engine.stackFrameCount,
-                        downsampleLongEdge: nil)
+                    let (broadcastMean, broadcastCG, integrationFrames, cleanCount) = try resolveBroadcastRender(
+                        onlineMean: mean, onlinePreviewCG: previewCG, onlineFrameCount: frameCount,
+                        downsampleLongEdge: nil, context: context)
 
                     // Pass the raw un-neutralized mean as linear: stats stay raw for v1.1 cloud gate.
                     let record = try recorder.save(
@@ -1245,6 +1361,8 @@ public final class SessionPipeline {
                         index: engine.acceptedCount, timestamp: frame.timestamp,
                         estimatedIntegrationSeconds: Double(integrationFrames) * profile.subExposureSeconds)
                     try session.recordSnapshot(record)
+                    deliverDisplay(revision: revision, preview: previewCG, broadcast: broadcastCG,
+                                   cleanCount: cleanCount, count: integrationFrames, record: record)
                     onUpdate?(previewCG, record)
                 } catch {
                     onLog?("Skipped frame (\(frame.sourceName)): \(error)")
@@ -1273,13 +1391,19 @@ public final class SessionPipeline {
                 // digest) the watcher validated on ITS pinned descriptor, so a file replaced between
                 // the watcher's validation and this read is skipped, never parsed.
                 let linear = try ImageLoader.load(url: update.url, expectedIdentity: update.identity)
+                displayRenderLock.lock()
+                defer { displayRenderLock.unlock() }
+                let revision = nextDisplayRevision()
                 let cg = try displayCGImage(from: linear)
                 let index = session.acceptedCount + 1
+                displayOnline = (linear, index, nil, nil)
                 let record = try recorder.save(
                     cgImage: cg, linear: linear, sourceFile: update.url.lastPathComponent,
                     index: index, timestamp: Date(),
                     estimatedIntegrationSeconds: Double(index) * profile.subExposureSeconds)
                 try session.recordSnapshot(record)
+                deliverDisplay(revision: revision, preview: cg, broadcast: cg,
+                               cleanCount: nil, count: index, record: record)
                 onUpdate?(cg, record)
             } catch let mismatch as FileIdentityMismatchError {
                 // A boundary failure may lose one frame, never the session; it appears honestly here.
@@ -1531,7 +1655,7 @@ public final class SessionPipeline {
         frozenGen: Int,
         master0: AstroImage,
         final: StackEngine.FinalizationState
-    ) -> RestackReport {
+    ) -> (report: RestackReport, cleanCount: Int?) {
         var clean: (image: AstroImage, coverage: [Float], survivorCount: Int)?
         if frozen.active {
             if let pub = frozen.published, pub.key == frozen.key {
@@ -1578,14 +1702,14 @@ public final class SessionPipeline {
         if let clean {
             // CLEAN global result: STACKCNT/TOTALEXP reflect the count that actually
             // combined into the written pixels, not the online engine's frame count.
-            return RestackReport(master: clean.image, stackedCount: clean.survivorCount,
+            return (RestackReport(master: clean.image, stackedCount: clean.survivorCount,
                                  skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
-                                 coverage: clean.coverage)
+                                 coverage: clean.coverage), clean.survivorCount)
         } else {
             // Online fallback / feature-off: EXACTLY today's counts, for byte parity.
-            return RestackReport(master: master0, stackedCount: final.frameCount,
+            return (RestackReport(master: master0, stackedCount: final.frameCount,
                                  skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
-                                 coverage: final.coverage)
+                                 coverage: final.coverage), nil)
         }
     }
 
@@ -1687,6 +1811,8 @@ public final class SessionPipeline {
             // `currentFreshnessKey()`/`publishedMasterIfCurrent()`, which re-acquire regLock and
             // would deadlock here since we already hold it).
             var finalization: SessionFinalizationFacts?
+            let finalContext = displayContext()
+            var finalBroadcast: (image: AstroImage, count: Int, cleanCount: Int?)?
             if let eng = engine {
                 let frozenGen = eng.currentStackGeneration
                 let frozen: (survivors: [SubRegistration], key: FreshnessKey, active: Bool,
@@ -1721,12 +1847,14 @@ public final class SessionPipeline {
                     guard let master0 = final.image else {
                         throw StackEngine.FinalizationError.invariantBreach
                     }
-                    let report = selectMasterReport(frozen: frozen, frozenGen: frozenGen,
+                    let (report, cleanCount) = selectMasterReport(frozen: frozen, frozenGen: frozenGen,
                                                     master0: master0, final: final)
                     let masterData = RestackPlanning.encodeMaster(
                         report, neutralize: neutralizeBackground,
                         metadata: sourceMetadata, subExposureSeconds: profile.subExposureSeconds)
                     try masterData.write(to: dir.appendingPathComponent("master.fit"))
+                    finalBroadcast = (cropToCoverage(report.master, coverage: report.coverage),
+                                      report.stackedCount, cleanCount)
                     outcome = .written
                 case .awaitingSeedAfterReseed:
                     onLog?("reference cleared by reseed (manual or automatic) and never re-seeded — no master available (\(final.sessionAcceptedCount) snapshots retained)")
@@ -1753,6 +1881,19 @@ public final class SessionPipeline {
             }
             // Commit point: master.fit is durable (native mode), so stamping end_time is now honest.
             try session.endSession(finalization: finalization)
+            // Drain the display renderer and publish one final, frozen pair. Late refiner or
+            // adjustment requests cannot resurrect an ended session's display.
+            displayRenderLock.lock()
+            let revision = displayRevisionLock.withLock { () -> UInt64 in
+                displayFinished = true
+                displayRevision &+= 1
+                return displayRevision
+            }
+            withCallbackDelivery {
+                renderDisplayTransition(revision: revision, finalBroadcast: finalBroadcast,
+                                        context: finalContext)
+            }
+            displayRenderLock.unlock()
             guard rendersReplay else { return dir }   // test seam: skip the AVFoundation render
             return try ReplayService.regenerate(sessionDirectory: dir,
                                                 replaySettings: replaySettings,

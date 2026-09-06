@@ -7,7 +7,7 @@ import UserNotifications
 /// Not unit-tested: UNUserNotificationCenter needs a real notification service;
 /// behavior is manual-verified (grant permission once, trip the idle timeout).
 final class SessionNotifier {
-    private let center = UNUserNotificationCenter.current()
+    private lazy var center = UNUserNotificationCenter.current()
 
     func requestAuthorizationIfNeeded() {
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
