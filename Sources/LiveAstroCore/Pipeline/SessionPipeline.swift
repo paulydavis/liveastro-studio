@@ -865,7 +865,29 @@ public final class SessionPipeline {
     /// slider drag re-renders ~1 MP instead of 26 MP. Downsampling (not cropping) is what keeps
     /// the preview honest: it preserves both the statistics `AutoStretch` derives its transform
     /// from and DBE's dimension-relative radius (`BackgroundExtraction.swift:281`).
-    static let previewLongEdge = 1200
+    /// Long edge the STAGED PREVIEW renders at.
+    ///
+    /// Raised from 1200 after driving the real app: at 1200 a 6236x4159 stack downsamples ~6x, and
+    /// operations with a FIXED-PIXEL kernel — the denoiser above all — then cover 6x more sky than
+    /// they will at full resolution, so the preview looked visibly softer than what Apply produces.
+    /// (The earlier honesty test only proved the STRETCH survives downsampling; it never covered
+    /// denoise or DBE, which is how that shipped.) At 2400 the factor drops to ~2.6x, which both
+    /// shrinks that discrepancy and gives the panel enough pixels to judge denoise and DBE at all.
+    /// Still a small fraction of a 26 MP render, so a slider drag stays cheap.
+    static let previewLongEdge = 2400
+    /// Long edge used while the operator is actively DRAGGING. Interaction and fidelity pull in
+    /// opposite directions: 2400 makes a settled preview faithful (a fixed-pixel denoise kernel
+    /// covers ~3x more sky instead of ~6x), but it is 4x the pixels of 1200, and this app is
+    /// already CPU-bound on a 26 MP live session. So a drag renders cheap and the SETTLED image
+    /// renders sharp — the coalesced trailing render, Apply, Revert, blink and new frames all use
+    /// the full-quality path.
+    static let previewDraftLongEdge = 1200
+
+    public enum PreviewQuality {
+        case draft      // mid-drag: cheap, refreshed continuously
+        case settled    // the image the operator actually judges
+        var longEdge: Int { self == .draft ? SessionPipeline.previewDraftLongEdge : SessionPipeline.previewLongEdge }
+    }
     /// Import-only: render (mean→downsample→neutralize→snapshot→preview) on a cadence so ~`snapshotBudget`
     /// snapshots are produced instead of one per accepted frame (the 1.78 s/frame finalize is 82% of the
     /// serial import cost, and the replay keeps only maxKeyframes). Internal `var` = test seam. Live/watcher
@@ -1294,9 +1316,9 @@ public final class SessionPipeline {
     /// Adjustments are deliberately absent from every case: the proxy is linear and
     /// pre-adjustment, so a slider drag reuses it.
     private enum PreviewProxyKey: Equatable {
-        case online(generation: Int, revision: Int)
-        case clean(FreshnessKey)
-        case watcher(token: Int)
+        case online(generation: Int, revision: Int, quality: PreviewQuality)
+        case clean(FreshnessKey, quality: PreviewQuality)
+        case watcher(token: Int, quality: PreviewQuality)
     }
     private let previewProxyLock = NSLock()
     /// One slot PER SOURCE, not a single slot. Hold-to-compare alternates clean -> online ->
@@ -1382,24 +1404,25 @@ public final class SessionPipeline {
     /// retained for the Apply path). Returns nil when the requested source has nothing to
     /// show: no stack yet, or `.clean` with no published master.
     public func renderPreview(source: PreviewSource,
-                              adjustments: DisplayAdjustments) -> CGImage? {
+                              adjustments: DisplayAdjustments,
+                              quality: PreviewQuality = .settled) -> CGImage? {
         // Resolve the cache key FIRST — it decides what may be reused, and for `.clean` it is
         // the FreshnessKey of the master actually being served.
         let key: PreviewProxyKey
         switch source {
         case .clean:
             guard let publishedKey = publishedMasterFreshnessKeyIfCurrent() else { return nil }
-            key = .clean(publishedKey)
+            key = .clean(publishedKey, quality: quality)
         case .online:
             if let engine {
                 key = .online(generation: engine.currentStackGeneration,
-                              revision: currentPreviewStackRevision)
+                              revision: currentPreviewStackRevision, quality: quality)
             } else {
                 lastPreviewLock.lock()
                 let token = lastPreviewLinear?.token
                 lastPreviewLock.unlock()
                 guard let token else { return nil }       // watcher mode, no frame yet
-                key = .watcher(token: token)
+                key = .watcher(token: token, quality: quality)
             }
         }
         var proxy: AstroImage?

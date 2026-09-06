@@ -210,7 +210,10 @@ final class PreviewRenderTests: XCTestCase {
 
         XCTAssertNil(pipeline.renderPreview(source: .online, adjustments: .neutral),
                      "no frame seen yet — the panel shows its placeholder")
-        pipeline.noteWatcherFrame(PreviewTestSupport.starField(w: 2400, h: 1800))
+        // Must EXCEED previewLongEdge, or "full resolution" and "capped at the preview size" are
+        // indistinguishable and the assertion below cannot fail. (At w: 2400 it silently became
+        // unsatisfiable the moment previewLongEdge was raised to 2400.)
+        pipeline.noteWatcherFrame(PreviewTestSupport.starField(w: 4800, h: 3600))
         let cg = try XCTUnwrap(pipeline.renderPreview(source: .online, adjustments: .neutral),
                                "watcher mode must still preview, from the retained last frame")
         XCTAssertLessThanOrEqual(max(cg.width, cg.height), SessionPipeline.previewLongEdge)
@@ -241,7 +244,10 @@ final class PreviewRenderTests: XCTestCase {
                      "renderCurrentDisplay has no engine to read in watcher mode — this is the bug " +
                      "renderSelectedSource exists to route around, not a call site to replace it with")
 
-        pipeline.noteWatcherFrame(PreviewTestSupport.starField(w: 2400, h: 1800))
+        // Must EXCEED previewLongEdge, or "full resolution" and "capped at the preview size" are
+        // indistinguishable and the assertion below cannot fail. (At w: 2400 it silently became
+        // unsatisfiable the moment previewLongEdge was raised to 2400.)
+        pipeline.noteWatcherFrame(PreviewTestSupport.starField(w: 4800, h: 3600))
 
         XCTAssertNil(pipeline.renderCurrentDisplay(adjustments: .neutral),
                      "renderCurrentDisplay must STILL produce nothing here — Apply no longer calls it")

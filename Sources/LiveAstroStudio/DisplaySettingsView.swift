@@ -3,6 +3,8 @@ import SwiftUI
 struct DisplaySettingsView: View {
     @Bindable var model: AppModel
 
+    @State private var windowHeight: CGFloat = 800
+
     var body: some View {
         VStack(spacing: 0) {
             previewPanel
@@ -126,7 +128,17 @@ struct DisplaySettingsView: View {
             }
             .scrollIndicators(.visible)
         }
+        .background(
+            GeometryReader { geo in
+                Color.clear.onAppear { windowHeight = geo.size.height }
+                    .onChange(of: geo.size.height) { _, h in windowHeight = h }
+            }
+        )
     }
+
+    /// Preview occupies a share of the window, floored so it stays useful in a small window and
+    /// capped so the controls beneath it never get squeezed out.
+    private var panelHeight: CGFloat { min(620, max(300, windowHeight * 0.42)) }
 
     @ViewBuilder private var previewPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -142,7 +154,10 @@ struct DisplaySettingsView: View {
                                     .font(.caption).foregroundStyle(.secondary))
                 }
             }
-            .frame(maxHeight: 260)
+            // Sized as a FRACTION of the window rather than a fixed cap: the old 260pt was an
+            // arbitrary number, and at that size denoise and background flattening — most of what
+            // this panel exists to judge — were impossible to see.
+            .frame(minHeight: 260, maxHeight: max(300, panelHeight))
             .overlay(alignment: .topLeading) {
                 if model.staged.hasPendingChanges {
                     Text("Pending — not yet on the broadcast")
@@ -164,6 +179,26 @@ struct DisplaySettingsView: View {
         }
     }
 
+    /// Press-and-hold styling that reports the press itself. A `Button` (rather than a `Text` +
+    /// `DragGesture`) is what makes this work at all: a Text's hit region is its GLYPHS, and
+    /// `.background(_:in:)` draws the pill without extending hit-testing to the padding, so most
+    /// of the control was dead to the gesture — found by hand, no test caught it. A Button also
+    /// brings keyboard activation, VoiceOver, and real `.disabled` semantics instead of a
+    /// cosmetic opacity.
+    private struct HoldToCompareStyle: ButtonStyle {
+        let onPressChange: (Bool) -> Void
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .font(.caption)
+                .padding(.vertical, 4).padding(.horizontal, 8)
+                .background(configuration.isPressed ? AnyShapeStyle(.tint.opacity(0.35))
+                                                    : AnyShapeStyle(.quaternary),
+                            in: RoundedRectangle(cornerRadius: 5))
+                .contentShape(RoundedRectangle(cornerRadius: 5))
+                .onChange(of: configuration.isPressed) { _, pressed in onPressChange(pressed) }
+        }
+    }
+
     @ViewBuilder private var blinkButton: some View {
         let status = model.liveRejectionStatus
         let (enabled, label): (Bool, String) = {
@@ -173,40 +208,33 @@ struct DisplaySettingsView: View {
             case .off(let reason): return (false, "Comparison unavailable — \(reason)")
             }
         }()
-        Text(label)
-            .font(.caption)
-            .padding(.vertical, 4).padding(.horizontal, 8)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
-            .opacity(enabled ? 1 : 0.5)
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { _ in
-                        guard enabled, !model.blinkHeld else { return }
-                        model.blinkHeld = true               // held: show the UN-rejected master
-                        model.refreshPreview(force: true)     // discrete action — never throttle it away
-                    }
-                    .onEnded { _ in
-                        // Must NOT gate on `enabled`: it derives from liveRejectionStatus, which can
-                        // flip to .building between press and release (a reject, a kappa change, a
-                        // reseed, a budget change, or the feature toggle). Gating the release on it
-                        // would swallow the release, strand blinkHeld true forever, and leave the
-                        // panel showing the un-rejected master under a "clean" label.
-                        guard model.blinkHeld else { return }
-                        model.blinkHeld = false              // released: back to the clean one
-                        model.refreshPreview(force: true)     // a swallowed release would strand the panel on online
-                    }
-            )
+        Button(label) { }
+            .buttonStyle(HoldToCompareStyle { pressed in
+                if pressed {
+                    guard !model.blinkHeld else { return }
+                    model.blinkHeld = true                // held: show the UN-rejected master
+                    model.refreshPreview(force: true)      // discrete action — never throttle it away
+                } else {
+                    // Deliberately NOT gated on `enabled`: that derives from liveRejectionStatus,
+                    // which can flip to .building between press and release (a reject, a kappa
+                    // change, a reseed, a budget change, the feature toggle). Swallowing the
+                    // release would strand blinkHeld true and leave the panel showing the
+                    // un-rejected master under a "clean" label.
+                    guard model.blinkHeld else { return }
+                    model.blinkHeld = false               // released: back to the clean one
+                    model.refreshPreview(force: true)
+                }
+            })
+            .disabled(!enabled)
+            .accessibilityLabel(label)
+            .accessibilityHint("Hold to see the stack without trail rejection.")
             .help("Hold to see the stack WITHOUT trail rejection. Each side is auto-stretched from "
                 + "its own statistics, so the overall brightness shifts too — look for the trail, not the tone.")
             .onDisappear {
-                // Safety net for a release that never arrives. Guarding onEnded on `blinkHeld`
-                // handles a stale release, but not a gesture that is ABANDONED: `selectLiveTab`
-                // (AppModel.swift:346, fired asynchronously by live-source auto-detect) switches
-                // `selectedTab` away from .setup, which tears this view out of the hierarchy
-                // mid-drag. SwiftUI does not run pending completion closures on teardown, so
-                // without this `blinkHeld` would stay true forever and `previewSource` would
-                // return .online permanently — the panel showing the un-rejected master under a
-                // "clean" label, which is exactly the failure the guard was added to prevent.
+                // Safety net for a release that never arrives: an ABANDONED gesture. selectLiveTab
+                // (AppModel.swift, fired asynchronously by live-source auto-detect) switches
+                // selectedTab away from .setup, tearing this view out mid-press; SwiftUI runs no
+                // pending completion on teardown, so blinkHeld would stay true forever.
                 if model.blinkHeld {
                     model.blinkHeld = false
                     model.refreshPreview(force: true)

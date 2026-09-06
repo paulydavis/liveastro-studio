@@ -617,6 +617,10 @@ final class AppModel {
         let seq = previewRenderSeq
         let adj = staged.pending
         let source = previewSource
+        // A drag (throttled path) renders cheap; every DISCRETE action — the coalesced trailing
+        // render that ends a drag, Apply, Revert, Reset, blink, a new frame, a session boundary —
+        // renders at full quality, so the image the operator judges is the faithful one.
+        let quality: SessionPipeline.PreviewQuality = force ? .settled : .draft
         // Test seam: when set, this stands in for `pipeline.renderPreview(source:adjustments:)`.
         // Captured here (not read again inside the detached task) so a test can gate ONE
         // specific in-flight call — e.g. block the render this refreshPreview() started while a
@@ -643,7 +647,7 @@ final class AppModel {
             if let renderOverride {
                 cg = await renderOverride(pipeline, source, adj)
             } else {
-                cg = pipeline.renderPreview(source: source, adjustments: adj)
+                cg = pipeline.renderPreview(source: source, adjustments: adj, quality: quality)
             }
             await MainActor.run {
                 self.draftRendersInFlight -= 1
