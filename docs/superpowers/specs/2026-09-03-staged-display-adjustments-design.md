@@ -29,7 +29,7 @@ one second. See `project-liveastro-trail-rejection-measured` in memory.
 | Preview content | **Whole-frame downsampled**, no 1:1 crop in v1 | See "Why not a crop" below — a crop would misrepresent the two most-used controls. |
 | Main display view | Shows **committed** | The big view stays ground truth for what the audience sees; the panel is the workbench. |
 | Blink interaction | **Press-and-hold** | The transition is what makes a faint trail pop; needs no mode, timer, or extra state. |
-| Import mode | Same staged model | One behaviour for one panel; `Apply` is ceremony there, but two modes would be worse. |
+| Import mode | Staged model applies, but NO live preview | `AppModel.pipeline` is never set for imports — `ImportController` owns `importPipeline` privately (`ImportController.swift:124`) — so the panel cannot render and `Apply` persists settings without reaching the running import. v1 makes this HONEST (the placeholder reads "Preview available during live sessions") rather than wiring the import pipeline through, which is real plumbing for a mode where `Apply` is ceremony. |
 
 ## Why not a 1:1 crop (the non-obvious constraint)
 
@@ -105,7 +105,14 @@ to the pipeline, persists, and refreshes the main view. `revert()` sets `pending
    NOT in the key: the proxy is linear, pre-adjustment, so slider drags reuse it.
 4. **Source selector** for blink: `.clean` (`publishedMasterIfCurrent()`) or `.online`, both
    cropped to coverage as the existing paths do, both rendered through the SAME pending
-   adjustments so the comparison isolates rejection.
+   adjustments. **Correction (2026-09-06, adversarial review + measurement):** identical
+   adjustment VALUES do not give an identical TRANSFORM — `AutoStretch` derives shadow/midtone
+   from each image's own median and MADN, and `neutralize` scales channels to each image's own
+   green median, so the clean and online sides are stretched and balanced independently. The
+   comparison therefore does NOT isolate rejection on its own; a global brightness shift rides
+   along with it. The confound's direction is conservative (the rejected master has lower MADN
+   and stretches harder, so a residual shows MORE, not less), but the flicker is real. Fixed by
+   the derive/apply seam below.
 
 ### Watcher / external-stacker mode has no engine
 
@@ -203,6 +210,32 @@ were seeing the clean one, actively misrepresenting the thing the comparison exi
 - **Reset** (`DisplaySettingsView.swift:108`) stages `.liveDefault` as a PENDING edit and
   refreshes the preview. It must not write through to the broadcast, or it would be the single
   control that bypasses staging.
+
+## Measured: what downsampling actually costs (2026-09-06)
+
+Downsampling destroys most of the MADN (noise averages away), so the preview's derived stretch is
+not identical to the broadcast's. Measured on Paul's real data rather than a fixture:
+
+| case | MADN change | 8-bit preview-vs-broadcast error |
+|---|---|---|
+| 16-sub master (deep) | -69% | 0.10/255 max |
+| single raw sub (noisiest real case) | -91.5% | 1.76/255 max, 1.44 mean |
+
+The error scales with MADN/median: `shadow = median - 2.8*MADN`, and on real astro frames MADN is
+10-130x smaller than the median, so the shadow point barely moves. An adversarial review measured
+7.4/255 and ~19/255 on synthetic fixtures whose noise-to-signal ratio is far above what this camera
+produces. NOTE the same weakness in our OWN honesty test: `PreviewTestSupport.starField` has a low
+MADN/median ratio, which is why it measured 0.007%. It measures the right quantity on an
+unrepresentative image and needs a noisy fixture added.
+
+### The derive/apply seam (fixes both this and the blink flicker)
+
+Split `AutoStretch` into `parameters(for:)` and `apply(_:params:)`, keeping
+`stretch()` == `apply(image, parameters(for: image))` so every existing caller — including the
+golden-hash path feeding the broadcast — stays byte-identical. Then: derive parameters from the
+FULL-RES linear image and apply them to the proxy (preview matches broadcast exactly), and derive
+ONCE for both blink sides (no flicker). `neutralize` is image-derived too and needs the same
+treatment or colour will still shift.
 
 ## Testing
 

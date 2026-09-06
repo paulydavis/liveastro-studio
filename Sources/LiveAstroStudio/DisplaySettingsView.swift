@@ -137,7 +137,9 @@ struct DisplaySettingsView: View {
                 } else {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(.quaternary)
-                        .overlay(Text("No stack yet").font(.caption).foregroundStyle(.secondary))
+                        .overlay(Text(model.isRunning ? "No stack yet"
+                                                       : "Preview available during live sessions")
+                                    .font(.caption).foregroundStyle(.secondary))
                 }
             }
             .frame(maxHeight: 260)
@@ -194,6 +196,21 @@ struct DisplaySettingsView: View {
                         model.refreshPreview(force: true)     // a swallowed release would strand the panel on online
                     }
             )
-            .help("Hold to see the same stretch WITHOUT trail rejection, so the difference is rejection alone.")
+            .help("Hold to see the stack WITHOUT trail rejection. Each side is auto-stretched from "
+                + "its own statistics, so the overall brightness shifts too — look for the trail, not the tone.")
+            .onDisappear {
+                // Safety net for a release that never arrives. Guarding onEnded on `blinkHeld`
+                // handles a stale release, but not a gesture that is ABANDONED: `selectLiveTab`
+                // (AppModel.swift:346, fired asynchronously by live-source auto-detect) switches
+                // `selectedTab` away from .setup, which tears this view out of the hierarchy
+                // mid-drag. SwiftUI does not run pending completion closures on teardown, so
+                // without this `blinkHeld` would stay true forever and `previewSource` would
+                // return .online permanently — the panel showing the un-rejected master under a
+                // "clean" label, which is exactly the failure the guard was added to prevent.
+                if model.blinkHeld {
+                    model.blinkHeld = false
+                    model.refreshPreview(force: true)
+                }
+            }
     }
 }
