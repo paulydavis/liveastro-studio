@@ -359,50 +359,62 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
     /// boundary) bypasses the 80 ms throttle entirely, so N such calls landing while a slow
     /// render is still in flight spawn N concurrent full renders. Demonstrates this directly:
     /// blocks every render open and counts how many are simultaneously executing.
-    @MainActor func testRefreshPreviewHasNoBoundOnConcurrentRendersInFlight() async throws {
+    /// The cap, and the thing a cap can plausibly break. Draft renders are bounded to
+    /// `maxDraftRendersInFlight`; anything beyond that would be wasted work, since the sequence
+    /// guard discards every result but the newest on completion anyway — but on a real 26 MP
+    /// session a proxy-cache miss makes each of those a full-resolution crop + downsample, so the
+    /// waste is measured in hundreds of MB, not cycles. Before the cap this measured 6 of 6
+    /// concurrent.
+    ///
+    /// The second assertion is the one that matters: a bound must not SWALLOW the operator's last
+    /// edit. Refuses-to-dispatch must schedule a coalesced retry, or the preview ends up showing
+    /// an older value than `staged.pending` — which is what Apply would publish, i.e. the exact
+    /// preview-disagrees-with-broadcast failure this feature exists to prevent.
+    @MainActor func testDraftRendersAreBoundedAndTheNewestEditStillRenders() async throws {
         let (model, _) = makeAttachedModel()
 
-        actor Counter {
+        actor Tracker {
             private(set) var concurrent = 0
             private(set) var maxConcurrent = 0
-            func enter() { concurrent += 1; maxConcurrent = max(maxConcurrent, concurrent) }
+            private(set) var seen: [Double] = []
+            func enter(_ bp: Double) { concurrent += 1; maxConcurrent = max(maxConcurrent, concurrent); seen.append(bp) }
             func exit() { concurrent -= 1 }
         }
-        let counter = Counter()
+        let tracker = Tracker()
         let gate = RenderGate()
         let n = 6
 
-        var resolvedCount = 0
-        let allResolved = expectation(description: "all \(n) renders resolved")
-        model.previewRenderCompletionForTest = { _, _ in
-            resolvedCount += 1
-            if resolvedCount == n { allResolved.fulfill() }
-        }
-        model.previewRenderOverrideForTest = { _, _, _ in
-            await counter.enter()
-            await gate.waitForRelease()   // hold every call open at once — nothing here throttles them
-            await counter.exit()
+        model.previewRenderOverrideForTest = { _, _, adj in
+            await tracker.enter(adj.blackPoint)
+            await gate.waitForRelease()
+            await tracker.exit()
             return nil
         }
 
         for i in 0..<n {
             var adj = model.staged.committed
-            adj.blackPoint = Double(i) / 100
+            adj.blackPoint = Double(i) / 100      // newest edit is 0.05
             model.staged.pending = adj
-            model.refreshPreview(force: true)   // force bypasses the throttle entirely
+            model.refreshPreview(force: true)
         }
-        // Give the N detached tasks a moment to actually reach the override and start blocking.
         try await Task.sleep(nanoseconds: 150_000_000)
-        let observedMax = await counter.maxConcurrent
+        let observedMax = await tracker.maxConcurrent
+        XCTAssertLessThanOrEqual(observedMax, 2,
+            "draft renders must be bounded — before the cap this was 6 of 6, each a potential "
+            + "full-resolution crop + downsample on a proxy-cache miss")
 
+        // Release the held renders; the coalesced retry must then render the NEWEST pending value.
         await gate.release()
-        await fulfillment(of: [allResolved], timeout: 3)
+        let rendered = expectation(description: "the newest edit eventually renders")
+        rendered.assertForOverFulfill = false
+        model.previewRenderOverrideForTest = { _, _, adj in
+            if abs(adj.blackPoint - 0.05) < 1e-9 { rendered.fulfill() }
+            return nil
+        }
+        await fulfillment(of: [rendered], timeout: 5)
 
-        print("OPEN-RISK-MEASUREMENT: \(observedMax) of \(n) forced refreshPreview() calls were " +
-              "simultaneously in flight — refreshPreview has no bound on outstanding detached renders.")
-        XCTAssertEqual(observedMax, n,
-                      "documents the open risk: the seq guard rejects stale RESULTS but does not " +
-                      "bound how many renders may be executing at once")
+        let seen = await tracker.seen
+        XCTAssertFalse(seen.isEmpty, "at least one render must have been dispatched")
     }
 
     // MARK: - Helpers

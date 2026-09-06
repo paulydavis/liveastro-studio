@@ -559,6 +559,14 @@ final class AppModel {
     /// stale image — visible as the preview snapping back to a setting you already moved past.
     private var previewRenderSeq = 0
 
+    /// How many draft renders are in flight. The sequence stamp rejects stale RESULTS but does
+    /// nothing to BOUND the WORK: measured 6 concurrent renders outstanding when each render
+    /// outlasts the throttle window, and on a real 26 MP session a proxy-cache miss makes each of
+    /// those a full-resolution crop + downsample. One render plus one queued is all that can ever
+    /// be useful, since anything older is discarded on completion anyway.
+    private var draftRendersInFlight = 0
+    private static let maxDraftRendersInFlight = 2
+
     /// Throttle clock for the PENDING draft render only. Main's pipeline coalesces the COMMITTED
     /// renders itself (DisplayDelivery), so the old shared `lastAdjustmentRender` went away with
     /// the old push-on-every-tick path; the operator-only draft preview still needs its own, since
@@ -616,6 +624,19 @@ final class AppModel {
         // build a real completion race rather than asserting on `previewRenderSeq`'s value.
         // nil in production; refreshPreview then behaves exactly as before this seam existed.
         let renderOverride = previewRenderOverrideForTest
+        guard draftRendersInFlight < Self.maxDraftRendersInFlight else {
+            // Saturated. Do not pile on: the newest pending values are already captured by
+            // `previewRenderSeq`, so schedule one coalesced retry instead of another render.
+            guard !previewTrailingScheduled else { return }
+            previewTrailingScheduled = true
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 90_000_000)
+                self?.previewTrailingScheduled = false
+                self?.refreshPreview(force: true)
+            }
+            return
+        }
+        draftRendersInFlight += 1
         Task.detached { [weak self] in
             guard let self else { return }
             let cg: CGImage?
@@ -625,6 +646,7 @@ final class AppModel {
                 cg = pipeline.renderPreview(source: source, adjustments: adj)
             }
             await MainActor.run {
+                self.draftRendersInFlight -= 1
                 // Only the newest request may publish; a slower earlier render is discarded.
                 let published = seq == self.previewRenderSeq
                 if published { self.previewImage = cg }
