@@ -102,7 +102,7 @@ final class AppModel {
     var backgroundNormalizationEnabled = true
     var scaleNormalizationEnabled = true
     var demosaic: DemosaicMethod = .malvar
-    var calibration = CalibrationStore.load(.standard)
+    var calibration: CalibrationSelection
 
     /// Reusable master darks/bias, matched to a session by camera + settings.
     let calibrationLibrary = CalibrationLibrary()
@@ -274,6 +274,14 @@ final class AppModel {
     private var pipeline: SessionPipeline?
     private var demoTask: Task<Void, Never>?
 
+    /// Where session/calibration settings persist. Defaults to `.standard` (production); tests
+    /// inject a per-test temporary suite (`UserDefaults(suiteName:)`) so a test run never reads
+    /// OR writes the real user's `com.pauldavis.liveastrostudio` domain — `init()`'s calls to
+    /// `CalibrationStore.load`/`SessionSettingsStore.load` (below) read through this SAME
+    /// property, not `.standard` directly, precisely so an injected suite is honestly isolated
+    /// on both the read and the write path, not just the write path.
+    private let userDefaults: UserDefaults
+
     /// Snapshot of the user's real session settings, captured when a Try-Demo
     /// session overrides them with demo values (branding: "Demo Nebula", 30 s,
     /// "Demo Stack Generator", …; and source config: stacker-output mode, the
@@ -302,7 +310,12 @@ final class AppModel {
     private var completionTick: Task<Void, Never>?
     private let notifier = SessionNotifier()
 
-    init() {
+    /// `userDefaults` defaults to `.standard` for every production call site (`AppModel()`
+    /// unchanged). Tests pass a temporary suite so no test run reads or writes the real user's
+    /// persisted settings.
+    init(userDefaults: UserDefaults = .standard) {
+        self.userDefaults = userDefaults
+        self.calibration = CalibrationStore.load(userDefaults)
         // Build the seam bundle and the Broadcast controller first. The closures
         // capture `self` (safe: they only fire after init completes), and
         // `broadcast` must exist before loadSettings()/session hooks reference it.
@@ -467,7 +480,7 @@ final class AppModel {
             settings.watchFolderPath = snap.watchFolder?.path
             settings.filePrefix = snap.fileNamePrefix
         }
-        SessionSettingsStore.save(settings, to: .standard)
+        SessionSettingsStore.save(settings, to: userDefaults)
     }
 
     /// Restore the user's real metadata captured before a Try-Demo session, so the
@@ -483,7 +496,7 @@ final class AppModel {
     }
 
     func loadSettings() {
-        let s = SessionSettingsStore.load(.standard)
+        let s = SessionSettingsStore.load(userDefaults)
         sourceMode = SourceMode(rawValue: s.sourceModeRaw) ?? .stackerOutput
         watchFolder = s.watchFolderPath.map { URL(fileURLWithPath: $0) }
         fileNamePrefix = s.filePrefix
@@ -501,7 +514,7 @@ final class AppModel {
         processorBackend = s.processorBackend
         // Fresh install (no saved settings) starts with the recommended DBE-on look;
         // a returning user keeps whatever they last had.
-        staged = StagedAdjustments(committed: SessionSettingsStore.exists(.standard) ? s.displayAdjustments : .liveDefault)
+        staged = StagedAdjustments(committed: SessionSettingsStore.exists(userDefaults) ? s.displayAdjustments : .liveDefault)
         idleSafeguardEnabled = s.idleSafeguardEnabled
         idleSafeguardMinutes = s.idleSafeguardMinutes
         plannedStopEnabled = s.plannedStopEnabled
@@ -596,16 +609,46 @@ final class AppModel {
         let seq = previewRenderSeq
         let adj = staged.pending
         let source = previewSource
+        // Test seam: when set, this stands in for `pipeline.renderPreview(source:adjustments:)`.
+        // Captured here (not read again inside the detached task) so a test can gate ONE
+        // specific in-flight call — e.g. block the render this refreshPreview() started while a
+        // later refreshPreview() call captures its own (different) override or none at all — to
+        // build a real completion race rather than asserting on `previewRenderSeq`'s value.
+        // nil in production; refreshPreview then behaves exactly as before this seam existed.
+        let renderOverride = previewRenderOverrideForTest
         Task.detached { [weak self] in
             guard let self else { return }
-            let cg = pipeline.renderPreview(source: source, adjustments: adj)
+            let cg: CGImage?
+            if let renderOverride {
+                cg = await renderOverride(pipeline, source, adj)
+            } else {
+                cg = pipeline.renderPreview(source: source, adjustments: adj)
+            }
             await MainActor.run {
                 // Only the newest request may publish; a slower earlier render is discarded.
-                guard seq == self.previewRenderSeq else { return }
-                self.previewImage = cg
+                let published = seq == self.previewRenderSeq
+                if published { self.previewImage = cg }
+                // Test seam: fires with the OUTCOME of the guard above (never influences it) so a
+                // test can await a definite acknowledgement that THIS render attempt has been
+                // resolved, instead of sleeping a guessed duration.
+                self.previewRenderCompletionForTest?(seq, published)
             }
         }
     }
+
+    /// Test seam only: substitutes for `pipeline.renderPreview(source:adjustments:)` inside
+    /// `refreshPreview`'s detached render task. Production never sets this (stays nil), so
+    /// `refreshPreview` is unchanged there. Tests use it to control render TIMING — e.g. to hold
+    /// one call open past a second, superseding call — without reimplementing or peeking at the
+    /// `previewRenderSeq` guard itself.
+    var previewRenderOverrideForTest: (@Sendable (SessionPipeline, SessionPipeline.PreviewSource, DisplayAdjustments) async -> CGImage?)?
+
+    /// Test seam only: called once every `refreshPreview` render attempt has been resolved on
+    /// the main actor, AFTER the `previewRenderSeq` guard ran — with that render's `seq` and
+    /// whether it actually published. Reports the guard's OUTCOME; never computes its own. Lets
+    /// a test await a specific render's resolution deterministically instead of polling
+    /// `previewImage` or sleeping a guessed duration. Production never sets this.
+    var previewRenderCompletionForTest: ((_ seq: Int, _ published: Bool) -> Void)?
 
     /// Which master the preview shows. Held → the un-rejected online master. Otherwise the
     /// clean master when one is actually being served, else online — so the panel still shows
@@ -630,8 +673,11 @@ final class AppModel {
         let committed = staged.apply()
         saveSettings()
         guard let pipeline else { return }
+        // No explicit refresh here: SessionPipeline.displayAdjustments' setter already calls
+        // refreshDisplay() (SessionPipeline.swift:794). Asking again bumped the revision a second
+        // time and invalidated the render the setter had just scheduled — a wasted full render on
+        // every Apply, and one more chance for the operator to see a flicker.
         pipeline.displayAdjustments = committed
-        pipeline.refreshDisplay()
     }
 
     /// Throws the pending edits away and puts the preview back on the committed look.
@@ -646,6 +692,26 @@ final class AppModel {
     func resetAdjustments() {
         staged.pending = .liveDefault
         refreshPreview(force: true)
+    }
+
+    /// The session-transition step shared by `startSession()` and `endSession()`: assign the
+    /// (possibly nil) active pipeline and invalidate any draft render in flight. This must stay
+    /// the ONE place that pairing happens — `attach(pipeline:)` below (the test seam) calls this
+    /// SAME method rather than repeating the assignment+invalidation itself, so a test exercising
+    /// "a session switch must reject a stale draft" is exercising this real method, not a
+    /// parallel re-implementation of it that could pass even if this one were broken.
+    private func setPipeline(_ pipeline: SessionPipeline?) {
+        self.pipeline = pipeline
+        clearPreview()
+    }
+
+    /// Test seam only: attaches `pipeline` through the SAME `setPipeline(_:)` `startSession()`/
+    /// `endSession()` use, so tests can drive the REAL `applyAdjustments()` / `revertAdjustments()`
+    /// / `resetAdjustments()` / `refreshPreview()` code paths — and the real session-transition
+    /// invalidation — against a real `SessionPipeline` without going through file-watching/
+    /// `startSession()`. `pipeline` itself stays `private`; this is the only other writer.
+    func attach(pipeline: SessionPipeline) {
+        setPipeline(pipeline)
     }
 
     private func makeStackEngine() -> StackEngine {
@@ -877,7 +943,7 @@ final class AppModel {
             let cal = resolveCalibration(
                 watchFolder: folder, prefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
             cal.messages.forEach { log.append($0) }
-            CalibrationStore.save(calibration, to: .standard)
+            CalibrationStore.save(calibration, to: userDefaults)
             // Empty folder at Start → resolve calibration from the first sub that lands.
             let provider = cal.foundMetadata ? nil : makeCalibratorProvider()
             p = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
@@ -927,8 +993,7 @@ final class AppModel {
         wireCallbacks(to: p, onAccepted: onAccepted)
         do {
             try p.start()
-            pipeline = p
-            clearPreview()
+            setPipeline(p)
             refreshPreview(force: true)   // fill the panel as soon as there is data
             isRunning = true
             selectedTab = .live
@@ -1585,10 +1650,9 @@ final class AppModel {
                 // the exact same calibration the live master used (Fix 1).
                 self.sessionCalibrator = p.effectiveCalibrator
                 self.sessionSourceMetadata = p.capturedSourceMetadata   // stamp re-stacked master.fit like the live one (Fix P1b)
-                self.pipeline = nil
                 // Pending edits die with the session, and nothing from a finished session
                 // lingers on screen.
-                self.clearPreview()
+                self.setPipeline(nil)
                 self.staged.revert()
                 self.sessionEnd = Date()
                 self.restackOfferPending = self.flaggedCount > 0
