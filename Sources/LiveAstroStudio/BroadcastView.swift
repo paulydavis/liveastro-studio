@@ -15,7 +15,8 @@ private enum BroadcastLayout {
     static let shadowOpacity: Double = 0.8
 }
 
-/// The OBS-captured scene: dark, non-interactive, never blanks (spec §5.6).
+/// The OBS-captured scene; also embedded as the operator pane when configuresWindow is false.
+/// The overlay remains visible while a new or invalidated stack waits for its first image.
 struct BroadcastView: View {
     @Environment(AppModel.self) private var model
     var configuresWindow: Bool = true
@@ -28,16 +29,20 @@ struct BroadcastView: View {
     @GestureState private var dragStartOffset: CGSize? = nil
     @GestureState private var magnifyStartScale: CGFloat? = nil
 
+    private var displayImage: CGImage? {
+        configuresWindow ? model.broadcastImage : model.latestImage
+    }
+
     var body: some View {
         GeometryReader { geo in
             @Bindable var model = model
             let uiScale = geo.size.height / BroadcastLayout.referenceHeight
             let fitted = fittedContentSize(
-                imageSize: model.latestImage.map { CGSize(width: $0.width, height: $0.height) },
+                imageSize: displayImage.map { CGSize(width: $0.width, height: $0.height) },
                 in: geo.size)
             ZStack {
                 Color.black
-                if let cg = model.latestImage {
+                if let cg = displayImage {
                     Image(decorative: cg, scale: 1)
                         .resizable()
                         .interpolation(.high)
@@ -125,7 +130,7 @@ struct BroadcastView: View {
                     }), in: 1...ZoomPanState.maxScale)
                     .frame(width: 180)
                 Button("100%") {
-                    if let img = model.wrappedValue.latestImage, fitted.width > 0 {
+                    if let img = displayImage, fitted.width > 0 {
                         model.wrappedValue.zoomPan.scale = ZoomPanState.clampScale(
                             CGFloat(img.width) / fitted.width)
                         model.wrappedValue.zoomPan.offset = ZoomPanState.clampedOffset(
@@ -165,7 +170,7 @@ struct BroadcastView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(model.targetName.isEmpty ? "LiveAstro" : model.targetName)
                         .font(.system(size: BroadcastLayout.titleSize * scale, weight: .bold, design: .rounded))
-                    Text(model.integrationCaption)
+                    Text(configuresWindow ? model.broadcastIntegrationCaption : model.integrationCaption)
                         .font(.system(size: BroadcastLayout.captionSize * scale, weight: .semibold, design: .rounded))
                         .foregroundStyle(.secondary)
                     Text(equipmentLine)

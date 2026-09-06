@@ -174,6 +174,12 @@ final class AppModel {
     /// that the operator may have edited after End but before Re-stack.
     private var sessionSubExposureSeconds: Double = 60
     var latestImage: CGImage?
+    var broadcastImage: CGImage?
+    private var displayedCleanMasterSubCount: Int?
+    private var displayedIntegrationSeconds: Double?
+    private var displayedPreviewIntegrationSeconds: Double?
+    private var displayedSubExposureSeconds: Double?
+    private let displayPresentation = DisplayPresentation()
     var latestRecord: SnapshotRecord?
     var sessionStart: Date?
     var sessionEnd: Date?
@@ -503,8 +509,6 @@ final class AppModel {
         plannedStopMinute = s.plannedStopMinute
     }
 
-    private var lastAdjustmentRender = Date.distantPast
-
     /// Download the star catalog on demand (3c). The download itself runs off-main (CatalogInstaller
     /// .download is nonisolated), so the UI never blocks; progress streams into `catalogState`, and on
     /// success it's applied to the live pipeline via reloadCatalog() so North-up can enable without a
@@ -542,13 +546,12 @@ final class AppModel {
     /// stale image — visible as the preview snapping back to a setting you already moved past.
     private var previewRenderSeq = 0
 
-    /// Monotonic stamp for Apply's main-view render — the same problem `previewRenderSeq` solves
-    /// for the preview, but for the committed path (correctness-wave defect 1). Apply A then
-    /// Apply B in quick succession both dispatch a detached render; without this stamp a slower
-    /// A can finish after B and publish A's image over B's, even though B is what was actually
-    /// committed — the broadcast/snapshots/replay would then disagree with what the operator
-    /// just applied. Captured before dispatch, checked on completion, mirroring `previewRenderSeq`.
-    private var applyRenderSeq = 0
+    /// Throttle clock for the PENDING draft render only. Main's pipeline coalesces the COMMITTED
+    /// renders itself (DisplayDelivery), so the old shared `lastAdjustmentRender` went away with
+    /// the old push-on-every-tick path; the operator-only draft preview still needs its own, since
+    /// DisplayDelivery does not own it.
+    private var lastAdjustmentRender = Date.distantPast
+
 
     /// True while a coalesced trailing render (see refreshPreview) is scheduled but hasn't fired yet.
     private var previewTrailingScheduled = false
@@ -612,41 +615,23 @@ final class AppModel {
         return pipeline?.publishedMasterSurvivorCount() != nil ? .clean : .online
     }
 
-    /// Promotes the pending adjustments to committed: pushes them to the pipeline (so the
-    /// broadcast, snapshots, latest.png and replay pick them up), persists them, and refreshes
-    /// the main view. This is the ONLY path by which a slider reaches the audience.
+    /// Promotes the pending adjustments to committed and hands them to the pipeline, which
+    /// coalesces the render and delivers the operator preview and the resolved BROADCAST image
+    /// together through `DisplayDelivery`. This is the ONLY path by which a slider reaches the
+    /// audience.
+    ///
+    /// There is deliberately no sequence stamp here any more. Ordering and session freshness for
+    /// the COMMITTED surfaces are owned by `DisplayDelivery` (its revision + `isCurrentDisplay`
+    /// guard), and the bespoke `applyRenderSeq` that used to live here was a narrower
+    /// reimplementation of the same thing — two competing ordering systems in one display path is
+    /// what produced this feature's stale-image bugs. `previewRenderSeq` below still guards the
+    /// PENDING draft render, which `DisplayDelivery` does not own.
     func applyAdjustments() {
         let committed = staged.apply()
         saveSettings()
         guard let pipeline else { return }
-        // The commit itself is synchronous and main-actor-ordered — unlike the detached render
-        // below, two quick Applies can never race writing this, so it needs no seq guard.
         pipeline.displayAdjustments = committed
-        applyRenderSeq &+= 1
-        let seq = applyRenderSeq
-        // The pipeline's contract deliberately keeps the per-frame main view ONLINE (see
-        // `testBroadcastRendersPublishedMasterWhilePreviewStaysOnline`) — Apply must render
-        // `.online` too, not the clean master the preview may currently be showing, or the main
-        // view would visibly alternate (clean on Apply, online again on the very next accepted
-        // frame). `renderSelectedSource(.online, ...)` still fixes the watcher-mode gap
-        // `renderCurrentDisplay` had (no engine there, so it always returned nil) via its
-        // retained-last-frame fallback, and has no committing side effect of its own — the
-        // commit above already did that job, so it stays intact even if this render is later
-        // discarded as stale.
-        Task.detached { [weak self] in
-            guard let self else { return }
-            let cg = pipeline.renderSelectedSource(.online, adjustments: committed)
-            await MainActor.run {
-                // Only the newest Apply's render may publish — an older, slower Apply finishing
-                // later must never overwrite a newer commit's image. NOTE: this guard is
-                // INCOMPLETE — it only orders Apply against Apply. A new accepted frame's
-                // `onUpdate` render, or a session boundary, can still race this detached render
-                // and be overwritten by a late-arriving stale image; that is a separate,
-                // still-open gap, not fixed by this stamp.
-                guard seq == self.applyRenderSeq, let cg else { return }
-                self.latestImage = cg
-            }
-        }
+        pipeline.refreshDisplay()
     }
 
     /// Throws the pending edits away and puts the preview back on the committed look.
@@ -688,6 +673,20 @@ final class AppModel {
     }
 
     var integrationCaption: String {
+        if let seconds = displayedPreviewIntegrationSeconds {
+            guard latestImage != nil else { return "waiting for stack…" }
+            return IntegrationFormat.caption(seconds: seconds, subSeconds: displayedSubExposureSeconds ?? sessionSubExposureSeconds)
+        }
+        guard let rec = latestRecord else { return "waiting for first stack…" }
+        return IntegrationFormat.caption(seconds: rec.estimatedIntegrationSeconds,
+                                         subSeconds: profile.subExposureSeconds)
+    }
+
+    var broadcastIntegrationCaption: String {
+        if let seconds = displayedIntegrationSeconds {
+            guard broadcastImage != nil else { return "waiting for stack…" }
+            return IntegrationFormat.caption(seconds: seconds, subSeconds: displayedSubExposureSeconds ?? sessionSubExposureSeconds)
+        }
         guard let rec = latestRecord else { return "waiting for first stack…" }
         return IntegrationFormat.caption(seconds: rec.estimatedIntegrationSeconds,
                                          subSeconds: profile.subExposureSeconds)
@@ -857,6 +856,7 @@ final class AppModel {
     /// Not unit-testable: needs FileManager, a live pipeline, and a real watch
     /// folder — the end-to-end test covers this path.
     func startSession() {
+        guard !isRestacking else { errorMessage = "Finish the re-stack before starting a session."; return }
         saveSettings()
         guard !isRunning else { return }
         guard !importer.isImporting else { errorMessage = "Finish the import before starting a session."; return }
@@ -1027,14 +1027,36 @@ final class AppModel {
     /// `onAnyFrame` runs synchronously on the pipeline's callback thread for
     /// every produced frame (accepted or rejected); `onAccepted` runs on the
     /// main actor alongside the model updates for each accepted frame.
-    private func wireCallbacks(to pipeline: SessionPipeline,
+    func wireCallbacks(to pipeline: SessionPipeline,
                                onAccepted: (@MainActor () -> Void)? = nil,
                                onAnyFrame: (() -> Void)? = nil) {
+        let sessionID = UUID()
+        displayPresentation.begin(sessionID: sessionID)
+        latestImage = nil
+        broadcastImage = nil
+        displayedCleanMasterSubCount = nil
+        displayedIntegrationSeconds = nil
+        displayedPreviewIntegrationSeconds = nil
+        displayedSubExposureSeconds = nil
+        latestRecord = nil
+        pipeline.onDisplayUpdate = { [weak self, weak pipeline] update in
+            guard let pipeline else { return }
+            Task { @MainActor in
+                guard let self, pipeline.isCurrentDisplay(update),
+                      self.displayPresentation.accept(update, sessionID: sessionID) else { return }
+                self.latestImage = update.previewImage
+                self.broadcastImage = update.broadcastImage
+                self.displayedCleanMasterSubCount = update.cleanMasterSubCount
+                self.displayedIntegrationSeconds = update.integrationSeconds
+                self.displayedPreviewIntegrationSeconds = update.previewIntegrationSeconds
+                self.displayedSubExposureSeconds = update.subExposureSeconds
+            }
+        }
         solveAvailable = false   // new session/pipeline: no solve yet — don't carry a stale gate over
-        pipeline.onUpdate = { [weak self] image, record in
+        pipeline.onUpdate = { [weak self] _, record in
             onAnyFrame?()
             Task { @MainActor in
-                self?.latestImage = image
+                guard self?.displayPresentation.belongs(to: sessionID) == true else { return }
                 self?.latestRecord = record
                 self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false   // gate the North-up toggle
                 self?.refreshPreview(force: true)   // a new sub changed the stack
@@ -1122,7 +1144,8 @@ final class AppModel {
 
     /// The resolved live trail-rejection status for the CaptureSettingsView caption (Task 11).
     var liveRejectionStatus: LiveRejectionStatus {
-        LiveRejectionGate.reason(sourceIsLocalLiveRelay: sourceIsLocalLiveRelay,
+        if let count = displayedCleanMasterSubCount { return .active(subs: count) }
+        return LiveRejectionGate.reason(sourceIsLocalLiveRelay: sourceIsLocalLiveRelay,
                                   subCount: liveRejectionSubCount,
                                   minSubs: GlobalRefiner.defaultMinSubs,
                                   reseeding: false,   // no live "reseed in progress" signal exists yet — reseed()
@@ -1132,7 +1155,7 @@ final class AppModel {
                                   // The clean master ACTUALLY being served, not the survivor count:
                                   // nil until a pass publishes, which is what makes the caption say
                                   // "building" instead of claiming a master the outputs don't have.
-                                  publishedSubs: pipeline?.publishedMasterSurvivorCount())
+                                  publishedSubs: displayedCleanMasterSubCount)
     }
 
     /// Human caption for `CaptureSettingsView`'s status line.
@@ -1326,7 +1349,7 @@ final class AppModel {
 
     /// Result of the off-actor durable master.fit write. `ok == false` means the durable
     /// deliverable did not land, so the caller must keep `restackOfferPending` up for retry.
-    private struct RestackMasterWrite { let ok: Bool; let logMessage: String? }
+    struct RestackMasterWrite { let ok: Bool; let logMessage: String? }
 
     /// Encodes the re-stacked master to a full-metadata FITS and writes it atomically over
     /// `master.fit`, matching the pipeline's own write (`SessionPipeline.writeMasterSnapshot` /
@@ -1374,7 +1397,7 @@ final class AppModel {
     /// durable deliverable is the corrected `master.fit`; the on-screen preview is a
     /// basic-stretch confirmation that the restack happened, not a faithful re-render of
     /// the operator's display settings.
-    private func finishRestack(_ report: RestackReport, excludedCount: Int,
+    func finishRestack(_ report: RestackReport, excludedCount: Int,
                                writeResult: RestackMasterWrite, sessionDir: URL?, neutralize: Bool) {
         guard writeResult.ok else {
             if let m = writeResult.logMessage { log.append(m) }
@@ -1398,7 +1421,13 @@ final class AppModel {
             }
         }
         if let cg = AutoStretch.makeCGImage(RestackPlanning.presentationMaster(report, neutralize: neutralize)) {
+            displayPresentation.begin(sessionID: UUID())
             latestImage = cg
+            broadcastImage = cg
+            displayedCleanMasterSubCount = nil
+            displayedIntegrationSeconds = Double(report.stackedCount) * sessionSubExposureSeconds
+            displayedPreviewIntegrationSeconds = displayedIntegrationSeconds
+            displayedSubExposureSeconds = sessionSubExposureSeconds
         }
         if report.skippedMissing > 0 {
             log.append("Re-stack: \(report.skippedMissing) raw sub(s) missing — used the rest.")

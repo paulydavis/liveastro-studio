@@ -1,5 +1,6 @@
 import XCTest
 import CoreGraphics
+import ImageIO
 @testable import LiveAstroCore
 
 /// Task 5: SessionPipeline captures a thread-safe cache of per-sub SubRegistration records so a
@@ -1562,7 +1563,12 @@ final class GlobalRefinerTests: XCTestCase {
         // Positive proof the final pass ran, independent of what it produced: it must LOAD the
         // frozen survivors. The exact-current branch loads nothing.
         let loadsBefore = loader.loads
+        let displayLock = NSLock()
+        var finalDisplay: DisplayDelivery?
+        pipeline.onDisplayUpdate = { update in displayLock.withLock { finalDisplay = update } }
         let replayDir = try pipeline.end()
+        XCTAssertEqual(displayLock.withLock { finalDisplay?.cleanMasterSubCount }, 6,
+                       "final broadcast must use the six-sub final refinement, not the shallow live publication")
         XCTAssertGreaterThanOrEqual(loader.loads - loadsBefore, 6,
                                     "end() must have loaded all 6 frozen survivors for the final pass — "
                                     + "zero new loads would mean it reused a published master instead")
@@ -1888,6 +1894,127 @@ final class GlobalRefinerTests: XCTestCase {
             survivorCount: 3, key: key)
         XCTAssertNotNil(pipeline.publishedMasterIfCurrent(), "precondition: the master is current")
         return (pipeline, source, engine, key)
+    }
+
+    /// Regression: the app's broadcast delivery must contain the same pixels saved to latest.png.
+    /// Routing the operator preview to the captured window must fail this test.
+    func testWindowBroadcastDeliveryMatchesSavedCleanImage() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, _, _) = try pipelineWithPublishedCleanMaster(sandbox: sandbox)
+        defer { source.stop() }
+        let received = expectation(description: "broadcast trigger")
+        let lock = NSLock()
+        var delivered: CGImage?
+        pipeline.onDisplayUpdate = { update in
+            guard update.record?.sourceFile == "trigger.fit" else { return }
+            XCTAssertEqual(update.cleanMasterSubCount, 3)
+            lock.withLock { delivered = update.broadcastImage }
+            received.fulfill()
+        }
+        source.send(renderTriggerFrame(dx: 0.2, dy: 0.1, timestamp: 3))
+        wait(for: [received], timeout: 10)
+        let image = try XCTUnwrap(lock.withLock { delivered })
+        let dir = try XCTUnwrap(pipeline.sessionDir)
+        let saved = try ImageLoader.load(url: dir.appendingPathComponent("latest.png"))
+        let pngSource = try XCTUnwrap(CGImageSourceCreateWithURL(dir.appendingPathComponent("latest.png") as CFURL, nil))
+        let savedImage = try XCTUnwrap(CGImageSourceCreateImageAtIndex(pngSource, 0, nil))
+        func rgba(_ cg: CGImage) throws -> Data {
+            let context = try XCTUnwrap(CGContext(data: nil, width: cg.width, height: cg.height,
+                bitsPerComponent: 8, bytesPerRow: cg.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+            context.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+            return Data(bytes: try XCTUnwrap(context.data), count: cg.width * cg.height * 4)
+        }
+        XCTAssertEqual(try rgba(image), try rgba(savedImage), "paired broadcast pixels must equal saved PNG pixels")
+        let windowPixels = [UInt8](pixelData(image))
+        XCTAssertLessThan(saved.stats[0].stddev, 0.01)
+        XCTAssertLessThan(stddev(windowPixels.map { Float($0) / 255 }), 0.01,
+                          "the OBS window must receive the uniform clean image, not the online stars")
+    }
+
+    func testDisplayReresolvesPublicationInvalidationAndReseedWithoutNewSubs() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, engine, _) = try pipelineWithPublishedCleanMaster(sandbox: sandbox)
+        defer { source.stop() }
+        pipeline.refinerForTest()?.quiesce()
+        let lock = NSLock()
+        var updates: [DisplayDelivery] = []
+        pipeline.onDisplayUpdate = { update in lock.withLock { updates.append(update) } }
+        source.send(renderTriggerFrame(dx: 0.2, dy: 0.1, timestamp: 3))
+        func waitFor(_ predicate: (DisplayDelivery) -> Bool) throws -> DisplayDelivery {
+            let deadline = Date().addingTimeInterval(8)
+            while Date() < deadline {
+                if let value = lock.withLock({ updates.last }), predicate(value) { return value }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            throw NSError(domain: "Display transition timeout", code: 1)
+        }
+        let initial = try waitFor { $0.record?.sourceFile == "trigger.fit" }
+        let accepted = engine.acceptedCount
+        let image = constImage(0.65, w: 512, h: 512)
+        let result = RefineResult(image: image, coverage: [Float](repeating: 1, count: 512 * 512),
+                                  survivorCount: 2, skipped: 0)
+        // Exercise the actual production publication closure, without waiting for disk refinement.
+        pipeline.refinerForTest()?.publish?(result, pipeline.currentFreshnessKey())
+        let published = try waitFor { $0.revision > initial.revision && $0.cleanMasterSubCount == 2 }
+        XCTAssertNotEqual(pixelData(try XCTUnwrap(initial.broadcastImage)), pixelData(try XCTUnwrap(published.broadcastImage)))
+        XCTAssertNil(published.record, "publication must not masquerade as another accepted frame")
+
+        pipeline.configureLiveRejection(enabled: false)
+        let off = try waitFor { $0.revision > published.revision && $0.cleanMasterSubCount == nil }
+        XCTAssertEqual(pixelData(try XCTUnwrap(off.previewImage)), pixelData(try XCTUnwrap(off.broadcastImage)))
+        pipeline.configureLiveRejection(enabled: true)
+        pipeline.refinerForTest()?.publish?(result, pipeline.currentFreshnessKey())
+        let enabled = try waitFor { $0.revision > off.revision && $0.cleanMasterSubCount == 2 }
+        pipeline.setUserRejected([1])
+        let rejected = try waitFor { $0.revision > enabled.revision && $0.cleanMasterSubCount == nil }
+        XCTAssertNotNil(rejected.broadcastImage)
+
+        pipeline.refinerForTest()?.publish?(result, pipeline.currentFreshnessKey())
+        let republished = try waitFor { $0.revision > rejected.revision && $0.cleanMasterSubCount == 2 }
+        pipeline.configureLiveRejection(kappa: 1.5)
+        let kappa = try waitFor { $0.revision > republished.revision && $0.cleanMasterSubCount == nil }
+        pipeline.refinerForTest()?.publish?(result, pipeline.currentFreshnessKey())
+        let beforeReseed = try waitFor { $0.revision > kappa.revision && $0.cleanMasterSubCount == 2 }
+        XCTAssertEqual(pipeline.reseed(), .reseeded)
+        let reseeded = try waitFor { $0.revision > beforeReseed.revision && $0.broadcastImage == nil }
+        XCTAssertNil(reseeded.previewImage)
+        XCTAssertNil(reseeded.cleanMasterSubCount)
+        XCTAssertEqual(engine.acceptedCount, accepted, "all transitions occurred between incoming subs")
+        XCTAssertFalse(pipeline.isCurrentDisplay(beforeReseed), "queued old renders must fail the UI delivery guard")
+    }
+
+    func testAcceptedFrameReseedBeforeRenderStillDeliversCurrentEmptyState() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source, _, _) = try pipelineWithPublishedCleanMaster(sandbox: sandbox)
+        defer { source.stop() }
+        pipeline.refinerForTest()?.quiesce()
+        let done = expectation(description: "accepted frame handler returned")
+        let lock = NSLock()
+        var last: DisplayDelivery?
+        pipeline.onDisplayUpdate = { value in lock.withLock { last = value } }
+        pipeline.onSubFrame = { record in
+            guard record.sourceFile == "trigger.fit" else { return }
+            XCTAssertEqual(pipeline.reseed(), .reseeded)
+            // A reseed refresh races the accepted frame's attempt to read its now-missing stack.
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { done.fulfill() }
+        }
+        source.send(renderTriggerFrame(dx: 0.2, dy: 0.1, timestamp: 3))
+        wait(for: [done], timeout: 10)
+        let deadline = Date().addingTimeInterval(5)
+        var current: DisplayDelivery?
+        while Date() < deadline {
+            if let value = lock.withLock({ last }), pipeline.isCurrentDisplay(value) {
+                current = value; break
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        let update = try XCTUnwrap(current, "accepted-frame nil path must not swallow reseed's clearing delivery")
+        XCTAssertNil(update.broadcastImage)
+        XCTAssertNil(update.cleanMasterSubCount)
     }
 
     /// Step 1a: with a CURRENT published master, the BROADCAST artifact (`latest.png`) must

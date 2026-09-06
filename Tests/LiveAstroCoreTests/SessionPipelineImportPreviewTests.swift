@@ -40,10 +40,29 @@ final class SessionPipelineImportPreviewTests: XCTestCase {
         pipeline.rendersReplay = false        // end() returns the session dir, skips the replay render
         pipeline.importPreviewLongEdge = 200  // shrink the cap so a 400px frame exercises the wiring fast
 
+        let deliveryLock = NSLock()
+        var recordedDelivery: DisplayDelivery?
+        var finalDelivery: DisplayDelivery?
+        pipeline.onDisplayUpdate = { update in
+            deliveryLock.withLock {
+                if update.record != nil { recordedDelivery = update }
+                finalDelivery = update
+            }
+        }
+
         try pipeline.start()
         let sessionDir = try pipeline.end()
         let snap = try ImageLoader.load(url: sessionDir.appendingPathComponent("snapshots/0001.png"))
         XCTAssertEqual(max(snap.width, snap.height), 200,
                        "import snapshot must be rendered from the downsampled preview, not the full 400px stack")
+        let delivered = try XCTUnwrap(deliveryLock.withLock { recordedDelivery })
+        XCTAssertEqual(delivered.broadcastImage?.width, snap.width)
+        XCTAssertEqual(delivered.previewImage?.dataProvider?.data as Data?, delivered.broadcastImage?.dataProvider?.data as Data?)
+        XCTAssertNil(delivered.cleanMasterSubCount)
+        let final = try XCTUnwrap(deliveryLock.withLock { finalDelivery })
+        XCTAssertGreaterThan(final.revision, delivered.revision, "end must resolve a final display")
+        XCTAssertTrue(pipeline.isCurrentDisplay(final))
+        pipeline.refreshDisplay()
+        XCTAssertTrue(pipeline.isCurrentDisplay(final), "an ended pipeline must keep its final delivery valid")
     }
 }

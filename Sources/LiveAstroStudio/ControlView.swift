@@ -102,7 +102,7 @@ struct ControlView: View {
                 } else {
                     Button("Start Session") { model.startSession() }
                         .buttonStyle(.borderedProminent)
-                        .disabled(model.importer.isImporting)
+                        .disabled(model.importer.isImporting || model.isRestacking)
                 }
                 Spacer()
                 Button {
