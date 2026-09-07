@@ -424,7 +424,7 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
     /// makes it hold still while the dials move the other one. (It previously showed the
     /// un-rejected master, which compared rejection rather than the edit, and looked identical
     /// because the two masters differ over 0.13% of the frame.)
-    @MainActor func testSideBySideComparesThePendingEditAgainstWhatIsLive() async throws {
+    @MainActor func testLivePaneAlwaysRendersAndTheEditablePaneDivergesOnlyWhenEdited() async throws {
         let (model, _) = makeAttachedModel()
 
         // The override distinguishes the two renders by the ADJUSTMENTS handed to them, which is
@@ -444,12 +444,17 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
             await fulfillment(of: [done], timeout: 3)
         }
 
-        // Nothing edited: one pane. A second pane here would show the same picture twice.
+        // Nothing edited: BOTH panes render (live on top, editable below) and show the same
+        // picture, because the pending and committed adjustments are equal. The panes are a
+        // permanent part of the layout, not a comparison that appears once you touch something —
+        // gating the live pane on hasPendingChanges meant it simply never appeared.
         await renderAndWait()
-        XCTAssertNotNil(model.previewImage, "the primary preview must render")
-        XCTAssertNil(model.previewCompareImage,
-                     "with no pending edit there is nothing to compare against — the panel must "
-                     + "not render a reference identical to the preview")
+        XCTAssertNotNil(model.previewImage, "the editable pane must render")
+        XCTAssertNotNil(model.previewCompareImage, "the 'currently live' pane must always render")
+        XCTAssertEqual(model.previewImage.flatMap { Self.dataOf($0) },
+                       model.previewCompareImage.flatMap { Self.dataOf($0) },
+                       "with no edit the two panes must agree — they are the same stack under the "
+                       + "same adjustments")
 
         // Edit a dial: now both panes, and they must differ.
         var pending = model.staged.committed
@@ -466,10 +471,13 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         XCTAssertEqual(live, Self.dataOf(liveImage),
                        "the reference must be rendered with the COMMITTED adjustments")
 
-        // Revert: back to a single pane.
+        // Revert: both panes remain, and they agree again.
         model.revertAdjustments()
         await renderAndWait()
-        XCTAssertNil(model.previewCompareImage, "reverting removes the thing being compared")
+        XCTAssertNotNil(model.previewCompareImage, "the live pane stays after a revert")
+        XCTAssertEqual(model.previewImage.flatMap { Self.dataOf($0) },
+                       model.previewCompareImage.flatMap { Self.dataOf($0) },
+                       "reverting discards the edit, so the panes must agree again")
     }
 
     // MARK: - Helpers

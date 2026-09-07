@@ -6,10 +6,34 @@ struct DisplaySettingsView: View {
     @State private var windowHeight: CGFloat = 800
 
     var body: some View {
-        VStack(spacing: 0) {
-            previewPanel
-                .padding(.horizontal).padding(.top)
-            Divider().padding(.top, 8)
+        HStack(alignment: .top, spacing: 12) {
+            // LEFT COLUMN: what the audience sees on top, what you are editing underneath.
+            VStack(spacing: 10) {
+                previewPane(model.previewCompareImage, title: "Currently live")
+                previewPane(model.previewImage,
+                            title: model.staged.hasPendingChanges ? "Your edit — not yet live" : "Your edit")
+                    .overlay(alignment: .topLeading) {
+                        if model.staged.hasPendingChanges {
+                            Text("Pending")
+                                .font(.caption2).padding(4)
+                                .background(.yellow.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
+                                .padding(6)
+                        }
+                    }
+                HStack {
+                    Button("Revert") { model.revertAdjustments() }
+                        .disabled(!model.staged.hasPendingChanges)
+                    Button("Apply") { model.applyAdjustments() }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!model.staged.hasPendingChanges)
+                }
+                Text(comparisonStatus)
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .frame(minWidth: 320, idealWidth: 460, maxWidth: .infinity)
+
+            // RIGHT COLUMN: the controls.
             ScrollView {
                 Form {
                     Section("Night vision") {
@@ -127,7 +151,9 @@ struct DisplaySettingsView: View {
                 .background(AlwaysVisibleScroller())
             }
             .scrollIndicators(.visible)
+            .frame(minWidth: 360)
         }
+        .padding(.horizontal).padding(.top)
         .background(
             GeometryReader { geo in
                 Color.clear.onAppear { windowHeight = geo.size.height }
@@ -202,7 +228,7 @@ struct DisplaySettingsView: View {
             case .off(let reason): return "Trail rejection off (\(reason))"
             }
         }
-        return "Left: your pending edit · Right: what the broadcast is showing now"
+        return "Top: what the broadcast is showing now · Bottom: your pending edit"
     }
 
 }

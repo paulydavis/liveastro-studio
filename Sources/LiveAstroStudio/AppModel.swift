@@ -650,9 +650,11 @@ final class AppModel {
             return
         }
         draftRendersInFlight += 1
-        // The reference pane is worth rendering only when there is an edit to compare against.
+        // The reference pane is ALWAYS rendered: it is the "currently live" image, shown above
+        // the editable one at all times, not a comparison that appears only once you touch a
+        // dial. (It briefly worked that way and the second pane simply never showed up.)
         let committed = staged.committed
-        let wantsCompare = staged.hasPendingChanges
+        let wantsCompare = true
         Task.detached { [weak self] in
             guard let self else { return }
             let cg: CGImage?
