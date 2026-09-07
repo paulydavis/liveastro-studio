@@ -38,7 +38,11 @@ public enum NorthUpRotation {
             outW = w; outH = h
             scale = CGFloat(c) + CGFloat(max(w / h, h / w)) * CGFloat(s)   // guarantees coverage
         } else {
-            // Letterbox: the full rotated bounding box, no scaling.
+            // Large rotation: draw the full rotated bounding box, then crop to the largest
+            // rectangle wholly inside it (below). Letterboxing kept every pixel, which suits an
+            // archive but not a broadcast — viewers saw black wedges rotating with the sky, and
+            // those wedges are indistinguishable from crushed shadows to anything measuring the
+            // image (the histogram counted them as clipped data).
             outW = w * c + h * s
             outH = w * s + h * c
             scale = 1
@@ -61,6 +65,32 @@ public enum NorthUpRotation {
         ctx.rotate(by: CGFloat(angle))
         ctx.scaleBy(x: scale, y: scale)
         ctx.draw(cg, in: CGRect(x: -w / 2, y: -h / 2, width: w, height: h))
-        return ctx.makeImage() ?? cg
+        guard let rotated = ctx.makeImage() else { return cg }
+        guard !(autoZoom && small) else { return rotated }   // small angles already crop-to-fill
+
+        let (iw, ih) = largestInscribedSize(w: Double(w), h: Double(h), angle: Double(angle))
+        let cw = max(1, Int(iw.rounded())), ch = max(1, Int(ih.rounded()))
+        guard cw < rotated.width || ch < rotated.height else { return rotated }
+        let x = (rotated.width - cw) / 2, y = (rotated.height - ch) / 2
+        return rotated.cropping(to: CGRect(x: x, y: y, width: cw, height: ch)) ?? rotated
+    }
+
+    /// Dimensions of the largest axis-aligned rectangle fitting inside a `w` x `h` rectangle
+    /// rotated by `angle`. Below a threshold the short side is the binding constraint (the
+    /// inscribed rectangle touches two opposite edges); above it, both pairs of edges bind.
+    static func largestInscribedSize(w: Double, h: Double, angle: Double) -> (Double, Double) {
+        guard w > 0, h > 0 else { return (w, h) }
+        var a = abs(angle.truncatingRemainder(dividingBy: .pi))
+        if a > .pi / 2 { a = .pi - a }
+        let sinA = abs(sin(a)), cosA = abs(cos(a))
+        let longSide = max(w, h), shortSide = min(w, h)
+        if shortSide <= 2 * sinA * cosA * longSide || abs(sinA - cosA) < 1e-10 {
+            let x = 0.5 * shortSide
+            return w >= h ? (x / max(sinA, 1e-9), x / max(cosA, 1e-9))
+                          : (x / max(cosA, 1e-9), x / max(sinA, 1e-9))
+        }
+        let cos2A = cosA * cosA - sinA * sinA
+        guard abs(cos2A) > 1e-9 else { return (w, h) }
+        return ((w * cosA - h * sinA) / cos2A, (h * cosA - w * sinA) / cos2A)
     }
 }
