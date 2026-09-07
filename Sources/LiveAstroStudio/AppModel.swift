@@ -214,7 +214,7 @@ final class AppModel {
     var previewHistogram: [Int] = []
     var compareHistogram: [Int] = []
 
-    /// What the cached "Currently live" render was made from. That pane depends only on the
+    /// What the cached reference-pane ("Current settings") render was made from. That pane depends only on the
     /// COMMITTED adjustments and the source — never on the pending edit — so re-rendering it on
     /// every slider tick doubled the work of a drag (two renders and two histograms per tick)
     /// to produce an identical image. Dragging felt slow because half the work was wasted.
@@ -826,16 +826,27 @@ final class AppModel {
     /// what produced this feature's stale-image bugs. `previewRenderSeq` below still guards the
     /// PENDING draft render, which `DisplayDelivery` does not own.
     func applyAdjustments() {
+        // Availability, not mere existence. A pipeline can be retained with its display already
+        // frozen: `end()` closes the display, and an import holds its pipeline through
+        // master-writing and replay generation after that. Applying into that window committed the
+        // edit, persisted it and cleared the "Not yet live" badge while the image never changed.
+        let sessionAcceptsDisplay = pipeline?.acceptsDisplayUpdates == true
+        if !sessionAcceptsDisplay, importer.hasActivePipeline, !importer.acceptsDisplayUpdates {
+            // Deliberately does NOT commit. Leaving the edit pending keeps the badge honest —
+            // clearing it here is exactly what made this a silent failure.
+            errorMessage = "The import is finalising — writing the master and building the replay "
+                + "— so its display is already closed and this change cannot reach it. Your edit "
+                + "is still pending; press Apply again once the import finishes."
+            return
+        }
         let committed = staged.apply()
         saveSettings()
         // An IMPORT owns its own pipeline (ImportController), not `pipeline`, which is nil while
-        // one runs. Apply used to commit the edit, persist it and clear the "Not yet live" badge,
-        // then return at the guard below — so the operator was told the change was live while the
-        // import carried on rendering with the settings it captured when it started.
+        // one runs.
         importer.applyDisplayAdjustments(committed)
-        guard let pipeline else {
-            // Still re-render the panes: without a pipeline they simply clear, but the badge and
-            // the panel state must not disagree with what was actually committed.
+        guard let pipeline, sessionAcceptsDisplay else {
+            // No live display at all (no session, no import): the edit is a persisted preference
+            // for the next render. Still re-render the panes so the panel and the badge agree.
             refreshPreview(force: true)
             return
         }

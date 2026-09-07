@@ -148,6 +148,11 @@ public final class SessionPipeline {
     /// nil in production. Reports watcher frame-processing lifecycle by file name.
     public var frameProcessingProbeForTest: (@Sendable (String, WorkProbeEvent) -> Void)?
 
+    /// False once `end()` has frozen the display. The pipeline object can outlive that — an
+    /// import holds its own through master-writing and replay generation — but `refreshDisplay()`
+    /// is a no-op from then on, so a caller must not report an adjustment as having gone live.
+    public var acceptsDisplayUpdates: Bool { displayRevisionLock.withLock { !displayFinished } }
+
     public func isCurrentDisplay(_ update: DisplayDelivery) -> Bool {
         displayRevisionLock.withLock { update.revision == displayRevision }
     }

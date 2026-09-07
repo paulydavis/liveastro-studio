@@ -19,7 +19,13 @@ struct DisplaySettingsView: View {
         HSplitView {
             // LEFT COLUMN: what the audience sees on top, what you are editing underneath.
             VStack(spacing: 6) {
-                previewPane(model.previewCompareImage, title: "Currently live",
+                // NOT labelled "Currently live". Both panes render from the same downsampled
+                // proxy, and the stretch is derived AFTER the downsample, so each differs from the
+                // broadcast by a measured ~30/255 on real data (see
+                // PreviewDownsampleHonestyTests). What IS faithful is the comparison between the
+                // two panes: same source, same path, only the adjustments differ. The label claims
+                // that and nothing more.
+                previewPane(model.previewCompareImage, title: "Current settings",
                             histogram: model.compareHistogram)
                 previewPane(model.previewImage,
                             title: "Your edit",
@@ -231,7 +237,7 @@ struct DisplaySettingsView: View {
             // framing path (pinned by NorthUpRotationTests.testAutoZoomFramingDimensions), so the
             // suppression outlived its cause and was hiding REAL clipping instead. It also read the
             // PENDING north-up flag for both panes, so an unapplied toggle changed the warning on
-            // "Currently live". Removing it fixes both.
+            // the reference pane. Removing it fixes both.
             let shadowClip = Double(counts.first ?? 0) / Double(total)
             let highlightClip = Double(counts.last ?? 0) / Double(total)
             VStack(spacing: 2) {
@@ -333,12 +339,13 @@ struct DisplaySettingsView: View {
     private var comparisonStatus: String {
         guard model.staged.hasPendingChanges else {
             switch model.liveRejectionStatus {
-            case .active(let subs): return "Clean master over \(subs) subs · move a slider to compare against what is live"
+            case .active(let subs): return "Clean master over \(subs) subs · move a slider to compare against your current settings"
             case .building(let subs): return "Building the clean master over \(subs) subs"
             case .off(let reason): return "Trail rejection off (\(reason))"
             }
         }
-        return "Top: what the broadcast is showing now · Bottom: your pending edit"
+        return "Top: your current committed settings · Bottom: your pending edit · "
+            + "both are downsampled previews, so tones differ slightly from the broadcast"
     }
 
 }

@@ -392,7 +392,7 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
 
     /// The reference pane has its own cache key, and it must include the quality. Without it, the
     /// pane rendered during a drag satisfies the cache permanently: the settled pass that follows
-    /// sees "nothing it depends on changed" and skips it, so "Currently live" stays at draft
+    /// sees "nothing it depends on changed" and skips it, so the reference pane stays at draft
     /// resolution beside a settled "Your edit" — the two panes the operator is comparing are then
     /// not rendered alike, which is the one thing a comparison view must guarantee.
     @MainActor func testTheReferencePaneIsUpgradedToSettledToo() async throws {
