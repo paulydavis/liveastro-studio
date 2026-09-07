@@ -651,7 +651,13 @@ final class AppModel {
     /// matches `settleGeneration` would re-render values the settle is already rendering, at lower
     /// quality — and bumping `previewRenderSeq` would make the settle's result unpublishable, so
     /// the expensive work would be thrown away.
-    private var settledRenderInFlightGeneration: UInt64?
+    /// The settled render currently in flight, identified by its render sequence number as well
+    /// as its settle generation. The token is what makes clearing safe: completions are not
+    /// ordered, so an OLDER settled render finishing while a newer one is still rendering used to
+    /// clear the newer one's protection, after which a queued draft retry could supersede it and
+    /// leave draft pixels on screen. Two forced renders can share a generation, so the generation
+    /// alone cannot identify the owner.
+    private var settledRenderInFlight: (token: Int, generation: UInt64)?
 
     /// Generation of the newest settle that actually PUBLISHED. Without this, a draft retry queued
     /// before a settle could run after it: the in-flight marker is cleared on completion, so the
@@ -689,7 +695,7 @@ final class AppModel {
         // no edit has arrived since (the generation is unchanged), so it would render identical
         // values more cheaply AND invalidate the settle's result through the sequence guard.
         if quality == .draft, isRetry,
-           settledRenderInFlightGeneration == settleGeneration
+           settledRenderInFlight?.generation == settleGeneration
                || lastPublishedSettleGeneration == settleGeneration { return }
         let now = Date()
         if !bypassThrottle {
@@ -726,7 +732,7 @@ final class AppModel {
         }
         draftRendersInFlight += 1
         let dispatchedSettleGeneration = settleGeneration
-        if quality == .settled { settledRenderInFlightGeneration = dispatchedSettleGeneration }
+        if quality == .settled { settledRenderInFlight = (token: seq, generation: dispatchedSettleGeneration) }
         let committed = staged.committed
         // The reference pane is always SHOWN, but only re-rendered when something it depends on
         // has actually moved: the committed adjustments, the source, or the underlying stack.
@@ -754,7 +760,11 @@ final class AppModel {
             }
             await MainActor.run {
                 self.draftRendersInFlight -= 1
-                if quality == .settled { self.settledRenderInFlightGeneration = nil }
+                // Clear ONLY if this render still owns the marker; an out-of-order completion
+                // must not release a newer render's protection.
+                if quality == .settled, self.settledRenderInFlight?.token == seq {
+                    self.settledRenderInFlight = nil
+                }
                 // Only the newest request may publish; a slower earlier render is discarded.
                 let published = seq == self.previewRenderSeq
                 if published {
@@ -818,7 +828,17 @@ final class AppModel {
     func applyAdjustments() {
         let committed = staged.apply()
         saveSettings()
-        guard let pipeline else { return }
+        // An IMPORT owns its own pipeline (ImportController), not `pipeline`, which is nil while
+        // one runs. Apply used to commit the edit, persist it and clear the "Not yet live" badge,
+        // then return at the guard below — so the operator was told the change was live while the
+        // import carried on rendering with the settings it captured when it started.
+        importer.applyDisplayAdjustments(committed)
+        guard let pipeline else {
+            // Still re-render the panes: without a pipeline they simply clear, but the badge and
+            // the panel state must not disagree with what was actually committed.
+            refreshPreview(force: true)
+            return
+        }
         // The pipeline's setter already calls refreshDisplay() for the COMMITTED surfaces
         // (SessionPipeline.swift), so no explicit refresh is needed for those — asking again
         // would bump the revision twice and throw away the render it just scheduled.

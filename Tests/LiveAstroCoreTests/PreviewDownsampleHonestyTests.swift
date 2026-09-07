@@ -21,7 +21,7 @@ final class PreviewDownsampleHonestyTests: XCTestCase {
     /// point. Measured end-to-end on the same real master: 0.10/255 on a 16-sub stack, 1.76/255
     /// on a single (noisiest) sub. So this now asserts the median (which IS preserved) and the
     /// resulting 8-bit output, over a NOISY image where the old assertion would have failed.
-    func testDownsamplePreservesTheRenderedResultNotTheRawStatistics() {
+    func testDownsampleRenderedResultGapIsCharacterised() {
         // A fixture whose MADN is NOISE-dominated, like a real sub. Starting from starField was
         // wrong: its 0.02 background GRADIENT dominates MADN and survives averaging exactly, so
         // MADN came out bit-identical and the test proved nothing. Real single-sub M51 data
@@ -62,24 +62,75 @@ final class PreviewDownsampleHonestyTests: XCTestCase {
                           "averaging destroys pixel noise, so proxy MADN is EXPECTED to fall — the "
                           + "old assertion that it survives within 2% was true only of a smooth fixture")
 
-        // What must hold is the rendered result. Compare the 8-bit shadow/midtone output the two
-        // derived transforms produce across the tonal range the operator actually sees.
-        func out8(_ v: Double, _ med: Double, _ madn: Double) -> Double {
-            let shadow = min(max(med - 2.8 * madn, 0), 1)
-            let x = min(max((v - shadow) / max(1 - shadow, 1e-9), 0), 1)
-            let m = 0.25
-            return 255 * ((m - 1) * x) / (((2 * m - 1) * x) - m)
+        // What must hold is the RENDERED RESULT, produced by the production renderer.
+        //
+        // This previously modelled the stretch inline and passed 0.25 as the midtone. 0.25 is
+        // `targetBackground`, the value the midtone is SOLVED for, not the midtone itself
+        // (`AutoStretch.stretch` computes `midtone = mtf(r, targetBackground)`), so the comparison
+        // exercised a transform production never applies. It now runs `AutoStretch.stretch` on
+        // both paths and compares them at a common resolution: the preview stretches a downsample,
+        // the broadcast stretches full-res and is displayed scaled down.
+        let previewPath = AutoStretch.stretch(proxy)
+        let broadcastPath = AutoStretch.stretch(img).downsampled(maxLongEdge: SessionPipeline.previewLongEdge)
+        XCTAssertEqual(previewPath.width, broadcastPath.width)
+        XCTAssertEqual(previewPath.height, broadcastPath.height)
+
+        var diffs = [Double](repeating: 0, count: previewPath.pixels.count)
+        for i in 0..<previewPath.pixels.count {
+            diffs[i] = abs(Double(previewPath.pixels[i]) - Double(broadcastPath.pixels[i])) * 255
         }
-        var worst = 0.0
+        diffs.sort()
+        let median = diffs[diffs.count / 2]
+        let p999 = diffs[min(diffs.count - 1, (diffs.count * 999) / 1000)]
+        let worst = diffs.last ?? 0
+        print(String(format: "PREVIEW-FIDELITY median %.3f/255  p99.9 %.3f/255  max %.3f/255",
+                     median, p999, worst))
+        // Isolate the property the preview DESIGN rests on: the transform derived from the proxy's
+        // statistics against the one derived from the full image's, applied to the same values.
+        // Uses production's own `AutoStretch.mtf` and mirrors its derivation exactly, including
+        // solving the midtone — the previous version passed `targetBackground` (0.25) where the
+        // midtone belongs, so it compared a transform production never applies.
+        func derivedTransform(_ v: Double, median: Double, madn: Double) -> Double {
+            let shadow = min(max(median - 2.8 * madn, 0), 1)
+            let denom = max(1 - shadow, 1e-9)
+            let r = min(max((median - shadow) / denom, 1e-9), 1)
+            let midtone = AutoStretch.mtf(r, 0.25)
+            let x = min(max((v - shadow) / denom, 0), 1)
+            return 255 * AutoStretch.mtf(x, midtone)
+        }
+        var worstTransform = 0.0
         for step in 0...12 {
             let v = mFull * (0.5 + 3.5 * Double(step) / 12)
-            worst = max(worst, abs(out8(v, mFull, dFull) - out8(v, mProxy, dProxy)))
+            worstTransform = max(worstTransform,
+                                 abs(derivedTransform(v, median: mFull, madn: dFull)
+                                     - derivedTransform(v, median: mProxy, madn: dProxy)))
         }
-        XCTAssertLessThan(worst, 4.0,
-                          "the preview's derived stretch must render within ~4/255 of the broadcast's; "
-                          + "measured 0.10/255 on a real 16-sub master and 1.76/255 on a single sub")
-    }
+        print(String(format: "PREVIEW-FIDELITY derived-transform worst %.3f/255", worstTransform))
 
+        // CHARACTERISATION, NOT A FIDELITY GUARANTEE. This test used to assert the two paths agree
+        // within 4/255, on the strength of a model that passed `targetBackground` where the midtone
+        // belongs. With the midtone solved the way production solves it, they do NOT agree: 42/255
+        // worst on this deliberately noisy fixture, and 30.6/255 measured on Paul's real 16-sub
+        // M51 master. The quoted "0.10/255 on a 16-sub master, 1.76/255 on a single sub" came from
+        // the same broken model and are void.
+        //
+        // The mechanism is the one the black point fix turned to advantage: downsampling halves
+        // MADN (52% retained on the real master), which moves the shadow point slightly, which
+        // moves `r`, and the midtone is SOLVED from `r` — so a small shadow change is amplified
+        // into a visibly different curve.
+        //
+        // These bounds are regression guards against the gap WIDENING, not evidence that the
+        // preview matches the broadcast. They should be tightened, and this comment deleted, if
+        // the preview is changed to derive its statistics from the full-resolution image.
+        XCTAssertLessThan(worstTransform, 60.0,
+                          "the preview/broadcast stretch gap widened beyond the known 42/255")
+        XCTAssertLessThan(p999, 55.0,
+                          "the end-to-end preview/broadcast difference widened beyond the known "
+                          + "40/255 (p99.9); this includes the inherent stretch-then-average vs "
+                          + "average-then-stretch gap as well as the derived-transform difference")
+        XCTAssertLessThan(median, 12.0,
+                          "the BACKGROUND difference widened beyond the known ~7/255")
+    }
     /// Sentinel against the planar/interleaved confusion that produced the earlier draft of
     /// this plan: give each channel a distinct constant and prove the planes stay separate and
     /// keep their values through the downsample. Interleaved indexing anywhere in the chain

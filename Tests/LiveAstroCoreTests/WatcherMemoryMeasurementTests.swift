@@ -427,15 +427,20 @@ final class WatcherMemoryMeasurementTests: XCTestCase {
                              "in watcher mode (lastPreviewLinear / displayOnline)")
         XCTAssertGreaterThanOrEqual(peakDeltaMB, steadyDeltaMB - 5,
                                     "peak-during-overlap must be at least the steady-state retention")
-        // The regression this test actually guards: raw RSS here runs far above one frame's
-        // byte count because macOS/libmalloc keeps large freed allocations resident (arena
-        // growth) rather than decommitting them — NOT because copies pile up per frame. A real
-        // per-frame leak (e.g. lastPreviewLinear/displayOnline diverging into two independently-
-        // retained full-res buffers instead of sharing one via COW) would cost roughly one more
-        // `frameMB` of RSS on EVERY additional frame; allocator-retention plateaus instead.
+        // The regression this test guards: raw RSS here runs far above one frame's byte count
+        // because macOS/libmalloc keeps large freed allocations resident (arena growth) rather
+        // than decommitting them — NOT because copies pile up per frame. Retention that GROWS by
+        // about `frameMB` on every additional frame is the shape of an unbounded per-frame leak;
+        // allocator retention plateaus instead.
+        //
+        // SCOPE, stated precisely because the previous wording overclaimed: this measures
+        // incremental resident growth per frame cycle. It CANNOT prove that lastPreviewLinear and
+        // displayOnline share one buffer — two independent buffers that are both REPLACED each
+        // frame plateau exactly the same way. Distinguishing shared ownership from
+        // replaced-in-place would need allocation-level evidence (a heap tool, or an identity
+        // check on the underlying storage), which this does not attempt.
         XCTAssertLessThan(settledAfterFrame3MB - settledAfterFrame2MB, frameMB,
                           "one further full-resolution frame cycle must not cost another whole " +
-                          "frame's worth of RSS — that pattern would indicate lastPreviewLinear " +
-                          "and displayOnline had stopped sharing one COW buffer")
+                          "frame's worth of RSS — that pattern is unbounded per-frame retention")
     }
 }

@@ -35,6 +35,14 @@ final class ImportController {
 
     /// The active one-shot import pipeline (nil unless an import is draining).
     private var importPipeline: SessionPipeline?
+
+    /// Routes committed display adjustments to a running import. The import captures the
+    /// adjustments once, when it starts (`importPipeline.displayAdjustments` below), so without
+    /// this an Apply during an import changed nothing that the operator could see.
+    /// No-op when no import is running.
+    func applyDisplayAdjustments(_ adjustments: DisplayAdjustments) {
+        importPipeline?.displayAdjustments = adjustments
+    }
     private var importPrepareGeneration = 0
     private var importPrepareInFlight = false
 
