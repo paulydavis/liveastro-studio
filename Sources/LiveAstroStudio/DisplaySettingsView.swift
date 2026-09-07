@@ -4,6 +4,13 @@ struct DisplaySettingsView: View {
     @Bindable var model: AppModel
 
     @State private var windowHeight: CGFloat = 800
+    /// Zoom and pan are SHARED by both panes: they exist to be compared, and independent
+    /// viewports would defeat that — you would be looking at different parts of the sky.
+    /// Widening the column cannot help on its own; two stacked panes are height-constrained, so
+    /// the only way to see detail is to magnify.
+    @State private var zoom: CGFloat = 1
+    @State private var pan: CGSize = .zero
+    @State private var panAnchor: CGSize = .zero
 
     var body: some View {
         // HSplitView rather than a fixed HStack: how much room the pictures deserve depends on
@@ -18,7 +25,18 @@ struct DisplaySettingsView: View {
                             title: "Your edit",
                             badge: model.staged.hasPendingChanges ? "Not yet live" : nil,
                             histogram: model.previewHistogram)
-                HStack {
+                HStack(spacing: 8) {
+                    Text("Zoom").font(.caption).foregroundStyle(.secondary)
+                    Slider(value: $zoom, in: 1...6)
+                        .frame(width: 150)
+                        .onChange(of: zoom) { _, z in
+                            if z <= 1.001 { pan = .zero; panAnchor = .zero }   // fit resets the pan
+                        }
+                    Text(zoom <= 1.001 ? "fit" : String(format: "%.1fx", zoom))
+                        .font(.caption).monospacedDigit().frame(width: 34, alignment: .leading)
+                    Button("Reset") { zoom = 1; pan = .zero; panAnchor = .zero }
+                        .disabled(zoom <= 1.001 && pan == .zero)
+                    Spacer()
                     Button("Revert") { model.revertAdjustments() }
                         .disabled(!model.staged.hasPendingChanges)
                     Button("Apply") { model.applyAdjustments() }
@@ -261,7 +279,19 @@ struct DisplaySettingsView: View {
                 if let image {
                     Image(decorative: image, scale: 1)
                         .resizable().aspectRatio(contentMode: .fit)
+                        .scaleEffect(zoom)
+                        .offset(x: pan.width, y: pan.height)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .clipped()
+                        .gesture(
+                            DragGesture()
+                                .onChanged { v in
+                                    guard zoom > 1 else { return }
+                                    pan = CGSize(width: panAnchor.width + v.translation.width,
+                                                 height: panAnchor.height + v.translation.height)
+                                }
+                                .onEnded { _ in panAnchor = pan }
+                        )
                 } else {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(.quaternary)
