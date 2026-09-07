@@ -141,44 +141,122 @@ final class WatcherMemoryMeasurementTests: XCTestCase {
             pollingDone.fulfill()
         }
 
+        // A window with a start and an end, so the test can PROVE the three operations overlapped
+        // instead of assuming that dispatching them together was enough. A peak-RSS-under-overlap
+        // measurement taken while the operations actually ran one after another measures nothing.
+        final class Span: @unchecked Sendable {
+            private let lock = NSLock()
+            private var began: Date?
+            private var ended: Date?
+            let name: String
+            init(_ name: String) { self.name = name }
+            func open() { lock.lock(); if began == nil { began = Date() }; lock.unlock() }
+            // First completion wins. Later deliveries for the same operation would otherwise
+            // stretch the window and overstate the overlap.
+            func close() { lock.lock(); if ended == nil { ended = Date() }; lock.unlock() }
+            var window: (start: Date, end: Date)? {
+                lock.lock(); defer { lock.unlock() }
+                guard let began, let ended else { return nil }
+                return (began, ended)
+            }
+        }
+        let frameSpan = Span("frame"), draftSpan = Span("draft"), applySpan = Span("apply")
+
         let frame2 = expectation(description: "frame 2 processed")
-        pipeline.onUpdate = { _, _ in print("PIPELOG \(Date()): frame2 onUpdate fired"); frame2.fulfill() }
+        pipeline.onUpdate = { _, _ in
+            print("PIPELOG \(Date()): frame2 onUpdate fired")
+            frameSpan.close(); frame2.fulfill()
+        }
 
         let draftDone = expectation(description: "draft render finished")
         let applyRevisionDelivered = expectation(description: "Apply's revision delivered")
+        applyRevisionDelivered.assertForOverFulfill = false
 
-        let revisionBeforeApply = currentDisplayRevision(pipeline) ?? 0
-        let expectedApplyRevision = revisionBeforeApply + 1
+        // DELIVERY, not scheduling. `refreshDisplay()` bumps `displayRevision` BEFORE it dispatches
+        // the render, so observing the revision only proves the work was REQUESTED. `onDisplayUpdate`
+        // fires from `deliverDisplay`, past the `isCurrentDisplay` guard, so it is the real
+        // completion signal. The comparison is `>=`, never `==`: revisions are monotonic and a
+        // newer one supersedes the render in flight, so an exact-equality wait can miss its target
+        // and spin until the enclosing timeout — reporting a timeout for work that did complete.
+        let applyLock = NSLock()
+        var applyRevision: UInt64?
+        var lastDelivered: UInt64 = 0
+        pipeline.onDisplayUpdate = { update in
+            applyLock.lock()
+            lastDelivered = max(lastDelivered, update.revision)
+            let reached = applyRevision.map { update.revision >= $0 } ?? false
+            applyLock.unlock()
+            if reached {
+                print("PIPELOG \(Date()): delivered revision \(update.revision) >= Apply's")
+                applySpan.close(); applyRevisionDelivered.fulfill()
+            }
+        }
 
         print("PIPELOG \(Date()): === overlap window opens ===")
+        // Start barrier: every operation blocks here, so they begin within microseconds of each
+        // other rather than in dispatch order.
+        let releaseAll = DispatchSemaphore(value: 0)
+
         print("PIPELOG \(Date()): draft render dispatching")
         DispatchQueue.global().async {
+            releaseAll.wait()
+            draftSpan.open()
             print("PIPELOG \(Date()): draft render EXECUTING (synchronous call starts)")
             _ = pipeline.renderPreview(source: .online, adjustments: DisplayAdjustments(blackPoint: 0.02))
             print("PIPELOG \(Date()): draft render EXECUTING finished (synchronous call returns)")
-            draftDone.fulfill()
+            draftSpan.close(); draftDone.fulfill()
         }
         print("PIPELOG \(Date()): apply dispatching")
         DispatchQueue.global().async {
+            releaseAll.wait()
+            applySpan.open()
             print("PIPELOG \(Date()): apply setter call starting")
             var adjustments = DisplayAdjustments.neutral
             adjustments.midtoneStrength = 0.15
             pipeline.displayAdjustments = adjustments   // "Apply" — schedules refreshDisplay() async
-            print("PIPELOG \(Date()): apply setter call returned (async transition now in flight)")
+            // The setter has returned, so refreshDisplay() has already claimed its revision. Read it
+            // HERE, after the mutation, so the wait cannot be satisfied by a delivery that predates
+            // the Apply (frame 2 also bumps the revision, concurrently).
+            let claimed = self.currentDisplayRevision(pipeline) ?? 0
+            applyLock.lock()
+            applyRevision = claimed
+            let alreadyDelivered = lastDelivered >= claimed
+            applyLock.unlock()
+            print("PIPELOG \(Date()): apply setter returned; its revision is \(claimed)")
+            // Delivery can beat this assignment; without the re-check the signal would be missed.
+            if alreadyDelivered { applySpan.close(); applyRevisionDelivered.fulfill() }
         }
-        print("PIPELOG \(Date()): frame 2 write starting (pre-built Data, fast)")
-        try frame2Data.write(to: liveStackURL)   // frame delivery begins
-        print("PIPELOG \(Date()): frame 2 write returned — watcher can now detect it")
-
-        // Confirm Apply's transition actually delivered (bounded end-signal for its async work).
         DispatchQueue.global().async {
-            while self.currentDisplayRevision(pipeline) != expectedApplyRevision { usleep(2_000) }
-            print("PIPELOG \(Date()): Apply's revision \(expectedApplyRevision) confirmed delivered")
-            applyRevisionDelivered.fulfill()
+            releaseAll.wait()
+            frameSpan.open()
+            print("PIPELOG \(Date()): frame 2 write starting (pre-built Data, fast)")
+            try? frame2Data.write(to: liveStackURL)   // frame delivery begins
+            print("PIPELOG \(Date()): frame 2 write returned — watcher can now detect it")
         }
+        releaseAll.signal(); releaseAll.signal(); releaseAll.signal()
 
         wait(for: [frame2, draftDone, applyRevisionDelivered], timeout: 90)
         print("PIPELOG \(Date()): === all three operations confirmed resolved ===")
+
+        // The measurement below is only meaningful if the windows genuinely intersected. Report it
+        // rather than asserting: this is a measurement test, and a machine that serialises the work
+        // should say so plainly instead of failing as though the pipeline regressed.
+        let spans = [frameSpan, draftSpan, applySpan].compactMap { s -> (String, Date, Date)? in
+            s.window.map { (s.name, $0.start, $0.end) }
+        }
+        if spans.count == 3 {
+            let latestStart = spans.map(\.1).max()!
+            let earliestEnd = spans.map(\.2).min()!
+            let overlap = earliestEnd.timeIntervalSince(latestStart)
+            for (name, a, b) in spans {
+                print(String(format: "PIPELOG span %@: %.3f s", name, b.timeIntervalSince(a)))
+            }
+            print(String(format: "PIPELOG three-way overlap: %.3f s", overlap))
+            if overlap <= 0 {
+                print("PIPELOG WARNING: the operations did NOT all overlap — the peak below is "
+                      + "not a concurrency measurement on this run.")
+            }
+        }
         Thread.sleep(forTimeInterval: 0.3)   // let any just-finished renders' transient buffers drain
         stopPolling.set()
         wait(for: [pollingDone], timeout: 5)
