@@ -205,6 +205,10 @@ final class AppModel {
     /// (It previously showed the un-rejected master, comparing rejection instead of the edit.
     /// That answered a different question, and answered it badly: the two masters differ over
     /// 0.13% of the frame, so both panes looked identical while both moved together.)
+    /// The reference pane. This is the DELIVERED BROADCAST IMAGE itself, not a re-render of the
+    /// same source through the preview path — so the pane labelled as what is live genuinely is
+    /// what is live, at the resolution and through the exact render the audience received. It also
+    /// removes a whole render from every preview refresh.
     var previewCompareImage: CGImage?
 
     /// Luminance histograms of the two panes, computed from the rendered images. Shown under each
@@ -218,12 +222,10 @@ final class AppModel {
     /// COMMITTED adjustments and the source — never on the pending edit — so re-rendering it on
     /// every slider tick doubled the work of a drag (two renders and two histograms per tick)
     /// to produce an identical image. Dragging felt slow because half the work was wasted.
-    /// Includes `quality`: without it a reference pane rendered during a drag (draft) satisfies
-    /// the cache forever, and the settled pass that follows never upgrades it.
-    private var compareRenderKey: (adjustments: DisplayAdjustments,
-                                   source: SessionPipeline.PreviewSource,
-                                   revision: UInt64,
-                                   quality: SessionPipeline.PreviewQuality)?
+    /// True when the last published preview could not reuse the broadcast's stretch statistics
+    /// and derived its own instead. Surfaced in the panel: a preview that renders a different
+    /// curve than the broadcast must not be presented as though it matches.
+    var previewIsApproximate = false
 
     /// Red night-vision tint of the *whole Mac display* (not just the astro image).
     /// In-memory only — defaults off each launch so the app never opens unexpectedly red.
@@ -613,7 +615,7 @@ final class AppModel {
         previewCompareImage = nil
         previewHistogram = []
         compareHistogram = []
-        compareRenderKey = nil
+        previewIsApproximate = false
     }
 
     /// Called when a slider changes: re-render the PREVIEW only. Nothing reaches the pipeline
@@ -733,30 +735,19 @@ final class AppModel {
         draftRendersInFlight += 1
         let dispatchedSettleGeneration = settleGeneration
         if quality == .settled { settledRenderInFlight = (token: seq, generation: dispatchedSettleGeneration) }
-        let committed = staged.committed
-        // The reference pane is always SHOWN, but only re-rendered when something it depends on
-        // has actually moved: the committed adjustments, the source, or the underlying stack.
-        let stackRevision = pipeline.currentDisplayRevision
-        let needsCompare = compareRenderKey.map {
-            $0.adjustments != committed || $0.source != source || $0.revision != stackRevision
-                || $0.quality != quality
-        } ?? true
-        let wantsCompare = needsCompare || previewCompareImage == nil
         Task.detached { [weak self] in
             guard let self else { return }
             let cg: CGImage?
-            let compare: CGImage?
+            var approximate = false
             if let renderOverride {
                 cg = await renderOverride(pipeline, source, adj, quality)
-                compare = wantsCompare ? await renderOverride(pipeline, source, committed, quality) : nil
             } else {
-                cg = pipeline.renderPreview(source: source, adjustments: adj, quality: quality)
-                // The side-by-side counterpart. Only rendered when a clean master is being served;
-                // otherwise there is nothing to compare the online stack against and the panel
-                // shows a single image.
-                compare = wantsCompare
-                    ? pipeline.renderPreview(source: source, adjustments: committed, quality: quality)
-                    : nil
+                let result = pipeline.renderPreviewDetailed(source: source, adjustments: adj,
+                                                            quality: quality)
+                cg = result.image
+                // False means the stretch was derived from the downsample instead of reusing the
+                // broadcast's, which renders a measurably different curve. The panel says so.
+                approximate = !result.usedFullResolutionStatistics
             }
             await MainActor.run {
                 self.draftRendersInFlight -= 1
@@ -774,13 +765,7 @@ final class AppModel {
                     if quality == .settled { self.lastPublishedSettleGeneration = dispatchedSettleGeneration }
                     self.previewImage = cg
                     self.previewHistogram = cg.map { DisplayHistogram.of($0) } ?? []
-                    // Keep the previous reference image and histogram when nothing it depends on
-                    // changed — recomputing them would produce the same pixels at real cost.
-                    if wantsCompare {
-                        self.previewCompareImage = compare
-                        self.compareHistogram = compare.map { DisplayHistogram.of($0) } ?? []
-                        self.compareRenderKey = (committed, source, stackRevision, quality)
-                    }
+                    self.previewIsApproximate = approximate
                 }
                 self.previewRenderCompletionForTest?(seq, published)
             }
@@ -1291,6 +1276,9 @@ final class AppModel {
                       self.displayPresentation.accept(update, sessionID: sessionID) else { return }
                 self.latestImage = update.previewImage
                 self.broadcastImage = update.broadcastImage
+                // The reference pane and its histogram follow the delivered broadcast directly.
+                self.previewCompareImage = update.broadcastImage
+                self.compareHistogram = update.broadcastImage.map { DisplayHistogram.of($0) } ?? []
                 self.displayedCleanMasterSubCount = update.cleanMasterSubCount
                 self.displayedIntegrationSeconds = update.integrationSeconds
                 self.displayedPreviewIntegrationSeconds = update.previewIntegrationSeconds
@@ -1669,6 +1657,8 @@ final class AppModel {
             displayPresentation.begin(sessionID: UUID())
             latestImage = cg
             broadcastImage = cg
+            previewCompareImage = cg
+            compareHistogram = DisplayHistogram.of(cg)
             displayedCleanMasterSubCount = nil
             displayedIntegrationSeconds = Double(report.stackedCount) * sessionSubExposureSeconds
             displayedPreviewIntegrationSeconds = displayedIntegrationSeconds

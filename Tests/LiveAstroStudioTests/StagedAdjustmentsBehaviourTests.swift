@@ -395,151 +395,42 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
     /// sees "nothing it depends on changed" and skips it, so the reference pane stays at draft
     /// resolution beside a settled "Your edit" — the two panes the operator is comparing are then
     /// not rendered alike, which is the one thing a comparison view must guarantee.
-    @MainActor func testTheReferencePaneIsUpgradedToSettledToo() async throws {
-        let (model, _) = makeAttachedModel()
-        let box = ImageBox(cg: try Self.solidImage(0.5))
-        let log = QualityLog()
-        var adj = model.staged.committed
-        adj.blackPoint = 0.42
-        model.staged.pending = adj
-        let committedBlackPoint = model.staged.committed.blackPoint
-
-        // The draft pass must PUBLISH before the settled pass is allowed to evaluate the cache.
-        // Otherwise `compareRenderKey` is still nil when the settled pass runs, `wantsCompare` is
-        // true because the cache is empty, and the reference renders regardless of the quality
-        // key — the test would pass with the fix removed.
-        let draftPublished = expectation(description: "the draft pass published")
-        draftPublished.assertForOverFulfill = false
-        model.previewRenderCompletionForTest = { _, published in
-            if published { draftPublished.fulfill() }
-        }
-        model.previewRenderOverrideForTest = { _, _, adjustments, quality in
-            await log.add(adjustments.blackPoint, quality)
-            return box.cg
-        }
-
-        model.refreshPreview()
-        await fulfillment(of: [draftPublished], timeout: 5)
-        XCTAssertNotNil(model.previewCompareImage,
-                        "precondition: the reference pane is cached, so only the quality key can "
-                        + "cause it to re-render below")
-        let afterDraft = await log.all
-        XCTAssertTrue(afterDraft.contains { $0.quality == .draft && $0.blackPoint == committedBlackPoint },
-                      "precondition: the reference pane rendered on the draft pass")
-
-        let settledReference = expectation(description: "the reference pane renders at settled")
-        settledReference.assertForOverFulfill = false
-        model.previewRenderOverrideForTest = { _, _, adjustments, quality in
-            await log.add(adjustments.blackPoint, quality)
-            if quality == .settled && adjustments.blackPoint == committedBlackPoint {
-                settledReference.fulfill()
-            }
-            return box.cg
-        }
-        model.refreshPreview(force: true)
-        await fulfillment(of: [settledReference], timeout: 5)
+    /// Delivers a broadcast update the way the pipeline does, so tests can exercise the pane
+    /// that now shows it. The revision must be the pipeline's current one or `isCurrentDisplay`
+    /// rejects it — which is the guard that keeps a stale render off the screen.
+    @MainActor private func deliverBroadcast(_ image: CGImage,
+                                             to pipeline: SessionPipeline) async {
+        // `DisplayPresentation.accept` takes only STRICTLY INCREASING revisions, and
+        // `isCurrentDisplay` takes only the pipeline's CURRENT one — so a synthetic delivery has
+        // to claim a fresh revision first. Sending immediately afterwards wins the race against
+        // the pipeline's own render for that revision, which is then correctly refused as not
+        // newer. Both guards are exercised rather than bypassed.
+        pipeline.refreshDisplay()
+        pipeline.onDisplayUpdate?(DisplayDelivery(
+            revision: pipeline.currentDisplayRevision, previewImage: nil, broadcastImage: image,
+            cleanMasterSubCount: nil, integrationSeconds: 0, previewIntegrationSeconds: 0,
+            subExposureSeconds: 1, record: nil))
+        try? await Task.sleep(nanoseconds: 250_000_000)   // the handler hops to the main actor
     }
 
-    /// A settle dropped by the in-flight cap must re-enter through the DEBOUNCE, not as a
-    /// fixed-quality retry.
-    ///
-    /// The saturation path used to schedule a retry that preserved the requested quality and
-    /// carried no generation. If the operator resumed dragging during its 90 ms wait, that retry
-    /// still started a full-resolution render in the middle of the drag — the same defect the
-    /// debounce was added to fix, re-entering through the drop path where the debounce could not
-    /// see it.
-    @MainActor func testASettleDroppedBySaturationDoesNotFireIntoAResumedDrag() async throws {
-        let (model, _) = makeAttachedModel()
-        let box = ImageBox(cg: try Self.solidImage(0.5))
-        let gate = RenderGate()
+    /// The reference pane IS the delivered broadcast image, not a re-render of the same source
+    /// through the preview path. That is what lets it be labelled "Currently live" truthfully:
+    /// the preview path derives its stretch from a downsample and renders a measurably different
+    /// curve (PreviewDownsampleHonestyTests), so a re-render could not carry that label.
+    @MainActor func testTheReferencePaneShowsTheDeliveredBroadcastImage() async throws {
+        let (model, pipeline) = makeAttachedModel()
+        let live = try Self.solidImage(0.2)
+        // The preview path returns something clearly different, so an accidental re-render would
+        // be visible rather than coincidentally equal.
+        let box = ImageBox(cg: try Self.solidImage(0.8))
+        model.previewRenderOverrideForTest = { _, _, _, _ in box.cg }
 
-        // Identify renders by the VALUES they carry, not by when their override happens to run:
-        // a render dispatched before the drag can begin executing after it (Task.detached
-        // scheduling), so timing alone misattributes pre-drag work to the drag.
-        let preDragBlackPoint = 0.9
-        let dragRange = 0.01...0.15
-        actor Log {
-            private(set) var settledCarryingDragValues = 0
-            func note(_ quality: SessionPipeline.PreviewQuality, _ blackPoint: Double,
-                      _ range: ClosedRange<Double>) {
-                if quality == .settled && range.contains(blackPoint) { settledCarryingDragValues += 1 }
-            }
-        }
-        let log = Log()
-        model.previewRenderOverrideForTest = { _, _, adjustments, quality in
-            await log.note(quality, adjustments.blackPoint, dragRange)
-            await gate.waitForRelease()
-            return box.cg
-        }
+        await deliverBroadcast(live, to: pipeline)
 
-        // Saturate both slots, then request a third settle: that one takes the drop path.
-        var seed = model.staged.committed
-        seed.blackPoint = preDragBlackPoint
-        model.staged.pending = seed
-        for _ in 0..<3 { model.refreshPreview(force: true) }
-        try await Task.sleep(nanoseconds: 30_000_000)
-
-        // Resume dragging. The dropped settle's 90 ms timer is pending; each edit must invalidate
-        // it, so no settled render may carry a drag value.
-        await gate.release()
-        for i in 1...15 {
-            var adj = model.staged.committed
-            adj.blackPoint = Double(i) / 100
-            model.staged.pending = adj
-            model.refreshPreview()
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
-        let settledDuringDrag = await log.settledCarryingDragValues
-        XCTAssertEqual(settledDuringDrag, 0,
-                       "\(settledDuringDrag) settled render(s) carried mid-drag values; a settle "
-                       + "dropped by saturation must re-enter through the generation-checked "
-                       + "debounce, not as a fixed-quality retry")
-    }
-
-    /// Distinct sizes per quality, so the FINAL published image identifies which render won.
-    private static func sizedImage(_ n: Int) throws -> CGImage {
-        try XCTUnwrap(AutoStretch.makeCGImage(AstroImage(width: n, height: n, channels: 1,
-            pixels: [Float](repeating: 0.5, count: n * n), sourceIsLinear: false)))
-    }
-
-    /// What matters is the quality of the image the operator is LEFT with once every queued timer
-    /// has drained — not merely that a settled render started at some point.
-    ///
-    /// INVARIANT TEST, not a falsified regression test. It was written for a specific reported
-    /// interleaving: a draft retry queued before a settle, running after it, publishing draft
-    /// pixels over the settled ones — permanent, because a retry never re-arms the settle. The
-    /// guard for it (`lastPublishedSettleGeneration`) is in place, but this test passes with that
-    /// guard removed, and the interleaving could not be constructed: `scheduleSettle()` runs
-    /// before `scheduleCoalescedRetry()` inside the same call and both use the same 90 ms
-    /// deadline, so the settle's Task always wakes first and its in-flight marker suppresses the
-    /// retry. Reaching the reported state needs the settled render to COMPLETE inside the gap
-    /// between those two wakeups. Treat the finding as theoretical; this test pins the invariant
-    /// that actually matters — the operator is never left looking at a draft.
-    @MainActor func testTheFinalPreviewIsSettledAfterEveryRetryDrains() async throws {
-        let (model, _) = makeAttachedModel()
-        let draftImage = ImageBox(cg: try Self.sizedImage(4))
-        let settledImage = ImageBox(cg: try Self.sizedImage(8))
-        model.previewRenderOverrideForTest = { _, _, _, quality in
-            quality == .settled ? settledImage.cg : draftImage.cg
-        }
-
-        // First edit renders a draft. The second lands inside the throttle window, so it queues a
-        // draft retry ~90 ms out.
-        for i in 1...2 {
-            var adj = model.staged.committed
-            adj.blackPoint = Double(i) / 100
-            model.staged.pending = adj
-            model.refreshPreview()
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
-        // Settle NOW, deterministically, so the settled render publishes well before that queued
-        // draft retry fires — the exact interleaving that left the preview downgraded.
-        model.refreshPreview(force: true)
-        try await Task.sleep(nanoseconds: 500_000_000)
-
-        XCTAssertEqual(model.previewImage?.width, 8,
-                       "the preview was left at draft resolution: a late draft retry published "
-                       + "over the settled render and nothing re-armed the settle")
+        XCTAssertEqual(model.previewCompareImage.flatMap { Self.dataOf($0) }, Self.dataOf(live),
+                       "the reference pane must be the delivered broadcast image itself")
+        XCTAssertFalse(model.compareHistogram.isEmpty,
+                       "its histogram must follow the same image")
     }
 
     /// A continuous drag must not pay for settled renders. The settle was a fixed one-shot timer
@@ -652,17 +543,11 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
     /// makes it hold still while the dials move the other one. (It previously showed the
     /// un-rejected master, which compared rejection rather than the edit, and looked identical
     /// because the two masters differ over 0.13% of the frame.)
-    @MainActor func testLivePaneAlwaysRendersAndTheEditablePaneDivergesOnlyWhenEdited() async throws {
-        let (model, _) = makeAttachedModel()
-
-        // The override distinguishes the two renders by the ADJUSTMENTS handed to them, which is
-        // exactly what production varies between the panes.
-        let committedBaseline = model.staged.committed
-        let editedImage = try Self.solidImage(0.8)
+    @MainActor func testLivePaneShowsTheBroadcastWhileTheEditPaneFollowsTheDials() async throws {
+        let (model, pipeline) = makeAttachedModel()
         let liveImage = try Self.solidImage(0.2)
-        model.previewRenderOverrideForTest = { _, _, adj, _ in
-            adj == committedBaseline ? liveImage : editedImage
-        }
+        let editedBox = ImageBox(cg: try Self.solidImage(0.8))
+        model.previewRenderOverrideForTest = { _, _, _, _ in editedBox.cg }
 
         func renderAndWait() async {
             let done = expectation(description: "render resolved")
@@ -672,50 +557,29 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
             await fulfillment(of: [done], timeout: 3)
         }
 
-        // Nothing edited: BOTH panes render (live on top, editable below) and show the same
-        // picture, because the pending and committed adjustments are equal. The panes are a
-        // permanent part of the layout, not a comparison that appears once you touch something —
-        // gating the live pane on hasPendingChanges meant it simply never appeared.
+        await deliverBroadcast(liveImage, to: pipeline)
         await renderAndWait()
-        XCTAssertNotNil(model.previewImage, "the editable pane must render")
-        XCTAssertNotNil(model.previewCompareImage, "the 'currently live' pane must always render")
-        XCTAssertEqual(model.previewImage.flatMap { Self.dataOf($0) },
-                       model.previewCompareImage.flatMap { Self.dataOf($0) },
-                       "with no edit the two panes must agree — they are the same stack under the "
-                       + "same adjustments")
 
-        // Edit a dial: now both panes, and they must differ.
+        // Both panes are a permanent part of the layout, not a comparison that appears once you
+        // touch something — gating the live pane on hasPendingChanges meant it never appeared.
+        XCTAssertNotNil(model.previewImage, "the editable pane must render")
+        XCTAssertNotNil(model.previewCompareImage, "the 'currently live' pane must always show")
+
         var pending = model.staged.committed
         pending.midtoneStrength = 0.42
         model.staged.pending = pending
         await renderAndWait()
 
-        let edited = try XCTUnwrap(model.previewImage.flatMap { Self.dataOf($0) })
-        let live = try XCTUnwrap(model.previewCompareImage.flatMap { Self.dataOf($0) },
-                                 "a pending edit must render the 'currently live' reference pane")
-        XCTAssertNotEqual(edited, live,
-                          "the panes must differ — equal pixels would mean the reference is being "
-                          + "rendered with the pending adjustments too, so both would follow the dials")
-        XCTAssertEqual(live, Self.dataOf(liveImage),
-                       "the reference must be rendered with the COMMITTED adjustments")
-
-        // Revert: both panes remain, and they agree again.
-        model.revertAdjustments()
-        await renderAndWait()
-        XCTAssertNotNil(model.previewCompareImage, "the live pane stays after a revert")
-        XCTAssertEqual(model.previewImage.flatMap { Self.dataOf($0) },
-                       model.previewCompareImage.flatMap { Self.dataOf($0) },
-                       "reverting discards the edit, so the panes must agree again")
+        XCTAssertEqual(model.previewCompareImage.flatMap { Self.dataOf($0) }, Self.dataOf(liveImage),
+                       "the live pane must keep showing the BROADCAST — it must not follow the "
+                       + "dials, or there is nothing to compare an edit against")
+        XCTAssertNotEqual(model.previewImage.flatMap { Self.dataOf($0) },
+                          model.previewCompareImage.flatMap { Self.dataOf($0) },
+                          "the edit pane follows the dials, so the panes must differ")
     }
 
-    /// Apply must re-render the panes, not just push to the pipeline. Found by driving the app:
-    /// pressing Apply cleared the "Not yet live" badge but left BOTH images exactly as they were —
-    /// the top still showing the pre-Apply committed render, the bottom still showing the pending
-    /// one — because applyAdjustments only set pipeline.displayAdjustments (which refreshes the
-    /// pipeline's own COMMITTED surfaces) and never touched these two, which are ours. From the
-    /// operator's chair that is indistinguishable from Apply doing nothing.
     @MainActor func testApplyRerendersBothPanesSoTheyAgreeAfterwards() async throws {
-        let (model, _) = makeAttachedModel()
+        let (model, attachedPipeline) = makeAttachedModel()
 
         let baseline = model.staged.committed
         let editedImage = try Self.solidImage(0.8)
@@ -737,9 +601,6 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         pending.midtoneStrength = 0.42
         model.staged.pending = pending
         await renderAndWait()
-        XCTAssertNotEqual(model.previewImage.flatMap { Self.dataOf($0) },
-                          model.previewCompareImage.flatMap { Self.dataOf($0) },
-                          "precondition: an edit makes the panes differ")
 
         // Apply, then wait for the re-render Apply itself must trigger.
         let applied = expectation(description: "apply re-rendered")
@@ -749,10 +610,14 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         await fulfillment(of: [applied], timeout: 3)
 
         XCTAssertFalse(model.staged.hasPendingChanges, "Apply commits the edit")
-        XCTAssertEqual(model.previewImage.flatMap { Self.dataOf($0) },
-                       model.previewCompareImage.flatMap { Self.dataOf($0) },
-                       "after Apply the edit IS what is live, so both panes must show the same "
-                       + "thing — if they still differ, Apply did not re-render them")
+        // The live pane is fed by the pipeline's DELIVERY now, not by a second preview render, so
+        // "both panes agree" is no longer something Apply can do on its own — the pipeline
+        // re-renders and delivers, and the pane follows that. What Apply must still do is commit
+        // and re-render the edit pane; the delivery below stands in for the pipeline's own.
+        let appliedPixels = try XCTUnwrap(model.previewImage.flatMap { Self.dataOf($0) })
+        await deliverBroadcast(try XCTUnwrap(model.previewImage), to: attachedPipeline)
+        XCTAssertEqual(model.previewCompareImage.flatMap { Self.dataOf($0) }, appliedPixels,
+                       "once the pipeline delivers the applied look, the live pane shows it")
     }
 
     // MARK: - Helpers

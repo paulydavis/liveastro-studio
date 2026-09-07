@@ -19,17 +19,13 @@ struct DisplaySettingsView: View {
         HSplitView {
             // LEFT COLUMN: what the audience sees on top, what you are editing underneath.
             VStack(spacing: 6) {
-                // NOT labelled "Currently live". Both panes render from the same downsampled
-                // proxy, and the stretch is derived AFTER the downsample, so each differs from the
-                // broadcast by a measured ~30/255 on real data (see
-                // PreviewDownsampleHonestyTests). What IS faithful is the comparison between the
-                // two panes: same source, same path, only the adjustments differ. The label claims
-                // that and nothing more.
-                previewPane(model.previewCompareImage, title: "Current settings",
+                // This pane IS the delivered broadcast image now — not a re-render of the same
+                // source through the preview path — so the label is literally true.
+                previewPane(model.previewCompareImage, title: "Currently live",
                             histogram: model.compareHistogram)
                 previewPane(model.previewImage,
                             title: "Your edit",
-                            badge: model.staged.hasPendingChanges ? "Not yet live" : nil,
+                            badge: editPaneBadge,
                             histogram: model.previewHistogram)
                 HStack(spacing: 8) {
                     Text("Zoom").font(.caption).foregroundStyle(.secondary)
@@ -335,6 +331,16 @@ struct DisplaySettingsView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    /// "Not yet live" is about STAGING; "Approximate" is about FIDELITY, and they are
+    /// independent — an applied edit can still be approximate while a DBE change is in play, and a
+    /// pending edit is usually exact. Both are shown when both are true.
+    private var editPaneBadge: String? {
+        var parts: [String] = []
+        if model.staged.hasPendingChanges { parts.append("Not yet live") }
+        if model.previewIsApproximate { parts.append("Approximate") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
     /// Explains itself when there is nothing to compare, rather than silently showing one pane.
     private var comparisonStatus: String {
         guard model.staged.hasPendingChanges else {
@@ -344,8 +350,13 @@ struct DisplaySettingsView: View {
             case .off(let reason): return "Trail rejection off (\(reason))"
             }
         }
-        return "Top: your current committed settings · Bottom: your pending edit · "
-            + "both are downsampled previews, so tones differ slightly from the broadcast"
+        if model.previewIsApproximate {
+            return "Top: the live broadcast · Bottom: your pending edit — APPROXIMATE: its stretch "
+                + "is derived from the downsampled preview, so tones differ from the broadcast "
+                + "until this edit is applied"
+        }
+        return "Top: the live broadcast · Bottom: your pending edit, rendered with the "
+            + "broadcast's own stretch so the tones match"
     }
 
 }
