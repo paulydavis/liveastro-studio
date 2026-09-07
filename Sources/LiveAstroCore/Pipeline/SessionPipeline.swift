@@ -945,8 +945,10 @@ public final class SessionPipeline {
     /// Still a small fraction of a 26 MP render, so a slider drag stays cheap.
     static let previewLongEdge = 2400
     /// Long edge used while the operator is actively DRAGGING. Interaction and fidelity pull in
-    /// opposite directions: 2400 makes a settled preview faithful (a fixed-pixel denoise kernel
-    /// covers ~3x more sky instead of ~6x), but it is 4x the pixels of 1200, and this app is
+    /// opposite directions: 2400 puts a settled preview MUCH closer to the broadcast than 1200
+    /// does (measured curve gap 5.98/255 vs 38.89/255 on a noisy fixture; a fixed-pixel denoise
+    /// kernel also covers ~3x more sky instead of ~6x) — closer, not equal, since the stretch is
+    /// still derived from the proxy. But 2400 is 4x the pixels of 1200, and this app is
     /// already CPU-bound on a 26 MP live session. So a drag renders cheap and the SETTLED image
     /// renders sharp — the coalesced trailing render, Apply, Revert, blink and new frames all use
     /// the full-quality path.

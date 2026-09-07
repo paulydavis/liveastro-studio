@@ -710,7 +710,9 @@ final class AppModel {
             guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else {
                 // The retry is a DRAFT, deliberately. It exists to keep the preview showing the
                 // newest pending value during a drag, which is cheap work; the settle above is
-                // what eventually renders it faithfully.
+                // what eventually renders it at full preview quality. "Full quality" is not the
+                // same as matching the broadcast — every proxy preview is approximate; see
+                // `previewIsApproximate`.
                 scheduleCoalescedRetry()
                 return
             }

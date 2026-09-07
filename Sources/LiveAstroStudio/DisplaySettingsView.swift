@@ -350,10 +350,12 @@ struct DisplaySettingsView: View {
             case .off(let reason): return "Trail rejection off (\(reason))"
             }
         }
-        return "Top: the live broadcast · Bottom: your pending edit — approximate: it renders "
-            + "from a downsampled proxy, so its tones differ slightly from the broadcast. The "
-            + "COMPARISON between the panes is faithful; the bottom pane alone is not a preview "
-            + "of exact output."
+        // Neither "slightly" nor "the comparison is faithful" was established, and the second was
+        // actively WRONG once the top pane became the delivered broadcast image: the panes now
+        // come from two different render paths (broadcast render vs downsampled proxy), so they
+        // are not like-for-like. Says only what is known.
+        return "Top: the live broadcast · Bottom: an approximate preview of your pending edit; "
+            + "tones and detail may differ from the applied output."
     }
 
 }
