@@ -331,9 +331,9 @@ struct DisplaySettingsView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// "Not yet live" is about STAGING; "Approximate" is about FIDELITY, and they are
-    /// independent — an applied edit can still be approximate while a DBE change is in play, and a
-    /// pending edit is usually exact. Both are shown when both are true.
+    /// "Not yet live" is about STAGING; "Approximate" is about FIDELITY. They are independent, and
+    /// the second is unconditional: the edit pane always renders from a downsampled proxy, so it
+    /// never carries the broadcast's exact tones.
     private var editPaneBadge: String? {
         var parts: [String] = []
         if model.staged.hasPendingChanges { parts.append("Not yet live") }
@@ -350,13 +350,10 @@ struct DisplaySettingsView: View {
             case .off(let reason): return "Trail rejection off (\(reason))"
             }
         }
-        if model.previewIsApproximate {
-            return "Top: the live broadcast · Bottom: your pending edit — APPROXIMATE: its stretch "
-                + "is derived from the downsampled preview, so tones differ from the broadcast "
-                + "until this edit is applied"
-        }
-        return "Top: the live broadcast · Bottom: your pending edit, rendered with the "
-            + "broadcast's own stretch so the tones match"
+        return "Top: the live broadcast · Bottom: your pending edit — approximate: it renders "
+            + "from a downsampled proxy, so its tones differ slightly from the broadcast. The "
+            + "COMPARISON between the panes is faithful; the bottom pane alone is not a preview "
+            + "of exact output."
     }
 
 }

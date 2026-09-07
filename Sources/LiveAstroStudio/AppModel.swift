@@ -222,10 +222,16 @@ final class AppModel {
     /// COMMITTED adjustments and the source — never on the pending edit — so re-rendering it on
     /// every slider tick doubled the work of a drag (two renders and two histograms per tick)
     /// to produce an identical image. Dragging felt slow because half the work was wasted.
-    /// True when the last published preview could not reuse the broadcast's stretch statistics
-    /// and derived its own instead. Surfaced in the panel: a preview that renders a different
-    /// curve than the broadcast must not be presented as though it matches.
-    var previewIsApproximate = false
+    /// The edit pane is ALWAYS approximate, and says so unconditionally.
+    ///
+    /// It renders from a downsampled proxy and derives its stretch from that proxy, so its curve
+    /// is not the broadcast's. A mechanism to reuse the broadcast's statistics was built and then
+    /// removed: measured on a noise-dominated fixture it made agreement WORSE, not better (the
+    /// rendered percentiles moved further from the broadcast, and further still after a new
+    /// frame), because matching the curve does not match the output once downsampling has changed
+    /// the pixel distribution the curve is applied to. Labelling every proxy preview approximate
+    /// is the honest position, and it does not depend on cache state that could silently go stale.
+    let previewIsApproximate = true
 
     /// Red night-vision tint of the *whole Mac display* (not just the astro image).
     /// In-memory only — defaults off each launch so the app never opens unexpectedly red.
@@ -615,7 +621,7 @@ final class AppModel {
         previewCompareImage = nil
         previewHistogram = []
         compareHistogram = []
-        previewIsApproximate = false
+
     }
 
     /// Called when a slider changes: re-render the PREVIEW only. Nothing reaches the pipeline
@@ -738,16 +744,10 @@ final class AppModel {
         Task.detached { [weak self] in
             guard let self else { return }
             let cg: CGImage?
-            var approximate = false
             if let renderOverride {
                 cg = await renderOverride(pipeline, source, adj, quality)
             } else {
-                let result = pipeline.renderPreviewDetailed(source: source, adjustments: adj,
-                                                            quality: quality)
-                cg = result.image
-                // False means the stretch was derived from the downsample instead of reusing the
-                // broadcast's, which renders a measurably different curve. The panel says so.
-                approximate = !result.usedFullResolutionStatistics
+                cg = pipeline.renderPreview(source: source, adjustments: adj, quality: quality)
             }
             await MainActor.run {
                 self.draftRendersInFlight -= 1
@@ -765,7 +765,6 @@ final class AppModel {
                     if quality == .settled { self.lastPublishedSettleGeneration = dispatchedSettleGeneration }
                     self.previewImage = cg
                     self.previewHistogram = cg.map { DisplayHistogram.of($0) } ?? []
-                    self.previewIsApproximate = approximate
                 }
                 self.previewRenderCompletionForTest?(seq, published)
             }
@@ -811,37 +810,35 @@ final class AppModel {
     /// what produced this feature's stale-image bugs. `previewRenderSeq` below still guards the
     /// PENDING draft render, which `DisplayDelivery` does not own.
     func applyAdjustments() {
-        // Availability, not mere existence. A pipeline can be retained with its display already
-        // frozen: `end()` closes the display, and an import holds its pipeline through
-        // master-writing and replay generation after that. Applying into that window committed the
-        // edit, persisted it and cleared the "Not yet live" badge while the image never changed.
-        let sessionAcceptsDisplay = pipeline?.acceptsDisplayUpdates == true
-        if !sessionAcceptsDisplay, importer.hasActivePipeline, !importer.acceptsDisplayUpdates {
-            // Deliberately does NOT commit. Leaving the edit pending keeps the badge honest —
-            // clearing it here is exactly what made this a silent failure.
-            errorMessage = "The import is finalising — writing the master and building the replay "
-                + "— so its display is already closed and this change cannot reach it. Your edit "
-                + "is still pending; press Apply again once the import finishes."
-            return
-        }
-        let committed = staged.apply()
-        saveSettings()
+        // Place the adjustments FIRST, atomically, and commit only if they landed.
+        //
+        // A separate "is it accepting?" check followed by an assignment is not enough: `end()` can
+        // freeze the display between the two, and the edit is then committed, its badge cleared,
+        // and the change silently overwritten by the final render. `applyCommittedAdjustments`
+        // does the check and the assignment in one critical section and says whether it took.
+        let candidate = staged.pending
+        let landedOnSession = pipeline?.applyCommittedAdjustments(candidate) ?? false
         // An IMPORT owns its own pipeline (ImportController), not `pipeline`, which is nil while
         // one runs.
-        importer.applyDisplayAdjustments(committed)
-        guard let pipeline, sessionAcceptsDisplay else {
-            // No live display at all (no session, no import): the edit is a persisted preference
-            // for the next render. Still re-render the panes so the panel and the badge agree.
-            refreshPreview(force: true)
+        let landedOnImport = importer.applyDisplayAdjustments(candidate)
+        let hadSomewhereToLand = pipeline != nil || importer.hasActivePipeline
+
+        if hadSomewhereToLand, !landedOnSession, !landedOnImport {
+            // Deliberately does NOT commit. Leaving the edit pending keeps the badge honest —
+            // clearing it is exactly what made this a silent failure.
+            errorMessage = "The session is finalising — writing the master and building the replay "
+                + "— so its display is already closed and this change cannot reach it. Your edit "
+                + "is still pending; press Apply again once it finishes."
             return
         }
-        // The pipeline's setter already calls refreshDisplay() for the COMMITTED surfaces
-        // (SessionPipeline.swift), so no explicit refresh is needed for those — asking again
-        // would bump the revision twice and throw away the render it just scheduled.
-        pipeline.displayAdjustments = committed
+
+        // Either it landed, or there was nothing live to land on — in which case committing is
+        // right: it is a persisted preference for the next render, with no live image to
+        // misrepresent.
+        _ = staged.apply()
+        saveSettings()
         // The two PREVIEW panes are ours, not the pipeline's, and nothing else re-renders them:
-        // without this the top pane keeps the pre-Apply committed image and the bottom keeps its
-        // pending one, so pressing Apply appears to do nothing at all.
+        // without this the bottom pane keeps its pending image, so Apply appears to do nothing.
         refreshPreview(force: true)
     }
 

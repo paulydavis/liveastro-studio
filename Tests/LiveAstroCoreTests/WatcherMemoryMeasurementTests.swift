@@ -269,13 +269,24 @@ final class WatcherMemoryMeasurementTests: XCTestCase {
         // is somehow closed makes the probe silent, and a silent probe is indistinguishable in the
         // report from work that genuinely did not overlap. Recording everything and filtering
         // afterwards cannot fail that way — and the raw log shows what was seen either way.
-        let eventLock = NSLock()
-        var frameEvents: [(Date, String, SessionPipeline.WorkProbeEvent)] = []
+        // Probes fire from pipeline queues, so the collector must own its own locking rather
+        // than mutating a captured var (a real race, and an error under Swift 6).
+        final class FrameEvents: @unchecked Sendable {
+            private let lock = NSLock()
+            private var items: [(Date, String, SessionPipeline.WorkProbeEvent)] = []
+            func add(_ e: (Date, String, SessionPipeline.WorkProbeEvent)) {
+                lock.lock(); items.append(e); lock.unlock()
+            }
+            var all: [(Date, String, SessionPipeline.WorkProbeEvent)] {
+                lock.lock(); defer { lock.unlock() }; return items
+            }
+        }
+        let frameEvents = FrameEvents()
         let frameProcessingFinished = expectation(description: "frame processing finished in window")
         frameProcessingFinished.assertForOverFulfill = false
         pipeline.frameProcessingProbeForTest = { name, event in
             let at = Date()
-            eventLock.lock(); frameEvents.append((at, name, event)); eventLock.unlock()
+            frameEvents.add((at, name, event))
             print("PIPELOG \(at): frame processing \(event) (\(name))")
             // `.finished` runs in a defer, AFTER onUpdate. Snapshotting the events on the onUpdate
             // signal alone can therefore miss the completion and report a missing window.
@@ -289,8 +300,13 @@ final class WatcherMemoryMeasurementTests: XCTestCase {
         // records when that happened so the report can say so instead of implying three distinct
         // concurrent renders.
         let revisionBeforeApply = currentDisplayRevision(pipeline) ?? 0
-        let renderLock = NSLock()
-        var supersededRevisions: [UInt64] = []
+        final class Superseded: @unchecked Sendable {
+            private let lock = NSLock()
+            private var items: [UInt64] = []
+            func add(_ r: UInt64) { lock.lock(); items.append(r); lock.unlock() }
+            var all: [UInt64] { lock.lock(); defer { lock.unlock() }; return items }
+        }
+        let supersededRevisions = Superseded()
         pipeline.displayRenderProbeForTest = { revision, event in
             guard revision > revisionBeforeApply else { return }
             switch event {
@@ -304,7 +320,7 @@ final class WatcherMemoryMeasurementTests: XCTestCase {
                 // frame processing supersedes Apply's queued refresh NO transition render finishes
                 // under this probe — waiting only on `.finished` then burns the full 90 s timeout
                 // and reports a failure for a pipeline that behaved exactly as designed.
-                renderLock.lock(); supersededRevisions.append(revision); renderLock.unlock()
+                supersededRevisions.add(revision)
                 applyRenderDone.fulfill()
             }
             print("PIPELOG \(Date()): display render \(event) revision \(revision)")
@@ -346,9 +362,7 @@ final class WatcherMemoryMeasurementTests: XCTestCase {
         print("PIPELOG \(Date()): === all three operations confirmed resolved ===")
 
         // Attribute frame events to the overlap window by time, then build its span.
-        eventLock.lock()
-        let recordedFrameEvents = frameEvents
-        eventLock.unlock()
+        let recordedFrameEvents = frameEvents.all
         let inWindow = recordedFrameEvents.filter { $0.0 >= windowOpenedAt }
         if let began = inWindow.first(where: { $0.2 == .began }) {
             // Stamped with the RECORDED event times, not the time this reconstruction runs.
@@ -366,9 +380,7 @@ final class WatcherMemoryMeasurementTests: XCTestCase {
         let spans = [frameSpan, draftSpan, displaySpan].compactMap { s -> (String, Date, Date)? in
             s.window.map { (s.name, $0.start, $0.end) }
         }
-        renderLock.lock()
-        let superseded = supersededRevisions
-        renderLock.unlock()
+        let superseded = supersededRevisions.all
         if !superseded.isEmpty {
             print("PIPELOG WARNING: the intended three-way measurement was NOT obtained on this run.")
             print("PIPELOG note: display revisions \(superseded) were superseded before rendering. "

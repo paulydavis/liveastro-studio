@@ -62,25 +62,30 @@ final class PreviewDownsampleHonestyTests: XCTestCase {
                           "averaging destroys pixel noise, so proxy MADN is EXPECTED to fall — the "
                           + "old assertion that it survives within 2% was true only of a smooth fixture")
 
-        // What must hold is the RENDERED RESULT, produced by the production renderer, compared
-        // against WHAT THE BROADCAST ACTUALLY RENDERS.
+        // CHARACTERISATION of how far each preview tier's curve sits from the broadcast's. It
+        // makes no fidelity claim: the preview renders from a downsampled proxy and derives its
+        // stretch there, and that is the shipped behaviour.
         //
-        // Getting that baseline wrong is what made an earlier version of this test alarming and
-        // wrong. The broadcast is NOT full resolution: `renderDisplayTransition` and
-        // `renderSnapshot` both downsample to `SnapshotRecorder.maxSnapshotLongEdge` (2560).
-        // Measured against full resolution the preview looked ~30/255 off; measured against the
-        // real broadcast the SETTLED preview (2400) is 2.25/255 off, and full-resolution
-        // statistics would have been 23.3/255 off — i.e. "fixing" it against full res would have
-        // made the settled preview worse. The genuine gap is the DRAFT tier (1200) during a drag.
-        let broadcast = AutoStretch.stretch(img.downsampled(maxLongEdge: SnapshotRecorder.maxSnapshotLongEdge))
+        // Two baselines were wrong before this settled. The broadcast is NOT full resolution —
+        // `renderDisplayTransition` and `renderSnapshot` both downsample to
+        // `SnapshotRecorder.maxSnapshotLongEdge` (2560). Measured against full resolution the
+        // preview looked ~30/255 off; measured against the real broadcast the SETTLED preview
+        // (2400) is 2.25/255 off on real data, and full-resolution statistics would have been
+        // 23.3/255 off.
+        //
+        // A mechanism to reuse the broadcast's statistics was built on the strength of the DRAFT
+        // gap below and then REMOVED: matching the curve does not match the rendered output once
+        // downsampling has changed the distribution the curve is applied to. On a noise-dominated
+        // fixture the rendered percentiles moved FURTHER from the broadcast with reuse than
+        // without (and further again after a new frame). Curve distance is therefore a useful
+        // characterisation and a poor proxy for output fidelity — which is why the panel labels
+        // every proxy preview approximate instead of claiming a match.
         let broadcastStats = AutoStretch.linkedStatistics(
             img.downsampled(maxLongEdge: SnapshotRecorder.maxSnapshotLongEdge))
 
         // Compare the CURVES, not resampled pixels. Comparing a 1200px render to a 2560px one
-        // means resampling one to the other, and that resampling dominates the difference at
-        // stars and edges — it measures the resampler, not the stretch. What the operator sees as
-        // "wrong tones" is the curve, so the curve is what this measures: production's own
-        // `AutoStretch.stretch`, run over a tonal ramp with each candidate's statistics.
+        // means resampling one to the other, and that resampling dominates the difference at stars
+        // and edges — it measures the resampler, not the stretch.
         func renderedCurve(_ stats: AutoStretch.LinkedStatistics) -> [Float] {
             let sweep = (0...200).map { Float(mFull * (0.5 + 3.5 * Double($0) / 200)) }
             let ramp = AstroImage(width: sweep.count, height: 1, channels: 1,
@@ -97,25 +102,15 @@ final class PreviewDownsampleHonestyTests: XCTestCase {
                                          broadcastCurve)
         let settledDerived = worstCurveGap(renderedCurve(AutoStretch.linkedStatistics(proxy)),
                                            broadcastCurve)
-        // Reuse means the preview renders with the BROADCAST's statistics, so its curve is the
-        // broadcast's curve exactly. Asserted, not assumed.
-        let reused = worstCurveGap(renderedCurve(broadcastStats), broadcastCurve)
-        print(String(format: "PREVIEW-VS-BROADCAST curve gap: draft derived %.2f/255, settled derived %.2f/255, reused %.2f/255",
-                     draftDerived, settledDerived, reused))
+        print(String(format: "PREVIEW-VS-BROADCAST curve gap: draft derived %.2f/255, settled derived %.2f/255",
+                     draftDerived, settledDerived))
 
         XCTAssertGreaterThan(draftDerived, 10.0,
-                             "precondition: deriving from the DRAFT downsample really does render "
-                             + "a different curve than the broadcast — this is the problem reuse "
-                             + "exists to fix, and if it ever stops being true this test should "
-                             + "be re-examined rather than quietly passing")
-        XCTAssertEqual(reused, 0.0, accuracy: 1e-9,
-                       "reusing the broadcast's statistics must reproduce the broadcast's curve "
-                       + "exactly, at any preview resolution")
-        // The settled tier was already close; reuse must not be sold as fixing something it did
-        // not, nor allowed to regress it.
+                             "the DRAFT tier's curve really does differ from the broadcast's — "
+                             + "recorded so the 'approximate' label stays justified rather than "
+                             + "decorative")
         XCTAssertLessThan(settledDerived, draftDerived,
-                          "the settled tier is much closer to the broadcast than the draft tier — "
-                          + "the draft is where the visible gap lives")
+                          "the settled tier sits closer to the broadcast than the draft tier")
     }
 
     /// Sentinel against the planar/interleaved confusion that produced the earlier draft of

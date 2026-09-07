@@ -49,9 +49,9 @@ final class ImportController {
     /// nothing the operator could see. Returns whether they actually landed.
     @discardableResult
     func applyDisplayAdjustments(_ adjustments: DisplayAdjustments) -> Bool {
-        guard let importPipeline, importPipeline.acceptsDisplayUpdates else { return false }
-        importPipeline.displayAdjustments = adjustments
-        return true
+        // Atomic on the pipeline's side: checking acceptance and then assigning separately can be
+        // frozen in between, which reports success for a change the final render overwrites.
+        importPipeline?.applyCommittedAdjustments(adjustments) ?? false
     }
     private var importPrepareGeneration = 0
     private var importPrepareInFlight = false
