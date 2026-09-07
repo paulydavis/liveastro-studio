@@ -197,11 +197,16 @@ struct DisplaySettingsView: View {
     /// The end bins are called out in red when they hold a meaningful share of the frame — that
     /// is shadows crushed to black or highlights blown to white, the two things an adjustment can
     /// destroy irreversibly and the reason to look at a histogram at all while editing.
-    @ViewBuilder private func histogramInset(_ counts: [Int]) -> some View {
+    @ViewBuilder private func histogramInset(_ counts: [Int], rotated: Bool) -> some View {
         if !counts.isEmpty {
             let total = max(counts.reduce(0, +), 1)
             let peak = max(1.0, Double(counts.max() ?? 1).squareRoot())
-            let shadowClip = Double(counts.first ?? 0) / Double(total)
+            // North-up rotation pads the corners with OPAQUE BLACK (CGImageAlphaInfo.noneSkipLast,
+            // NorthUpRotation.swift), which is indistinguishable by value from genuinely crushed
+            // shadows — it reported "clipped 5.2%" on an image whose adjustments clipped nothing.
+            // Suppressed while rotated rather than shown falsely; the real fix is computing the
+            // histogram BEFORE the rotation, which needs it threaded out of the render.
+            let shadowClip = rotated ? 0 : Double(counts.first ?? 0) / Double(total)
             let highlightClip = Double(counts.last ?? 0) / Double(total)
             VStack(spacing: 2) {
                 GeometryReader { geo in
@@ -229,7 +234,8 @@ struct DisplaySettingsView: View {
                 }
                 .frame(width: 220, height: 56)
                 HStack(spacing: 0) {
-                    Text(shadowClip > 0.005 ? String(format: "clipped %.1f%%", shadowClip * 100) : "0")
+                    Text(rotated ? "0 (rotated)"
+                                 : (shadowClip > 0.005 ? String(format: "clipped %.1f%%", shadowClip * 100) : "0"))
                         .foregroundStyle(shadowClip > 0.005 ? .red : .secondary)
                     Spacer()
                     Text(highlightClip > 0.005 ? String(format: "blown %.1f%%", highlightClip * 100) : "255")
@@ -279,7 +285,9 @@ struct DisplaySettingsView: View {
                 }
                 .padding(8)
             }
-            .overlay(alignment: .bottomLeading) { histogramInset(histogram) }
+            .overlay(alignment: .bottomLeading) {
+                histogramInset(histogram, rotated: model.staged.pending.northUp)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
