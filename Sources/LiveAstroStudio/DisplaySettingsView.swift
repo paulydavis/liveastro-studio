@@ -182,41 +182,6 @@ struct DisplaySettingsView: View {
     /// capped so the controls beneath it never get squeezed out.
     private var panelHeight: CGFloat { min(620, max(300, windowHeight * 0.42)) }
 
-    @ViewBuilder private var previewPanel: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                previewPane(model.previewImage,
-                            title: model.staged.hasPendingChanges ? "Your edit (not yet live)" : "Preview")
-                if let compare = model.previewCompareImage {
-                    // The reference: same stack, COMMITTED adjustments — what the audience sees
-                    // right now. It holds still while the left pane follows the dials, so the
-                    // difference between the panes is the edit and nothing else.
-                    previewPane(compare, title: "Currently live")
-                }
-            }
-            .frame(minHeight: 300, maxHeight: max(340, panelHeight))
-            .overlay(alignment: .topLeading) {
-                if model.staged.hasPendingChanges {
-                    Text("Pending — not yet on the broadcast")
-                        .font(.caption2).padding(4)
-                        .background(.yellow.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
-                        .padding(6)
-                }
-            }
-
-            HStack {
-                Text(comparisonStatus).font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button("Revert") { model.revertAdjustments() }
-                    .disabled(!model.staged.hasPendingChanges)
-                Button("Apply") { model.applyAdjustments() }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!model.staged.hasPendingChanges)
-            }
-        }
-    }
-
-    /// One labelled pane of the comparison.
     /// Compact luminance histogram under a pane. Log-scaled counts: sky background dominates by
     /// orders of magnitude, and on a linear count axis everything except the background bin is a
     /// flat line — which is exactly the detail the operator needs when placing a black point.
@@ -274,6 +239,7 @@ struct DisplaySettingsView: View {
                 }
                 .padding(8)
             }
+            histogramStrip(histogram)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
