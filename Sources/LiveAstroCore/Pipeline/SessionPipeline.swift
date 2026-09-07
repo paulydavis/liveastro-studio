@@ -132,6 +132,11 @@ public final class SessionPipeline {
         DisplayRenderContext(adjustments: displayAdjustments, wcs: currentWCS)
     }
 
+    /// Current display revision — bumped whenever the pipeline's committed surfaces need
+    /// re-rendering. `AppModel` reads it to know when its cached "currently live" preview has
+    /// gone stale, so a slider drag can skip re-rendering a pane that cannot have changed.
+    public var currentDisplayRevision: UInt64 { displayRevisionLock.withLock { displayRevision } }
+
     public func isCurrentDisplay(_ update: DisplayDelivery) -> Bool {
         displayRevisionLock.withLock { update.revision == displayRevision }
     }

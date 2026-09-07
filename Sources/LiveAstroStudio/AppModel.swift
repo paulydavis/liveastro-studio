@@ -214,6 +214,14 @@ final class AppModel {
     var previewHistogram: [Int] = []
     var compareHistogram: [Int] = []
 
+    /// What the cached "Currently live" render was made from. That pane depends only on the
+    /// COMMITTED adjustments and the source — never on the pending edit — so re-rendering it on
+    /// every slider tick doubled the work of a drag (two renders and two histograms per tick)
+    /// to produce an identical image. Dragging felt slow because half the work was wasted.
+    private var compareRenderKey: (adjustments: DisplayAdjustments,
+                                   source: SessionPipeline.PreviewSource,
+                                   revision: UInt64)?
+
     /// Red night-vision tint of the *whole Mac display* (not just the astro image).
     /// In-memory only — defaults off each launch so the app never opens unexpectedly red.
     var nightVisionOn = false
@@ -602,6 +610,7 @@ final class AppModel {
         previewCompareImage = nil
         previewHistogram = []
         compareHistogram = []
+        compareRenderKey = nil
     }
 
     /// Called when a slider changes: re-render the PREVIEW only. Nothing reaches the pipeline
@@ -659,11 +668,14 @@ final class AppModel {
             return
         }
         draftRendersInFlight += 1
-        // The reference pane is ALWAYS rendered: it is the "currently live" image, shown above
-        // the editable one at all times, not a comparison that appears only once you touch a
-        // dial. (It briefly worked that way and the second pane simply never showed up.)
         let committed = staged.committed
-        let wantsCompare = true
+        // The reference pane is always SHOWN, but only re-rendered when something it depends on
+        // has actually moved: the committed adjustments, the source, or the underlying stack.
+        let stackRevision = pipeline.currentDisplayRevision
+        let needsCompare = compareRenderKey.map {
+            $0.adjustments != committed || $0.source != source || $0.revision != stackRevision
+        } ?? true
+        let wantsCompare = needsCompare || previewCompareImage == nil
         Task.detached { [weak self] in
             guard let self else { return }
             let cg: CGImage?
@@ -686,9 +698,14 @@ final class AppModel {
                 let published = seq == self.previewRenderSeq
                 if published {
                     self.previewImage = cg
-                    self.previewCompareImage = compare
                     self.previewHistogram = cg.map { DisplayHistogram.of($0) } ?? []
-                    self.compareHistogram = compare.map { DisplayHistogram.of($0) } ?? []
+                    // Keep the previous reference image and histogram when nothing it depends on
+                    // changed — recomputing them would produce the same pixels at real cost.
+                    if wantsCompare {
+                        self.previewCompareImage = compare
+                        self.compareHistogram = compare.map { DisplayHistogram.of($0) } ?? []
+                        self.compareRenderKey = (committed, source, stackRevision)
+                    }
                 }
                 self.previewRenderCompletionForTest?(seq, published)
             }

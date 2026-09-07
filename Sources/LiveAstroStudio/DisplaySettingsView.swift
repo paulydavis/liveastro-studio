@@ -182,25 +182,65 @@ struct DisplaySettingsView: View {
     /// capped so the controls beneath it never get squeezed out.
     private var panelHeight: CGFloat { min(620, max(300, windowHeight * 0.42)) }
 
-    /// Compact luminance histogram under a pane. Log-scaled counts: sky background dominates by
-    /// orders of magnitude, and on a linear count axis everything except the background bin is a
-    /// flat line — which is exactly the detail the operator needs when placing a black point.
-    @ViewBuilder private func histogramStrip(_ counts: [Int]) -> some View {
-        GeometryReader { geo in
-            let peak = max(1.0, log1p(Double(counts.max() ?? 1)))
-            Path { path in
-                let w = geo.size.width / CGFloat(max(counts.count, 1))
-                for (i, c) in counts.enumerated() {
-                    let hgt = CGFloat(log1p(Double(c)) / peak) * geo.size.height
-                    path.addRect(CGRect(x: CGFloat(i) * w, y: geo.size.height - hgt,
-                                        width: max(w - 0.5, 0.5), height: hgt))
+    /// Small histogram inset, drawn in the corner OF the image.
+    ///
+    /// FIXED 0-255 axis, deliberately. An earlier version auto-ranged to the populated span, which
+    /// defeats the purpose: when a stretch shifts the whole distribution brighter, an auto-ranged
+    /// view rescales and looks identical, so the adjustment appears to do nothing. On a fixed axis
+    /// the histogram visibly slides and spreads as the dials move, which is the entire point of
+    /// having it while editing.
+    ///
+    /// SQRT counts: sky background outnumbers stars by orders of magnitude, so a linear axis
+    /// hides the tail entirely; log flattens the background spike into a ramp and hides the
+    /// landmark. Square root keeps both readable.
+    ///
+    /// The end bins are called out in red when they hold a meaningful share of the frame — that
+    /// is shadows crushed to black or highlights blown to white, the two things an adjustment can
+    /// destroy irreversibly and the reason to look at a histogram at all while editing.
+    @ViewBuilder private func histogramInset(_ counts: [Int]) -> some View {
+        if !counts.isEmpty {
+            let total = max(counts.reduce(0, +), 1)
+            let peak = max(1.0, Double(counts.max() ?? 1).squareRoot())
+            let shadowClip = Double(counts.first ?? 0) / Double(total)
+            let highlightClip = Double(counts.last ?? 0) / Double(total)
+            VStack(spacing: 2) {
+                GeometryReader { geo in
+                    Path { path in
+                        let w = geo.size.width / CGFloat(counts.count)
+                        for (i, c) in counts.enumerated() {
+                            let hgt = CGFloat(Double(c).squareRoot() / peak) * geo.size.height
+                            path.addRect(CGRect(x: CGFloat(i) * w, y: geo.size.height - hgt,
+                                                width: max(w - 0.4, 0.4), height: max(hgt, c > 0 ? 0.8 : 0)))
+                        }
+                    }
+                    .fill(.white.opacity(0.85))
+                    .overlay(alignment: .leading) {
+                        if shadowClip > 0.005 {
+                            Rectangle().fill(.red.opacity(0.75))
+                                .frame(width: max(geo.size.width / CGFloat(counts.count), 2))
+                        }
+                    }
+                    .overlay(alignment: .trailing) {
+                        if highlightClip > 0.005 {
+                            Rectangle().fill(.red.opacity(0.75))
+                                .frame(width: max(geo.size.width / CGFloat(counts.count), 2))
+                        }
+                    }
                 }
+                .frame(width: 220, height: 56)
+                HStack(spacing: 0) {
+                    Text(shadowClip > 0.005 ? String(format: "clipped %.1f%%", shadowClip * 100) : "0")
+                        .foregroundStyle(shadowClip > 0.005 ? .red : .secondary)
+                    Spacer()
+                    Text(highlightClip > 0.005 ? String(format: "blown %.1f%%", highlightClip * 100) : "255")
+                        .foregroundStyle(highlightClip > 0.005 ? .red : .secondary)
+                }
+                .font(.system(size: 9)).frame(width: 220)
             }
-            .fill(.secondary)
+            .padding(6)
+            .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 4))
+            .padding(8)
         }
-        .frame(height: 34)
-        .background(.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 3))
-        .opacity(counts.isEmpty ? 0 : 1)
     }
 
     @ViewBuilder private func previewPane(_ image: CGImage?, title: String,
@@ -239,7 +279,7 @@ struct DisplaySettingsView: View {
                 }
                 .padding(8)
             }
-            histogramStrip(histogram)
+            .overlay(alignment: .bottomLeading) { histogramInset(histogram) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
