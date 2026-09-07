@@ -653,6 +653,14 @@ final class AppModel {
     /// the expensive work would be thrown away.
     private var settledRenderInFlightGeneration: UInt64?
 
+    /// Generation of the newest settle that actually PUBLISHED. Without this, a draft retry queued
+    /// before a settle could run after it: the in-flight marker is cleared on completion, so the
+    /// retry's guard passed, it published lower-resolution pixels over the settled ones, and
+    /// because a retry never re-arms the settle nothing upgraded them again — the preview stayed
+    /// draft permanently. Compared against the CURRENT generation, so a genuine new edit (which
+    /// bumps it) still gets its draft.
+    private var lastPublishedSettleGeneration: UInt64?
+
     /// Schedules one coalesced DRAFT retry, unless one is already pending. Used by the drop paths,
     /// which must not swallow the operator's last edit — the preview would then disagree with what
     /// Apply publishes. Settled work is never retried this way: it goes through `scheduleSettle`,
@@ -680,7 +688,9 @@ final class AppModel {
         // A draft retry is pointless once the settle for these same values is already rendering:
         // no edit has arrived since (the generation is unchanged), so it would render identical
         // values more cheaply AND invalidate the settle's result through the sequence guard.
-        if quality == .draft, isRetry, settledRenderInFlightGeneration == settleGeneration { return }
+        if quality == .draft, isRetry,
+           settledRenderInFlightGeneration == settleGeneration
+               || lastPublishedSettleGeneration == settleGeneration { return }
         let now = Date()
         if !bypassThrottle {
             guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else {
@@ -715,7 +725,8 @@ final class AppModel {
             return
         }
         draftRendersInFlight += 1
-        if quality == .settled { settledRenderInFlightGeneration = settleGeneration }
+        let dispatchedSettleGeneration = settleGeneration
+        if quality == .settled { settledRenderInFlightGeneration = dispatchedSettleGeneration }
         let committed = staged.committed
         // The reference pane is always SHOWN, but only re-rendered when something it depends on
         // has actually moved: the committed adjustments, the source, or the underlying stack.
@@ -747,6 +758,10 @@ final class AppModel {
                 // Only the newest request may publish; a slower earlier render is discarded.
                 let published = seq == self.previewRenderSeq
                 if published {
+                    // Record the settle only when it actually reached the screen; a settle whose
+                    // result was discarded leaves the preview un-settled, so a draft retry for
+                    // those values is still legitimate.
+                    if quality == .settled { self.lastPublishedSettleGeneration = dispatchedSettleGeneration }
                     self.previewImage = cg
                     self.previewHistogram = cg.map { DisplayHistogram.of($0) } ?? []
                     // Keep the previous reference image and histogram when nothing it depends on

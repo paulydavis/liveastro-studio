@@ -496,6 +496,52 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
                        + "debounce, not as a fixed-quality retry")
     }
 
+    /// Distinct sizes per quality, so the FINAL published image identifies which render won.
+    private static func sizedImage(_ n: Int) throws -> CGImage {
+        try XCTUnwrap(AutoStretch.makeCGImage(AstroImage(width: n, height: n, channels: 1,
+            pixels: [Float](repeating: 0.5, count: n * n), sourceIsLinear: false)))
+    }
+
+    /// What matters is the quality of the image the operator is LEFT with once every queued timer
+    /// has drained — not merely that a settled render started at some point.
+    ///
+    /// INVARIANT TEST, not a falsified regression test. It was written for a specific reported
+    /// interleaving: a draft retry queued before a settle, running after it, publishing draft
+    /// pixels over the settled ones — permanent, because a retry never re-arms the settle. The
+    /// guard for it (`lastPublishedSettleGeneration`) is in place, but this test passes with that
+    /// guard removed, and the interleaving could not be constructed: `scheduleSettle()` runs
+    /// before `scheduleCoalescedRetry()` inside the same call and both use the same 90 ms
+    /// deadline, so the settle's Task always wakes first and its in-flight marker suppresses the
+    /// retry. Reaching the reported state needs the settled render to COMPLETE inside the gap
+    /// between those two wakeups. Treat the finding as theoretical; this test pins the invariant
+    /// that actually matters — the operator is never left looking at a draft.
+    @MainActor func testTheFinalPreviewIsSettledAfterEveryRetryDrains() async throws {
+        let (model, _) = makeAttachedModel()
+        let draftImage = ImageBox(cg: try Self.sizedImage(4))
+        let settledImage = ImageBox(cg: try Self.sizedImage(8))
+        model.previewRenderOverrideForTest = { _, _, _, quality in
+            quality == .settled ? settledImage.cg : draftImage.cg
+        }
+
+        // First edit renders a draft. The second lands inside the throttle window, so it queues a
+        // draft retry ~90 ms out.
+        for i in 1...2 {
+            var adj = model.staged.committed
+            adj.blackPoint = Double(i) / 100
+            model.staged.pending = adj
+            model.refreshPreview()
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        // Settle NOW, deterministically, so the settled render publishes well before that queued
+        // draft retry fires — the exact interleaving that left the preview downgraded.
+        model.refreshPreview(force: true)
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        XCTAssertEqual(model.previewImage?.width, 8,
+                       "the preview was left at draft resolution: a late draft retry published "
+                       + "over the settled render and nothing re-armed the settle")
+    }
+
     /// A continuous drag must not pay for settled renders. The settle was a fixed one-shot timer
     /// armed 90 ms after the FIRST draft and never postponed, so it fired mid-drag and re-armed —
     /// a long drag rendered at full resolution roughly every 90 ms, which is precisely the cost
