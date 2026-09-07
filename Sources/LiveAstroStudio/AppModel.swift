@@ -207,6 +207,13 @@ final class AppModel {
     /// 0.13% of the frame, so both panes looked identical while both moved together.)
     var previewCompareImage: CGImage?
 
+    /// Luminance histograms of the two panes, computed from the rendered images. Shown under each
+    /// pane so an adjustment can be judged against the DATA rather than by feel on a bare slider —
+    /// the background of a real M51 stack sits near 0.0095 with a MADN of 0.00007, so the useful
+    /// travel of the black-point slider is a sliver the eye cannot place without this.
+    var previewHistogram: [Int] = []
+    var compareHistogram: [Int] = []
+
     /// Red night-vision tint of the *whole Mac display* (not just the astro image).
     /// In-memory only — defaults off each launch so the app never opens unexpectedly red.
     var nightVisionOn = false
@@ -593,6 +600,8 @@ final class AppModel {
         previewRenderSeq &+= 1
         previewImage = nil
         previewCompareImage = nil
+        previewHistogram = []
+        compareHistogram = []
     }
 
     /// Called when a slider changes: re-render the PREVIEW only. Nothing reaches the pipeline
@@ -678,6 +687,8 @@ final class AppModel {
                 if published {
                     self.previewImage = cg
                     self.previewCompareImage = compare
+                    self.previewHistogram = cg.map { DisplayHistogram.of($0) } ?? []
+                    self.compareHistogram = compare.map { DisplayHistogram.of($0) } ?? []
                 }
                 self.previewRenderCompletionForTest?(seq, published)
             }

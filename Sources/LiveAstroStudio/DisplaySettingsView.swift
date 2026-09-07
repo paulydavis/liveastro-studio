@@ -9,10 +9,12 @@ struct DisplaySettingsView: View {
         HStack(alignment: .top, spacing: 12) {
             // LEFT COLUMN: what the audience sees on top, what you are editing underneath.
             VStack(spacing: 10) {
-                previewPane(model.previewCompareImage, title: "Currently live")
+                previewPane(model.previewCompareImage, title: "Currently live",
+                            histogram: model.compareHistogram)
                 previewPane(model.previewImage,
                             title: "Your edit",
-                            badge: model.staged.hasPendingChanges ? "Not yet live" : nil)
+                            badge: model.staged.hasPendingChanges ? "Not yet live" : nil,
+                            histogram: model.previewHistogram)
                 HStack {
                     Button("Revert") { model.revertAdjustments() }
                         .disabled(!model.staged.hasPendingChanges)
@@ -51,27 +53,46 @@ struct DisplaySettingsView: View {
                     Section("Display Adjustments") {
                         VStack(alignment: .leading) {
                             Text("Black point")
-                            Slider(value: $model.staged.pending.blackPoint, in: 0...0.2)
-                                .onChange(of: model.staged.pending.blackPoint) { _, _ in
-                                    model.refreshPreview()
-                                }
-                                .help("Darken the sky background. 0 = auto.")
+                            HStack {
+                                Slider(value: $model.staged.pending.blackPoint, in: 0...0.05)
+                                    .onChange(of: model.staged.pending.blackPoint) { _, _ in
+                                        model.refreshPreview()
+                                    }
+                                Text(String(format: "%.4f", model.staged.pending.blackPoint))
+                                    .frame(width: 62, alignment: .trailing).monospacedDigit()
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            .help("Darken the sky background. 0 = auto. Range narrowed to 0-0.05: "
+                                + "the auto-stretch re-derives after this clip, so larger values do "
+                                + "very little. Click the slider and use arrow keys for fine steps.")
                         }
                         VStack(alignment: .leading) {
                             Text("Stretch strength")
-                            Slider(value: $model.staged.pending.midtoneStrength, in: -1...1)
-                                .onChange(of: model.staged.pending.midtoneStrength) { _, _ in
-                                    model.refreshPreview()
-                                }
-                                .help("How aggressive the stretch is. 0 = auto.")
+                            HStack {
+                                Slider(value: $model.staged.pending.midtoneStrength, in: -1...1)
+                                    .onChange(of: model.staged.pending.midtoneStrength) { _, _ in
+                                        model.refreshPreview()
+                                    }
+                                Text(String(format: "%+.3f", model.staged.pending.midtoneStrength))
+                                    .frame(width: 62, alignment: .trailing).monospacedDigit()
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            .help("How aggressive the stretch is. 0 = auto. Click the slider and use "
+                                + "arrow keys for fine steps.")
                         }
                         VStack(alignment: .leading) {
                             Text("Saturation")
-                            Slider(value: $model.staged.pending.saturation, in: 0...2)
-                                .onChange(of: model.staged.pending.saturation) { _, _ in
-                                    model.refreshPreview()
-                                }
-                                .help("Color intensity. 1 = unchanged.")
+                            HStack {
+                                Slider(value: $model.staged.pending.saturation, in: 0...2)
+                                    .onChange(of: model.staged.pending.saturation) { _, _ in
+                                        model.refreshPreview()
+                                    }
+                                Text(String(format: "%.3f", model.staged.pending.saturation))
+                                    .frame(width: 62, alignment: .trailing).monospacedDigit()
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            .help("Color intensity. 1 = unchanged. Click the slider and use arrow "
+                                + "keys for fine steps.")
                         }
                         helpToggle("Flatten background (DBE)", isOn: $model.staged.pending.backgroundExtraction,
                                    help: "Remove the light-pollution gradient so the sky darkens evenly. Off by default.")
@@ -85,7 +106,7 @@ struct DisplaySettingsView: View {
                                     .onChange(of: model.staged.pending.bgScale) { _, _ in
                                         model.refreshPreview()
                                     }
-                                Text(String(format: "%.1f%%", model.staged.pending.bgScale))
+                                Text(String(format: "%.2f%%", model.staged.pending.bgScale))
                                     .frame(width: 48, alignment: .trailing).monospacedDigit()
                             }
                             .help("Smoothing scale as % of image size — lower follows local/corner gradients, higher removes only broad gradients.")
@@ -95,7 +116,7 @@ struct DisplaySettingsView: View {
                                     .onChange(of: model.staged.pending.bgSmoothest) { _, _ in
                                         model.refreshPreview()
                                     }
-                                Text(String(format: "%.1f", model.staged.pending.bgSmoothest))
+                                Text(String(format: "%.2f", model.staged.pending.bgSmoothest))
                                     .frame(width: 48, alignment: .trailing).monospacedDigit()
                             }
                             .help("Extra blur on the background model — raise to remove residual blotchiness, lower to track non-smooth gradients.")
@@ -196,8 +217,30 @@ struct DisplaySettingsView: View {
     }
 
     /// One labelled pane of the comparison.
+    /// Compact luminance histogram under a pane. Log-scaled counts: sky background dominates by
+    /// orders of magnitude, and on a linear count axis everything except the background bin is a
+    /// flat line — which is exactly the detail the operator needs when placing a black point.
+    @ViewBuilder private func histogramStrip(_ counts: [Int]) -> some View {
+        GeometryReader { geo in
+            let peak = max(1.0, log1p(Double(counts.max() ?? 1)))
+            Path { path in
+                let w = geo.size.width / CGFloat(max(counts.count, 1))
+                for (i, c) in counts.enumerated() {
+                    let hgt = CGFloat(log1p(Double(c)) / peak) * geo.size.height
+                    path.addRect(CGRect(x: CGFloat(i) * w, y: geo.size.height - hgt,
+                                        width: max(w - 0.5, 0.5), height: hgt))
+                }
+            }
+            .fill(.secondary)
+        }
+        .frame(height: 34)
+        .background(.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 3))
+        .opacity(counts.isEmpty ? 0 : 1)
+    }
+
     @ViewBuilder private func previewPane(_ image: CGImage?, title: String,
-                                          badge: String? = nil) -> some View {
+                                          badge: String? = nil,
+                                          histogram: [Int] = []) -> some View {
         VStack(spacing: 4) {
             ZStack {
                 if let image {
