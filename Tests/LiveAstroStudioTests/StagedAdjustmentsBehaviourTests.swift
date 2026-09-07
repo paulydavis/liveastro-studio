@@ -417,6 +417,63 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         XCTAssertFalse(seen.isEmpty, "at least one render must have been dispatched")
     }
 
+    /// Does holding Compare actually put a DIFFERENT image on screen? Driving the real app, the
+    /// control highlighted on press but the picture appeared unchanged — and two very different
+    /// causes look identical from the operator's chair: the swap silently not happening, or the
+    /// two masters being visually indistinguishable. Measured on 6 real subs, clean vs online
+    /// differed by 0.86/255 on average with only 0.13% of pixels past 2/255, so "no visible
+    /// change" was expected there. This test pins the OTHER half: given two sources that genuinely
+    /// differ, the swap must produce different pixels. If this passes and the screen still looks
+    /// unchanged, the cause is perceptual, not a bug.
+    @MainActor func testHoldingCompareRendersADifferentImageWhenTheSourcesDiffer() async throws {
+        let (model, pipeline) = makeAttachedModel()
+
+        // Two obviously different sources: the override stands in for the render, keyed on the
+        // source the production `previewSource` chose, so this exercises the real selection path.
+        let cleanPixels = try Self.solidImage(0.2)
+        let onlinePixels = try Self.solidImage(0.8)
+        model.previewRenderOverrideForTest = { _, source, _ in
+            source == .clean ? cleanPixels : onlinePixels
+        }
+
+        func renderAndWait() async {
+            let done = expectation(description: "render resolved")
+            done.assertForOverFulfill = false
+            model.previewRenderCompletionForTest = { _, _ in done.fulfill() }
+            model.refreshPreview(force: true)
+            await fulfillment(of: [done], timeout: 3)
+        }
+
+        // publishedMasterSurvivorCount() is gated on the feature being ON, so without this the
+        // production selection returns .online for BOTH states and the test proves nothing.
+        pipeline.configureLiveRejection(enabled: true)
+
+        // Released: production picks .clean when a clean master is being served.
+        pipeline.publishedMaster = PublishedMaster(
+            image: AstroImage(width: 4, height: 4, channels: 1,
+                              pixels: [Float](repeating: 0.2, count: 16), sourceIsLinear: false),
+            coverage: [Float](repeating: 1, count: 16), survivorCount: 6,
+            key: pipeline.currentFreshnessKey())
+        await renderAndWait()
+        let released = model.previewImage.flatMap { Self.dataOf($0) }
+        XCTAssertNotNil(released, "a render must have published an image")
+
+        // Held: must swap to the un-rejected online source.
+        model.blinkHeld = true
+        await renderAndWait()
+        let held = model.previewImage.flatMap { Self.dataOf($0) }
+
+        XCTAssertNotEqual(released, held,
+                          "holding Compare must render the OTHER source — if these are equal the "
+                          + "swap is not happening at all, independent of whether a human could see it")
+
+        // And releasing must come back.
+        model.blinkHeld = false
+        await renderAndWait()
+        XCTAssertEqual(model.previewImage.flatMap { Self.dataOf($0) }, released,
+                       "releasing must restore the clean source")
+    }
+
     // MARK: - Helpers
 
     private static func dataOf(_ image: CGImage) -> Data? { image.dataProvider?.data as Data? }
