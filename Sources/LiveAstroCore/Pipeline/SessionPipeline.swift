@@ -207,7 +207,13 @@ public final class SessionPipeline {
         do {
             let context = context ?? displayContext()
             let small = online.cap.map { online.image.downsampled(maxLongEdge: $0) } ?? online.image
-            let preview = try displayCGImage(from: small, context: context)
+            // This is the render whose curve the audience actually sees — it is the one delivered
+            // by `deliverDisplay` below. Capture here, not only in `renderSnapshot`: snapshot
+            // rendering is throttled and, on a live source, this transition path is what refreshes
+            // the committed surfaces between snapshots.
+            let preview = try displayCGImage(
+                from: small, context: context,
+                statisticsKey: stretchStatsKey(for: .online, adjustments: context.adjustments))
             if let finalBroadcast {
                 let image = online.cap.map { finalBroadcast.image.downsampled(maxLongEdge: $0) } ?? finalBroadcast.image
                 let broadcast = try displayCGImage(from: image, context: context)
@@ -1108,7 +1114,11 @@ public final class SessionPipeline {
         }
         let broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
         let displaySource = downsampleLongEdge.map { broadcastMean.downsampled(maxLongEdge: $0) } ?? broadcastMean
-        let broadcastCG = try displayCGImage(from: displaySource, context: context)
+        // Same for the CLEAN master the broadcast serves: capture what this render derives.
+        let broadcastCG = try displayCGImage(
+            from: displaySource, context: context,
+            statisticsKey: stretchStatsKey(for: .clean,
+                                           adjustments: (context ?? displayContext()).adjustments))
         return (broadcastMean, broadcastCG, published.survivorCount, published.survivorCount)
     }
 
@@ -1129,7 +1139,18 @@ public final class SessionPipeline {
         guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
         do {
             let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
-            let previewCG = try displayCGImage(from: displaySource, context: context)
+            // Capture the statistics THIS render derives, whatever resolution it runs at.
+            //
+            // Corrected: an earlier version only captured when the render was full-resolution,
+            // which never fired — `importPreviewLongEdge` defaults to
+            // SnapshotRecorder.maxSnapshotLongEdge (2560) for every session, not just imports. And
+            // full-resolution statistics would have been the WRONG ones to reuse: the broadcast
+            // derives its own curve at 2560, so matching the broadcast means matching THAT, not
+            // the raw stack. Measured on a real master, full-res statistics sit 23.3/255 away from
+            // the broadcast while the 2400 proxy's own sit 2.25/255 away.
+            let previewCG = try displayCGImage(
+                from: displaySource, context: context,
+                statisticsKey: stretchStatsKey(for: .online, adjustments: context.adjustments))
 
             // BROADCAST/latest.png: prefer the clean published master over the online mean, with
             // the downsample applied to whichever is served (D10: see resolveBroadcastRender).
@@ -1276,6 +1297,8 @@ public final class SessionPipeline {
     /// that depends on DBE being on — notably skipping the additive neutralize — still behaves as
     /// though it ran, because it did.
     private func displayCGImage(from linear: AstroImage, context: DisplayRenderContext? = nil,
+                                statisticsKey: StretchStatsKey? = nil,
+                                injectedStatistics: AutoStretch.LinkedStatistics? = nil,
                                 preflattened: Bool = false) throws -> CGImage {
         let context = context ?? displayContext()
         let adj = context.adjustments
@@ -1292,9 +1315,23 @@ public final class SessionPipeline {
         } else {
             balanced = flattened
         }
-        let stretched = balanced.sourceIsLinear
-            ? AutoStretch.stretch(balanced, blackPoint: adj.blackPoint, midtoneStrength: adj.midtoneStrength)
-            : balanced
+        let stretched: AstroImage
+        if balanced.sourceIsLinear {
+            // Inject when the caller supplied full-resolution statistics; otherwise derive from
+            // this image, and cache them when the caller says this render IS the full-resolution
+            // one. Deriving from a downsample is what made the preview's curve diverge.
+            let stats = injectedStatistics ?? AutoStretch.linkedStatistics(balanced)
+            if injectedStatistics == nil, let statisticsKey {
+                stretchStatsLock.lock()
+                fullResolutionStretchStats = (statisticsKey, stats)
+                stretchStatsCaptureCountForTest += 1
+                stretchStatsLock.unlock()
+            }
+            stretched = AutoStretch.stretch(balanced, blackPoint: adj.blackPoint,
+                                            midtoneStrength: adj.midtoneStrength, statistics: stats)
+        } else {
+            stretched = balanced
+        }
         // Denoise AFTER stretch + DBE (the targeted noise is the post-stretch
         // appearance) and BEFORE saturation/packing, so broadcast, snapshots,
         // latest.png and replay all inherit it while master.fit stays raw (spec §2.2).
@@ -1351,6 +1388,46 @@ public final class SessionPipeline {
         case clean(FreshnessKey, quality: PreviewQuality)
         case watcher(token: Int, quality: PreviewQuality)
     }
+    /// Identifies the linear image a set of stretch statistics was measured on, together with
+    /// every upstream setting that changes those statistics. Quality is deliberately absent: the
+    /// point is to reuse the BROADCAST's statistics for a preview render at a different scale, so
+    /// the preview applies the curve the audience is actually seeing.
+    ///
+    /// Denoise and saturation are absent too, and that is not an oversight — both run AFTER the
+    /// stretch (see `displayCGImage`), so neither can move the statistics it derives from. Black
+    /// point and stretch strength are absent because they are applied BY the stretch, not to its
+    /// input. What remains is the source image and the DBE stage.
+    public struct StretchStatsKey: Equatable, Sendable {
+        public enum Source: Equatable, Sendable {
+            /// Deliberately WITHOUT the per-frame revision. Snapshot rendering is throttled, so
+            /// the broadcast is routinely a frame or more behind the preview's source; keying on
+            /// revision meant the captured statistics never matched and reuse never happened.
+            /// It is also the wrong question: the preview should apply the curve the audience is
+            /// CURRENTLY seeing, which is the one the last committed render derived, whichever
+            /// frame that was. Generation still invalidates — a re-seed or re-stack is a
+            /// different image, not a newer one.
+            case online(generation: Int)
+            case clean(FreshnessKey)
+            case watcher
+        }
+        let source: Source
+        let backgroundExtraction: Bool
+        let bgScale: Double
+        let bgSmoothest: Double
+    }
+
+    private let stretchStatsLock = NSLock()
+    private var fullResolutionStretchStats: (key: StretchStatsKey, stats: AutoStretch.LinkedStatistics)?
+
+    /// Test seam: how many preview renders reused the broadcast's statistics.
+    public private(set) var previewStatsReuseCountForTest = 0
+    /// Test seam: how many committed renders CAPTURED statistics, and the key of the last one.
+    public private(set) var stretchStatsCaptureCountForTest = 0
+    public var lastCapturedStatsKeyDescriptionForTest: String {
+        stretchStatsLock.lock(); defer { stretchStatsLock.unlock() }
+        return String(describing: fullResolutionStretchStats?.key)
+    }
+
     /// Flattened (DBE-applied) preview proxies, keyed by the proxy AND the two DBE parameters.
     /// Measured on a 1200x800 proxy, `flattenMultiscale` costs roughly 4x a denoise pass, 15x a
     /// stretch and 200x a histogram — it dominates a preview render completely. It depends only
@@ -1454,15 +1531,58 @@ public final class SessionPipeline {
     /// `renderCurrentDisplay(adjustments:)` deliberately does not have (it commits, and is
     /// retained for the Apply path). Returns nil when the requested source has nothing to
     /// show: no stack yet, or `.clean` with no published master.
+    /// The statistics key for a preview source under `adjustments`. Mirrors the proxy cache's
+    /// identity resolution exactly, minus quality — if these two ever disagree the preview would
+    /// reuse statistics measured on a different image.
+    private func stretchStatsKey(for source: PreviewSource,
+                                 adjustments: DisplayAdjustments) -> StretchStatsKey? {
+        let resolved: StretchStatsKey.Source
+        switch source {
+        case .clean:
+            guard let publishedKey = publishedMasterFreshnessKeyIfCurrent() else { return nil }
+            resolved = .clean(publishedKey)
+        case .online:
+            if let engine {
+                resolved = .online(generation: engine.currentStackGeneration)
+            } else {
+                lastPreviewLock.lock()
+                let hasFrame = lastPreviewLinear != nil
+                lastPreviewLock.unlock()
+                guard hasFrame else { return nil }
+                resolved = .watcher
+            }
+        }
+        return StretchStatsKey(source: resolved,
+                               backgroundExtraction: adjustments.backgroundExtraction,
+                               bgScale: adjustments.bgScale,
+                               bgSmoothest: adjustments.bgSmoothest)
+    }
+
+    /// A preview render plus whether it managed to reuse the broadcast's statistics.
+    ///
+    /// `usedFullResolutionStatistics == false` means the stretch was derived from the downsample,
+    /// which renders a measurably different curve — the UI must say so rather than presenting it
+    /// as what the audience sees.
+    public struct PreviewRenderResult {
+        public let image: CGImage?
+        public let usedFullResolutionStatistics: Bool
+    }
+
     public func renderPreview(source: PreviewSource,
                               adjustments: DisplayAdjustments,
                               quality: PreviewQuality = .settled) -> CGImage? {
+        renderPreviewDetailed(source: source, adjustments: adjustments, quality: quality).image
+    }
+
+    public func renderPreviewDetailed(source: PreviewSource,
+                                      adjustments: DisplayAdjustments,
+                                      quality: PreviewQuality = .settled) -> PreviewRenderResult {
         // Resolve the cache key FIRST — it decides what may be reused, and for `.clean` it is
         // the FreshnessKey of the master actually being served.
         let key: PreviewProxyKey
         switch source {
         case .clean:
-            guard let publishedKey = publishedMasterFreshnessKeyIfCurrent() else { return nil }
+            guard let publishedKey = publishedMasterFreshnessKeyIfCurrent() else { return PreviewRenderResult(image: nil, usedFullResolutionStatistics: false) }
             key = .clean(publishedKey, quality: quality)
         case .online:
             if let engine {
@@ -1472,7 +1592,7 @@ public final class SessionPipeline {
                 lastPreviewLock.lock()
                 let token = lastPreviewLinear?.token
                 lastPreviewLock.unlock()
-                guard let token else { return nil }       // watcher mode, no frame yet
+                guard let token else { return PreviewRenderResult(image: nil, usedFullResolutionStatistics: false) }       // watcher mode, no frame yet
                 key = .watcher(token: token, quality: quality)
             }
         }
@@ -1483,7 +1603,7 @@ public final class SessionPipeline {
         previewProxyLock.unlock()
 
         if proxy == nil {
-            guard let (image, coverage) = selectedSourceFullRes(source) else { return nil }
+            guard let (image, coverage) = selectedSourceFullRes(source) else { return PreviewRenderResult(image: nil, usedFullResolutionStatistics: false) }
             let built = cropToCoverage(image, coverage: coverage)
                 .downsampled(maxLongEdge: quality.longEdge)
             previewProxyLock.lock()
@@ -1492,7 +1612,7 @@ public final class SessionPipeline {
             previewProxyLock.unlock()
             proxy = built
         }
-        guard let proxy else { return nil }
+        guard let proxy else { return PreviewRenderResult(image: nil, usedFullResolutionStatistics: false) }
 
         // Hoist the DBE stage out of the per-tick render and cache it.
         var working = proxy
@@ -1514,9 +1634,23 @@ public final class SessionPipeline {
             }
             preflattened = true
         }
-        return try? displayCGImage(from: working,
-                                   context: displayContext(overriding: adjustments),
-                                   preflattened: preflattened)
+        // Reuse the statistics the committed full-resolution render measured, when they describe
+        // the SAME source under the SAME upstream (DBE) settings. That is the common editing case
+        // — black point, stretch strength, saturation and denoise all leave this key untouched —
+        // so a drag keeps the broadcast's curve. Changing a DBE parameter legitimately misses,
+        // and the render falls back to proxy-derived statistics.
+        let statsKey = stretchStatsKey(for: source, adjustments: adjustments)
+        stretchStatsLock.lock()
+        let cachedStats = fullResolutionStretchStats
+        stretchStatsLock.unlock()
+        let reusable: AutoStretch.LinkedStatistics? =
+            (statsKey != nil && cachedStats?.key == statsKey) ? cachedStats?.stats : nil
+        if reusable != nil { previewStatsReuseCountForTest += 1 }
+        let cg = try? displayCGImage(from: working,
+                                     context: displayContext(overriding: adjustments),
+                                     injectedStatistics: reusable,
+                                     preflattened: preflattened)
+        return PreviewRenderResult(image: cg, usedFullResolutionStatistics: reusable != nil)
     }
 
     /// Renders `source` at FULL resolution — the Apply-path counterpart to `renderPreview`,

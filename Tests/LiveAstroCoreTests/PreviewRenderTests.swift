@@ -96,6 +96,90 @@ final class PreviewRenderTests: XCTestCase {
                        "revisiting a quality must reuse its cached proxy, not rebuild it")
     }
 
+    /// The preview can only match a curve the broadcast has actually rendered, so every reuse
+    /// test must first force one committed render and wait for it to be DELIVERED. Nothing in the
+    /// stub fixture renders the committed surfaces on its own — the first version of these tests
+    /// asserted reuse against a pipeline that had never rendered a broadcast at all.
+    private func awaitCommittedRender(_ pipeline: SessionPipeline) throws {
+        let delivered = expectation(description: "a committed display render was delivered")
+        delivered.assertForOverFulfill = false
+        pipeline.onDisplayUpdate = { _ in delivered.fulfill() }
+        pipeline.refreshDisplay()
+        wait(for: [delivered], timeout: 30)
+        XCTAssertGreaterThan(pipeline.stretchStatsCaptureCountForTest, 0,
+                             "precondition: the committed render must have captured statistics")
+    }
+
+    /// The preview reuses the statistics the committed full-resolution render measured, so its
+    /// stretch curve matches the broadcast's instead of being re-derived from the downsample.
+    func testPreviewReusesFullResolutionStatisticsForTheCommittedSource() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try PreviewRenderTests.runningPipeline(sandbox: sandbox)
+        defer { source.stop() }
+
+        try awaitCommittedRender(pipeline)
+        let result = pipeline.renderPreviewDetailed(source: .online, adjustments: .neutral)
+        XCTAssertNotNil(result.image)
+        XCTAssertTrue(result.usedFullResolutionStatistics,
+                      "the committed source under unchanged upstream settings must reuse the "
+                      + "statistics the full-resolution render already measured")
+    }
+
+    /// The reuse key must NOT be sensitive to settings that cannot move the statistics. Black
+    /// point, stretch strength, saturation and denoise are all applied at or after the stretch, so
+    /// dragging any of them must keep the broadcast's curve — that is the whole editing path this
+    /// feature exists for.
+    func testDownstreamAdjustmentsDoNotLoseTheStatistics() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try PreviewRenderTests.runningPipeline(sandbox: sandbox)
+        defer { source.stop() }
+        try awaitCommittedRender(pipeline)
+
+        for (label, mutate) in [("black point", { (a: inout DisplayAdjustments) in a.blackPoint = 0.4 }),
+                                ("stretch strength", { a in a.midtoneStrength = 0.6 }),
+                                ("saturation", { a in a.saturation = 1.7 }),
+                                ("denoise", { a in a.denoiseStrength = 0.5 })] {
+            var adjustments = DisplayAdjustments.neutral
+            mutate(&adjustments)
+            let result = pipeline.renderPreviewDetailed(source: .online, adjustments: adjustments)
+            XCTAssertTrue(result.usedFullResolutionStatistics,
+                          "\(label) is applied at or after the stretch and must not invalidate "
+                          + "its statistics")
+        }
+    }
+
+    /// A DBE change DOES move the statistics — it rewrites the pixels the stretch measures — so
+    /// the preview must fall back to deriving them, and must SAY it fell back. Silent fallback is
+    /// what would let the panel keep claiming a fidelity it no longer has.
+    func testChangingDBEFallsBackAndReportsIt() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try PreviewRenderTests.runningPipeline(sandbox: sandbox)
+        defer { source.stop() }
+        try awaitCommittedRender(pipeline)
+        XCTAssertTrue(pipeline.renderPreviewDetailed(source: .online, adjustments: .neutral)
+                        .usedFullResolutionStatistics, "precondition: reuse works before the change")
+
+        var dbe = DisplayAdjustments.neutral
+        dbe.backgroundExtraction = true
+        dbe.bgScale = 8
+        let changed = pipeline.renderPreviewDetailed(source: .online, adjustments: dbe)
+        XCTAssertNotNil(changed.image, "the fallback must still render")
+        XCTAssertFalse(changed.usedFullResolutionStatistics,
+                       "a DBE change rewrites the pixels the stretch measures; reusing statistics "
+                       + "from the un-flattened image would be worse than deriving them")
+
+        // And reuse returns once the upstream settings match again — the miss is scoped to the
+        // changed setting, not a latch that disables the feature for the rest of the session.
+        XCTAssertTrue(pipeline.renderPreviewDetailed(source: .online, adjustments: .neutral)
+                        .usedFullResolutionStatistics, "reuse must resume when DBE matches again")
+    }
+
     /// Finding 2: the spec requires a CACHED proxy. Without one, every slider tick walks the
     /// full 26 MP stack to build the downsample, so the drag is still O(26 MP) and only the
     /// final render got cheaper. Adjustment-only re-renders must reuse the proxy.

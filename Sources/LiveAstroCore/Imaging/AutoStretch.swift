@@ -17,12 +17,49 @@ public enum AutoStretch {
     /// sits comfortably inside the slider rather than in a sliver at one end.
     public static let blackPointMaxMADN = 8.0
 
+    /// The linked statistics the autostretch derives its transform from: the median and MADN of
+    /// the mean-of-channels sample. Exposed so a caller can compute them on the FULL-RESOLUTION
+    /// image and hand them to a render of a downsampled proxy, which is what keeps the preview's
+    /// curve identical to the broadcast's.
+    public struct LinkedStatistics: Equatable, Sendable {
+        public let median: Double
+        public let madn: Double
+        public init(median: Double, madn: Double) { self.median = median; self.madn = madn }
+    }
+
+    public static func linkedStatistics(_ image: AstroImage) -> LinkedStatistics {
+        let plane = image.width * image.height
+        guard plane > 0 else { return LinkedStatistics(median: 0, madn: 1e-10) }
+        let work = image.pixels
+        // Combined luminance sample (mean across channels), stride-sampled.
+        let stride = AstroImage.sampleStride(count: plane)
+        var sample: [Float] = []
+        sample.reserveCapacity(plane / stride + 1)
+        var i = 0
+        while i < plane {
+            var s: Float = 0
+            for c in 0..<image.channels { s += work[c * plane + i] }
+            sample.append(s / Float(image.channels))
+            i += stride
+        }
+        sample.sort()
+        let median = Double(sample[sample.count / 2])
+        var deviations = sample.map { abs(Double($0) - median) }
+        deviations.sort()
+        // 1.4826 = 1 / Φ⁻¹(0.75): MAD→σ consistency factor for Gaussian data
+        let madnRaw = 1.4826 * deviations[deviations.count / 2]
+        // When all samples are nearly identical (madn ≈ 0), use median as fallback to preserve
+        // channel ratios.
+        return LinkedStatistics(median: median, madn: madnRaw > 1e-10 ? madnRaw : max(median, 1e-10))
+    }
+
     /// Linked autostretch: statistics from the mean-of-channels sample, one transform for all channels.
     public static func stretch(_ image: AstroImage,
                                targetBackground: Double = 0.25,
                                shadowsClipping: Double = -2.8,
                                blackPoint: Double = 0,
-                               midtoneStrength: Double = 0) -> AstroImage {
+                               midtoneStrength: Double = 0,
+                               statistics: LinkedStatistics? = nil) -> AstroImage {
         // Black point is applied AFTER the auto-stretch statistics are derived, not before.
         //
         // It used to clip the LINEAR data first; the median and MADN were then measured on the
@@ -45,25 +82,14 @@ public enum AutoStretch {
         // A zero-pixel image has no samples: median indexing below would trap. Nothing
         // to stretch — return it unchanged (mirrors the AstroImage.computeStats guard).
         guard plane > 0 else { return image }
-        // Combined luminance sample (mean across channels), stride-sampled.
-        let stride = AstroImage.sampleStride(count: plane)
-        var sample: [Float] = []
-        sample.reserveCapacity(plane / stride + 1)
-        var i = 0
-        while i < plane {
-            var s: Float = 0
-            for c in 0..<image.channels { s += work[c * plane + i] }
-            sample.append(s / Float(image.channels))
-            i += stride
-        }
-        sample.sort()
-        let median = Double(sample[sample.count / 2])
-        var deviations = sample.map { abs(Double($0) - median) }
-        deviations.sort()
-        // 1.4826 = 1 / Φ⁻¹(0.75): MAD→σ consistency factor for Gaussian data
-        let madn_raw = 1.4826 * deviations[deviations.count / 2]
-        // When all samples are nearly identical (madn ≈ 0), use median as fallback to preserve channel ratios
-        let madn = madn_raw > 1e-10 ? madn_raw : max(median, 1e-10)
+        // Statistics may be INJECTED. The preview renders a downsample, and deriving the
+        // transform from the downsample's own statistics is not the same transform the
+        // full-resolution broadcast derives: averaging halves MADN, which moves the shadow point,
+        // and the midtone is solved from that — so the curve visibly diverges. Passing the
+        // full-resolution statistics in makes the preview apply the BROADCAST's curve.
+        let stats = statistics ?? linkedStatistics(image)
+        let median = stats.median
+        let madn = stats.madn
 
         let autoShadow = min(max(median + shadowsClipping * madn, 0), 1)
         // The slider spans 0...1; full travel lifts the cut by `blackPointMaxMADN` sigma above the

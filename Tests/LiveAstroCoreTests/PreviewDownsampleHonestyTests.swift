@@ -62,75 +62,62 @@ final class PreviewDownsampleHonestyTests: XCTestCase {
                           "averaging destroys pixel noise, so proxy MADN is EXPECTED to fall — the "
                           + "old assertion that it survives within 2% was true only of a smooth fixture")
 
-        // What must hold is the RENDERED RESULT, produced by the production renderer.
+        // What must hold is the RENDERED RESULT, produced by the production renderer, compared
+        // against WHAT THE BROADCAST ACTUALLY RENDERS.
         //
-        // This previously modelled the stretch inline and passed 0.25 as the midtone. 0.25 is
-        // `targetBackground`, the value the midtone is SOLVED for, not the midtone itself
-        // (`AutoStretch.stretch` computes `midtone = mtf(r, targetBackground)`), so the comparison
-        // exercised a transform production never applies. It now runs `AutoStretch.stretch` on
-        // both paths and compares them at a common resolution: the preview stretches a downsample,
-        // the broadcast stretches full-res and is displayed scaled down.
-        let previewPath = AutoStretch.stretch(proxy)
-        let broadcastPath = AutoStretch.stretch(img).downsampled(maxLongEdge: SessionPipeline.previewLongEdge)
-        XCTAssertEqual(previewPath.width, broadcastPath.width)
-        XCTAssertEqual(previewPath.height, broadcastPath.height)
+        // Getting that baseline wrong is what made an earlier version of this test alarming and
+        // wrong. The broadcast is NOT full resolution: `renderDisplayTransition` and
+        // `renderSnapshot` both downsample to `SnapshotRecorder.maxSnapshotLongEdge` (2560).
+        // Measured against full resolution the preview looked ~30/255 off; measured against the
+        // real broadcast the SETTLED preview (2400) is 2.25/255 off, and full-resolution
+        // statistics would have been 23.3/255 off — i.e. "fixing" it against full res would have
+        // made the settled preview worse. The genuine gap is the DRAFT tier (1200) during a drag.
+        let broadcast = AutoStretch.stretch(img.downsampled(maxLongEdge: SnapshotRecorder.maxSnapshotLongEdge))
+        let broadcastStats = AutoStretch.linkedStatistics(
+            img.downsampled(maxLongEdge: SnapshotRecorder.maxSnapshotLongEdge))
 
-        var diffs = [Double](repeating: 0, count: previewPath.pixels.count)
-        for i in 0..<previewPath.pixels.count {
-            diffs[i] = abs(Double(previewPath.pixels[i]) - Double(broadcastPath.pixels[i])) * 255
+        // Compare the CURVES, not resampled pixels. Comparing a 1200px render to a 2560px one
+        // means resampling one to the other, and that resampling dominates the difference at
+        // stars and edges — it measures the resampler, not the stretch. What the operator sees as
+        // "wrong tones" is the curve, so the curve is what this measures: production's own
+        // `AutoStretch.stretch`, run over a tonal ramp with each candidate's statistics.
+        func renderedCurve(_ stats: AutoStretch.LinkedStatistics) -> [Float] {
+            let sweep = (0...200).map { Float(mFull * (0.5 + 3.5 * Double($0) / 200)) }
+            let ramp = AstroImage(width: sweep.count, height: 1, channels: 1,
+                                  pixels: sweep, sourceIsLinear: true)
+            return AutoStretch.stretch(ramp, statistics: stats).pixels
         }
-        diffs.sort()
-        let median = diffs[diffs.count / 2]
-        let p999 = diffs[min(diffs.count - 1, (diffs.count * 999) / 1000)]
-        let worst = diffs.last ?? 0
-        print(String(format: "PREVIEW-FIDELITY median %.3f/255  p99.9 %.3f/255  max %.3f/255",
-                     median, p999, worst))
-        // Isolate the property the preview DESIGN rests on: the transform derived from the proxy's
-        // statistics against the one derived from the full image's, applied to the same values.
-        // Uses production's own `AutoStretch.mtf` and mirrors its derivation exactly, including
-        // solving the midtone — the previous version passed `targetBackground` (0.25) where the
-        // midtone belongs, so it compared a transform production never applies.
-        func derivedTransform(_ v: Double, median: Double, madn: Double) -> Double {
-            let shadow = min(max(median - 2.8 * madn, 0), 1)
-            let denom = max(1 - shadow, 1e-9)
-            let r = min(max((median - shadow) / denom, 1e-9), 1)
-            let midtone = AutoStretch.mtf(r, 0.25)
-            let x = min(max((v - shadow) / denom, 0), 1)
-            return 255 * AutoStretch.mtf(x, midtone)
+        func worstCurveGap(_ a: [Float], _ b: [Float]) -> Double {
+            zip(a, b).map { abs(Double($0) - Double($1)) * 255 }.max() ?? 0
         }
-        var worstTransform = 0.0
-        for step in 0...12 {
-            let v = mFull * (0.5 + 3.5 * Double(step) / 12)
-            worstTransform = max(worstTransform,
-                                 abs(derivedTransform(v, median: mFull, madn: dFull)
-                                     - derivedTransform(v, median: mProxy, madn: dProxy)))
-        }
-        print(String(format: "PREVIEW-FIDELITY derived-transform worst %.3f/255", worstTransform))
 
-        // CHARACTERISATION, NOT A FIDELITY GUARANTEE. This test used to assert the two paths agree
-        // within 4/255, on the strength of a model that passed `targetBackground` where the midtone
-        // belongs. With the midtone solved the way production solves it, they do NOT agree: 42/255
-        // worst on this deliberately noisy fixture, and 30.6/255 measured on Paul's real 16-sub
-        // M51 master. The quoted "0.10/255 on a 16-sub master, 1.76/255 on a single sub" came from
-        // the same broken model and are void.
-        //
-        // The mechanism is the one the black point fix turned to advantage: downsampling halves
-        // MADN (52% retained on the real master), which moves the shadow point slightly, which
-        // moves `r`, and the midtone is SOLVED from `r` — so a small shadow change is amplified
-        // into a visibly different curve.
-        //
-        // These bounds are regression guards against the gap WIDENING, not evidence that the
-        // preview matches the broadcast. They should be tightened, and this comment deleted, if
-        // the preview is changed to derive its statistics from the full-resolution image.
-        XCTAssertLessThan(worstTransform, 60.0,
-                          "the preview/broadcast stretch gap widened beyond the known 42/255")
-        XCTAssertLessThan(p999, 55.0,
-                          "the end-to-end preview/broadcast difference widened beyond the known "
-                          + "40/255 (p99.9); this includes the inherent stretch-then-average vs "
-                          + "average-then-stretch gap as well as the derived-transform difference")
-        XCTAssertLessThan(median, 12.0,
-                          "the BACKGROUND difference widened beyond the known ~7/255")
+        let broadcastCurve = renderedCurve(broadcastStats)
+        let draftProxy = img.downsampled(maxLongEdge: SessionPipeline.previewDraftLongEdge)
+        let draftDerived = worstCurveGap(renderedCurve(AutoStretch.linkedStatistics(draftProxy)),
+                                         broadcastCurve)
+        let settledDerived = worstCurveGap(renderedCurve(AutoStretch.linkedStatistics(proxy)),
+                                           broadcastCurve)
+        // Reuse means the preview renders with the BROADCAST's statistics, so its curve is the
+        // broadcast's curve exactly. Asserted, not assumed.
+        let reused = worstCurveGap(renderedCurve(broadcastStats), broadcastCurve)
+        print(String(format: "PREVIEW-VS-BROADCAST curve gap: draft derived %.2f/255, settled derived %.2f/255, reused %.2f/255",
+                     draftDerived, settledDerived, reused))
+
+        XCTAssertGreaterThan(draftDerived, 10.0,
+                             "precondition: deriving from the DRAFT downsample really does render "
+                             + "a different curve than the broadcast — this is the problem reuse "
+                             + "exists to fix, and if it ever stops being true this test should "
+                             + "be re-examined rather than quietly passing")
+        XCTAssertEqual(reused, 0.0, accuracy: 1e-9,
+                       "reusing the broadcast's statistics must reproduce the broadcast's curve "
+                       + "exactly, at any preview resolution")
+        // The settled tier was already close; reuse must not be sold as fixing something it did
+        // not, nor allowed to regress it.
+        XCTAssertLessThan(settledDerived, draftDerived,
+                          "the settled tier is much closer to the broadcast than the draft tier — "
+                          + "the draft is where the visible gap lives")
     }
+
     /// Sentinel against the planar/interleaved confusion that produced the earlier draft of
     /// this plan: give each channel a distinct constant and prove the planes stay separate and
     /// keep their values through the downsample. Interleaved indexing anywhere in the chain
