@@ -218,9 +218,12 @@ final class AppModel {
     /// COMMITTED adjustments and the source — never on the pending edit — so re-rendering it on
     /// every slider tick doubled the work of a drag (two renders and two histograms per tick)
     /// to produce an identical image. Dragging felt slow because half the work was wasted.
+    /// Includes `quality`: without it a reference pane rendered during a drag (draft) satisfies
+    /// the cache forever, and the settled pass that follows never upgrades it.
     private var compareRenderKey: (adjustments: DisplayAdjustments,
                                    source: SessionPipeline.PreviewSource,
-                                   revision: UInt64)?
+                                   revision: UInt64,
+                                   quality: SessionPipeline.PreviewQuality)?
 
     /// Red night-vision tint of the *whole Mac display* (not just the astro image).
     /// In-memory only — defaults off each launch so the app never opens unexpectedly red.
@@ -648,6 +651,18 @@ final class AppModel {
         // render that ends a drag, Apply, Revert, Reset, blink, a new frame, a session boundary —
         // renders at full quality, so the image the operator judges is the faithful one.
         let quality: SessionPipeline.PreviewQuality = force ? .settled : .draft
+        // A draft is never the final word. Without this, a SINGLE unforced edit — one arrow-key
+        // nudge, one click on a slider track — renders at draft resolution and stops there, and
+        // the operator judges the image at half resolution forever. The trailing flag coalesces,
+        // so a continuous drag still settles exactly once, when it stops.
+        if quality == .draft && !previewTrailingScheduled {
+            previewTrailingScheduled = true
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 90_000_000)
+                self?.previewTrailingScheduled = false
+                self?.refreshPreview(force: true)
+            }
+        }
         // Test seam: when set, this stands in for `pipeline.renderPreview(source:adjustments:)`.
         // Captured here (not read again inside the detached task) so a test can gate ONE
         // specific in-flight call — e.g. block the render this refreshPreview() started while a
@@ -674,6 +689,7 @@ final class AppModel {
         let stackRevision = pipeline.currentDisplayRevision
         let needsCompare = compareRenderKey.map {
             $0.adjustments != committed || $0.source != source || $0.revision != stackRevision
+                || $0.quality != quality
         } ?? true
         let wantsCompare = needsCompare || previewCompareImage == nil
         Task.detached { [weak self] in
@@ -681,8 +697,8 @@ final class AppModel {
             let cg: CGImage?
             let compare: CGImage?
             if let renderOverride {
-                cg = await renderOverride(pipeline, source, adj)
-                compare = wantsCompare ? await renderOverride(pipeline, source, committed) : nil
+                cg = await renderOverride(pipeline, source, adj, quality)
+                compare = wantsCompare ? await renderOverride(pipeline, source, committed, quality) : nil
             } else {
                 cg = pipeline.renderPreview(source: source, adjustments: adj, quality: quality)
                 // The side-by-side counterpart. Only rendered when a clean master is being served;
@@ -704,7 +720,7 @@ final class AppModel {
                     if wantsCompare {
                         self.previewCompareImage = compare
                         self.compareHistogram = compare.map { DisplayHistogram.of($0) } ?? []
-                        self.compareRenderKey = (committed, source, stackRevision)
+                        self.compareRenderKey = (committed, source, stackRevision, quality)
                     }
                 }
                 self.previewRenderCompletionForTest?(seq, published)
@@ -717,7 +733,7 @@ final class AppModel {
     /// `refreshPreview` is unchanged there. Tests use it to control render TIMING — e.g. to hold
     /// one call open past a second, superseding call — without reimplementing or peeking at the
     /// `previewRenderSeq` guard itself.
-    var previewRenderOverrideForTest: (@Sendable (SessionPipeline, SessionPipeline.PreviewSource, DisplayAdjustments) async -> CGImage?)?
+    var previewRenderOverrideForTest: (@Sendable (SessionPipeline, SessionPipeline.PreviewSource, DisplayAdjustments, SessionPipeline.PreviewQuality) async -> CGImage?)?
 
     /// Test seam only: called once every `refreshPreview` render attempt has been resolved on
     /// the main actor, AFTER the `previewRenderSeq` guard ran — with that render's `seq` and

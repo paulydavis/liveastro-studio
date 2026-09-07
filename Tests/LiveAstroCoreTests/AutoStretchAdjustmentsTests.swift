@@ -88,6 +88,33 @@ final class AutoStretchAdjustmentsTests: XCTestCase {
         }
     }
 
+    /// Black point 0 must reproduce the plain auto-stretch EXACTLY, including on frames whose
+    /// auto shadow point lands above the slider's denominator cap.
+    ///
+    /// The first version of the black point fix capped the shadow at a flat 0.99. On a
+    /// near-saturated frame the auto shadow already exceeds that, so the cap pulled the cut BELOW
+    /// the auto point and silently altered the neutral render — the exact path the fix promised to
+    /// leave byte-identical. Caught by review as a calculated counterexample; this is it executed.
+    func testNeutralIsUnchangedWhenAutoShadowExceedsTheCap() {
+        // Three near-saturated samples: median 0.9990, MADN 1.48e-4, auto shadow 0.9986 > 0.99.
+        let px: [Float] = [0.9989, 0.9990, 0.9991]
+        let img = AstroImage(width: 3, height: 1, channels: 1, pixels: px, sourceIsLinear: true)
+
+        let plain = AutoStretch.stretch(img)
+        let neutral = AutoStretch.stretch(img, blackPoint: 0)
+        XCTAssertEqual(plain.pixels, neutral.pixels, "black point 0 must not alter the auto-stretch")
+
+        // Pin the value too, so a change to BOTH paths at once cannot slip through the comparison
+        // above. The auto-stretch places the background at targetBackground; a flat 0.99 cap
+        // rendered this median at 0.878 instead.
+        XCTAssertEqual(Double(neutral.pixels[1]), 0.25, accuracy: 1e-3)
+
+        // And the control still works from there — the cap must bound the denominator, not freeze
+        // the slider, once the user actually engages it.
+        let darkened = AutoStretch.stretch(img, blackPoint: 1)
+        XCTAssertLessThan(darkened.pixels[1], neutral.pixels[1])
+    }
+
     func testMidtoneStrengthDirection() {
         // Positive strength brightens mids (harder stretch): mean output rises.
         let img = linearImage()

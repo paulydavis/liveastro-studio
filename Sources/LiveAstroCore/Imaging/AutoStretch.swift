@@ -68,7 +68,17 @@ public enum AutoStretch {
         let autoShadow = min(max(median + shadowsClipping * madn, 0), 1)
         // The slider spans 0...1; full travel lifts the cut by `blackPointMaxMADN` sigma above the
         // auto point, which is past the point where the background is fully crushed on real data.
-        let shadow = min(max(autoShadow + bp * blackPointMaxMADN * madn, 0), 0.99)
+        //
+        // The cut is bounded by the headroom ABOVE the auto shadow, not by an absolute ceiling.
+        // An absolute cap gets both edge cases wrong on a near-saturated frame, where the auto
+        // shadow itself is already above the ceiling: a flat 0.99 pulls the cut BELOW the auto
+        // point and changes the render at black point 0 (measured on [0.9989, 0.9990, 0.9991]:
+        // rendered median 0.25 -> 0.878), while `max(autoShadow, 0.99)` lands exactly ON the auto
+        // point and freezes the slider instead. Letting the offset consume at most 99% of the
+        // distance from the auto shadow to 1 keeps `denom` strictly positive, leaves black point 0
+        // byte-identical on every input, and keeps the control live on every input.
+        let headroom = max(1 - autoShadow, 0)
+        let shadow = autoShadow + min(max(bp, 0) * blackPointMaxMADN * madn, 0.99 * headroom)
         let denom = max(1 - shadow, 1e-9)
         // r — and therefore the midtone — comes from the AUTO shadow, never the user-shifted one.
         // Deriving it from `shadow` is what made black point self-cancelling.

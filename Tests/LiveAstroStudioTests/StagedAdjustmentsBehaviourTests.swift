@@ -198,7 +198,7 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         let imageNewer = try Self.solidImage(0.1)
         let olderBlackPoint = older.blackPoint
 
-        model.previewRenderOverrideForTest = { _, _, adjustments in
+        model.previewRenderOverrideForTest = { _, _, adjustments, _ in
             if adjustments.blackPoint == olderBlackPoint {
                 await gate.markStarted()
                 await gate.waitForRelease()   // held open deliberately
@@ -254,7 +254,7 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         let gate = RenderGate()
         let staleImage = try Self.solidImage(0.9)
 
-        model.previewRenderOverrideForTest = { _, _, _ in
+        model.previewRenderOverrideForTest = { _, _, _, _ in
             await gate.markStarted()
             await gate.waitForRelease()
             return staleImage
@@ -352,6 +352,79 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
                        "explicit refreshDisplay() call would bump it twice")
     }
 
+    /// CGImage is not Sendable; the render override is. The box carries one across, which is safe
+    /// here because the image is created once and only read.
+    private struct ImageBox: @unchecked Sendable { let cg: CGImage }
+
+    private actor QualityLog {
+        private(set) var entries: [(blackPoint: Double, quality: SessionPipeline.PreviewQuality)] = []
+        func add(_ bp: Double, _ q: SessionPipeline.PreviewQuality) { entries.append((bp, q)) }
+        var all: [(blackPoint: Double, quality: SessionPipeline.PreviewQuality)] { entries }
+    }
+
+    /// A draft render must never be the operator's final image. A drag is throttled and its last
+    /// tick settles, but a SINGLE unforced edit — one arrow-key nudge, one click on the slider
+    /// track — took the un-throttled path straight to `.draft` and stopped there, leaving the
+    /// operator judging a half-resolution image with no further event coming to fix it.
+    @MainActor func testAnIsolatedDraftEditIsFollowedByASettledRender() async throws {
+        let (model, _) = makeAttachedModel()
+        let box = ImageBox(cg: try Self.solidImage(0.5))
+        let log = QualityLog()
+        let settled = expectation(description: "a settled render follows the isolated draft edit")
+        settled.assertForOverFulfill = false
+        model.previewRenderOverrideForTest = { _, _, adj, quality in
+            await log.add(adj.blackPoint, quality)
+            if quality == .settled { settled.fulfill() }
+            return box.cg
+        }
+
+        var adj = model.staged.committed
+        adj.blackPoint = 0.3
+        model.staged.pending = adj
+        model.refreshPreview()          // ONE unforced edit, then no further input at all
+
+        await fulfillment(of: [settled], timeout: 5)
+        let all = await log.all
+        XCTAssertEqual(all.first?.quality, .draft, "the immediate render should still be cheap")
+        XCTAssertTrue(all.contains { $0.quality == .settled },
+                      "a settled render must follow with no further input")
+    }
+
+    /// The reference pane has its own cache key, and it must include the quality. Without it, the
+    /// pane rendered during a drag satisfies the cache permanently: the settled pass that follows
+    /// sees "nothing it depends on changed" and skips it, so "Currently live" stays at draft
+    /// resolution beside a settled "Your edit" — the two panes the operator is comparing are then
+    /// not rendered alike, which is the one thing a comparison view must guarantee.
+    @MainActor func testTheReferencePaneIsUpgradedToSettledToo() async throws {
+        let (model, _) = makeAttachedModel()
+        let box = ImageBox(cg: try Self.solidImage(0.5))
+        let log = QualityLog()
+        // Pending differs from committed, so the two renders per pass are distinguishable by value.
+        var adj = model.staged.committed
+        adj.blackPoint = 0.42
+        model.staged.pending = adj
+        let committedBlackPoint = model.staged.committed.blackPoint
+
+        let settledReference = expectation(description: "the reference pane renders at settled")
+        settledReference.assertForOverFulfill = false
+        model.previewRenderOverrideForTest = { _, _, adjustments, quality in
+            await log.add(adjustments.blackPoint, quality)
+            if quality == .settled && adjustments.blackPoint == committedBlackPoint {
+                settledReference.fulfill()
+            }
+            return box.cg
+        }
+
+        model.refreshPreview()
+        await fulfillment(of: [settledReference], timeout: 5)
+
+        let all = await log.all
+        XCTAssertTrue(all.contains { $0.quality == .draft && $0.blackPoint == committedBlackPoint },
+                      "precondition: the reference pane also rendered on the draft pass")
+        XCTAssertTrue(all.contains { $0.quality == .settled && $0.blackPoint == committedBlackPoint },
+                      "the reference pane must be re-rendered when the quality changes")
+    }
+
     // MARK: - OPEN RISK (documented, not fixed): refreshPreview has no bound on concurrent renders
 
     /// NOT a correctness fix — a measurement. `previewRenderSeq` rejects a stale RESULT from
@@ -385,7 +458,7 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         let gate = RenderGate()
         let n = 6
 
-        model.previewRenderOverrideForTest = { _, _, adj in
+        model.previewRenderOverrideForTest = { _, _, adj, _ in
             await tracker.enter(adj.blackPoint)
             await gate.waitForRelease()
             await tracker.exit()
@@ -408,7 +481,7 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         await gate.release()
         let rendered = expectation(description: "the newest edit eventually renders")
         rendered.assertForOverFulfill = false
-        model.previewRenderOverrideForTest = { _, _, adj in
+        model.previewRenderOverrideForTest = { _, _, adj, _ in
             if abs(adj.blackPoint - 0.05) < 1e-9 { rendered.fulfill() }
             return nil
         }
@@ -432,7 +505,7 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         let committedBaseline = model.staged.committed
         let editedImage = try Self.solidImage(0.8)
         let liveImage = try Self.solidImage(0.2)
-        model.previewRenderOverrideForTest = { _, _, adj in
+        model.previewRenderOverrideForTest = { _, _, adj, _ in
             adj == committedBaseline ? liveImage : editedImage
         }
 
@@ -493,7 +566,7 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         let editedImage = try Self.solidImage(0.8)
         let liveImage = try Self.solidImage(0.2)
         // Renders whatever adjustments it is handed: the baseline look, or the edited look.
-        model.previewRenderOverrideForTest = { _, _, adj in
+        model.previewRenderOverrideForTest = { _, _, adj, _ in
             adj == baseline ? liveImage : editedImage
         }
 

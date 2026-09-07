@@ -54,6 +54,48 @@ final class PreviewRenderTests: XCTestCase {
         XCTAssertLessThanOrEqual(max(cg.width, cg.height), SessionPipeline.previewLongEdge)
     }
 
+    /// The draft tier must actually be cheaper. `PreviewQuality.longEdge` existed, the cache key
+    /// carried the quality, and the app asked for `.draft` during drags — but the proxy was built
+    /// at `previewLongEdge` regardless, so a drag did full settled-resolution work and switching
+    /// quality merely invalidated the cache to rebuild an identically sized image. The tier was
+    /// strictly worse than not having one.
+    ///
+    /// Asserted relationally rather than against the constants, so a future retune of either
+    /// long-edge value cannot make this test unsatisfiable.
+    func testDraftQualityRendersSmallerThanSettled() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try PreviewRenderTests.runningPipeline(sandbox: sandbox)
+        defer { source.stop() }
+
+        let draft = try XCTUnwrap(pipeline.renderPreview(source: .online, adjustments: .neutral,
+                                                         quality: .draft))
+        let settled = try XCTUnwrap(pipeline.renderPreview(source: .online, adjustments: .neutral,
+                                                           quality: .settled))
+        XCTAssertLessThanOrEqual(max(draft.width, draft.height), SessionPipeline.previewDraftLongEdge)
+        XCTAssertLessThan(max(draft.width, draft.height), max(settled.width, settled.height),
+                          "draft must be cheaper than settled, not the same size")
+    }
+
+    /// Each quality keeps its OWN proxy: asking for the other one must not evict it, or a drag
+    /// rebuilds the full-resolution proxy on every settle and vice versa.
+    func testEachQualityCachesItsOwnProxy() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try PreviewRenderTests.runningPipeline(sandbox: sandbox)
+        defer { source.stop() }
+
+        _ = pipeline.renderPreview(source: .online, adjustments: .neutral, quality: .draft)
+        _ = pipeline.renderPreview(source: .online, adjustments: .neutral, quality: .settled)
+        let afterBoth = pipeline.previewProxyBuildCountForTest
+        _ = pipeline.renderPreview(source: .online, adjustments: .neutral, quality: .draft)
+        _ = pipeline.renderPreview(source: .online, adjustments: .neutral, quality: .settled)
+        XCTAssertEqual(pipeline.previewProxyBuildCountForTest, afterBoth,
+                       "revisiting a quality must reuse its cached proxy, not rebuild it")
+    }
+
     /// Finding 2: the spec requires a CACHED proxy. Without one, every slider tick walks the
     /// full 26 MP stack to build the downsample, so the drag is still O(26 MP) and only the
     /// final render got cheaper. Adjustment-only re-renders must reuse the proxy.

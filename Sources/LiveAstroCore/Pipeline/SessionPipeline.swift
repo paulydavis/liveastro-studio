@@ -1347,7 +1347,15 @@ public final class SessionPipeline {
     /// clean, so a single slot would evict and rebuild from the full-resolution stack on every
     /// press AND every release — the interaction that has to feel instant would be the most
     /// expensive one in the panel.
-    private var previewProxies: [PreviewSource: (key: PreviewProxyKey, image: AstroImage)] = [:]
+    /// One slot per (source, quality). Keying on source ALONE meant the two qualities evicted
+    /// each other, so every drag paid an extra full-resolution walk of the stack: the first draft
+    /// tick rebuilt the proxy the previous settle had just replaced. Bounded at 2 sources x 2
+    /// qualities; the draft entries are ~1/4 the pixels of the settled ones.
+    private struct ProxySlot: Hashable {
+        let source: PreviewSource
+        let quality: PreviewQuality
+    }
+    private var previewProxies: [ProxySlot: (key: PreviewProxyKey, image: AstroImage)] = [:]
     /// Test seam: how many times the proxy has actually been rebuilt.
     private(set) var previewProxyBuildCountForTest = 0
 
@@ -1449,15 +1457,16 @@ public final class SessionPipeline {
         }
         var proxy: AstroImage?
         previewProxyLock.lock()
-        if let cached = previewProxies[source], cached.key == key { proxy = cached.image }
+        let slot = ProxySlot(source: source, quality: quality)
+        if let cached = previewProxies[slot], cached.key == key { proxy = cached.image }
         previewProxyLock.unlock()
 
         if proxy == nil {
             guard let (image, coverage) = selectedSourceFullRes(source) else { return nil }
             let built = cropToCoverage(image, coverage: coverage)
-                .downsampled(maxLongEdge: Self.previewLongEdge)
+                .downsampled(maxLongEdge: quality.longEdge)
             previewProxyLock.lock()
-            previewProxies[source] = (key, built)
+            previewProxies[slot] = (key, built)
             previewProxyBuildCountForTest += 1
             previewProxyLock.unlock()
             proxy = built
