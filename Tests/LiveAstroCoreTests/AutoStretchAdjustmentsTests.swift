@@ -19,27 +19,73 @@ final class AutoStretchAdjustmentsTests: XCTestCase {
         XCTAssertEqual(plain.pixels, neutral.pixels)   // exact byte-for-byte
     }
 
-    func testBlackPointClipsAndRescales() {
-        // Black-point clip is applied to the LINEAR input: x' = max(0,(x-bp)/(1-bp)).
-        // Verify the clip transform directly on a known ramp via a helper.
-        let bp = 0.25
-        func clip(_ x: Double) -> Double { max(0, (x - bp) / (1 - bp)) }
-        XCTAssertEqual(clip(0.25), 0, accuracy: 1e-9)      // at bp → 0
-        XCTAssertEqual(clip(1.0), 1, accuracy: 1e-9)       // at 1 → 1
-        XCTAssertEqual(clip(0.625), 0.5, accuracy: 1e-9)   // midway above bp
-        // And a bp>0 stretch darkens: its minimum output <= the neutral minimum.
-        let img = linearImage()
-        let neutral = AutoStretch.stretch(img)
-        let clipped = AutoStretch.stretch(img, blackPoint: 0.25)
-        XCTAssertLessThanOrEqual(clipped.pixels.min()!, neutral.pixels.min()!)
+    /// Synthetic frame with the shape of real astro data: a TIGHT background (median 0.010,
+    /// MADN ~7e-5, matching Paul's M51 master) plus a sparse bright population. The tightness
+    /// is the whole point — it is what made the old black point inert.
+    func astroLikeImage() -> AstroImage {
+        let w = 64, h = 64, n = w * h
+        var px = [Float](repeating: 0, count: n * 3)
+        var seed: UInt64 = 0x5EED
+        func next() -> Double {          // deterministic LCG; tests must not be random
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            return Double(seed >> 11) / Double(UInt64(1) << 53)
+        }
+        for i in 0..<n {
+            // Background: 0.010 with +/- 1e-4 of noise, so MADN lands near 7e-5.
+            var v = 0.010 + (next() - 0.5) * 2e-4
+            if i % 97 == 0 { v += 0.2 * next() }   // ~1% of pixels are stars
+            for c in 0..<3 { px[c * n + i] = Float(v) }
+        }
+        return AstroImage(width: w, height: h, channels: 3, pixels: px, sourceIsLinear: true)
+    }
 
-        // Integration: prove the clip flows through stretch into shadow/denom, not just
-        // that `work` is built. The ramp is i/15 per channel (n=16). With bp=0.25:
-        //   - pixel 0 (linear 0.0) is below bp → clipped to 0 → mtf(0, m) == 0 in output.
-        //   - pixel 15 (linear 1.0) is above bp → maps to > 0.
-        // Catches a regression where `work` is computed but the transform still reads image.pixels.
-        XCTAssertEqual(clipped.pixels[0], 0.0, accuracy: 1e-6)   // at/below bp → 0
-        XCTAssertGreaterThan(clipped.pixels[15], 0.0)            // above bp → > 0
+    func testBlackPointDarkensTheRenderedBackground() {
+        // Black point raises the shadow cut while the midtone stays at its AUTO value.
+        //
+        // This is the regression that matters. The old implementation clipped the LINEAR data
+        // and then re-derived the midtone from the clipped statistics, which is solved to place
+        // the background back at `targetBackground` — so the clip was undone almost exactly.
+        // Measured on Paul's real M51 master, the old control moved the render by 0.00/255 at
+        // 0.005 and 0.21/255 across its whole range. It was inert in the app, and this test
+        // fails if that renormalisation ever comes back.
+        let img = astroLikeImage()
+        func backgroundLevel(_ bp: Double) -> Double {
+            let out = AutoStretch.stretch(img, blackPoint: bp).pixels.map(Double.init).sorted()
+            return out[out.count / 2]        // median == the background, stars are sparse
+        }
+
+        let neutral = backgroundLevel(0)
+        // Neutral must land on targetBackground: that is what the auto-stretch is solved for,
+        // and it anchors the comparisons below.
+        XCTAssertEqual(neutral, 0.25, accuracy: 0.03)
+
+        // Monotone darkening, and each step is visible (>= 8/255) rather than arithmetic noise.
+        var previous = neutral
+        for bp in [0.125, 0.25, 0.5] {
+            let level = backgroundLevel(bp)
+            XCTAssertLessThan(level, previous - 8.0 / 255.0,
+                              "black point \(bp) must visibly darken the background")
+            previous = level
+        }
+        // Full travel crushes the background to black: blackPointMaxMADN is chosen so the
+        // useful range sits inside the slider rather than in a sliver at one end.
+        XCTAssertLessThan(backgroundLevel(1.0), 2.0 / 255.0)
+    }
+
+    func testBlackPointLeavesTheBrightEndAlone() {
+        // Only the shadow cut moves; a pixel at full scale must still render at full scale.
+        // Guards against a "fix" that simply scales the whole frame down.
+        let img = astroLikeImage()
+        var px = img.pixels
+        let plane = img.width * img.height
+        for c in 0..<3 { px[c * plane] = 1.0 }
+        let withHighlight = AstroImage(width: img.width, height: img.height, channels: 3,
+                                       pixels: px, sourceIsLinear: true)
+        for bp in [0.0, 0.25, 0.5, 1.0] {
+            let out = AutoStretch.stretch(withHighlight, blackPoint: bp)
+            XCTAssertEqual(Double(out.pixels[0]), 1.0, accuracy: 1e-6,
+                           "black point \(bp) must not pull down the highlight")
+        }
     }
 
     func testMidtoneStrengthDirection() {

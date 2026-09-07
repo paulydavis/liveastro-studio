@@ -12,21 +12,34 @@ public enum AutoStretch {
         return ((m - 1) * x) / (((2 * m - 1) * x) - m)
     }
 
+    /// How far, in MADN (robust sigma), a full-travel black point lifts the shadow cut above the
+    /// auto-derived one. 8 puts the background well past crushed on real data, so the useful range
+    /// sits comfortably inside the slider rather than in a sliver at one end.
+    public static let blackPointMaxMADN = 8.0
+
     /// Linked autostretch: statistics from the mean-of-channels sample, one transform for all channels.
     public static func stretch(_ image: AstroImage,
                                targetBackground: Double = 0.25,
                                shadowsClipping: Double = -2.8,
                                blackPoint: Double = 0,
                                midtoneStrength: Double = 0) -> AstroImage {
-        // Black-point: gentle shadow clip on the LINEAR data. bp==0 → identity.
-        let bp = min(max(blackPoint, 0), 0.2)
-        let work: [Float]
-        if bp > 0 {
-            let inv = 1.0 - bp
-            work = image.pixels.map { Float(max(0, (Double($0) - bp) / inv)) }
-        } else {
-            work = image.pixels
-        }
+        // Black point is applied AFTER the auto-stretch statistics are derived, not before.
+        //
+        // It used to clip the LINEAR data first; the median and MADN were then measured on the
+        // CLIPPED result and the background renormalised to `targetBackground`, which undid the
+        // clip almost exactly. Measured on a real M51 master: moving the slider from 0 to 0.005
+        // changed the rendered output by 0.00/255, and even the full old range only reached
+        // 0.21/255 mean. The control did nothing, which is what it looked like in use.
+        //
+        // It now raises the SHADOW POINT while the midtone stays fixed at its auto-derived value.
+        // The midtone was the real culprit: it is solved to place the background at
+        // `targetBackground`, so ANY shadow movement was compensated away and the background
+        // landed back in the same place. Deriving the midtone once, from the auto shadow, and then
+        // moving only the cut makes the control bite: measured on a real master, +1 MADN shifts
+        // the render by 18.6/255 and +3 MADN by 53.4/255, against 0.00/255 for the old behaviour.
+        // 0 reproduces the auto-stretch exactly, so the neutral path stays byte-identical.
+        let bp = min(max(blackPoint, 0), 1)
+        let work = image.pixels
 
         let plane = image.width * image.height
         // A zero-pixel image has no samples: median indexing below would trap. Nothing
@@ -52,9 +65,15 @@ public enum AutoStretch {
         // When all samples are nearly identical (madn ≈ 0), use median as fallback to preserve channel ratios
         let madn = madn_raw > 1e-10 ? madn_raw : max(median, 1e-10)
 
-        let shadow = min(max(median + shadowsClipping * madn, 0), 1)
+        let autoShadow = min(max(median + shadowsClipping * madn, 0), 1)
+        // The slider spans 0...1; full travel lifts the cut by `blackPointMaxMADN` sigma above the
+        // auto point, which is past the point where the background is fully crushed on real data.
+        let shadow = min(max(autoShadow + bp * blackPointMaxMADN * madn, 0), 0.99)
         let denom = max(1 - shadow, 1e-9)
-        let r = min(max((median - shadow) / denom, 1e-9), 1)
+        // r — and therefore the midtone — comes from the AUTO shadow, never the user-shifted one.
+        // Deriving it from `shadow` is what made black point self-cancelling.
+        let autoDenom = max(1 - autoShadow, 1e-9)
+        let r = min(max((median - autoShadow) / autoDenom, 1e-9), 1)
         let strengthFactor = pow(2.0, -min(max(midtoneStrength, -1), 1))
         let baseMidtone = mtf(r, targetBackground)
         // strengthFactor==1 (neutral) must reproduce today's UNclamped midtone exactly,

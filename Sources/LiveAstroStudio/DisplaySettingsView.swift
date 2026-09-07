@@ -76,11 +76,11 @@ struct DisplaySettingsView: View {
                         VStack(alignment: .leading) {
                             Text("Black point")
                             HStack {
-                                Slider(value: $model.staged.pending.blackPoint, in: 0...0.05)
+                                Slider(value: $model.staged.pending.blackPoint, in: 0...1)
                                     .onChange(of: model.staged.pending.blackPoint) { _, _ in
                                         model.refreshPreview()
                                     }
-                                Text(String(format: "%.4f", model.staged.pending.blackPoint))
+                                Text(String(format: "%.2f", model.staged.pending.blackPoint))
                                     .frame(width: 62, alignment: .trailing).monospacedDigit()
                                     .font(.caption).foregroundStyle(.secondary)
                             }
