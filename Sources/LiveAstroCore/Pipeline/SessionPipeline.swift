@@ -1250,12 +1250,17 @@ public final class SessionPipeline {
         DisplayRenderContext(adjustments: adjustments, wcs: currentWCS)
     }
 
-    private func displayCGImage(from linear: AstroImage, context: DisplayRenderContext? = nil) throws -> CGImage {
+    /// `preflattened` means the caller has ALREADY applied background extraction to `linear`
+    /// (see the preview's DBE cache): the flatten step is skipped, but every downstream decision
+    /// that depends on DBE being on — notably skipping the additive neutralize — still behaves as
+    /// though it ran, because it did.
+    private func displayCGImage(from linear: AstroImage, context: DisplayRenderContext? = nil,
+                                preflattened: Bool = false) throws -> CGImage {
         let context = context ?? displayContext()
         let adj = context.adjustments
         // DBE first, on linear data. When on, it removes the per-channel spatial
         // background, so skip the additive neutralize (keep multiplicative WB).
-        let flattened = adj.backgroundExtraction
+        let flattened = (adj.backgroundExtraction && !preflattened)
             ? BackgroundExtraction.flattenMultiscale(linear, scale: adj.bgScale, smoothest: adj.bgSmoothest)
             : linear
         let balanced: AstroImage
@@ -1325,6 +1330,18 @@ public final class SessionPipeline {
         case clean(FreshnessKey, quality: PreviewQuality)
         case watcher(token: Int, quality: PreviewQuality)
     }
+    /// Flattened (DBE-applied) preview proxies, keyed by the proxy AND the two DBE parameters.
+    /// Measured on a 1200x800 proxy, `flattenMultiscale` costs roughly 4x a denoise pass, 15x a
+    /// stretch and 200x a histogram — it dominates a preview render completely. It depends only
+    /// on the image and its own two parameters, so dragging black point, stretch, saturation or
+    /// denoise re-ran it for an identical result and made the panel feel sluggish.
+    private struct FlattenedKey: Equatable {
+        let proxy: PreviewProxyKey
+        let scale: Double
+        let smoothest: Double
+    }
+    private var flattenedProxy: (key: FlattenedKey, image: AstroImage)?
+
     private let previewProxyLock = NSLock()
     /// One slot PER SOURCE, not a single slot. Hold-to-compare alternates clean -> online ->
     /// clean, so a single slot would evict and rebuild from the full-resolution stack on every
@@ -1446,7 +1463,30 @@ public final class SessionPipeline {
             proxy = built
         }
         guard let proxy else { return nil }
-        return try? displayCGImage(from: proxy, context: displayContext(overriding: adjustments))
+
+        // Hoist the DBE stage out of the per-tick render and cache it.
+        var working = proxy
+        var preflattened = false
+        if adjustments.backgroundExtraction {
+            let fk = FlattenedKey(proxy: key, scale: adjustments.bgScale,
+                                  smoothest: adjustments.bgSmoothest)
+            previewProxyLock.lock()
+            let cached = (flattenedProxy?.key == fk) ? flattenedProxy?.image : nil
+            previewProxyLock.unlock()
+            if let cached {
+                working = cached
+            } else {
+                working = BackgroundExtraction.flattenMultiscale(
+                    proxy, scale: adjustments.bgScale, smoothest: adjustments.bgSmoothest)
+                previewProxyLock.lock()
+                flattenedProxy = (fk, working)
+                previewProxyLock.unlock()
+            }
+            preflattened = true
+        }
+        return try? displayCGImage(from: working,
+                                   context: displayContext(overriding: adjustments),
+                                   preflattened: preflattened)
     }
 
     /// Renders `source` at FULL resolution — the Apply-path counterpart to `renderPreview`,
