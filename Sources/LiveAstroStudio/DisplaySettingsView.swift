@@ -144,13 +144,12 @@ struct DisplaySettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 previewPane(model.previewImage,
-                            title: model.canCompare ? "Trail-rejected" : "Preview")
+                            title: model.staged.hasPendingChanges ? "Your edit (not yet live)" : "Preview")
                 if let compare = model.previewCompareImage {
-                    // Side by side rather than a hold-to-blink swap. The two masters differ over
-                    // only a small fraction of the frame — measured 0.13% of pixels past 2/255 on
-                    // real subs — which a blink cannot convey but a direct comparison can, since
-                    // the operator can study the same region in both for as long as they like.
-                    previewPane(compare, title: "Not rejected")
+                    // The reference: same stack, COMMITTED adjustments — what the audience sees
+                    // right now. It holds still while the left pane follows the dials, so the
+                    // difference between the panes is the edit and nothing else.
+                    previewPane(compare, title: "Currently live")
                 }
             }
             .frame(minHeight: 300, maxHeight: max(340, panelHeight))
@@ -196,11 +195,14 @@ struct DisplaySettingsView: View {
 
     /// Explains itself when there is nothing to compare, rather than silently showing one pane.
     private var comparisonStatus: String {
-        switch model.liveRejectionStatus {
-        case .active(let subs): return "Comparing against the un-rejected stack · clean master over \(subs) subs"
-        case .building(let subs): return "Building the clean master over \(subs) subs — nothing to compare yet"
-        case .off(let reason): return "Trail rejection off (\(reason)) — nothing to compare"
+        guard model.staged.hasPendingChanges else {
+            switch model.liveRejectionStatus {
+            case .active(let subs): return "Clean master over \(subs) subs · move a slider to compare against what is live"
+            case .building(let subs): return "Building the clean master over \(subs) subs"
+            case .off(let reason): return "Trail rejection off (\(reason))"
+            }
         }
+        return "Left: your pending edit · Right: what the broadcast is showing now"
     }
 
 }

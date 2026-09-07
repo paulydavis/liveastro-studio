@@ -197,12 +197,14 @@ final class AppModel {
     /// source to `.clean` would blank the preview entirely whenever rejection is off (there
     /// is no published master, so `renderPreview(source: .clean)` returns nil) — which is
     /// every import session. `previewSource` below resolves it instead.
-    /// The ONLINE (un-rejected) counterpart, rendered alongside `previewImage` whenever a clean
-    /// master is being served, so the two sit side by side. Replaces the old hold-to-compare
-    /// gesture: a blink relies on the eye catching a transition, and measured on real data the
-    /// two masters differ by 0.86/255 with 0.13% of pixels past 2/255 — far too little to catch
-    /// in a flash, and indistinguishable from a dead button. Side by side, the operator can
-    /// study the same region in both at leisure. nil when there is nothing to compare against.
+    /// The reference pane: the SAME source rendered with the COMMITTED adjustments — i.e. what
+    /// the audience is seeing right now. Turning a dial moves `previewImage` and leaves this one
+    /// still, so the comparison isolates the operator's edit rather than putting two moving
+    /// targets side by side.
+    ///
+    /// (It previously showed the un-rejected master, comparing rejection instead of the edit.
+    /// That answered a different question, and answered it badly: the two masters differ over
+    /// 0.13% of the frame, so both panes looked identical while both moved together.)
     var previewCompareImage: CGImage?
 
     /// Red night-vision tint of the *whole Mac display* (not just the astro image).
@@ -648,21 +650,23 @@ final class AppModel {
             return
         }
         draftRendersInFlight += 1
-        let wantsCompare = canCompare
+        // The reference pane is worth rendering only when there is an edit to compare against.
+        let committed = staged.committed
+        let wantsCompare = staged.hasPendingChanges
         Task.detached { [weak self] in
             guard let self else { return }
             let cg: CGImage?
             let compare: CGImage?
             if let renderOverride {
                 cg = await renderOverride(pipeline, source, adj)
-                compare = wantsCompare ? await renderOverride(pipeline, .online, adj) : nil
+                compare = wantsCompare ? await renderOverride(pipeline, source, committed) : nil
             } else {
                 cg = pipeline.renderPreview(source: source, adjustments: adj, quality: quality)
                 // The side-by-side counterpart. Only rendered when a clean master is being served;
                 // otherwise there is nothing to compare the online stack against and the panel
                 // shows a single image.
                 compare = wantsCompare
-                    ? pipeline.renderPreview(source: .online, adjustments: adj, quality: quality)
+                    ? pipeline.renderPreview(source: source, adjustments: committed, quality: quality)
                     : nil
             }
             await MainActor.run {

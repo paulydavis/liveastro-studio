@@ -418,18 +418,22 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         XCTAssertFalse(seen.isEmpty, "at least one render must have been dispatched")
     }
 
-    /// The side-by-side must actually show two DIFFERENT pictures when a clean master is served,
-    /// and a single one when there is nothing to compare. Replaces a hold-to-compare test: driving
-    /// the real app, that control highlighted on press and appeared to do nothing, because the two
-    /// masters differ over only 0.13% of pixels (0.86/255 mean, measured on real subs) — far too
-    /// little for a blink to convey, which is why the comparison is now shown side by side.
-    @MainActor func testSideBySideRendersBothSourcesOnlyWhenThereIsSomethingToCompare() async throws {
-        let (model, pipeline) = makeAttachedModel()
+    /// The side-by-side compares the operator's PENDING edit against what is currently live, so:
+    /// with no edit there is one pane, and with an edit there are two that must differ. The
+    /// reference pane renders the SAME source with the COMMITTED adjustments — which is what
+    /// makes it hold still while the dials move the other one. (It previously showed the
+    /// un-rejected master, which compared rejection rather than the edit, and looked identical
+    /// because the two masters differ over 0.13% of the frame.)
+    @MainActor func testSideBySideComparesThePendingEditAgainstWhatIsLive() async throws {
+        let (model, _) = makeAttachedModel()
 
-        let cleanPixels = try Self.solidImage(0.2)
-        let onlinePixels = try Self.solidImage(0.8)
-        model.previewRenderOverrideForTest = { _, source, _ in
-            source == .clean ? cleanPixels : onlinePixels
+        // The override distinguishes the two renders by the ADJUSTMENTS handed to them, which is
+        // exactly what production varies between the panes.
+        let committedBaseline = model.staged.committed
+        let editedImage = try Self.solidImage(0.8)
+        let liveImage = try Self.solidImage(0.2)
+        model.previewRenderOverrideForTest = { _, _, adj in
+            adj == committedBaseline ? liveImage : editedImage
         }
 
         func renderAndWait() async {
@@ -440,28 +444,32 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
             await fulfillment(of: [done], timeout: 3)
         }
 
-        // No clean master yet: one pane, nothing to compare against.
+        // Nothing edited: one pane. A second pane here would show the same picture twice.
         await renderAndWait()
         XCTAssertNotNil(model.previewImage, "the primary preview must render")
         XCTAssertNil(model.previewCompareImage,
-                     "with no clean master there is nothing to compare — the panel must not invent "
-                     + "a second pane showing the same thing twice")
+                     "with no pending edit there is nothing to compare against — the panel must "
+                     + "not render a reference identical to the preview")
 
-        // A clean master publishes: now both panes render, and they must DIFFER.
-        pipeline.configureLiveRejection(enabled: true)
-        pipeline.publishedMaster = PublishedMaster(
-            image: AstroImage(width: 4, height: 4, channels: 1,
-                              pixels: [Float](repeating: 0.2, count: 16), sourceIsLinear: false),
-            coverage: [Float](repeating: 1, count: 16), survivorCount: 6,
-            key: pipeline.currentFreshnessKey())
+        // Edit a dial: now both panes, and they must differ.
+        var pending = model.staged.committed
+        pending.midtoneStrength = 0.42
+        model.staged.pending = pending
         await renderAndWait()
 
-        let primary = try XCTUnwrap(model.previewImage.flatMap { Self.dataOf($0) })
-        let compare = try XCTUnwrap(model.previewCompareImage.flatMap { Self.dataOf($0) },
-                                    "a clean master is served, so the un-rejected counterpart must render")
-        XCTAssertNotEqual(primary, compare,
-                          "the two panes must show DIFFERENT sources — equal pixels would mean the "
-                          + "comparison is showing the same master twice")
+        let edited = try XCTUnwrap(model.previewImage.flatMap { Self.dataOf($0) })
+        let live = try XCTUnwrap(model.previewCompareImage.flatMap { Self.dataOf($0) },
+                                 "a pending edit must render the 'currently live' reference pane")
+        XCTAssertNotEqual(edited, live,
+                          "the panes must differ — equal pixels would mean the reference is being "
+                          + "rendered with the pending adjustments too, so both would follow the dials")
+        XCTAssertEqual(live, Self.dataOf(liveImage),
+                       "the reference must be rendered with the COMMITTED adjustments")
+
+        // Revert: back to a single pane.
+        model.revertAdjustments()
+        await renderAndWait()
+        XCTAssertNil(model.previewCompareImage, "reverting removes the thing being compared")
     }
 
     // MARK: - Helpers
