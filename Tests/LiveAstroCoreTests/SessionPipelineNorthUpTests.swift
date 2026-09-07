@@ -91,11 +91,13 @@ final class SessionPipelineNorthUpTests: XCTestCase {
         var on = DisplayAdjustments.neutral; on.northUp = true
         let a = try XCTUnwrap(pipeline.renderCurrentDisplay(adjustments: off))
         let b = try XCTUnwrap(pipeline.renderCurrentDisplay(adjustments: on))
-        // 30° rotation → letterbox bounding box → strictly larger than the un-rotated frame.
+        // 30° rotation → rotate, then crop to the largest inscribed rectangle, so the display gets
+        // SMALLER. It used to letterbox to the full bounding box; that padding is pure black and
+        // was being counted as clipped shadows by the display histogram.
         XCTAssertTrue(b.width != a.width || b.height != a.height,
                       "north-up should change the display dimensions (a=\(a.width)x\(a.height) b=\(b.width)x\(b.height))")
-        XCTAssertGreaterThanOrEqual(b.width, a.width)
-        XCTAssertGreaterThanOrEqual(b.height, a.height)
+        XCTAssertLessThan(b.width, a.width)
+        XCTAssertLessThan(b.height, a.height)
     }
 
     /// EMPIRICAL source of truth (gated on LAS_SOLVE_FRAME + real catalog + ~/Desktop/M63-import):

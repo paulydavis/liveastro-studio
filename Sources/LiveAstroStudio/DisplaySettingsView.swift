@@ -84,9 +84,10 @@ struct DisplaySettingsView: View {
                                     .frame(width: 62, alignment: .trailing).monospacedDigit()
                                     .font(.caption).foregroundStyle(.secondary)
                             }
-                            .help("Darken the sky background. 0 = auto. Range narrowed to 0-0.05: "
-                                + "the auto-stretch re-derives after this clip, so larger values do "
-                                + "very little. Click the slider and use arrow keys for fine steps.")
+                            .help("Darken the sky background. 0 = the auto-stretch on its own; 1 lifts the "
+                                + "shadow cut 8 sigma above it, which crushes the background to "
+                                + "black. Most of the useful range is below 0.4. Click the slider "
+                                + "and use arrow keys for fine steps.")
                         }
                         VStack(alignment: .leading) {
                             Text("Stretch strength")

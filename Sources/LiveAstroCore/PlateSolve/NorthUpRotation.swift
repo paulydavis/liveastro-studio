@@ -14,8 +14,10 @@ import Foundation
 /// CoreGraphics, whose y-up convention vs the top-down display is reconciled EMPIRICALLY by the gated
 /// real-frame test — if north comes out down, the fix is the draw transform in `apply`, not this angle.
 public enum NorthUpRotation {
-    /// Rotations at or below this magnitude crop-to-fill (no black corners); larger ones letterbox the
-    /// full rotated frame so a heavily-rotated image is never cropped. ~15°.
+    /// Rotations at or below this magnitude crop-to-fill the original canvas; larger ones rotate
+    /// into the full bounding box and then crop to the largest inscribed rectangle. Either way the
+    /// result carries no black padding — padding lands in the display histogram and reads as
+    /// clipped shadows. ~15°.
     public static let autoZoomMaxAngle = 15.0 * .pi / 180.0
 
     /// Angle (radians) to rotate the top-down display so north is up. See type doc for the derivation.
