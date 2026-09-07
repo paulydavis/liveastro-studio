@@ -726,11 +726,14 @@ final class AppModel {
         let committed = staged.apply()
         saveSettings()
         guard let pipeline else { return }
-        // No explicit refresh here: SessionPipeline.displayAdjustments' setter already calls
-        // refreshDisplay() (SessionPipeline.swift:794). Asking again bumped the revision a second
-        // time and invalidated the render the setter had just scheduled — a wasted full render on
-        // every Apply, and one more chance for the operator to see a flicker.
+        // The pipeline's setter already calls refreshDisplay() for the COMMITTED surfaces
+        // (SessionPipeline.swift), so no explicit refresh is needed for those — asking again
+        // would bump the revision twice and throw away the render it just scheduled.
         pipeline.displayAdjustments = committed
+        // The two PREVIEW panes are ours, not the pipeline's, and nothing else re-renders them:
+        // without this the top pane keeps the pre-Apply committed image and the bottom keeps its
+        // pending one, so pressing Apply appears to do nothing at all.
+        refreshPreview(force: true)
     }
 
     /// Throws the pending edits away and puts the preview back on the committed look.

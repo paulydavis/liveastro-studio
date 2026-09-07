@@ -11,15 +11,8 @@ struct DisplaySettingsView: View {
             VStack(spacing: 10) {
                 previewPane(model.previewCompareImage, title: "Currently live")
                 previewPane(model.previewImage,
-                            title: model.staged.hasPendingChanges ? "Your edit — not yet live" : "Your edit")
-                    .overlay(alignment: .topLeading) {
-                        if model.staged.hasPendingChanges {
-                            Text("Pending")
-                                .font(.caption2).padding(4)
-                                .background(.yellow.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
-                                .padding(6)
-                        }
-                    }
+                            title: "Your edit",
+                            badge: model.staged.hasPendingChanges ? "Not yet live" : nil)
                 HStack {
                     Button("Revert") { model.revertAdjustments() }
                         .disabled(!model.staged.hasPendingChanges)
@@ -31,7 +24,7 @@ struct DisplaySettingsView: View {
                     .font(.caption2).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
-            .frame(minWidth: 320, idealWidth: 460, maxWidth: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             // RIGHT COLUMN: the controls.
             ScrollView {
@@ -151,7 +144,9 @@ struct DisplaySettingsView: View {
                 .background(AlwaysVisibleScroller())
             }
             .scrollIndicators(.visible)
-            .frame(minWidth: 360)
+            // Pinned rather than flexible: the controls need a readable width and no more, so
+            // every remaining pixel goes to the images. They were ~555pt wide in a 2000pt window.
+            .frame(width: 380)
         }
         .padding(.horizontal).padding(.top)
         .background(
@@ -201,13 +196,14 @@ struct DisplaySettingsView: View {
     }
 
     /// One labelled pane of the comparison.
-    @ViewBuilder private func previewPane(_ image: CGImage?, title: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.caption2).foregroundStyle(.secondary)
+    @ViewBuilder private func previewPane(_ image: CGImage?, title: String,
+                                          badge: String? = nil) -> some View {
+        VStack(spacing: 4) {
             ZStack {
                 if let image {
                     Image(decorative: image, scale: 1)
                         .resizable().aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(.quaternary)
@@ -216,7 +212,27 @@ struct DisplaySettingsView: View {
                                     .font(.caption).foregroundStyle(.secondary))
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Label and badge overlay the IMAGE. Anchoring them to the pane's frame left them
+            // stranded at the far edge once the frame grew to fill the column.
+            .overlay(alignment: .topLeading) {
+                HStack(spacing: 6) {
+                    Text(title)
+                        .font(.caption2)
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 4))
+                    if let badge {
+                        Text(badge)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6).padding(.vertical, 3)
+                            .background(.yellow.opacity(0.9), in: RoundedRectangle(cornerRadius: 4))
+                            .foregroundStyle(.black)
+                    }
+                }
+                .padding(8)
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// Explains itself when there is nothing to compare, rather than silently showing one pane.

@@ -480,6 +480,53 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
                        "reverting discards the edit, so the panes must agree again")
     }
 
+    /// Apply must re-render the panes, not just push to the pipeline. Found by driving the app:
+    /// pressing Apply cleared the "Not yet live" badge but left BOTH images exactly as they were —
+    /// the top still showing the pre-Apply committed render, the bottom still showing the pending
+    /// one — because applyAdjustments only set pipeline.displayAdjustments (which refreshes the
+    /// pipeline's own COMMITTED surfaces) and never touched these two, which are ours. From the
+    /// operator's chair that is indistinguishable from Apply doing nothing.
+    @MainActor func testApplyRerendersBothPanesSoTheyAgreeAfterwards() async throws {
+        let (model, _) = makeAttachedModel()
+
+        let baseline = model.staged.committed
+        let editedImage = try Self.solidImage(0.8)
+        let liveImage = try Self.solidImage(0.2)
+        // Renders whatever adjustments it is handed: the baseline look, or the edited look.
+        model.previewRenderOverrideForTest = { _, _, adj in
+            adj == baseline ? liveImage : editedImage
+        }
+
+        func renderAndWait() async {
+            let done = expectation(description: "render resolved")
+            done.assertForOverFulfill = false
+            model.previewRenderCompletionForTest = { _, _ in done.fulfill() }
+            model.refreshPreview(force: true)
+            await fulfillment(of: [done], timeout: 3)
+        }
+
+        var pending = baseline
+        pending.midtoneStrength = 0.42
+        model.staged.pending = pending
+        await renderAndWait()
+        XCTAssertNotEqual(model.previewImage.flatMap { Self.dataOf($0) },
+                          model.previewCompareImage.flatMap { Self.dataOf($0) },
+                          "precondition: an edit makes the panes differ")
+
+        // Apply, then wait for the re-render Apply itself must trigger.
+        let applied = expectation(description: "apply re-rendered")
+        applied.assertForOverFulfill = false
+        model.previewRenderCompletionForTest = { _, _ in applied.fulfill() }
+        model.applyAdjustments()
+        await fulfillment(of: [applied], timeout: 3)
+
+        XCTAssertFalse(model.staged.hasPendingChanges, "Apply commits the edit")
+        XCTAssertEqual(model.previewImage.flatMap { Self.dataOf($0) },
+                       model.previewCompareImage.flatMap { Self.dataOf($0) },
+                       "after Apply the edit IS what is live, so both panes must show the same "
+                       + "thing — if they still differ, Apply did not re-render them")
+    }
+
     // MARK: - Helpers
 
     private static func dataOf(_ image: CGImage) -> Data? { image.dataProvider?.data as Data? }
