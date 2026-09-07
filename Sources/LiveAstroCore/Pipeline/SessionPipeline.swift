@@ -137,6 +137,17 @@ public final class SessionPipeline {
     /// gone stale, so a slider drag can skip re-rendering a pane that cannot have changed.
     public var currentDisplayRevision: UInt64 { displayRevisionLock.withLock { displayRevision } }
 
+    /// Lifecycle of a unit of pipeline work, for measurement tests that must distinguish work
+    /// that RAN from work that was scheduled and then superseded. `superseded` means the revision
+    /// was overtaken before its render started, so it did no work and consumed no memory — a
+    /// measurement that counts it as a completed operation overstates what overlapped.
+    public enum WorkProbeEvent: Sendable { case began, finished, superseded }
+
+    /// nil in production. Reports display-render lifecycle by revision.
+    public var displayRenderProbeForTest: (@Sendable (UInt64, WorkProbeEvent) -> Void)?
+    /// nil in production. Reports watcher frame-processing lifecycle by file name.
+    public var frameProcessingProbeForTest: (@Sendable (String, WorkProbeEvent) -> Void)?
+
     public func isCurrentDisplay(_ update: DisplayDelivery) -> Bool {
         displayRevisionLock.withLock { update.revision == displayRevision }
     }
@@ -158,8 +169,13 @@ public final class SessionPipeline {
             guard let self else { return }
             self.displayRenderLock.lock()
             defer { self.displayRenderLock.unlock() }
-            guard self.displayRevisionLock.withLock({ !self.displayFinished && revision == self.displayRevision }) else { return }
+            guard self.displayRevisionLock.withLock({ !self.displayFinished && revision == self.displayRevision }) else {
+                self.displayRenderProbeForTest?(revision, .superseded)
+                return
+            }
+            self.displayRenderProbeForTest?(revision, .began)
             self.withCallbackDelivery { self.renderDisplayTransition(revision: revision) }
+            self.displayRenderProbeForTest?(revision, .finished)
         }
     }
 
@@ -1686,6 +1702,9 @@ public final class SessionPipeline {
     /// Processes one watcher update (watcher mode). Callback deliveries inside are
     /// reentrancy-guarded (review10 item 4).
     private func handle(_ update: StackUpdate) {
+        let probeName = update.url.lastPathComponent
+        frameProcessingProbeForTest?(probeName, .began)
+        defer { frameProcessingProbeForTest?(probeName, .finished) }
         withCallbackDelivery {
             guard let recorder else {
                 onLog?("recorder missing — frame dropped (\(update.url.lastPathComponent))")

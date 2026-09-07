@@ -619,26 +619,75 @@ final class AppModel {
     /// Called when a slider changes: re-render the PREVIEW only. Nothing reaches the pipeline
     /// here — that is what makes tuning mid-broadcast safe.
     ///
-    /// `force` bypasses the throttle. Slider drags are throttled to ~12 fps because they fire
-    /// continuously, but DISCRETE actions (Revert, Reset, blink press/release, a new frame, a
-    /// session boundary) must never be silently dropped for landing inside an 80 ms window —
-    /// a swallowed blink release would leave the panel showing the online master and quietly
-    /// misrepresent what rejection is doing.
+    /// `force` marks a DISCRETE action (Apply, Revert, Reset, blink press/release, a new frame, a
+    /// session boundary): it bypasses the drag throttle and renders at full quality. Those must
+    /// never be silently dropped for landing inside an 80 ms window — a swallowed blink release
+    /// would leave the panel showing the online master and quietly misrepresent rejection.
     func refreshPreview(force: Bool = false) {
+        performPreviewRefresh(bypassThrottle: force, quality: force ? .settled : .draft)
+    }
+
+    /// Debounce generation for the settle. Each edit invalidates the pending settle by bumping it.
+    private var settleGeneration: UInt64 = 0
+
+    /// Arms the settled render that follows a drag, RESETTING any settle already pending.
+    ///
+    /// A fixed one-shot timer is wrong here, and was the bug: armed 90 ms after the FIRST draft
+    /// and not postponed by later edits, it fired a full-resolution render in the middle of a
+    /// continuous drag, then re-armed on the next draft — so a long drag paid for a settled render
+    /// roughly every 90 ms. That is the exact cost the draft tier exists to avoid. Resetting on
+    /// every edit means a drag settles exactly once, after it stops.
+    private func scheduleSettle() {
+        settleGeneration &+= 1
+        let generation = settleGeneration
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 90_000_000)
+            guard let self, self.settleGeneration == generation else { return }
+            self.performPreviewRefresh(bypassThrottle: true, quality: .settled, isRetry: true)
+        }
+    }
+
+    /// Generation of the settled render currently in flight, if any. A draft retry while this
+    /// matches `settleGeneration` would re-render values the settle is already rendering, at lower
+    /// quality — and bumping `previewRenderSeq` would make the settle's result unpublishable, so
+    /// the expensive work would be thrown away.
+    private var settledRenderInFlightGeneration: UInt64?
+
+    /// Schedules one coalesced DRAFT retry, unless one is already pending. Used by the drop paths,
+    /// which must not swallow the operator's last edit — the preview would then disagree with what
+    /// Apply publishes. Settled work is never retried this way: it goes through `scheduleSettle`,
+    /// whose generation check is what keeps full-resolution renders out of an active drag.
+    private func scheduleCoalescedRetry() {
+        guard !previewTrailingScheduled else { return }
+        previewTrailingScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 90_000_000)
+            self?.previewTrailingScheduled = false
+            self?.performPreviewRefresh(bypassThrottle: true, quality: .draft, isRetry: true)
+        }
+    }
+
+    /// `isRetry` marks a call that came from a timer rather than from the operator. Retries must
+    /// not re-arm the settle (the edit that caused them already did) and must re-check that they
+    /// are still wanted, since the world may have moved on during their 90 ms wait.
+    private func performPreviewRefresh(bypassThrottle: Bool,
+                                       quality: SessionPipeline.PreviewQuality,
+                                       isRetry: Bool = false) {
         guard let pipeline else { return }
+        // Re-arm the settle for EVERY operator draft request, including ones about to be dropped:
+        // the last edit must settle even when its own render never ran.
+        if quality == .draft && !isRetry { scheduleSettle() }
+        // A draft retry is pointless once the settle for these same values is already rendering:
+        // no edit has arrived since (the generation is unchanged), so it would render identical
+        // values more cheaply AND invalidate the settle's result through the sequence guard.
+        if quality == .draft, isRetry, settledRenderInFlightGeneration == settleGeneration { return }
         let now = Date()
-        if !force {
+        if !bypassThrottle {
             guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else {
-                // Coalesced trailing render: the LAST edit of a drag often lands inside the
-                // throttle window, and dropping it outright leaves the preview disagreeing with
-                // what Apply will publish.
-                guard !previewTrailingScheduled else { return }
-                previewTrailingScheduled = true
-                Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: 90_000_000)
-                    self?.previewTrailingScheduled = false
-                    self?.refreshPreview(force: true)
-                }
+                // The retry is a DRAFT, deliberately. It exists to keep the preview showing the
+                // newest pending value during a drag, which is cheap work; the settle above is
+                // what eventually renders it faithfully.
+                scheduleCoalescedRetry()
                 return
             }
         }
@@ -647,22 +696,6 @@ final class AppModel {
         let seq = previewRenderSeq
         let adj = staged.pending
         let source = previewSource
-        // A drag (throttled path) renders cheap; every DISCRETE action — the coalesced trailing
-        // render that ends a drag, Apply, Revert, Reset, blink, a new frame, a session boundary —
-        // renders at full quality, so the image the operator judges is the faithful one.
-        let quality: SessionPipeline.PreviewQuality = force ? .settled : .draft
-        // A draft is never the final word. Without this, a SINGLE unforced edit — one arrow-key
-        // nudge, one click on a slider track — renders at draft resolution and stops there, and
-        // the operator judges the image at half resolution forever. The trailing flag coalesces,
-        // so a continuous drag still settles exactly once, when it stops.
-        if quality == .draft && !previewTrailingScheduled {
-            previewTrailingScheduled = true
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 90_000_000)
-                self?.previewTrailingScheduled = false
-                self?.refreshPreview(force: true)
-            }
-        }
         // Test seam: when set, this stands in for `pipeline.renderPreview(source:adjustments:)`.
         // Captured here (not read again inside the detached task) so a test can gate ONE
         // specific in-flight call — e.g. block the render this refreshPreview() started while a
@@ -673,16 +706,16 @@ final class AppModel {
         guard draftRendersInFlight < Self.maxDraftRendersInFlight else {
             // Saturated. Do not pile on: the newest pending values are already captured by
             // `previewRenderSeq`, so schedule one coalesced retry instead of another render.
-            guard !previewTrailingScheduled else { return }
-            previewTrailingScheduled = true
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 90_000_000)
-                self?.previewTrailingScheduled = false
-                self?.refreshPreview(force: true)
-            }
+            //
+            // A dropped SETTLE must come back through `scheduleSettle`, not as a fixed-quality
+            // retry. A fixed retry carried no generation, so if the operator resumed dragging
+            // during its 90 ms wait it still started a full-resolution render mid-drag — the same
+            // defect the debounce was added to fix, re-entering through the drop path.
+            if quality == .settled { scheduleSettle() } else { scheduleCoalescedRetry() }
             return
         }
         draftRendersInFlight += 1
+        if quality == .settled { settledRenderInFlightGeneration = settleGeneration }
         let committed = staged.committed
         // The reference pane is always SHOWN, but only re-rendered when something it depends on
         // has actually moved: the committed adjustments, the source, or the underlying stack.
@@ -710,6 +743,7 @@ final class AppModel {
             }
             await MainActor.run {
                 self.draftRendersInFlight -= 1
+                if quality == .settled { self.settledRenderInFlightGeneration = nil }
                 // Only the newest request may publish; a slower earlier render is discarded.
                 let published = seq == self.previewRenderSeq
                 if published {

@@ -399,11 +399,33 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         let (model, _) = makeAttachedModel()
         let box = ImageBox(cg: try Self.solidImage(0.5))
         let log = QualityLog()
-        // Pending differs from committed, so the two renders per pass are distinguishable by value.
         var adj = model.staged.committed
         adj.blackPoint = 0.42
         model.staged.pending = adj
         let committedBlackPoint = model.staged.committed.blackPoint
+
+        // The draft pass must PUBLISH before the settled pass is allowed to evaluate the cache.
+        // Otherwise `compareRenderKey` is still nil when the settled pass runs, `wantsCompare` is
+        // true because the cache is empty, and the reference renders regardless of the quality
+        // key — the test would pass with the fix removed.
+        let draftPublished = expectation(description: "the draft pass published")
+        draftPublished.assertForOverFulfill = false
+        model.previewRenderCompletionForTest = { _, published in
+            if published { draftPublished.fulfill() }
+        }
+        model.previewRenderOverrideForTest = { _, _, adjustments, quality in
+            await log.add(adjustments.blackPoint, quality)
+            return box.cg
+        }
+
+        model.refreshPreview()
+        await fulfillment(of: [draftPublished], timeout: 5)
+        XCTAssertNotNil(model.previewCompareImage,
+                        "precondition: the reference pane is cached, so only the quality key can "
+                        + "cause it to re-render below")
+        let afterDraft = await log.all
+        XCTAssertTrue(afterDraft.contains { $0.quality == .draft && $0.blackPoint == committedBlackPoint },
+                      "precondition: the reference pane rendered on the draft pass")
 
         let settledReference = expectation(description: "the reference pane renders at settled")
         settledReference.assertForOverFulfill = false
@@ -414,15 +436,102 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
             }
             return box.cg
         }
-
-        model.refreshPreview()
+        model.refreshPreview(force: true)
         await fulfillment(of: [settledReference], timeout: 5)
+    }
 
-        let all = await log.all
-        XCTAssertTrue(all.contains { $0.quality == .draft && $0.blackPoint == committedBlackPoint },
-                      "precondition: the reference pane also rendered on the draft pass")
-        XCTAssertTrue(all.contains { $0.quality == .settled && $0.blackPoint == committedBlackPoint },
-                      "the reference pane must be re-rendered when the quality changes")
+    /// A settle dropped by the in-flight cap must re-enter through the DEBOUNCE, not as a
+    /// fixed-quality retry.
+    ///
+    /// The saturation path used to schedule a retry that preserved the requested quality and
+    /// carried no generation. If the operator resumed dragging during its 90 ms wait, that retry
+    /// still started a full-resolution render in the middle of the drag — the same defect the
+    /// debounce was added to fix, re-entering through the drop path where the debounce could not
+    /// see it.
+    @MainActor func testASettleDroppedBySaturationDoesNotFireIntoAResumedDrag() async throws {
+        let (model, _) = makeAttachedModel()
+        let box = ImageBox(cg: try Self.solidImage(0.5))
+        let gate = RenderGate()
+
+        // Identify renders by the VALUES they carry, not by when their override happens to run:
+        // a render dispatched before the drag can begin executing after it (Task.detached
+        // scheduling), so timing alone misattributes pre-drag work to the drag.
+        let preDragBlackPoint = 0.9
+        let dragRange = 0.01...0.15
+        actor Log {
+            private(set) var settledCarryingDragValues = 0
+            func note(_ quality: SessionPipeline.PreviewQuality, _ blackPoint: Double,
+                      _ range: ClosedRange<Double>) {
+                if quality == .settled && range.contains(blackPoint) { settledCarryingDragValues += 1 }
+            }
+        }
+        let log = Log()
+        model.previewRenderOverrideForTest = { _, _, adjustments, quality in
+            await log.note(quality, adjustments.blackPoint, dragRange)
+            await gate.waitForRelease()
+            return box.cg
+        }
+
+        // Saturate both slots, then request a third settle: that one takes the drop path.
+        var seed = model.staged.committed
+        seed.blackPoint = preDragBlackPoint
+        model.staged.pending = seed
+        for _ in 0..<3 { model.refreshPreview(force: true) }
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        // Resume dragging. The dropped settle's 90 ms timer is pending; each edit must invalidate
+        // it, so no settled render may carry a drag value.
+        await gate.release()
+        for i in 1...15 {
+            var adj = model.staged.committed
+            adj.blackPoint = Double(i) / 100
+            model.staged.pending = adj
+            model.refreshPreview()
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let settledDuringDrag = await log.settledCarryingDragValues
+        XCTAssertEqual(settledDuringDrag, 0,
+                       "\(settledDuringDrag) settled render(s) carried mid-drag values; a settle "
+                       + "dropped by saturation must re-enter through the generation-checked "
+                       + "debounce, not as a fixed-quality retry")
+    }
+
+    /// A continuous drag must not pay for settled renders. The settle was a fixed one-shot timer
+    /// armed 90 ms after the FIRST draft and never postponed, so it fired mid-drag and re-armed —
+    /// a long drag rendered at full resolution roughly every 90 ms, which is precisely the cost
+    /// the draft tier exists to avoid.
+    @MainActor func testAContinuousDragDoesNotSettleUntilItStops() async throws {
+        let (model, _) = makeAttachedModel()
+        let box = ImageBox(cg: try Self.solidImage(0.5))
+        let log = QualityLog()
+        model.previewRenderOverrideForTest = { _, _, adjustments, quality in
+            await log.add(adjustments.blackPoint, quality)
+            return box.cg
+        }
+
+        // ~300 ms of continuous dragging: long enough that a fixed 90 ms timer fires three times.
+        for i in 0..<15 {
+            var adj = model.staged.committed
+            adj.blackPoint = Double(i) / 100
+            model.staged.pending = adj
+            model.refreshPreview()
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let duringDrag = await log.all
+        let settledDuringDrag = duringDrag.filter { $0.quality == .settled }.count
+        XCTAssertEqual(settledDuringDrag, 0,
+                       "settled renders fired during the drag (\(settledDuringDrag) of "
+                       + "\(duringDrag.count) renders); the settle must be reset by each edit")
+
+        // Now stop. The last edit must still settle, or the operator is left on a draft image.
+        let settled = expectation(description: "the drag settles once it stops")
+        settled.assertForOverFulfill = false
+        model.previewRenderOverrideForTest = { _, _, adjustments, quality in
+            await log.add(adjustments.blackPoint, quality)
+            if quality == .settled { settled.fulfill() }
+            return box.cg
+        }
+        await fulfillment(of: [settled], timeout: 5)
     }
 
     // MARK: - OPEN RISK (documented, not fixed): refreshPreview has no bound on concurrent renders
