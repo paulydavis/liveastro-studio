@@ -6,9 +6,12 @@ struct DisplaySettingsView: View {
     @State private var windowHeight: CGFloat = 800
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        // HSplitView rather than a fixed HStack: how much room the pictures deserve depends on
+        // the window, the sensor's aspect, and whether north-up has rotated the frame to portrait
+        // — all things the operator can judge and this code cannot. The divider is draggable.
+        HSplitView {
             // LEFT COLUMN: what the audience sees on top, what you are editing underneath.
-            VStack(spacing: 10) {
+            VStack(spacing: 6) {
                 previewPane(model.previewCompareImage, title: "Currently live",
                             histogram: model.compareHistogram)
                 previewPane(model.previewImage,
@@ -26,7 +29,8 @@ struct DisplaySettingsView: View {
                     .font(.caption2).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(minWidth: 420, idealWidth: 1000, maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.trailing, 4)
 
             // RIGHT COLUMN: the controls.
             ScrollView {
@@ -165,11 +169,11 @@ struct DisplaySettingsView: View {
                 .background(AlwaysVisibleScroller())
             }
             .scrollIndicators(.visible)
-            // Pinned rather than flexible: the controls need a readable width and no more, so
-            // every remaining pixel goes to the images. They were ~555pt wide in a 2000pt window.
-            .frame(width: 380)
+            // A readable minimum; everything above that is the operator's to allocate by dragging
+            // the divider toward the controls or the pictures.
+            .frame(minWidth: 300, idealWidth: 340, maxWidth: 560)
         }
-        .padding(.horizontal).padding(.top)
+        .padding(.horizontal, 8).padding(.top, 6)
         .background(
             GeometryReader { geo in
                 Color.clear.onAppear { windowHeight = geo.size.height }
