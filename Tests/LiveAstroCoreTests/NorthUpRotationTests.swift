@@ -128,8 +128,29 @@ final class NorthUpRotationTests: XCTestCase {
                              "marker should rotate to the BOTTOM (top-down math); got y=\(c.y)/\(out.height) — apply sign is inverted")
     }
 
-    /// Auto-zoom: a SMALL rotation keeps the original canvas (crop-to-fill); a LARGE rotation returns the
-    /// full rotated bounding box (letterbox).
+    /// The darkest pixel in the frame, ignoring a 2px border (rotation resampling darkens the
+    /// outermost row slightly, which is not padding).
+    private func darkestPixel(_ cg: CGImage) -> Int {
+        let w = cg.width, h = cg.height
+        var buf = [UInt8](repeating: 0, count: w * h * 4)
+        let ctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        var darkest = 255
+        for y in 2..<max(3, h - 2) { for x in 2..<max(3, w - 2) {
+            darkest = min(darkest, Int(buf[(y * w + x) * 4]))
+        } }
+        return darkest
+    }
+
+    /// Auto-zoom framing. A SMALL rotation crops-to-fill the original canvas; a LARGE one rotates
+    /// and then crops to the largest inscribed rectangle. The output is therefore never LARGER
+    /// than the input — it used to be, when large rotations letterboxed the full bounding box.
+    ///
+    /// The padding that letterboxing added was not merely cosmetic: it is pure black, so it landed
+    /// in the display histogram and read as several percent of clipped shadows on a frame that
+    /// clipped nothing. That is the contract the last assertion pins.
     func testAutoZoomFramingDimensions() {
         let w = 400, h = 300
         let img = solidImage(w, h)
@@ -140,12 +161,19 @@ final class NorthUpRotationTests: XCTestCase {
         let smallOut = NorthUpRotation.apply(img, wcs: wcs(5), autoZoom: true)
         XCTAssertEqual(smallOut.width, w)
         XCTAssertEqual(smallOut.height, h)
-        // Large angle (90°) → rotated bounding box (a 400×300 rotated 90° → 300×400).
+        // A quarter turn is lossless: the inscribed rectangle IS the whole rotated frame.
         let bigOut = NorthUpRotation.apply(img, wcs: wcs(90), autoZoom: true)
         XCTAssertEqual(bigOut.width, h)
         XCTAssertEqual(bigOut.height, w)
-        // autoZoom off → always the bounding box, even for a small angle.
+        // autoZoom off → rotate, then crop inside the rotated bounding box. Smaller than the
+        // input, because removing the black corners of a 5° rotation also costs real pixels.
         let noZoom = NorthUpRotation.apply(img, wcs: wcs(5), autoZoom: false)
-        XCTAssertGreaterThanOrEqual(noZoom.width, w)   // bbox of a 5° rotation is slightly larger
+        XCTAssertLessThan(noZoom.width, w)
+        XCTAssertLessThan(noZoom.height, h)
+        // No black padding survives on ANY path. The input is uniform mid-grey, so any dark pixel
+        // in the interior is padding the crop failed to remove.
+        for (label, out) in [("small", smallOut), ("quarter turn", bigOut), ("no zoom", noZoom)] {
+            XCTAssertGreaterThan(darkestPixel(out), 64, "\(label) rotation left black padding in the frame")
+        }
     }
 }

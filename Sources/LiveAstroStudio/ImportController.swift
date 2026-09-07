@@ -35,6 +35,24 @@ final class ImportController {
 
     /// The active one-shot import pipeline (nil unless an import is draining).
     private var importPipeline: SessionPipeline?
+
+    /// True while an import still holds a pipeline — including through finalization, when its
+    /// display is already closed.
+    var hasActivePipeline: Bool { importPipeline != nil }
+
+    /// True only while a running import can still take display changes. Goes false at `end()`,
+    /// which freezes the display well before the pipeline is released.
+    var acceptsDisplayUpdates: Bool { importPipeline?.acceptsDisplayUpdates ?? false }
+
+    /// Routes committed display adjustments to a running import. The import captures the
+    /// adjustments once, when it starts, so without this an Apply during an import changed
+    /// nothing the operator could see. Returns whether they actually landed.
+    @discardableResult
+    func applyDisplayAdjustments(_ adjustments: DisplayAdjustments) -> Bool {
+        // Atomic on the pipeline's side: checking acceptance and then assigning separately can be
+        // frozen in between, which reports success for a change the final render overwrites.
+        importPipeline?.applyCommittedAdjustments(adjustments) ?? false
+    }
     private var importPrepareGeneration = 0
     private var importPrepareInFlight = false
 

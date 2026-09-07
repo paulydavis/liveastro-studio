@@ -12,26 +12,25 @@ public enum AutoStretch {
         return ((m - 1) * x) / (((2 * m - 1) * x) - m)
     }
 
-    /// Linked autostretch: statistics from the mean-of-channels sample, one transform for all channels.
-    public static func stretch(_ image: AstroImage,
-                               targetBackground: Double = 0.25,
-                               shadowsClipping: Double = -2.8,
-                               blackPoint: Double = 0,
-                               midtoneStrength: Double = 0) -> AstroImage {
-        // Black-point: gentle shadow clip on the LINEAR data. bp==0 → identity.
-        let bp = min(max(blackPoint, 0), 0.2)
-        let work: [Float]
-        if bp > 0 {
-            let inv = 1.0 - bp
-            work = image.pixels.map { Float(max(0, (Double($0) - bp) / inv)) }
-        } else {
-            work = image.pixels
-        }
+    /// How far, in MADN (robust sigma), a full-travel black point lifts the shadow cut above the
+    /// auto-derived one. 8 puts the background well past crushed on real data, so the useful range
+    /// sits comfortably inside the slider rather than in a sliver at one end.
+    public static let blackPointMaxMADN = 8.0
 
+    /// The linked statistics the autostretch derives its transform from: the median and MADN of
+    /// the mean-of-channels sample. Exposed so a caller can compute them on the FULL-RESOLUTION
+    /// image and hand them to a render of a downsampled proxy, which is what keeps the preview's
+    /// curve identical to the broadcast's.
+    public struct LinkedStatistics: Equatable, Sendable {
+        public let median: Double
+        public let madn: Double
+        public init(median: Double, madn: Double) { self.median = median; self.madn = madn }
+    }
+
+    public static func linkedStatistics(_ image: AstroImage) -> LinkedStatistics {
         let plane = image.width * image.height
-        // A zero-pixel image has no samples: median indexing below would trap. Nothing
-        // to stretch — return it unchanged (mirrors the AstroImage.computeStats guard).
-        guard plane > 0 else { return image }
+        guard plane > 0 else { return LinkedStatistics(median: 0, madn: 1e-10) }
+        let work = image.pixels
         // Combined luminance sample (mean across channels), stride-sampled.
         let stride = AstroImage.sampleStride(count: plane)
         var sample: [Float] = []
@@ -48,13 +47,69 @@ public enum AutoStretch {
         var deviations = sample.map { abs(Double($0) - median) }
         deviations.sort()
         // 1.4826 = 1 / Φ⁻¹(0.75): MAD→σ consistency factor for Gaussian data
-        let madn_raw = 1.4826 * deviations[deviations.count / 2]
-        // When all samples are nearly identical (madn ≈ 0), use median as fallback to preserve channel ratios
-        let madn = madn_raw > 1e-10 ? madn_raw : max(median, 1e-10)
+        let madnRaw = 1.4826 * deviations[deviations.count / 2]
+        // When all samples are nearly identical (madn ≈ 0), use median as fallback to preserve
+        // channel ratios.
+        return LinkedStatistics(median: median, madn: madnRaw > 1e-10 ? madnRaw : max(median, 1e-10))
+    }
 
-        let shadow = min(max(median + shadowsClipping * madn, 0), 1)
+    /// Linked autostretch: statistics from the mean-of-channels sample, one transform for all channels.
+    public static func stretch(_ image: AstroImage,
+                               targetBackground: Double = 0.25,
+                               shadowsClipping: Double = -2.8,
+                               blackPoint: Double = 0,
+                               midtoneStrength: Double = 0,
+                               statistics: LinkedStatistics? = nil) -> AstroImage {
+        // Black point is applied AFTER the auto-stretch statistics are derived, not before.
+        //
+        // It used to clip the LINEAR data first; the median and MADN were then measured on the
+        // CLIPPED result and the background renormalised to `targetBackground`, which undid the
+        // clip almost exactly. Measured on a real M51 master: moving the slider from 0 to 0.005
+        // changed the rendered output by 0.00/255, and even the full old range only reached
+        // 0.21/255 mean. The control did nothing, which is what it looked like in use.
+        //
+        // It now raises the SHADOW POINT while the midtone stays fixed at its auto-derived value.
+        // The midtone was the real culprit: it is solved to place the background at
+        // `targetBackground`, so ANY shadow movement was compensated away and the background
+        // landed back in the same place. Deriving the midtone once, from the auto shadow, and then
+        // moving only the cut makes the control bite: measured on a real master, +1 MADN shifts
+        // the render by 18.6/255 and +3 MADN by 53.4/255, against 0.00/255 for the old behaviour.
+        // 0 reproduces the auto-stretch exactly, so the neutral path stays byte-identical.
+        let bp = min(max(blackPoint, 0), 1)
+        let work = image.pixels
+
+        let plane = image.width * image.height
+        // A zero-pixel image has no samples: median indexing below would trap. Nothing
+        // to stretch — return it unchanged (mirrors the AstroImage.computeStats guard).
+        guard plane > 0 else { return image }
+        // Statistics may be INJECTED. The preview renders a downsample, and deriving the
+        // transform from the downsample's own statistics is not the same transform the
+        // full-resolution broadcast derives: averaging halves MADN, which moves the shadow point,
+        // and the midtone is solved from that — so the curve visibly diverges. Passing the
+        // full-resolution statistics in makes the preview apply the BROADCAST's curve.
+        let stats = statistics ?? linkedStatistics(image)
+        let median = stats.median
+        let madn = stats.madn
+
+        let autoShadow = min(max(median + shadowsClipping * madn, 0), 1)
+        // The slider spans 0...1; full travel lifts the cut by `blackPointMaxMADN` sigma above the
+        // auto point, which is past the point where the background is fully crushed on real data.
+        //
+        // The cut is bounded by the headroom ABOVE the auto shadow, not by an absolute ceiling.
+        // An absolute cap gets both edge cases wrong on a near-saturated frame, where the auto
+        // shadow itself is already above the ceiling: a flat 0.99 pulls the cut BELOW the auto
+        // point and changes the render at black point 0 (measured on [0.9989, 0.9990, 0.9991]:
+        // rendered median 0.25 -> 0.878), while `max(autoShadow, 0.99)` lands exactly ON the auto
+        // point and freezes the slider instead. Letting the offset consume at most 99% of the
+        // distance from the auto shadow to 1 keeps `denom` strictly positive, leaves black point 0
+        // byte-identical on every input, and keeps the control live on every input.
+        let headroom = max(1 - autoShadow, 0)
+        let shadow = autoShadow + min(max(bp, 0) * blackPointMaxMADN * madn, 0.99 * headroom)
         let denom = max(1 - shadow, 1e-9)
-        let r = min(max((median - shadow) / denom, 1e-9), 1)
+        // r — and therefore the midtone — comes from the AUTO shadow, never the user-shifted one.
+        // Deriving it from `shadow` is what made black point self-cancelling.
+        let autoDenom = max(1 - autoShadow, 1e-9)
+        let r = min(max((median - autoShadow) / autoDenom, 1e-9), 1)
         let strengthFactor = pow(2.0, -min(max(midtoneStrength, -1), 1))
         let baseMidtone = mtf(r, targetBackground)
         // strengthFactor==1 (neutral) must reproduce today's UNclamped midtone exactly,

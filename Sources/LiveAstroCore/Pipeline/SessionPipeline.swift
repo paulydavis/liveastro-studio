@@ -132,6 +132,70 @@ public final class SessionPipeline {
         DisplayRenderContext(adjustments: displayAdjustments, wcs: currentWCS)
     }
 
+    /// Current display revision — bumped whenever the pipeline's committed surfaces need
+    /// re-rendering. `AppModel` reads it to know when its cached "currently live" preview has
+    /// gone stale, so a slider drag can skip re-rendering a pane that cannot have changed.
+    public var currentDisplayRevision: UInt64 { displayRevisionLock.withLock { displayRevision } }
+
+    /// Lifecycle of a unit of pipeline work, for measurement tests that must distinguish work
+    /// that RAN from work that was scheduled and then superseded. `superseded` means the revision
+    /// was overtaken before its render started, so it did no work and consumed no memory — a
+    /// measurement that counts it as a completed operation overstates what overlapped.
+    public enum WorkProbeEvent: Sendable { case began, finished, superseded }
+
+    /// nil in production. Reports display-render lifecycle by revision.
+    public var displayRenderProbeForTest: (@Sendable (UInt64, WorkProbeEvent) -> Void)?
+    /// nil in production. Reports watcher frame-processing lifecycle by file name.
+    public var frameProcessingProbeForTest: (@Sendable (String, WorkProbeEvent) -> Void)?
+
+    /// False from the moment `end()` captures the context its FINAL render will use, not merely
+    /// from when the display is torn down.
+    ///
+    /// Those are far apart: `finalContext` is captured before master processing — a refiner pass
+    /// and a full-resolution master write, seconds on a 26 MP session — while `displayFinished`
+    /// is set at the very end. An Apply landing in that window committed, cleared its badge and
+    /// set `displayAdjustments`, and was then silently overwritten by the final delivery rendering
+    /// with the older captured context. Acceptance and capture now flip together.
+    public var acceptsDisplayUpdates: Bool {
+        displayAcceptanceLock.withLock {
+            displayContextFrozen ? false : displayRevisionLock.withLock { !displayFinished }
+        }
+    }
+    /// Guards `displayContextFrozen` AND serialises it against adjustment writes.
+    ///
+    /// Deliberately NOT the existing `finalizationLock`, which guards `finalizationClaimed` and is
+    /// held across reseed and end() work — entangling display acceptance with that would put an
+    /// adjustment write inside an unrelated critical section. Ordering here is always
+    /// displayAcceptanceLock -> displayRevisionLock / adjLock / plateSolveLock, never the reverse;
+    /// nothing holding those calls back into these three entry points.
+    private let displayAcceptanceLock = NSLock()
+    private var displayContextFrozen = false
+
+    /// Captures the context the final render will use and closes acceptance in ONE critical
+    /// section, so no adjustment can be accepted after the context it would have to affect is
+    /// already fixed.
+    private func freezeDisplayContextForFinalRender() -> DisplayRenderContext {
+        displayAcceptanceLock.lock()
+        defer { displayAcceptanceLock.unlock() }
+        displayContextFrozen = true
+        return displayContext()
+    }
+
+    /// Takes committed adjustments only if the display is still accepting them, with the check and
+    /// the assignment in the SAME critical section. A caller that reads `acceptsDisplayUpdates` and
+    /// then assigns separately can be frozen in between — it would report success for a change the
+    /// final render then overwrites. Returns whether the adjustments were taken.
+    @discardableResult
+    public func applyCommittedAdjustments(_ adjustments: DisplayAdjustments) -> Bool {
+        displayAcceptanceLock.lock()
+        defer { displayAcceptanceLock.unlock() }
+        guard !displayContextFrozen, displayRevisionLock.withLock({ !displayFinished }) else {
+            return false
+        }
+        displayAdjustments = adjustments   // its setter schedules refreshDisplay()
+        return true
+    }
+
     public func isCurrentDisplay(_ update: DisplayDelivery) -> Bool {
         displayRevisionLock.withLock { update.revision == displayRevision }
     }
@@ -153,8 +217,13 @@ public final class SessionPipeline {
             guard let self else { return }
             self.displayRenderLock.lock()
             defer { self.displayRenderLock.unlock() }
-            guard self.displayRevisionLock.withLock({ !self.displayFinished && revision == self.displayRevision }) else { return }
+            guard self.displayRevisionLock.withLock({ !self.displayFinished && revision == self.displayRevision }) else {
+                self.displayRenderProbeForTest?(revision, .superseded)
+                return
+            }
+            self.displayRenderProbeForTest?(revision, .began)
             self.withCallbackDelivery { self.renderDisplayTransition(revision: revision) }
+            self.displayRenderProbeForTest?(revision, .finished)
         }
     }
 
@@ -287,6 +356,12 @@ public final class SessionPipeline {
     /// toggle's availability from `hasSolvedWCS` here, since neither edge emits a display update of its
     /// own (the solve runs off the hot path; reseed just clears state). May fire on a background queue.
     public var onSolveStateChanged: (() -> Void)?
+
+    /// Fired after a refiner pass installs a SERVABLE clean master. The staged preview needs it
+    /// because `AppModel.liveRejectionStatus` is computed with no change notification, so there
+    /// is no transition to observe: without this the preview would keep showing the online
+    /// master after the first clean one publishes.
+    public var onCleanMasterPublished: (() -> Void)?
 
     /// Void the stored/in-flight solve and re-enable solving so the NEXT reference re-solves. Called
     /// on BOTH reseed paths — manual `reseed()` and the engine's internal auto-reseed. The generation
@@ -438,6 +513,10 @@ public final class SessionPipeline {
     /// off — and that enable-ON still does. Mirrors the other `...ForTest` seams; not for product code.
     func refinerForTest() -> GlobalRefiner? { currentRefiner() }
 
+    /// Test seam: the owned engine, so a test can read the online stack directly. Mirrors
+    /// `refinerForTest()`; not for product code.
+    var engineForTest: StackEngine? { engine }
+
     /// Survivor count of the clean master that would be SERVED right now, or nil if none is
     /// current. The caption needs this rather than `currentSurvivorCount()`: the two differ
     /// exactly when a pass hasn't published yet, which is precisely the state the operator
@@ -447,6 +526,17 @@ public final class SessionPipeline {
             guard liveRejectionActive, let pm = publishedMaster,
                   pm.key.isServable(against: _freshnessKey) else { return nil }
             return pm.survivorCount
+        }
+    }
+
+    /// The FreshnessKey of the clean master currently being SERVED, or nil if none is. The
+    /// preview proxy cache keys `.clean` on this so a kappa change or a user reject invalidates
+    /// it — generation and sub count would both miss those.
+    func publishedMasterFreshnessKeyIfCurrent() -> FreshnessKey? {
+        regLock.withLock {
+            guard liveRejectionActive, let pm = publishedMaster,
+                  pm.key.isServable(against: _freshnessKey) else { return nil }
+            return pm.key
         }
     }
 
@@ -743,7 +833,10 @@ public final class SessionPipeline {
                                               survivorCount: result.survivorCount, key: key)
             return true
         }
-        if installed { refreshDisplay() }
+        if installed {
+            refreshDisplay()              // committed surfaces, via DisplayDelivery
+            onCleanMasterPublished?()     // pending draft preview may need to switch source
+        }
     }
 
     /// Returns the published master ONLY while the live-rejection feature is ON and its stored
@@ -837,6 +930,35 @@ public final class SessionPipeline {
     /// passes don't run on all 26 MP. Defaults to the SnapshotRecorder cap; internal so tests
     /// can shrink it to keep the call-site test off a full-size frame.
     var importPreviewLongEdge = SnapshotRecorder.maxSnapshotLongEdge
+    /// Long edge the STAGED PREVIEW renders at. A 26 MP 6236x4159 stack lands ~1200x800, so a
+    /// slider drag re-renders ~1 MP instead of 26 MP. Downsampling (not cropping) is what keeps
+    /// the preview honest: it preserves both the statistics `AutoStretch` derives its transform
+    /// from and DBE's dimension-relative radius (`BackgroundExtraction.swift:281`).
+    /// Long edge the STAGED PREVIEW renders at.
+    ///
+    /// Raised from 1200 after driving the real app: at 1200 a 6236x4159 stack downsamples ~6x, and
+    /// operations with a FIXED-PIXEL kernel — the denoiser above all — then cover 6x more sky than
+    /// they will at full resolution, so the preview looked visibly softer than what Apply produces.
+    /// (The earlier honesty test only proved the STRETCH survives downsampling; it never covered
+    /// denoise or DBE, which is how that shipped.) At 2400 the factor drops to ~2.6x, which both
+    /// shrinks that discrepancy and gives the panel enough pixels to judge denoise and DBE at all.
+    /// Still a small fraction of a 26 MP render, so a slider drag stays cheap.
+    static let previewLongEdge = 2400
+    /// Long edge used while the operator is actively DRAGGING. Interaction and fidelity pull in
+    /// opposite directions: 2400 puts a settled preview MUCH closer to the broadcast than 1200
+    /// does (measured curve gap 5.98/255 vs 38.89/255 on a noisy fixture; a fixed-pixel denoise
+    /// kernel also covers ~3x more sky instead of ~6x) — closer, not equal, since the stretch is
+    /// still derived from the proxy. But 2400 is 4x the pixels of 1200, and this app is
+    /// already CPU-bound on a 26 MP live session. So a drag renders cheap and the SETTLED image
+    /// renders sharp — the coalesced trailing render, Apply, Revert, blink and new frames all use
+    /// the full-quality path.
+    static let previewDraftLongEdge = 1200
+
+    public enum PreviewQuality {
+        case draft      // mid-drag: cheap, refreshed continuously
+        case settled    // the image the operator actually judges
+        var longEdge: Int { self == .draft ? SessionPipeline.previewDraftLongEdge : SessionPipeline.previewLongEdge }
+    }
     /// Import-only: render (mean→downsample→neutralize→snapshot→preview) on a cadence so ~`snapshotBudget`
     /// snapshots are produced instead of one per accepted frame (the 1.78 s/frame finalize is 82% of the
     /// serial import cost, and the replay keeps only maxKeyframes). Internal `var` = test seam. Live/watcher
@@ -950,6 +1072,16 @@ public final class SessionPipeline {
         // By this point engine.reseed() (inside the block above) has already bumped the engine's
         // generation, so the recompute observes the POST-reseed generation.
         if result == .reseeded {
+            // Correctness-wave defect 3: recompute the freshness key FIRST, before
+            // invalidatePlateSolve() fires onSolveStateChanged. onSolveStateChanged is a public
+            // callback (AppModel hops it onto the main actor and calls refreshPreview) — it runs
+            // async, on a different thread, with no synchronization back to this one, so calling
+            // it before the recompute let that render observe the PRE-reseed freshness key and
+            // serve the clean master this reseed has just invalidated, with nothing later
+            // guaranteed to correct it (the triggering frame is itself rejected). Recomputing
+            // first means publishedMasterIfCurrent() already refuses the stale master by the time
+            // any callback can act on it.
+            regLock.withLock { recomputeCachedFreshnessKeyLocked() }
             // Void any stored/in-flight solve so the new reference re-solves against its (fresh)
             // stars. sourceMetadata is left as-is: reseed is a same-target re-establish (center
             // unchanged), and it's owned by the serial frame-processing path — clearing it here
@@ -961,7 +1093,6 @@ public final class SessionPipeline {
             // from inside that closure). No other behavior change: this still only runs once, only
             // on the .reseeded outcome, and engine.reseed() has already run by this point.
             invalidatePlateSolve()
-            regLock.withLock { recomputeCachedFreshnessKeyLocked() }
             // Task 8: notify the background refiner AFTER the recompute above (this hook does not
             // recompute again — reseed already did). A no-op when live rejection has never been
             // enabled this session.
@@ -983,6 +1114,7 @@ public final class SessionPipeline {
             if sourceMetadata == nil, let m = metadata { sourceMetadata = m }
             attemptPlateSolveIfNeeded(engine: engine)
             processedCount += 1
+            bumpPreviewStackRevision()
             lastCommitted = (sourceName, timestamp)       // remembered for end()'s guaranteed final render
             if shouldRenderImport(acceptedIndex: index) {
                 renderSnapshot(index: index, sourceName: sourceName, timestamp: timestamp, engine: engine)
@@ -1074,6 +1206,7 @@ public final class SessionPipeline {
         noteFrameProgress()   // cold1 I1: a finalized frame is drain progress
         withCallbackDelivery {
             processedCount += 1
+            bumpPreviewStackRevision()
             onRejected?(.noTransform, sourceName)
             onLog?("Rejected \(sourceName)")
             if let total = source?.totalCount {
@@ -1177,12 +1310,23 @@ public final class SessionPipeline {
 
     /// Shared display pipeline: optional background neutralization, then stretch
     /// if still linear, then pack to CGImage.
-    private func displayCGImage(from linear: AstroImage, context: DisplayRenderContext? = nil) throws -> CGImage {
+    /// Build a render context that overrides the committed adjustments — the seam the staged
+    /// preview needs. `wcs` still comes from live state so north-up matches the broadcast.
+    private func displayContext(overriding adjustments: DisplayAdjustments) -> DisplayRenderContext {
+        DisplayRenderContext(adjustments: adjustments, wcs: currentWCS)
+    }
+
+    /// `preflattened` means the caller has ALREADY applied background extraction to `linear`
+    /// (see the preview's DBE cache): the flatten step is skipped, but every downstream decision
+    /// that depends on DBE being on — notably skipping the additive neutralize — still behaves as
+    /// though it ran, because it did.
+    private func displayCGImage(from linear: AstroImage, context: DisplayRenderContext? = nil,
+                                preflattened: Bool = false) throws -> CGImage {
         let context = context ?? displayContext()
         let adj = context.adjustments
         // DBE first, on linear data. When on, it removes the per-channel spatial
         // background, so skip the additive neutralize (keep multiplicative WB).
-        let flattened = adj.backgroundExtraction
+        let flattened = (adj.backgroundExtraction && !preflattened)
             ? BackgroundExtraction.flattenMultiscale(linear, scale: adj.bgScale, smoothest: adj.bgSmoothest)
             : linear
         let balanced: AstroImage
@@ -1225,7 +1369,223 @@ public final class SessionPipeline {
         // doesn't snap the preview back to the ragged full-union frame.
         guard let (mean0, coverage) = engine?.currentStackAndCoverage() else { return nil }
         let mean = cropToCoverage(mean0, coverage: coverage)
-        return try? displayCGImage(from: mean)
+        return try? displayCGImage(from: mean, context: displayContext(overriding: adjustments))
+    }
+
+    /// Which master the staged preview shows. `.clean` is the trail-rejected master when one
+    /// is being served; `.online` is the un-rejected running stack. The blink control swaps
+    /// between them through the SAME adjustments, so the comparison isolates rejection rather
+    /// than confounding it with a stretch difference.
+    public enum PreviewSource: Hashable {
+        case clean
+        case online
+    }
+
+    /// Cached preview proxy, keyed on everything that changes the PIXELS — per source.
+    ///
+    /// `.clean` is keyed on the published master's FreshnessKey, NOT on generation/sub count: a
+    /// kappa change, a user reject, a budget change or an enable-state transition each produce a
+    /// different clean master while generation and count stay put, so a weaker key would serve a
+    /// STALE clean master — and the blink comparison would then be comparing against something
+    /// that no longer exists.
+    ///
+    /// Adjustments are deliberately absent from every case: the proxy is linear and
+    /// pre-adjustment, so a slider drag reuses it.
+    private enum PreviewProxyKey: Equatable {
+        case online(generation: Int, revision: Int, quality: PreviewQuality)
+        case clean(FreshnessKey, quality: PreviewQuality)
+        case watcher(token: Int, quality: PreviewQuality)
+    }
+    /// Flattened (DBE-applied) preview proxies, keyed by the proxy AND the two DBE parameters.
+    /// Measured on a 1200x800 proxy, `flattenMultiscale` costs roughly 4x a denoise pass, 15x a
+    /// stretch and 200x a histogram — it dominates a preview render completely. It depends only
+    /// on the image and its own two parameters, so dragging black point, stretch, saturation or
+    /// denoise re-ran it for an identical result and made the panel feel sluggish.
+    private struct FlattenedKey: Equatable {
+        let proxy: PreviewProxyKey
+        let scale: Double
+        let smoothest: Double
+    }
+    private var flattenedProxy: (key: FlattenedKey, image: AstroImage)?
+
+    private let previewProxyLock = NSLock()
+    /// One slot PER SOURCE, not a single slot. Hold-to-compare alternates clean -> online ->
+    /// clean, so a single slot would evict and rebuild from the full-resolution stack on every
+    /// press AND every release — the interaction that has to feel instant would be the most
+    /// expensive one in the panel.
+    /// One slot per (source, quality). Keying on source ALONE meant the two qualities evicted
+    /// each other, so every drag paid an extra full-resolution walk of the stack: the first draft
+    /// tick rebuilt the proxy the previous settle had just replaced. Bounded at 2 sources x 2
+    /// qualities; the draft entries are ~1/4 the pixels of the settled ones.
+    private struct ProxySlot: Hashable {
+        let source: PreviewSource
+        let quality: PreviewQuality
+    }
+    private var previewProxies: [ProxySlot: (key: PreviewProxyKey, image: AstroImage)] = [:]
+    /// Test seam: how many times the proxy has actually been rebuilt.
+    private(set) var previewProxyBuildCountForTest = 0
+
+    /// Monotonic stack revision for the preview cache key. `processedCount` is a private var
+    /// mutated on the consume task, so reading it from a preview render — which runs on a
+    /// detached task — would be a data race. Bumped under the lock at ALL THREE places
+    /// `processedCount` is incremented, including the native live path; missing that one
+    /// freezes a live session's preview.
+    private let previewRevLock = NSLock()
+    private var previewStackRevision = 0
+    private func bumpPreviewStackRevision() {
+        previewRevLock.lock(); previewStackRevision += 1; previewRevLock.unlock()
+    }
+    private var currentPreviewStackRevision: Int {
+        previewRevLock.lock(); defer { previewRevLock.unlock() }; return previewStackRevision
+    }
+
+    /// The most recent rendered linear image, at FULL resolution, with the monotonic token it
+    /// was retained under. Watcher / external-stacker mode has NO engine — it loads and renders
+    /// each incoming file — so without this neither the preview nor Apply would have anything
+    /// to render from there, even though display adjustments apply exactly as they do natively.
+    /// Kept at full resolution (not pre-downsampled) so `renderSelectedSource(.online, ...)` (the
+    /// Apply path's watcher-mode fallback — correctness-wave fix) can render the main view at
+    /// full resolution too, not just the preview's downsampled proxy; `renderPreview` downsamples
+    /// its own copy on demand below, and only pays that cost once per incoming frame (the cache
+    /// keyed on `token` absorbs repeats).
+    /// Keyed by a monotonic TOKEN, not the file digest: `StackUpdate.identity` is
+    /// `FileIdentity?` and `FileIdentity.digest` is `String?`, so a digest key would need a
+    /// double unwrap and a fallback for the nil case.
+    private let lastPreviewLock = NSLock()
+    private var watcherFrameToken = 0
+    private var lastPreviewLinear: (token: Int, image: AstroImage)?
+    func noteWatcherFrame(_ linear: AstroImage) {
+        lastPreviewLock.lock()
+        watcherFrameToken += 1
+        lastPreviewLinear = (watcherFrameToken, linear)
+        lastPreviewLock.unlock()
+    }
+
+    /// Full-resolution image (and coverage mask) that `PreviewSource.online` currently resolves
+    /// to: `engine.currentStackAndCoverage()` in native/import mode, or the retained last frame
+    /// in watcher/external-stacker mode (full-weight coverage — `handle()` doesn't crop watcher
+    /// frames either, so this makes the `cropToCoverage` below a no-op for them). nil means
+    /// nothing to render yet (no stack, or no watcher frame seen yet).
+    private func onlineSourceFullRes() -> (image: AstroImage, coverage: [Float]?)? {
+        if let engine, let (mean, coverage) = engine.currentStackAndCoverage() {
+            return (mean, coverage)
+        }
+        lastPreviewLock.lock()
+        let cached = lastPreviewLinear?.image
+        lastPreviewLock.unlock()
+        guard let cached else { return nil }
+        return (cached, nil)   // watcher frames arrive already coverage-cropped by the external stacker
+    }
+
+    /// Full-resolution image (and coverage) `source` resolves to right now: `.clean` is the
+    /// published clean master when one is servable, `.online` is `onlineSourceFullRes()` above.
+    /// Shared by `renderPreview` (which downsamples the result and DOES choose between `.clean`
+    /// and `.online`) and `renderSelectedSource` (Apply's full-resolution counterpart). Apply
+    /// itself always calls `renderSelectedSource(.online, ...)` — the pipeline's contract keeps
+    /// the main view ONLINE, matching the per-frame broadcast render (see
+    /// `testBroadcastRendersPublishedMasterWhilePreviewStaysOnline`) — so in practice only the
+    /// `.online` branch here is reached from Apply; `.clean` exists for `renderPreview`'s use.
+    private func selectedSourceFullRes(_ source: PreviewSource) -> (image: AstroImage, coverage: [Float]?)? {
+        switch source {
+        case .clean:
+            guard let published = publishedMasterIfCurrent() else { return nil }
+            return (published.image, published.coverage)
+        case .online:
+            return onlineSourceFullRes()
+        }
+    }
+
+    /// Renders the staged preview WITHOUT touching committed state — the property
+    /// `renderCurrentDisplay(adjustments:)` deliberately does not have (it commits, and is
+    /// retained for the Apply path). Returns nil when the requested source has nothing to
+    /// show: no stack yet, or `.clean` with no published master.
+    public func renderPreview(source: PreviewSource,
+                              adjustments: DisplayAdjustments,
+                              quality: PreviewQuality = .settled) -> CGImage? {
+        // Resolve the cache key FIRST — it decides what may be reused, and for `.clean` it is
+        // the FreshnessKey of the master actually being served.
+        let key: PreviewProxyKey
+        switch source {
+        case .clean:
+            guard let publishedKey = publishedMasterFreshnessKeyIfCurrent() else { return nil }
+            key = .clean(publishedKey, quality: quality)
+        case .online:
+            if let engine {
+                key = .online(generation: engine.currentStackGeneration,
+                              revision: currentPreviewStackRevision, quality: quality)
+            } else {
+                lastPreviewLock.lock()
+                let token = lastPreviewLinear?.token
+                lastPreviewLock.unlock()
+                guard let token else { return nil }       // watcher mode, no frame yet
+                key = .watcher(token: token, quality: quality)
+            }
+        }
+        var proxy: AstroImage?
+        previewProxyLock.lock()
+        let slot = ProxySlot(source: source, quality: quality)
+        if let cached = previewProxies[slot], cached.key == key { proxy = cached.image }
+        previewProxyLock.unlock()
+
+        if proxy == nil {
+            guard let (image, coverage) = selectedSourceFullRes(source) else { return nil }
+            let built = cropToCoverage(image, coverage: coverage)
+                .downsampled(maxLongEdge: quality.longEdge)
+            previewProxyLock.lock()
+            previewProxies[slot] = (key, built)
+            previewProxyBuildCountForTest += 1
+            previewProxyLock.unlock()
+            proxy = built
+        }
+        guard let proxy else { return nil }
+
+        // Hoist the DBE stage out of the per-tick render and cache it.
+        var working = proxy
+        var preflattened = false
+        if adjustments.backgroundExtraction {
+            let fk = FlattenedKey(proxy: key, scale: adjustments.bgScale,
+                                  smoothest: adjustments.bgSmoothest)
+            previewProxyLock.lock()
+            let cached = (flattenedProxy?.key == fk) ? flattenedProxy?.image : nil
+            previewProxyLock.unlock()
+            if let cached {
+                working = cached
+            } else {
+                working = BackgroundExtraction.flattenMultiscale(
+                    proxy, scale: adjustments.bgScale, smoothest: adjustments.bgSmoothest)
+                previewProxyLock.lock()
+                flattenedProxy = (fk, working)
+                previewProxyLock.unlock()
+            }
+            preflattened = true
+        }
+        return try? displayCGImage(from: working,
+                                   context: displayContext(overriding: adjustments),
+                                   preflattened: preflattened)
+    }
+
+    /// Renders `source` at FULL resolution — the Apply-path counterpart to `renderPreview`,
+    /// which renders the same sources downsampled. Apply always calls this with `.online`: the
+    /// pipeline's contract keeps the main view ONLINE (matching the per-frame broadcast render;
+    /// see `testBroadcastRendersPublishedMasterWhilePreviewStaysOnline`), so this exists mainly
+    /// to fix a real gap in `renderCurrentDisplay(adjustments:)` — it always reads
+    /// `engine.currentStack()`, which is nil in watcher/external-stacker mode (no engine there),
+    /// so Apply produced no image at all there; this falls back to the retained last watcher
+    /// frame instead. Deliberately has NO committing side effect (unlike
+    /// `renderCurrentDisplay(adjustments:)`, which callers use when they need
+    /// `displayAdjustments` written as well); returns nil when the requested source has nothing
+    /// to render.
+    public func renderSelectedSource(_ source: PreviewSource,
+                                     adjustments: DisplayAdjustments) -> CGImage? {
+        guard let (image, coverage) = selectedSourceFullRes(source) else { return nil }
+        let cropped = cropToCoverage(image, coverage: coverage)
+        return try? displayCGImage(from: cropped, context: displayContext(overriding: adjustments))
+    }
+
+    /// Test seam: render an arbitrary image through the SAME path the broadcast uses.
+    /// Exists so `DisplayRenderParityTests` can pin the committed output by hash.
+    func renderForTest(_ image: AstroImage, adjustments: DisplayAdjustments) throws -> CGImage {
+        try displayCGImage(from: image, context: displayContext(overriding: adjustments))
     }
 
     /// Processes one raw frame through the stack engine (native mode). Callback deliveries
@@ -1248,13 +1608,8 @@ public final class SessionPipeline {
             let outcome = result.outcome
             if engine.autoReseedCount != lastAutoReseedCount {
                 lastAutoReseedCount = engine.autoReseedCount
-                // The engine dropped its reference and will re-seed on the next good sub — void the
-                // stale WCS and re-enable solving so the NEW reference plate-solves (its center/rotation
-                // can differ). MUST run before attemptPlateSolveIfNeeded below so this frame's attempt
-                // sees the reset state (manual reseed() does the same via invalidatePlateSolve()).
-                invalidatePlateSolve()
                 // T8 review fix: an auto-reseed is a FreshnessKey mutation point (generation change)
-                // exactly like manual reseed() (see reseed()'s matching block ~681-685) — refresh the
+                // exactly like manual reseed() (see reseed()'s matching block) — refresh the
                 // cached key HERE so publishedMasterIfCurrent() immediately stops serving a master built
                 // from the just-discarded reference, instead of staying stale until the next accepted
                 // sub's .becameReference append happens to recompute it. Lock-safety: neither `regLock`
@@ -1263,12 +1618,29 @@ public final class SessionPipeline {
                 // regLock -> engine.lock leaf-edge ordering with no new cycle. By this point
                 // engine.autoReseedCount has already been bumped (checked just above), so the recompute
                 // observes the POST-reseed generation.
+                //
+                // Correctness-wave defect 3: this recompute MUST run BEFORE invalidatePlateSolve()
+                // below, not after. invalidatePlateSolve() fires the public onSolveStateChanged
+                // callback, which AppModel hops onto the main actor to call refreshPreview() —
+                // asynchronously, on a different thread, with no synchronization back to this
+                // (serial consume) thread. With the old order (invalidate, then recompute), that
+                // async render could run before the recompute landed and serve the clean master
+                // this reseed just invalidated — and since the triggering frame is itself
+                // rejected, nothing later was guaranteed to correct it, leaving a stale master on
+                // screen indefinitely. Recomputing first closes the window: by the time the
+                // callback can act, publishedMasterIfCurrent() already refuses the stale master.
                 regLock.withLock { recomputeCachedFreshnessKeyLocked() }
+                // The engine dropped its reference and will re-seed on the next good sub — void the
+                // stale WCS and re-enable solving so the NEW reference plate-solves (its center/rotation
+                // can differ). MUST run before attemptPlateSolveIfNeeded below so this frame's attempt
+                // sees the reset state (manual reseed() does the same via invalidatePlateSolve()).
+                invalidatePlateSolve()
                 noteReseeded()
                 onLog?("Auto-reseeded — the reference frame didn't match; re-seeding on the next good sub. (Earlier subs that couldn't register stay rejected.)")
             }
             attemptPlateSolveIfNeeded(engine: engine)   // idempotent; no-op until a reference is seeded
             processedCount += 1
+            bumpPreviewStackRevision()
             // A frame the engine has finalized (accepted OR rejected) is drain progress for the
             // progress-aware live drain in end() — ticked HERE, before the snapshot-render guards
             // below (which can early-return on a nil coverage/recorder), so an accepted frame whose
@@ -1380,6 +1752,9 @@ public final class SessionPipeline {
     /// Processes one watcher update (watcher mode). Callback deliveries inside are
     /// reentrancy-guarded (review10 item 4).
     private func handle(_ update: StackUpdate) {
+        let probeName = update.url.lastPathComponent
+        frameProcessingProbeForTest?(probeName, .began)
+        defer { frameProcessingProbeForTest?(probeName, .finished) }
         withCallbackDelivery {
             guard let recorder else {
                 onLog?("recorder missing — frame dropped (\(update.url.lastPathComponent))")
@@ -1391,6 +1766,7 @@ public final class SessionPipeline {
                 // digest) the watcher validated on ITS pinned descriptor, so a file replaced between
                 // the watcher's validation and this read is skipped, never parsed.
                 let linear = try ImageLoader.load(url: update.url, expectedIdentity: update.identity)
+                noteWatcherFrame(linear)
                 displayRenderLock.lock()
                 defer { displayRenderLock.unlock() }
                 let revision = nextDisplayRevision()
@@ -1811,7 +2187,7 @@ public final class SessionPipeline {
             // `currentFreshnessKey()`/`publishedMasterIfCurrent()`, which re-acquire regLock and
             // would deadlock here since we already hold it).
             var finalization: SessionFinalizationFacts?
-            let finalContext = displayContext()
+            let finalContext = freezeDisplayContextForFinalRender()
             var finalBroadcast: (image: AstroImage, count: Int, cleanCount: Int?)?
             if let eng = engine {
                 let frozenGen = eng.currentStackGeneration

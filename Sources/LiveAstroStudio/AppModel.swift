@@ -102,7 +102,7 @@ final class AppModel {
     var backgroundNormalizationEnabled = true
     var scaleNormalizationEnabled = true
     var demosaic: DemosaicMethod = .malvar
-    var calibration = CalibrationStore.load(.standard)
+    var calibration: CalibrationSelection
 
     /// Reusable master darks/bias, matched to a session by camera + settings.
     let calibrationLibrary = CalibrationLibrary()
@@ -186,7 +186,52 @@ final class AppModel {
     var log: [String] = []
     var replayURL: URL?
     var processorBackend: ProcessorBackend = .none
-    var displayAdjustments = DisplayAdjustments.liveDefault
+    /// Committed vs pending display adjustments. Sliders bind to `staged.pending`; only
+    /// `applyAdjustments()` promotes it and pushes to the pipeline. See StagedAdjustments.
+    var staged = StagedAdjustments(committed: .liveDefault)
+    /// The staged preview image (pending adjustments, proxy-sized). Distinct from
+    /// `latestImage`, which stays on the COMMITTED render so the main view always shows what
+    /// the audience sees.
+    var previewImage: CGImage?
+    /// True only while the blink control is held down. NOT a stored source: defaulting a
+    /// source to `.clean` would blank the preview entirely whenever rejection is off (there
+    /// is no published master, so `renderPreview(source: .clean)` returns nil) — which is
+    /// every import session. `previewSource` below resolves it instead.
+    /// The reference pane: the SAME source rendered with the COMMITTED adjustments — i.e. what
+    /// the audience is seeing right now. Turning a dial moves `previewImage` and leaves this one
+    /// still, so the comparison isolates the operator's edit rather than putting two moving
+    /// targets side by side.
+    ///
+    /// (It previously showed the un-rejected master, comparing rejection instead of the edit.
+    /// That answered a different question, and answered it badly: the two masters differ over
+    /// 0.13% of the frame, so both panes looked identical while both moved together.)
+    /// The reference pane. This is the DELIVERED BROADCAST IMAGE itself, not a re-render of the
+    /// same source through the preview path — so the pane labelled as what is live genuinely is
+    /// what is live, at the resolution and through the exact render the audience received. It also
+    /// removes a whole render from every preview refresh.
+    var previewCompareImage: CGImage?
+
+    /// Luminance histograms of the two panes, computed from the rendered images. Shown under each
+    /// pane so an adjustment can be judged against the DATA rather than by feel on a bare slider —
+    /// the background of a real M51 stack sits near 0.0095 with a MADN of 0.00007, so the useful
+    /// travel of the black-point slider is a sliver the eye cannot place without this.
+    var previewHistogram: [Int] = []
+    var compareHistogram: [Int] = []
+
+    /// What the cached reference-pane ("Current settings") render was made from. That pane depends only on the
+    /// COMMITTED adjustments and the source — never on the pending edit — so re-rendering it on
+    /// every slider tick doubled the work of a drag (two renders and two histograms per tick)
+    /// to produce an identical image. Dragging felt slow because half the work was wasted.
+    /// The edit pane is ALWAYS approximate, and says so unconditionally.
+    ///
+    /// It renders from a downsampled proxy and derives its stretch from that proxy, so its curve
+    /// is not the broadcast's. A mechanism to reuse the broadcast's statistics was built and then
+    /// removed: measured on a noise-dominated fixture it made agreement WORSE, not better (the
+    /// rendered percentiles moved further from the broadcast, and further still after a new
+    /// frame), because matching the curve does not match the output once downsampling has changed
+    /// the pixel distribution the curve is applied to. Labelling every proxy preview approximate
+    /// is the honest position, and it does not depend on cache state that could silently go stale.
+    let previewIsApproximate = true
 
     /// Red night-vision tint of the *whole Mac display* (not just the astro image).
     /// In-memory only — defaults off each launch so the app never opens unexpectedly red.
@@ -263,6 +308,14 @@ final class AppModel {
     private var pipeline: SessionPipeline?
     private var demoTask: Task<Void, Never>?
 
+    /// Where session/calibration settings persist. Defaults to `.standard` (production); tests
+    /// inject a per-test temporary suite (`UserDefaults(suiteName:)`) so a test run never reads
+    /// OR writes the real user's `com.pauldavis.liveastrostudio` domain — `init()`'s calls to
+    /// `CalibrationStore.load`/`SessionSettingsStore.load` (below) read through this SAME
+    /// property, not `.standard` directly, precisely so an injected suite is honestly isolated
+    /// on both the read and the write path, not just the write path.
+    private let userDefaults: UserDefaults
+
     /// Snapshot of the user's real session settings, captured when a Try-Demo
     /// session overrides them with demo values (branding: "Demo Nebula", 30 s,
     /// "Demo Stack Generator", …; and source config: stacker-output mode, the
@@ -291,7 +344,12 @@ final class AppModel {
     private var completionTick: Task<Void, Never>?
     private let notifier = SessionNotifier()
 
-    init() {
+    /// `userDefaults` defaults to `.standard` for every production call site (`AppModel()`
+    /// unchanged). Tests pass a temporary suite so no test run reads or writes the real user's
+    /// persisted settings.
+    init(userDefaults: UserDefaults = .standard) {
+        self.userDefaults = userDefaults
+        self.calibration = CalibrationStore.load(userDefaults)
         // Build the seam bundle and the Broadcast controller first. The closures
         // capture `self` (safe: they only fire after init completes), and
         // `broadcast` must exist before loadSettings()/session hooks reference it.
@@ -356,7 +414,7 @@ final class AppModel {
             makeStackEngine: { [weak self] in MainActor.assumeIsolated { self!.makeStackEngine() } },
             currentCalibration: { [weak self] in MainActor.assumeIsolated { self!.calibration } },
             currentNeutralizeBackground: { [weak self] in MainActor.assumeIsolated { self?.neutralizeBackground ?? false } },
-            currentDisplayAdjustments: { [weak self] in MainActor.assumeIsolated { self?.displayAdjustments ?? .neutral } },
+            currentDisplayAdjustments: { [weak self] in MainActor.assumeIsolated { self?.staged.committed ?? .neutral } },
             currentFileNamePrefix: { [weak self] in MainActor.assumeIsolated { self?.fileNamePrefix ?? "" } },
             currentLiveAstroRoot: { [weak self] in MainActor.assumeIsolated { self!.liveAstroRoot } },
             currentProfile: { [weak self] in MainActor.assumeIsolated { self!.profile } },
@@ -411,7 +469,7 @@ final class AppModel {
             backgroundNormalizationEnabled: backgroundNormalizationEnabled,
             scaleNormalizationEnabled: scaleNormalizationEnabled,
             processorBackend: processorBackend,
-            displayAdjustments: displayAdjustments,
+            displayAdjustments: staged.committed,
             relayRetentionDays: liveSource.relayRetentionDays,
             demosaic: demosaic,
             idleSafeguardEnabled: idleSafeguardEnabled,
@@ -456,7 +514,7 @@ final class AppModel {
             settings.watchFolderPath = snap.watchFolder?.path
             settings.filePrefix = snap.fileNamePrefix
         }
-        SessionSettingsStore.save(settings, to: .standard)
+        SessionSettingsStore.save(settings, to: userDefaults)
     }
 
     /// Restore the user's real metadata captured before a Try-Demo session, so the
@@ -472,7 +530,7 @@ final class AppModel {
     }
 
     func loadSettings() {
-        let s = SessionSettingsStore.load(.standard)
+        let s = SessionSettingsStore.load(userDefaults)
         sourceMode = SourceMode(rawValue: s.sourceModeRaw) ?? .stackerOutput
         watchFolder = s.watchFolderPath.map { URL(fileURLWithPath: $0) }
         fileNamePrefix = s.filePrefix
@@ -490,7 +548,7 @@ final class AppModel {
         processorBackend = s.processorBackend
         // Fresh install (no saved settings) starts with the recommended DBE-on look;
         // a returning user keeps whatever they last had.
-        displayAdjustments = SessionSettingsStore.exists(.standard) ? s.displayAdjustments : .liveDefault
+        staged = StagedAdjustments(committed: SessionSettingsStore.exists(userDefaults) ? s.displayAdjustments : .liveDefault)
         idleSafeguardEnabled = s.idleSafeguardEnabled
         idleSafeguardMinutes = s.idleSafeguardMinutes
         plannedStopEnabled = s.plannedStopEnabled
@@ -530,15 +588,294 @@ final class AppModel {
         }
     }
 
-    /// Called when a slider changes: persist, push adjustments to the pipeline so
-    /// the next frame's snapshot matches, and re-render the current stack off-main
-    /// (the pipeline coalesces pending renders while adjustments are changing).
-    func applyDisplayAdjustments() {
-        saveSettings()
+    /// Monotonic stamp for preview render requests. Renders run on detached tasks, so without
+    /// it a slow EARLIER render can finish after a newer one and overwrite the preview with a
+    /// stale image — visible as the preview snapping back to a setting you already moved past.
+    private var previewRenderSeq = 0
+
+    /// How many draft renders are in flight. The sequence stamp rejects stale RESULTS but does
+    /// nothing to BOUND the WORK: measured 6 concurrent renders outstanding when each render
+    /// outlasts the throttle window, and on a real 26 MP session a proxy-cache miss makes each of
+    /// those a full-resolution crop + downsample. One render plus one queued is all that can ever
+    /// be useful, since anything older is discarded on completion anyway.
+    private var draftRendersInFlight = 0
+    private static let maxDraftRendersInFlight = 2
+
+    /// Throttle clock for the PENDING draft render only. Main's pipeline coalesces the COMMITTED
+    /// renders itself (DisplayDelivery), so the old shared `lastAdjustmentRender` went away with
+    /// the old push-on-every-tick path; the operator-only draft preview still needs its own, since
+    /// DisplayDelivery does not own it.
+    private var lastAdjustmentRender = Date.distantPast
+
+
+    /// True while a coalesced trailing render (see refreshPreview) is scheduled but hasn't fired yet.
+    private var previewTrailingScheduled = false
+
+    /// Clears the preview and invalidates any in-flight render. Bumping the stamp is the point:
+    /// a detached render that started before the clear would otherwise pass the seq guard on
+    /// completion and put the old session's image back, where it would then be frozen because
+    /// `pipeline` is nil and every later refresh returns early.
+    private func clearPreview() {
+        previewRenderSeq &+= 1
+        previewImage = nil
+        previewCompareImage = nil
+        previewHistogram = []
+        compareHistogram = []
+
+    }
+
+    /// Called when a slider changes: re-render the PREVIEW only. Nothing reaches the pipeline
+    /// here — that is what makes tuning mid-broadcast safe.
+    ///
+    /// `force` marks a DISCRETE action (Apply, Revert, Reset, blink press/release, a new frame, a
+    /// session boundary): it bypasses the drag throttle and renders at full quality. Those must
+    /// never be silently dropped for landing inside an 80 ms window — a swallowed blink release
+    /// would leave the panel showing the online master and quietly misrepresent rejection.
+    func refreshPreview(force: Bool = false) {
+        performPreviewRefresh(bypassThrottle: force, quality: force ? .settled : .draft)
+    }
+
+    /// Debounce generation for the settle. Each edit invalidates the pending settle by bumping it.
+    private var settleGeneration: UInt64 = 0
+
+    /// Arms the settled render that follows a drag, RESETTING any settle already pending.
+    ///
+    /// A fixed one-shot timer is wrong here, and was the bug: armed 90 ms after the FIRST draft
+    /// and not postponed by later edits, it fired a full-resolution render in the middle of a
+    /// continuous drag, then re-armed on the next draft — so a long drag paid for a settled render
+    /// roughly every 90 ms. That is the exact cost the draft tier exists to avoid. Resetting on
+    /// every edit means a drag settles exactly once, after it stops.
+    private func scheduleSettle() {
+        settleGeneration &+= 1
+        let generation = settleGeneration
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 90_000_000)
+            guard let self, self.settleGeneration == generation else { return }
+            self.performPreviewRefresh(bypassThrottle: true, quality: .settled, isRetry: true)
+        }
+    }
+
+    /// Generation of the settled render currently in flight, if any. A draft retry while this
+    /// matches `settleGeneration` would re-render values the settle is already rendering, at lower
+    /// quality — and bumping `previewRenderSeq` would make the settle's result unpublishable, so
+    /// the expensive work would be thrown away.
+    /// The settled render currently in flight, identified by its render sequence number as well
+    /// as its settle generation. The token is what makes clearing safe: completions are not
+    /// ordered, so an OLDER settled render finishing while a newer one is still rendering used to
+    /// clear the newer one's protection, after which a queued draft retry could supersede it and
+    /// leave draft pixels on screen. Two forced renders can share a generation, so the generation
+    /// alone cannot identify the owner.
+    private var settledRenderInFlight: (token: Int, generation: UInt64)?
+
+    /// Generation of the newest settle that actually PUBLISHED. Without this, a draft retry queued
+    /// before a settle could run after it: the in-flight marker is cleared on completion, so the
+    /// retry's guard passed, it published lower-resolution pixels over the settled ones, and
+    /// because a retry never re-arms the settle nothing upgraded them again — the preview stayed
+    /// draft permanently. Compared against the CURRENT generation, so a genuine new edit (which
+    /// bumps it) still gets its draft.
+    private var lastPublishedSettleGeneration: UInt64?
+
+    /// Schedules one coalesced DRAFT retry, unless one is already pending. Used by the drop paths,
+    /// which must not swallow the operator's last edit — the preview would then disagree with what
+    /// Apply publishes. Settled work is never retried this way: it goes through `scheduleSettle`,
+    /// whose generation check is what keeps full-resolution renders out of an active drag.
+    private func scheduleCoalescedRetry() {
+        guard !previewTrailingScheduled else { return }
+        previewTrailingScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 90_000_000)
+            self?.previewTrailingScheduled = false
+            self?.performPreviewRefresh(bypassThrottle: true, quality: .draft, isRetry: true)
+        }
+    }
+
+    /// `isRetry` marks a call that came from a timer rather than from the operator. Retries must
+    /// not re-arm the settle (the edit that caused them already did) and must re-check that they
+    /// are still wanted, since the world may have moved on during their 90 ms wait.
+    private func performPreviewRefresh(bypassThrottle: Bool,
+                                       quality: SessionPipeline.PreviewQuality,
+                                       isRetry: Bool = false) {
         guard let pipeline else { return }
-        let adj = displayAdjustments
-        pipeline.displayAdjustments = adj
-        // The pipeline coalesces adjustment renders and delivers both surfaces together.
+        // Re-arm the settle for EVERY operator draft request, including ones about to be dropped:
+        // the last edit must settle even when its own render never ran.
+        if quality == .draft && !isRetry { scheduleSettle() }
+        // A draft retry is pointless once the settle for these same values is already rendering:
+        // no edit has arrived since (the generation is unchanged), so it would render identical
+        // values more cheaply AND invalidate the settle's result through the sequence guard.
+        if quality == .draft, isRetry,
+           settledRenderInFlight?.generation == settleGeneration
+               || lastPublishedSettleGeneration == settleGeneration { return }
+        let now = Date()
+        if !bypassThrottle {
+            guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else {
+                // The retry is a DRAFT, deliberately. It exists to keep the preview showing the
+                // newest pending value during a drag, which is cheap work; the settle above is
+                // what eventually renders it at full preview quality. "Full quality" is not the
+                // same as matching the broadcast — every proxy preview is approximate; see
+                // `previewIsApproximate`.
+                scheduleCoalescedRetry()
+                return
+            }
+        }
+        lastAdjustmentRender = now
+        previewRenderSeq &+= 1
+        let seq = previewRenderSeq
+        let adj = staged.pending
+        let source = previewSource
+        // Test seam: when set, this stands in for `pipeline.renderPreview(source:adjustments:)`.
+        // Captured here (not read again inside the detached task) so a test can gate ONE
+        // specific in-flight call — e.g. block the render this refreshPreview() started while a
+        // later refreshPreview() call captures its own (different) override or none at all — to
+        // build a real completion race rather than asserting on `previewRenderSeq`'s value.
+        // nil in production; refreshPreview then behaves exactly as before this seam existed.
+        let renderOverride = previewRenderOverrideForTest
+        guard draftRendersInFlight < Self.maxDraftRendersInFlight else {
+            // Saturated. Do not pile on: the newest pending values are already captured by
+            // `previewRenderSeq`, so schedule one coalesced retry instead of another render.
+            //
+            // A dropped SETTLE must come back through `scheduleSettle`, not as a fixed-quality
+            // retry. A fixed retry carried no generation, so if the operator resumed dragging
+            // during its 90 ms wait it still started a full-resolution render mid-drag — the same
+            // defect the debounce was added to fix, re-entering through the drop path.
+            if quality == .settled { scheduleSettle() } else { scheduleCoalescedRetry() }
+            return
+        }
+        draftRendersInFlight += 1
+        let dispatchedSettleGeneration = settleGeneration
+        if quality == .settled { settledRenderInFlight = (token: seq, generation: dispatchedSettleGeneration) }
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let cg: CGImage?
+            if let renderOverride {
+                cg = await renderOverride(pipeline, source, adj, quality)
+            } else {
+                cg = pipeline.renderPreview(source: source, adjustments: adj, quality: quality)
+            }
+            await MainActor.run {
+                self.draftRendersInFlight -= 1
+                // Clear ONLY if this render still owns the marker; an out-of-order completion
+                // must not release a newer render's protection.
+                if quality == .settled, self.settledRenderInFlight?.token == seq {
+                    self.settledRenderInFlight = nil
+                }
+                // Only the newest request may publish; a slower earlier render is discarded.
+                let published = seq == self.previewRenderSeq
+                if published {
+                    // Record the settle only when it actually reached the screen; a settle whose
+                    // result was discarded leaves the preview un-settled, so a draft retry for
+                    // those values is still legitimate.
+                    if quality == .settled { self.lastPublishedSettleGeneration = dispatchedSettleGeneration }
+                    self.previewImage = cg
+                    self.previewHistogram = cg.map { DisplayHistogram.of($0) } ?? []
+                }
+                self.previewRenderCompletionForTest?(seq, published)
+            }
+        }
+    }
+
+    /// Test seam only: substitutes for `pipeline.renderPreview(source:adjustments:)` inside
+    /// `refreshPreview`'s detached render task. Production never sets this (stays nil), so
+    /// `refreshPreview` is unchanged there. Tests use it to control render TIMING — e.g. to hold
+    /// one call open past a second, superseding call — without reimplementing or peeking at the
+    /// `previewRenderSeq` guard itself.
+    var previewRenderOverrideForTest: (@Sendable (SessionPipeline, SessionPipeline.PreviewSource, DisplayAdjustments, SessionPipeline.PreviewQuality) async -> CGImage?)?
+
+    /// Test seam only: called once every `refreshPreview` render attempt has been resolved on
+    /// the main actor, AFTER the `previewRenderSeq` guard ran — with that render's `seq` and
+    /// whether it actually published. Reports the guard's OUTCOME; never computes its own. Lets
+    /// a test await a specific render's resolution deterministically instead of polling
+    /// `previewImage` or sleeping a guessed duration. Production never sets this.
+    var previewRenderCompletionForTest: ((_ seq: Int, _ published: Bool) -> Void)?
+
+    /// Which master the preview shows. Held → the un-rejected online master. Otherwise the
+    /// clean master when one is actually being served, else online — so the panel still shows
+    /// a picture when rejection is off, building, or unavailable, rather than going blank.
+    /// The PRIMARY preview source: the clean master when one is being served, else the online
+    /// stack. No blink branch any more — the comparison is rendered as a second image rather than
+    /// by swapping this one.
+    var previewSource: SessionPipeline.PreviewSource {
+        pipeline?.publishedMasterSurvivorCount() != nil ? .clean : .online
+    }
+
+    /// True when a clean master is being served, i.e. when there are two different things to show.
+    var canCompare: Bool { pipeline?.publishedMasterSurvivorCount() != nil }
+
+    /// Promotes the pending adjustments to committed and hands them to the pipeline, which
+    /// coalesces the render and delivers the operator preview and the resolved BROADCAST image
+    /// together through `DisplayDelivery`. This is the ONLY path by which a slider reaches the
+    /// audience.
+    ///
+    /// There is deliberately no sequence stamp here any more. Ordering and session freshness for
+    /// the COMMITTED surfaces are owned by `DisplayDelivery` (its revision + `isCurrentDisplay`
+    /// guard), and the bespoke `applyRenderSeq` that used to live here was a narrower
+    /// reimplementation of the same thing — two competing ordering systems in one display path is
+    /// what produced this feature's stale-image bugs. `previewRenderSeq` below still guards the
+    /// PENDING draft render, which `DisplayDelivery` does not own.
+    func applyAdjustments() {
+        // Place the adjustments FIRST, atomically, and commit only if they landed.
+        //
+        // A separate "is it accepting?" check followed by an assignment is not enough: `end()` can
+        // freeze the display between the two, and the edit is then committed, its badge cleared,
+        // and the change silently overwritten by the final render. `applyCommittedAdjustments`
+        // does the check and the assignment in one critical section and says whether it took.
+        let candidate = staged.pending
+        let landedOnSession = pipeline?.applyCommittedAdjustments(candidate) ?? false
+        // An IMPORT owns its own pipeline (ImportController), not `pipeline`, which is nil while
+        // one runs.
+        let landedOnImport = importer.applyDisplayAdjustments(candidate)
+        let hadSomewhereToLand = pipeline != nil || importer.hasActivePipeline
+
+        if hadSomewhereToLand, !landedOnSession, !landedOnImport {
+            // Deliberately does NOT commit. Leaving the edit pending keeps the badge honest —
+            // clearing it is exactly what made this a silent failure.
+            errorMessage = "The session is finalising — writing the master and building the replay "
+                + "— so its display is already closed and this change cannot reach it. Your edit "
+                + "is still pending; press Apply again once it finishes."
+            return
+        }
+
+        // Either it landed, or there was nothing live to land on — in which case committing is
+        // right: it is a persisted preference for the next render, with no live image to
+        // misrepresent.
+        _ = staged.apply()
+        saveSettings()
+        // The two PREVIEW panes are ours, not the pipeline's, and nothing else re-renders them:
+        // without this the bottom pane keeps its pending image, so Apply appears to do nothing.
+        refreshPreview(force: true)
+    }
+
+    /// Throws the pending edits away and puts the preview back on the committed look.
+    func revertAdjustments() {
+        staged.revert()
+        refreshPreview(force: true)
+    }
+
+    /// Restores the shipped defaults as a PENDING edit — Reset must not reach the broadcast on
+    /// its own, or it would be the one control that bypasses staging entirely. Apply commits it
+    /// like any other change.
+    func resetAdjustments() {
+        staged.pending = .liveDefault
+        refreshPreview(force: true)
+    }
+
+    /// The session-transition step shared by `startSession()` and `endSession()`: assign the
+    /// (possibly nil) active pipeline and invalidate any draft render in flight. This must stay
+    /// the ONE place that pairing happens — `attach(pipeline:)` below (the test seam) calls this
+    /// SAME method rather than repeating the assignment+invalidation itself, so a test exercising
+    /// "a session switch must reject a stale draft" is exercising this real method, not a
+    /// parallel re-implementation of it that could pass even if this one were broken.
+    private func setPipeline(_ pipeline: SessionPipeline?) {
+        self.pipeline = pipeline
+        clearPreview()
+    }
+
+    /// Test seam only: attaches `pipeline` through the SAME `setPipeline(_:)` `startSession()`/
+    /// `endSession()` use, so tests can drive the REAL `applyAdjustments()` / `revertAdjustments()`
+    /// / `resetAdjustments()` / `refreshPreview()` code paths — and the real session-transition
+    /// invalidation — against a real `SessionPipeline` without going through file-watching/
+    /// `startSession()`. `pipeline` itself stays `private`; this is the only other writer.
+    func attach(pipeline: SessionPipeline) {
+        setPipeline(pipeline)
     }
 
     private func makeStackEngine() -> StackEngine {
@@ -770,7 +1107,7 @@ final class AppModel {
             let cal = resolveCalibration(
                 watchFolder: folder, prefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
             cal.messages.forEach { log.append($0) }
-            CalibrationStore.save(calibration, to: .standard)
+            CalibrationStore.save(calibration, to: userDefaults)
             // Empty folder at Start → resolve calibration from the first sub that lands.
             let provider = cal.foundMetadata ? nil : makeCalibratorProvider()
             p = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
@@ -785,7 +1122,7 @@ final class AppModel {
             sessionNeutralizeBackground = neutralizeBackground
             sessionSubExposureSeconds = profile.subExposureSeconds
         }
-        p.displayAdjustments = displayAdjustments
+        p.displayAdjustments = staged.committed
 
         acceptedCount = 0
         rejectedCount = 0
@@ -820,7 +1157,8 @@ final class AppModel {
         wireCallbacks(to: p, onAccepted: onAccepted)
         do {
             try p.start()
-            pipeline = p
+            setPipeline(p)
+            refreshPreview(force: true)   // fill the panel as soon as there is data
             isRunning = true
             selectedTab = .live
             sessionStart = Date()
@@ -937,6 +1275,9 @@ final class AppModel {
                       self.displayPresentation.accept(update, sessionID: sessionID) else { return }
                 self.latestImage = update.previewImage
                 self.broadcastImage = update.broadcastImage
+                // The reference pane and its histogram follow the delivered broadcast directly.
+                self.previewCompareImage = update.broadcastImage
+                self.compareHistogram = update.broadcastImage.map { DisplayHistogram.of($0) } ?? []
                 self.displayedCleanMasterSubCount = update.cleanMasterSubCount
                 self.displayedIntegrationSeconds = update.integrationSeconds
                 self.displayedPreviewIntegrationSeconds = update.previewIntegrationSeconds
@@ -950,9 +1291,15 @@ final class AppModel {
                 guard self?.displayPresentation.belongs(to: sessionID) == true else { return }
                 self?.latestRecord = record
                 self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false   // gate the North-up toggle
+                self?.refreshPreview(force: true)   // a new sub changed the stack
                 onAccepted?()
                 self?.log.append("✓ update \(record.index) — \(record.snapshotFile)")
             }
+        }
+        // Fires from the refiner's BACKGROUND pass when a clean master publishes — hop to the
+        // main actor like every other callback here before touching AppModel state.
+        pipeline.onCleanMasterPublished = { [weak self] in
+            Task { @MainActor in self?.refreshPreview(force: true) }
         }
         pipeline.onRejected = { [weak self] reason, name in
             onAnyFrame?()
@@ -976,9 +1323,16 @@ final class AppModel {
             }
         }
         // Solve state changes off the hot path and emits no display update — refresh the toggle gate on
-        // BOTH edges: a solve landing (enable) and a reseed/auto-reseed invalidating it (disable).
+        // BOTH edges: a solve landing (enable) and a reseed/auto-reseed invalidating it (disable). Also
+        // refresh the preview on both edges: a MANUAL reseed changes the stack immediately and may not
+        // produce another accepted frame for a while, so onUpdate alone can leave the panel showing the
+        // old stack; and North-up rotation is applied inside displayCGImage, so the preview's orientation
+        // changes the moment a solve lands.
         pipeline.onSolveStateChanged = { [weak self] in
-            Task { @MainActor in self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false }
+            Task { @MainActor in
+                self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false   // existing behaviour
+                self?.refreshPreview(force: true)                              // added
+            }
         }
         // Task 8a data plane: mirror each persisted sub onto the main actor for the Stats
         // UI. The pipeline already wrote the record to session.subFrames on its own
@@ -1056,6 +1410,9 @@ final class AppModel {
         guard let pipeline else { return }
         let enabled = liveTrailRejection && sourceIsLocalLiveRelay
         pipeline.configureLiveRejection(enabled: enabled, kappa: rejectionStrength.kappa)
+        // Turning rejection off, or changing kappa, invalidates whatever clean master was being
+        // served exactly like a reject does — refresh so the panel doesn't keep showing it.
+        refreshPreview(force: true)
     }
 
     /// Advisory-only budget check (Task 11 point 6): only runs when an expected frame size is
@@ -1105,6 +1462,9 @@ final class AppModel {
         let rejected = Set(subFrames.filter(\.rejectedByUser).map(\.index))
         pipeline?.setUserRejected(rejected)
         pipeline?.noteUserRejectChanged()
+        // A reject makes the currently-published clean master unservable immediately, so
+        // previewSource falls back to .online — refresh so the panel reflects that at once.
+        refreshPreview(force: true)
     }
 
     /// Clears the native-session-only stats/re-stack state at the START of an offline import
@@ -1296,6 +1656,8 @@ final class AppModel {
             displayPresentation.begin(sessionID: UUID())
             latestImage = cg
             broadcastImage = cg
+            previewCompareImage = cg
+            compareHistogram = DisplayHistogram.of(cg)
             displayedCleanMasterSubCount = nil
             displayedIntegrationSeconds = Double(report.stackedCount) * sessionSubExposureSeconds
             displayedPreviewIntegrationSeconds = displayedIntegrationSeconds
@@ -1457,7 +1819,10 @@ final class AppModel {
                 // the exact same calibration the live master used (Fix 1).
                 self.sessionCalibrator = p.effectiveCalibrator
                 self.sessionSourceMetadata = p.capturedSourceMetadata   // stamp re-stacked master.fit like the live one (Fix P1b)
-                self.pipeline = nil
+                // Pending edits die with the session, and nothing from a finished session
+                // lingers on screen.
+                self.setPipeline(nil)
+                self.staged.revert()
                 self.sessionEnd = Date()
                 self.restackOfferPending = self.flaggedCount > 0
                 // Common completion (success OR replay failure): only now stop

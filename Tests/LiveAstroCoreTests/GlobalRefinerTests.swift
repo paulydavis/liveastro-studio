@@ -7,29 +7,6 @@ import ImageIO
 /// later background refiner (Task 6) can reuse each accepted sub's transform/leveling/scale
 /// without re-registering.
 final class GlobalRefinerTests: XCTestCase {
-    /// A live (isFinite == false) source that yields a fixed sequence of RawFrames up front
-    /// (buffered), stays open like a real live source, and finishes its stream on stop().
-    /// Mirrors SessionPipelineShutdownTests.BacklogLiveSource.
-    final class StubLiveSource: FrameSource {
-        let frames: AsyncStream<RawFrame>
-        private let cont: AsyncStream<RawFrame>.Continuation
-        var isFinite: Bool { false }
-        var totalCount: Int? { nil }
-        init(sequence: [RawFrame]) {
-            var c: AsyncStream<RawFrame>.Continuation!
-            frames = AsyncStream(bufferingPolicy: .unbounded) { c = $0 }
-            cont = c
-            for f in sequence { cont.yield(f) }
-            // Stream stays open (live source) until stop().
-        }
-        func start() throws {}
-        func stop() { cont.finish() }
-        /// Task 7: push an additional frame after construction (e.g. post-reseed), so a test can
-        /// drive a NEW reference through the real handleNative path instead of poking pipeline
-        /// state directly.
-        func send(_ frame: RawFrame) { cont.yield(frame) }
-    }
-
     /// A ≥15-star field so the engine accepts every translated variant (mirrors
     /// StackEngineTests.field / starFrame).
     private let field: [(x: Double, y: Double)] = [
@@ -948,6 +925,89 @@ final class GlobalRefinerTests: XCTestCase {
         XCTAssertEqual(pipeline.subRegistrations().count, 1,
                        "no accepted sub landed after the auto-reseed — proves the invalidation didn't " +
                        "come from the (T7) sub-append recompute path")
+
+        source.stop()
+    }
+
+    /// Correctness-wave defect 3: the test above proves the master goes stale "immediately" as
+    /// observed AFTER the whole auto-reseed block has finished running — which passes whether
+    /// the freshness-key recompute happens before OR after `invalidatePlateSolve()` fires
+    /// `onSolveStateChanged`, since by then both have already run. That ordering matters because
+    /// `onSolveStateChanged` is a PUBLIC callback the app hops onto the main actor to re-render
+    /// the preview from — if it fires while the cached freshness key still reflects the
+    /// PRE-reseed state, that render can serve the master this very reseed is about to discard,
+    /// and because the triggering frame is itself rejected, nothing later is guaranteed to
+    /// correct it (the operator could sit on a stale clean master indefinitely). This test
+    /// observes the state from INSIDE the callback itself — synchronously, at the instant it
+    /// fires — which is the only place the ordering bug is actually visible.
+    func testAutoReseedRecomputesFreshnessBeforeFiringTheSolveStateCallback() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = sandbox.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let profile = SessionProfile(targetName: "AutoReseedCallbackOrder", telescope: "T", camera: "C",
+                                     mount: "M", filter: "F", locationLabel: "L", bortle: 5,
+                                     subExposureSeconds: 20, notes: "")
+        let engine = StackEngine(autoReseedThreshold: 3)
+
+        let seed = stubFrame(dx: 0, dy: 0, name: "aro-seed.fit", digest: "aro-seed", timestamp: 0)
+        let source = StubLiveSource(sequence: [seed])
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine,
+                                       profile: profile, rootDirectory: sessions)
+        var log = ""
+        let logLock = NSLock()
+        pipeline.onLog = { msg in logLock.withLock { log += msg } }
+        try pipeline.start()
+
+        _ = waitForRegistrations(pipeline, count: 1)
+        pipeline.configureLiveRejection(enabled: true)
+
+        let dummyMaster = constImage(0.42)
+        let preReseedKey = pipeline.currentFreshnessKey()
+        pipeline.publishedMaster = PublishedMaster(image: dummyMaster, coverage: [1, 1, 1, 1], survivorCount: 1, key: preReseedKey)
+        XCTAssertNotNil(pipeline.publishedMasterIfCurrent(),
+                        "precondition: a master published under the current key must be served")
+
+        // Capture what publishedMasterIfCurrent() reports at the EXACT moment
+        // onSolveStateChanged fires — invalidatePlateSolve() calls it synchronously on the
+        // pipeline's own callback-delivery thread, so whatever the freshness key says AT THAT
+        // INSTANT is exactly what a real onSolveStateChanged-driven render would see.
+        final class Capture: @unchecked Sendable {
+            private let lock = NSLock()
+            private var _fired = false
+            private var _stillCurrent: Bool?
+            func recordIfFirst(_ pipeline: SessionPipeline) {
+                lock.withLock {
+                    guard !_fired else { return }
+                    _fired = true
+                    _stillCurrent = pipeline.publishedMasterIfCurrent() != nil
+                }
+            }
+            var fired: Bool { lock.withLock { _fired } }
+            var stillCurrent: Bool? { lock.withLock { _stillCurrent } }
+        }
+        let capture = Capture()
+        pipeline.onSolveStateChanged = { [weak pipeline] in
+            guard let pipeline else { return }
+            capture.recordIfFirst(pipeline)
+        }
+
+        var u = 0
+        let deadline = Date().addingTimeInterval(15)
+        while !(logLock.withLock { log.contains("Auto-reseeded") }) && Date() < deadline {
+            source.send(unmatchedFrame(name: "u\(u).fit")); u += 1
+            let step = Date().addingTimeInterval(1)
+            while !(logLock.withLock { log.contains("Auto-reseeded") }) && Date() < step { usleep(30_000) }
+        }
+        XCTAssertTrue(logLock.withLock { log.contains("Auto-reseeded") },
+                     "unmatched frames should trigger the engine's internal auto-reseed")
+        XCTAssertTrue(capture.fired, "invalidatePlateSolve() must fire onSolveStateChanged on the auto-reseed path")
+        XCTAssertEqual(capture.stillCurrent, false,
+                       "the freshness key must already be recomputed BEFORE onSolveStateChanged fires — " +
+                       "otherwise a render triggered from inside that callback would serve the master " +
+                       "this reseed is discarding, with no later sub guaranteed to correct it")
 
         source.stop()
     }
