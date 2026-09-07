@@ -142,22 +142,18 @@ struct DisplaySettingsView: View {
 
     @ViewBuilder private var previewPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ZStack {
-                if let cg = model.previewImage {
-                    Image(decorative: cg, scale: 1)
-                        .resizable().aspectRatio(contentMode: .fit)
-                } else {
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(.quaternary)
-                        .overlay(Text(model.isRunning ? "No stack yet"
-                                                       : "Preview available during live sessions")
-                                    .font(.caption).foregroundStyle(.secondary))
+            HStack(spacing: 10) {
+                previewPane(model.previewImage,
+                            title: model.canCompare ? "Trail-rejected" : "Preview")
+                if let compare = model.previewCompareImage {
+                    // Side by side rather than a hold-to-blink swap. The two masters differ over
+                    // only a small fraction of the frame — measured 0.13% of pixels past 2/255 on
+                    // real subs — which a blink cannot convey but a direct comparison can, since
+                    // the operator can study the same region in both for as long as they like.
+                    previewPane(compare, title: "Not rejected")
                 }
             }
-            // Sized as a FRACTION of the window rather than a fixed cap: the old 260pt was an
-            // arbitrary number, and at that size denoise and background flattening — most of what
-            // this panel exists to judge — were impossible to see.
-            .frame(minHeight: 260, maxHeight: max(300, panelHeight))
+            .frame(minHeight: 300, maxHeight: max(340, panelHeight))
             .overlay(alignment: .topLeading) {
                 if model.staged.hasPendingChanges {
                     Text("Pending — not yet on the broadcast")
@@ -168,7 +164,7 @@ struct DisplaySettingsView: View {
             }
 
             HStack {
-                blinkButton
+                Text(comparisonStatus).font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Revert") { model.revertAdjustments() }
                     .disabled(!model.staged.hasPendingChanges)
@@ -179,66 +175,32 @@ struct DisplaySettingsView: View {
         }
     }
 
-    /// Press-and-hold styling that reports the press itself. A `Button` (rather than a `Text` +
-    /// `DragGesture`) is what makes this work at all: a Text's hit region is its GLYPHS, and
-    /// `.background(_:in:)` draws the pill without extending hit-testing to the padding, so most
-    /// of the control was dead to the gesture — found by hand, no test caught it. A Button also
-    /// brings keyboard activation, VoiceOver, and real `.disabled` semantics instead of a
-    /// cosmetic opacity.
-    private struct HoldToCompareStyle: ButtonStyle {
-        let onPressChange: (Bool) -> Void
-        func makeBody(configuration: Configuration) -> some View {
-            configuration.label
-                .font(.caption)
-                .padding(.vertical, 4).padding(.horizontal, 8)
-                .background(configuration.isPressed ? AnyShapeStyle(.tint.opacity(0.35))
-                                                    : AnyShapeStyle(.quaternary),
-                            in: RoundedRectangle(cornerRadius: 5))
-                .contentShape(RoundedRectangle(cornerRadius: 5))
-                .onChange(of: configuration.isPressed) { _, pressed in onPressChange(pressed) }
+    /// One labelled pane of the comparison.
+    @ViewBuilder private func previewPane(_ image: CGImage?, title: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+            ZStack {
+                if let image {
+                    Image(decorative: image, scale: 1)
+                        .resizable().aspectRatio(contentMode: .fit)
+                } else {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(.quaternary)
+                        .overlay(Text(model.isRunning ? "No stack yet"
+                                                      : "Preview available during live sessions")
+                                    .font(.caption).foregroundStyle(.secondary))
+                }
+            }
         }
     }
 
-    @ViewBuilder private var blinkButton: some View {
-        let status = model.liveRejectionStatus
-        let (enabled, label): (Bool, String) = {
-            switch status {
-            case .active(let subs): return (true, "Hold to compare (clean, \(subs) subs)")
-            case .building(let subs): return (false, "Building over \(subs) subs…")
-            case .off(let reason): return (false, "Comparison unavailable — \(reason)")
-            }
-        }()
-        Button(label) { }
-            .buttonStyle(HoldToCompareStyle { pressed in
-                if pressed {
-                    guard !model.blinkHeld else { return }
-                    model.blinkHeld = true                // held: show the UN-rejected master
-                    model.refreshPreview(force: true)      // discrete action — never throttle it away
-                } else {
-                    // Deliberately NOT gated on `enabled`: that derives from liveRejectionStatus,
-                    // which can flip to .building between press and release (a reject, a kappa
-                    // change, a reseed, a budget change, the feature toggle). Swallowing the
-                    // release would strand blinkHeld true and leave the panel showing the
-                    // un-rejected master under a "clean" label.
-                    guard model.blinkHeld else { return }
-                    model.blinkHeld = false               // released: back to the clean one
-                    model.refreshPreview(force: true)
-                }
-            })
-            .disabled(!enabled)
-            .accessibilityLabel(label)
-            .accessibilityHint("Hold to see the stack without trail rejection.")
-            .help("Hold to see the stack WITHOUT trail rejection. Each side is auto-stretched from "
-                + "its own statistics, so the overall brightness shifts too — look for the trail, not the tone.")
-            .onDisappear {
-                // Safety net for a release that never arrives: an ABANDONED gesture. selectLiveTab
-                // (AppModel.swift, fired asynchronously by live-source auto-detect) switches
-                // selectedTab away from .setup, tearing this view out mid-press; SwiftUI runs no
-                // pending completion on teardown, so blinkHeld would stay true forever.
-                if model.blinkHeld {
-                    model.blinkHeld = false
-                    model.refreshPreview(force: true)
-                }
-            }
+    /// Explains itself when there is nothing to compare, rather than silently showing one pane.
+    private var comparisonStatus: String {
+        switch model.liveRejectionStatus {
+        case .active(let subs): return "Comparing against the un-rejected stack · clean master over \(subs) subs"
+        case .building(let subs): return "Building the clean master over \(subs) subs — nothing to compare yet"
+        case .off(let reason): return "Trail rejection off (\(reason)) — nothing to compare"
+        }
     }
+
 }

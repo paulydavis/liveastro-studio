@@ -149,34 +149,35 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
                        "revert must never reach the pipeline — only Apply may")
     }
 
-    // MARK: - 3. Compare never reaches the broadcast
+    // MARK: - 3. The comparison never reaches the broadcast
 
-    /// With `blinkHeld == true` (the panel showing the online master to the operator),
-    /// `applyAdjustments()` must still commit the pending ADJUSTMENTS, and the committed result
-    /// must be identical to what an otherwise-identical Apply produces with blink OFF — proving
-    /// blink state and `previewSource` have zero influence on what Apply commits.
-    @MainActor func testApplyCommitsPendingAdjustmentsRegardlessOfBlinkOrPreviewSource() throws {
-        let (modelNoBlink, pipelineNoBlink) = makeAttachedModel()
-        var pending = modelNoBlink.staged.committed
+    /// The comparison is now a second IMAGE rather than a mode, so there is no blink state that
+    /// could leak into what Apply commits. What still needs pinning is that rendering the
+    /// un-rejected counterpart for the operator has no effect on the committed adjustments: the
+    /// panel may show two pictures, but Apply publishes exactly the pending values, once.
+    @MainActor func testApplyCommitsPendingAdjustmentsWhateverThePanelIsShowing() throws {
+        let (plain, plainPipeline) = makeAttachedModel()
+        var pending = plain.staged.committed
         pending.midtoneStrength = 0.42
-        modelNoBlink.staged.pending = pending
-        modelNoBlink.blinkHeld = false
-        modelNoBlink.applyAdjustments()
-        let committedWithoutBlink = pipelineNoBlink.displayAdjustments
+        plain.staged.pending = pending
+        plain.applyAdjustments()
+        let committedWithoutComparison = plainPipeline.displayAdjustments
 
-        let (modelBlink, pipelineBlink) = makeAttachedModel()
-        modelBlink.staged.pending = pending
-        modelBlink.blinkHeld = true
-        XCTAssertEqual(modelBlink.previewSource, .online,
-                       "sanity: blink held really does select the online master for the DRAFT preview")
-        modelBlink.applyAdjustments()
-        let committedWithBlink = pipelineBlink.displayAdjustments
+        let (comparing, comparingPipeline) = makeAttachedModel()
+        comparingPipeline.configureLiveRejection(enabled: true)
+        comparingPipeline.publishedMaster = PublishedMaster(
+            image: AstroImage(width: 4, height: 4, channels: 1,
+                              pixels: [Float](repeating: 0.2, count: 16), sourceIsLinear: false),
+            coverage: [Float](repeating: 1, count: 16), survivorCount: 6,
+            key: comparingPipeline.currentFreshnessKey())
+        XCTAssertTrue(comparing.canCompare, "sanity: a clean master is being served, so the panel compares")
+        comparing.staged.pending = pending
+        comparing.applyAdjustments()
 
-        XCTAssertEqual(committedWithBlink, pending,
-                       "Apply must commit the pending ADJUSTMENTS")
-        XCTAssertEqual(committedWithBlink, committedWithoutBlink,
-                       "blink/previewSource must not influence what Apply commits — both runs, " +
-                       "identical pending edits, must commit identically regardless of blink state")
+        XCTAssertEqual(comparingPipeline.displayAdjustments, pending,
+                       "Apply commits the pending values")
+        XCTAssertEqual(comparingPipeline.displayAdjustments, committedWithoutComparison,
+                       "and commits exactly the same thing whether or not the panel is comparing")
     }
 
     // MARK: - 4. Stale draft completion — the scenario, not the mechanism
@@ -417,19 +418,14 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
         XCTAssertFalse(seen.isEmpty, "at least one render must have been dispatched")
     }
 
-    /// Does holding Compare actually put a DIFFERENT image on screen? Driving the real app, the
-    /// control highlighted on press but the picture appeared unchanged — and two very different
-    /// causes look identical from the operator's chair: the swap silently not happening, or the
-    /// two masters being visually indistinguishable. Measured on 6 real subs, clean vs online
-    /// differed by 0.86/255 on average with only 0.13% of pixels past 2/255, so "no visible
-    /// change" was expected there. This test pins the OTHER half: given two sources that genuinely
-    /// differ, the swap must produce different pixels. If this passes and the screen still looks
-    /// unchanged, the cause is perceptual, not a bug.
-    @MainActor func testHoldingCompareRendersADifferentImageWhenTheSourcesDiffer() async throws {
+    /// The side-by-side must actually show two DIFFERENT pictures when a clean master is served,
+    /// and a single one when there is nothing to compare. Replaces a hold-to-compare test: driving
+    /// the real app, that control highlighted on press and appeared to do nothing, because the two
+    /// masters differ over only 0.13% of pixels (0.86/255 mean, measured on real subs) — far too
+    /// little for a blink to convey, which is why the comparison is now shown side by side.
+    @MainActor func testSideBySideRendersBothSourcesOnlyWhenThereIsSomethingToCompare() async throws {
         let (model, pipeline) = makeAttachedModel()
 
-        // Two obviously different sources: the override stands in for the render, keyed on the
-        // source the production `previewSource` chose, so this exercises the real selection path.
         let cleanPixels = try Self.solidImage(0.2)
         let onlinePixels = try Self.solidImage(0.8)
         model.previewRenderOverrideForTest = { _, source, _ in
@@ -444,34 +440,28 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
             await fulfillment(of: [done], timeout: 3)
         }
 
-        // publishedMasterSurvivorCount() is gated on the feature being ON, so without this the
-        // production selection returns .online for BOTH states and the test proves nothing.
-        pipeline.configureLiveRejection(enabled: true)
+        // No clean master yet: one pane, nothing to compare against.
+        await renderAndWait()
+        XCTAssertNotNil(model.previewImage, "the primary preview must render")
+        XCTAssertNil(model.previewCompareImage,
+                     "with no clean master there is nothing to compare — the panel must not invent "
+                     + "a second pane showing the same thing twice")
 
-        // Released: production picks .clean when a clean master is being served.
+        // A clean master publishes: now both panes render, and they must DIFFER.
+        pipeline.configureLiveRejection(enabled: true)
         pipeline.publishedMaster = PublishedMaster(
             image: AstroImage(width: 4, height: 4, channels: 1,
                               pixels: [Float](repeating: 0.2, count: 16), sourceIsLinear: false),
             coverage: [Float](repeating: 1, count: 16), survivorCount: 6,
             key: pipeline.currentFreshnessKey())
         await renderAndWait()
-        let released = model.previewImage.flatMap { Self.dataOf($0) }
-        XCTAssertNotNil(released, "a render must have published an image")
 
-        // Held: must swap to the un-rejected online source.
-        model.blinkHeld = true
-        await renderAndWait()
-        let held = model.previewImage.flatMap { Self.dataOf($0) }
-
-        XCTAssertNotEqual(released, held,
-                          "holding Compare must render the OTHER source — if these are equal the "
-                          + "swap is not happening at all, independent of whether a human could see it")
-
-        // And releasing must come back.
-        model.blinkHeld = false
-        await renderAndWait()
-        XCTAssertEqual(model.previewImage.flatMap { Self.dataOf($0) }, released,
-                       "releasing must restore the clean source")
+        let primary = try XCTUnwrap(model.previewImage.flatMap { Self.dataOf($0) })
+        let compare = try XCTUnwrap(model.previewCompareImage.flatMap { Self.dataOf($0) },
+                                    "a clean master is served, so the un-rejected counterpart must render")
+        XCTAssertNotEqual(primary, compare,
+                          "the two panes must show DIFFERENT sources — equal pixels would mean the "
+                          + "comparison is showing the same master twice")
     }
 
     // MARK: - Helpers

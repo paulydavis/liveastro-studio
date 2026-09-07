@@ -197,7 +197,13 @@ final class AppModel {
     /// source to `.clean` would blank the preview entirely whenever rejection is off (there
     /// is no published master, so `renderPreview(source: .clean)` returns nil) — which is
     /// every import session. `previewSource` below resolves it instead.
-    var blinkHeld = false
+    /// The ONLINE (un-rejected) counterpart, rendered alongside `previewImage` whenever a clean
+    /// master is being served, so the two sit side by side. Replaces the old hold-to-compare
+    /// gesture: a blink relies on the eye catching a transition, and measured on real data the
+    /// two masters differ by 0.86/255 with 0.13% of pixels past 2/255 — far too little to catch
+    /// in a flash, and indistinguishable from a dead button. Side by side, the operator can
+    /// study the same region in both at leisure. nil when there is nothing to compare against.
+    var previewCompareImage: CGImage?
 
     /// Red night-vision tint of the *whole Mac display* (not just the astro image).
     /// In-memory only — defaults off each launch so the app never opens unexpectedly red.
@@ -584,6 +590,7 @@ final class AppModel {
     private func clearPreview() {
         previewRenderSeq &+= 1
         previewImage = nil
+        previewCompareImage = nil
     }
 
     /// Called when a slider changes: re-render the PREVIEW only. Nothing reaches the pipeline
@@ -641,22 +648,31 @@ final class AppModel {
             return
         }
         draftRendersInFlight += 1
+        let wantsCompare = canCompare
         Task.detached { [weak self] in
             guard let self else { return }
             let cg: CGImage?
+            let compare: CGImage?
             if let renderOverride {
                 cg = await renderOverride(pipeline, source, adj)
+                compare = wantsCompare ? await renderOverride(pipeline, .online, adj) : nil
             } else {
                 cg = pipeline.renderPreview(source: source, adjustments: adj, quality: quality)
+                // The side-by-side counterpart. Only rendered when a clean master is being served;
+                // otherwise there is nothing to compare the online stack against and the panel
+                // shows a single image.
+                compare = wantsCompare
+                    ? pipeline.renderPreview(source: .online, adjustments: adj, quality: quality)
+                    : nil
             }
             await MainActor.run {
                 self.draftRendersInFlight -= 1
                 // Only the newest request may publish; a slower earlier render is discarded.
                 let published = seq == self.previewRenderSeq
-                if published { self.previewImage = cg }
-                // Test seam: fires with the OUTCOME of the guard above (never influences it) so a
-                // test can await a definite acknowledgement that THIS render attempt has been
-                // resolved, instead of sleeping a guessed duration.
+                if published {
+                    self.previewImage = cg
+                    self.previewCompareImage = compare
+                }
                 self.previewRenderCompletionForTest?(seq, published)
             }
         }
@@ -679,10 +695,15 @@ final class AppModel {
     /// Which master the preview shows. Held → the un-rejected online master. Otherwise the
     /// clean master when one is actually being served, else online — so the panel still shows
     /// a picture when rejection is off, building, or unavailable, rather than going blank.
+    /// The PRIMARY preview source: the clean master when one is being served, else the online
+    /// stack. No blink branch any more — the comparison is rendered as a second image rather than
+    /// by swapping this one.
     var previewSource: SessionPipeline.PreviewSource {
-        if blinkHeld { return .online }
-        return pipeline?.publishedMasterSurvivorCount() != nil ? .clean : .online
+        pipeline?.publishedMasterSurvivorCount() != nil ? .clean : .online
     }
+
+    /// True when a clean master is being served, i.e. when there are two different things to show.
+    var canCompare: Bool { pipeline?.publishedMasterSurvivorCount() != nil }
 
     /// Promotes the pending adjustments to committed and hands them to the pipeline, which
     /// coalesces the render and delivers the operator preview and the resolved BROADCAST image
