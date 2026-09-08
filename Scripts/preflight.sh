@@ -10,9 +10,18 @@
 # false-confidence pattern this gate exists to catch, reproduced inside the gate. It never touches
 # `.build/release`, which is a symlink into shared build output.
 #
-# Warnings are REPORTED, not fatal: making them fatal today would fail on a known-benign warning
-# deliberately deferred to a maintenance PR, and a gate that must be bypassed on day one teaches
-# people to bypass it.
+# SWIFT COMPILER warnings in the RELEASE build are FATAL, enforced by the compiler
+# (-warnings-as-errors), not by matching the log. That flag reaches only swiftc's own diagnostics:
+# SwiftPM, the linker and other tools can still emit warnings, which are reported, not fatal.
+#
+# Log matching would inherit every weakness this gate exists to avoid: it depends on message
+# formatting, it cannot tell a real warning from the word "warning" in a path, and it reports clean
+# when the step compiled nothing. Making the compiler the authority means a Swift warning is a
+# build failure, which this script already stops on.
+#
+# This was enabled only once the tree was at zero warnings (the GlobalCombine `var it` cleanup).
+# Turning it on earlier would have failed on day one, and a gate that must be bypassed immediately
+# teaches people to bypass it.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || { echo "preflight: cannot cd to repo root — aborting"; exit 2; }
@@ -27,16 +36,19 @@ if ! swift build 2>&1 | tee "$log.debug"; then
 fi
 echo "   warnings emitted by the debug build: $(grep -cE 'warning:' "$log.debug")"
 
-echo "== 2/3  RELEASE build, fresh scratch (the check that was missing) =="
-if ! swift build -c release --scratch-path "$relscratch" 2>&1 | tee "$log.release"; then
+echo "== 2/3  RELEASE build, fresh scratch, warnings are errors =="
+if ! swift build -c release --scratch-path "$relscratch" -Xswiftc -warnings-as-errors 2>&1 | tee "$log.release"; then
     echo "   RELEASE BUILD FAILED — stopping now, not running the 30-minute suite"
+    echo "   (warnings are errors here: a new warning fails this step by design)"
     exit 1
 fi
 relwarn=$(grep -E "warning:" "$log.release" | sed 's/.*Sources/Sources/' | sort -u)
 if [ -n "$relwarn" ]; then
-    # "emitted by the release build" — reading this log cannot establish that a warning is
-    # release-ONLY; that would need a comparison against the debug log's warnings.
-    echo "   warnings emitted by the release build:"
+    # Reachable WITH the flag working: `-Xswiftc -warnings-as-errors` governs the Swift compiler's
+    # diagnostics, and SwiftPM, the linker and other tools can emit warnings it does not reach.
+    # So report the diagnostic and leave the cause to the reader — do not assert the flag failed.
+    echo "   warnings reached this step despite -warnings-as-errors (which covers only the Swift"
+    echo "   compiler; SwiftPM, the linker and other tools can also emit warnings):"
     echo "$relwarn" | sed 's/^/     /'
 else
     echo "   warnings emitted by the release build: 0"
