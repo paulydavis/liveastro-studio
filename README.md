@@ -153,7 +153,16 @@ The release build matters and is easy to skip: `swift test` and `swift build` ar
 `-c release` is otherwise compiled only inside the packaging scripts. A release-configuration
 warning shipped in v3.6.2 for exactly that reason — nothing in the development loop ever compiled
 that configuration, so a release-only error would have surfaced at packaging time rather than at
-review. `preflight.sh` reports release warnings prominently but does not fail on them.
+review.
+
+The release step compiles into a throwaway scratch directory (so it cannot report "clean" by
+reusing existing output) and builds with `-Xswiftc -warnings-as-errors`. **A new Swift compiler
+warning in the release build fails the gate.** That is enforced by the compiler rather than by matching the build log,
+which would depend on message formatting and could not tell a real warning from the word "warning"
+in a path. Warnings from SwiftPM, the linker or other tools are outside that flag's reach; the gate
+reports those without failing. If a
+warning is genuinely acceptable, fix it or silence it deliberately at the source — do not weaken
+the gate.
 
 The individual steps, if you want them separately:
 
