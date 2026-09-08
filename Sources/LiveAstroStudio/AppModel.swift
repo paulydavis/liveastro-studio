@@ -226,12 +226,23 @@ final class AppModel {
     /// first delivery that carries that revision or a later one. While it is set, the live pane is
     /// known to be BEHIND the committed adjustments and says so.
     ///
-    /// Self-clearing by construction: revisions only increase and every delivery passes
-    /// `isCurrentDisplay`, so a superseded render cannot strand this — the next delivery clears it.
+    /// SCOPED TO ITS SESSION. A revision is only meaningful within the pipeline that issued it: a
+    /// new pipeline starts counting from zero, so a value left over from a previous session or
+    /// import can sit ABOVE everything the new one will ever deliver, and the badge would stick
+    /// forever. Reachable without any race: Apply during an import that accepts no frames leaves
+    /// this set (image-less deliveries deliberately do not clear it), the import releases its
+    /// pipeline, and the next short import restarts revisions below it.
     private(set) var pendingLiveRevision: UInt64?
+    /// The presentation the pending revision belongs to. Compared on every read and every clear.
+    private var pendingLiveSessionID: UUID?
+    /// The presentation currently bound by `wireCallbacks`.
+    private var currentDisplaySessionID: UUID?
 
-    /// True when the live pane is showing a render older than the committed adjustments.
-    var livePaneIsUpdating: Bool { pendingLiveRevision != nil }
+    /// True when the live pane is showing a render older than the committed adjustments — and only
+    /// for the session that is actually on screen.
+    var livePaneIsUpdating: Bool {
+        pendingLiveRevision != nil && pendingLiveSessionID == currentDisplaySessionID
+    }
 
     /// The edit pane is ALWAYS approximate, and says so unconditionally.
     ///
@@ -631,6 +642,7 @@ final class AppModel {
         // A session switch retires any pending Apply: its revision belongs to the old pipeline and
         // no delivery from the new one would ever clear it.
         pendingLiveRevision = nil
+        pendingLiveSessionID = nil
         previewImage = nil
         previewCompareImage = nil
         previewHistogram = []
@@ -860,6 +872,7 @@ final class AppModel {
         // (full-resolution DBE while stacking) that gap ran to tens of seconds, which reads as
         // "Apply did nothing" while the button greys itself out.
         pendingLiveRevision = sessionRevision ?? importRevision
+        pendingLiveSessionID = pendingLiveRevision == nil ? nil : currentDisplaySessionID
         // The two PREVIEW panes are ours, not the pipeline's, and nothing else re-renders them:
         // without this the bottom pane keeps its pending image, so Apply appears to do nothing.
         refreshPreview(force: true)
@@ -1282,6 +1295,16 @@ final class AppModel {
                                onAnyFrame: (() -> Void)? = nil) {
         let sessionID = UUID()
         displayPresentation.begin(sessionID: sessionID)
+        // Binding a new presentation retires any pending Apply. This and the session scoping on
+        // `livePaneIsUpdating` are REDUNDANT for the transition the regression test covers:
+        // removing either one alone leaves that test passing, and removing both reintroduces the
+        // leak. Neither is therefore "the" fix, and the test is not contorted into depending on
+        // one — its job is the observable behaviour, and overlapping safeguards legitimately
+        // survive individual removal. Imports bind here WITHOUT going through
+        // setPipeline/clearPreview, which is how the stale value survived at all.
+        currentDisplaySessionID = sessionID
+        pendingLiveRevision = nil
+        pendingLiveSessionID = nil
         latestImage = nil
         broadcastImage = nil
         displayedCleanMasterSubCount = nil
@@ -1305,9 +1328,12 @@ final class AppModel {
                 // same lie in a smaller window. Caught by a test: the image-less delivery that
                 // Apply's own refreshDisplay produces on a stackless pipeline cleared the badge
                 // immediately.
-                if let pending = self.pendingLiveRevision, update.revision >= pending,
+                if let pending = self.pendingLiveRevision,
+                   self.pendingLiveSessionID == sessionID,
+                   update.revision >= pending,
                    update.broadcastImage != nil {
                     self.pendingLiveRevision = nil
+                    self.pendingLiveSessionID = nil
                 }
                 self.displayedCleanMasterSubCount = update.cleanMasterSubCount
                 self.displayedIntegrationSeconds = update.integrationSeconds

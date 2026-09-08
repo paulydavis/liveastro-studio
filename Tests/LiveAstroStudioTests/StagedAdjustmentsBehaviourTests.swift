@@ -481,6 +481,44 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
                       "a delivery older than Apply's revision is not the catch-up render")
     }
 
+    /// A pending Apply must not leak across sessions — the import-to-import case.
+    ///
+    /// Imports bind a new presentation through `wireCallbacks` WITHOUT going through
+    /// `setPipeline`/`clearPreview`, so a pending revision used to survive the transition. That is
+    /// reachable with no race at all: Apply during an import that accepts no frames leaves the
+    /// revision set (image-less deliveries deliberately do not clear it), the import releases its
+    /// pipeline, and the next short import restarts revisions from zero — below the stale value —
+    /// so nothing it ever delivers can clear the badge. "Updating…" would then stick forever while
+    /// the broadcast is in fact showing the committed settings.
+    @MainActor func testAPendingApplyDoesNotLeakIntoTheNextSession() async throws {
+        let (model, firstPipeline) = makeAttachedModel()
+
+        var pending = model.staged.committed
+        pending.blackPoint = 0.25
+        model.staged.pending = pending
+        model.applyAdjustments()
+        let stale = try XCTUnwrap(model.pendingLiveRevision,
+                                  "precondition: Apply left a pending revision")
+        XCTAssertTrue(model.livePaneIsUpdating)
+        _ = firstPipeline
+
+        // A SECOND session binds its presentation the way an import does — wireCallbacks only.
+        let second = makePipeline()
+        model.wireCallbacks(to: second)
+
+        XCTAssertFalse(model.livePaneIsUpdating,
+                       "binding a new presentation must retire the previous session's pending "
+                       + "revision — the new pipeline counts from zero and could never clear it")
+
+        // And a delivery from the NEW session at a revision BELOW the stale one is normal here;
+        // it must simply be irrelevant rather than leaving the badge stuck.
+        XCTAssertLessThan(second.currentDisplayRevision, stale,
+                          "precondition: the new pipeline's revisions really do start below the "
+                          + "stale value, which is what made this leak permanent")
+        await deliverBroadcast(try Self.solidImage(0.4), to: second)
+        XCTAssertFalse(model.livePaneIsUpdating)
+    }
+
     /// A continuous drag must not pay for settled renders. The settle was a fixed one-shot timer
     /// armed 90 ms after the FIRST draft and never postponed, so it fired mid-drag and re-armed —
     /// a long drag rendered at full resolution roughly every 90 ms, which is precisely the cost
