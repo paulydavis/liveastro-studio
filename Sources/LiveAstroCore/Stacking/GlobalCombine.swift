@@ -75,7 +75,9 @@ extension GlobalCombine {
         var sumWV = [Float](repeating: 0, count: n)
         var coverage = [Float](repeating: 0, count: plane)   // per-pixel FRAME DEPTH (not binary)
         var any = false
-        var it = frames()
+        // `let`, not `var`: AnyIterator.next() is non-mutating (it calls a boxed closure), so the
+        // binding is never mutated and `var` drew a release-configuration warning.
+        let it = frames()
         while let f = it.next() {
             guard f.image.width == w, f.image.height == h, f.image.channels == c,
                   f.mask.count == plane, f.image.pixels.count == n else { return nil }
