@@ -100,6 +100,34 @@ final class PreviewRenderTests: XCTestCase {
 
 
 
+    /// `applyCommittedAdjustments` reports the revision its change will render under, and refuses
+    /// once the display is frozen. The revision is what lets a caller know when the change has
+    /// actually reached the screen — the committed surfaces re-render asynchronously, and under
+    /// load that gap ran to tens of seconds on a real session.
+    func testApplyCommittedAdjustmentsReportsARevisionThenRefusesAfterEnd() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let (pipeline, source) = try PreviewRenderTests.runningPipeline(sandbox: sandbox)
+        defer { source.stop() }
+
+        var adjustments = DisplayAdjustments.neutral
+        adjustments.blackPoint = 0.25
+        let first = try XCTUnwrap(pipeline.applyCommittedAdjustments(adjustments),
+                                  "a live display must take the adjustments and report a revision")
+        adjustments.blackPoint = 0.4
+        let second = try XCTUnwrap(pipeline.applyCommittedAdjustments(adjustments))
+        XCTAssertGreaterThan(second, first, "each Apply renders under a NEWER revision")
+
+        _ = try? pipeline.end()
+        XCTAssertFalse(pipeline.acceptsDisplayUpdates,
+                       "precondition: end() closes the display")
+        adjustments.blackPoint = 0.6
+        XCTAssertNil(pipeline.applyCommittedAdjustments(adjustments),
+                     "a frozen display must refuse, so the caller does not commit an edit the "
+                     + "final render would overwrite")
+    }
+
     /// Finding 2: the spec requires a CACHED proxy. Without one, every slider tick walks the
     /// full 26 MP stack to build the downsample, so the drag is still O(26 MP) and only the
     /// final render got cheaper. Adjustment-only re-renders must reuse the proxy.

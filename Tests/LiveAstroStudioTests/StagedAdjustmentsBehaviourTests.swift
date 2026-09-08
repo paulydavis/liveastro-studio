@@ -433,6 +433,54 @@ final class StagedAdjustmentsBehaviourTests: XCTestCase {
                        "its histogram must follow the same image")
     }
 
+    // MARK: - The live pane must admit when it is behind
+
+    /// Apply commits instantly; the committed surfaces re-render asynchronously. Until a delivery
+    /// carrying that render arrives, the pane labelled "Currently live" is showing the PREVIOUS
+    /// look. Observed on a real 26 MP session with DBE on: the gap ran tens of seconds while Apply
+    /// greyed its own button out, so the feature looked broken. The pane must say it is updating.
+    @MainActor func testApplyMarksTheLivePaneUpdatingUntilADeliveryArrives() async throws {
+        let (model, pipeline) = makeAttachedModel()
+        XCTAssertFalse(model.livePaneIsUpdating, "precondition: nothing pending before Apply")
+
+        var pending = model.staged.committed
+        pending.blackPoint = 0.25
+        model.staged.pending = pending
+        model.applyAdjustments()
+
+        XCTAssertTrue(model.livePaneIsUpdating,
+                      "after Apply the live pane is behind the committed adjustments and must "
+                      + "say so — it is still showing the pre-Apply render")
+
+        // A delivery carrying that revision (or later) is what makes it true again.
+        await deliverBroadcast(try Self.solidImage(0.3), to: pipeline)
+        XCTAssertFalse(model.livePaneIsUpdating,
+                       "a delivery at or past Apply's revision means the live pane caught up")
+    }
+
+    /// The clear must be driven by the REVISION, not by "any delivery arrived". A delivery that
+    /// predates Apply carries an older render — treating it as the catch-up would clear the badge
+    /// while the pane still shows the old look, which is the exact lie this fixes.
+    @MainActor func testAnOlderDeliveryDoesNotClearTheUpdatingState() async throws {
+        let (model, pipeline) = makeAttachedModel()
+        var pending = model.staged.committed
+        pending.blackPoint = 0.25
+        model.staged.pending = pending
+        model.applyAdjustments()
+        let pendingRevision = try XCTUnwrap(model.pendingLiveRevision)
+        XCTAssertTrue(model.livePaneIsUpdating)
+
+        // Hand-built delivery BELOW Apply's revision, delivered through the real handler.
+        pipeline.onDisplayUpdate?(DisplayDelivery(
+            revision: pendingRevision - 1, previewImage: nil,
+            broadcastImage: try Self.solidImage(0.9), cleanMasterSubCount: nil,
+            integrationSeconds: 0, previewIntegrationSeconds: 0, subExposureSeconds: 1, record: nil))
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertTrue(model.livePaneIsUpdating,
+                      "a delivery older than Apply's revision is not the catch-up render")
+    }
+
     /// A continuous drag must not pay for settled renders. The settle was a fixed one-shot timer
     /// armed 90 ms after the FIRST draft and never postponed, so it fired mid-drag and re-armed —
     /// a long drag rendered at full resolution roughly every 90 ms, which is precisely the cost

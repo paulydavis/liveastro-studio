@@ -222,6 +222,17 @@ final class AppModel {
     /// COMMITTED adjustments and the source — never on the pending edit — so re-rendering it on
     /// every slider tick doubled the work of a drag (two renders and two histograms per tick)
     /// to produce an identical image. Dragging felt slow because half the work was wasted.
+    /// Set by Apply to the display revision its change will render under, and cleared by the
+    /// first delivery that carries that revision or a later one. While it is set, the live pane is
+    /// known to be BEHIND the committed adjustments and says so.
+    ///
+    /// Self-clearing by construction: revisions only increase and every delivery passes
+    /// `isCurrentDisplay`, so a superseded render cannot strand this — the next delivery clears it.
+    private(set) var pendingLiveRevision: UInt64?
+
+    /// True when the live pane is showing a render older than the committed adjustments.
+    var livePaneIsUpdating: Bool { pendingLiveRevision != nil }
+
     /// The edit pane is ALWAYS approximate, and says so unconditionally.
     ///
     /// It renders from a downsampled proxy and derives its stretch from that proxy, so its curve
@@ -617,6 +628,9 @@ final class AppModel {
     /// `pipeline` is nil and every later refresh returns early.
     private func clearPreview() {
         previewRenderSeq &+= 1
+        // A session switch retires any pending Apply: its revision belongs to the old pipeline and
+        // no delivery from the new one would ever clear it.
+        pendingLiveRevision = nil
         previewImage = nil
         previewCompareImage = nil
         previewHistogram = []
@@ -819,10 +833,12 @@ final class AppModel {
         // and the change silently overwritten by the final render. `applyCommittedAdjustments`
         // does the check and the assignment in one critical section and says whether it took.
         let candidate = staged.pending
-        let landedOnSession = pipeline?.applyCommittedAdjustments(candidate) ?? false
+        let sessionRevision = pipeline?.applyCommittedAdjustments(candidate)
+        let landedOnSession = sessionRevision != nil
         // An IMPORT owns its own pipeline (ImportController), not `pipeline`, which is nil while
         // one runs.
-        let landedOnImport = importer.applyDisplayAdjustments(candidate)
+        let importRevision = importer.applyDisplayAdjustments(candidate)
+        let landedOnImport = importRevision != nil
         let hadSomewhereToLand = pipeline != nil || importer.hasActivePipeline
 
         if hadSomewhereToLand, !landedOnSession, !landedOnImport {
@@ -839,6 +855,11 @@ final class AppModel {
         // misrepresent.
         _ = staged.apply()
         saveSettings()
+        // The committed surfaces re-render ASYNCHRONOUSLY. Until a delivery carrying this revision
+        // arrives, anything labelled "currently live" is showing the PREVIOUS look — under load
+        // (full-resolution DBE while stacking) that gap ran to tens of seconds, which reads as
+        // "Apply did nothing" while the button greys itself out.
+        pendingLiveRevision = sessionRevision ?? importRevision
         // The two PREVIEW panes are ours, not the pipeline's, and nothing else re-renders them:
         // without this the bottom pane keeps its pending image, so Apply appears to do nothing.
         refreshPreview(force: true)
@@ -1278,6 +1299,16 @@ final class AppModel {
                 // The reference pane and its histogram follow the delivered broadcast directly.
                 self.previewCompareImage = update.broadcastImage
                 self.compareHistogram = update.broadcastImage.map { DisplayHistogram.of($0) } ?? []
+                // Clear only on a delivery that actually CARRIES AN IMAGE. A delivery at the right
+                // revision but with no broadcast image (nothing to render yet) means the live pane
+                // still has not shown the committed look, so reporting it caught up would be the
+                // same lie in a smaller window. Caught by a test: the image-less delivery that
+                // Apply's own refreshDisplay produces on a stackless pipeline cleared the badge
+                // immediately.
+                if let pending = self.pendingLiveRevision, update.revision >= pending,
+                   update.broadcastImage != nil {
+                    self.pendingLiveRevision = nil
+                }
                 self.displayedCleanMasterSubCount = update.cleanMasterSubCount
                 self.displayedIntegrationSeconds = update.integrationSeconds
                 self.displayedPreviewIntegrationSeconds = update.previewIntegrationSeconds

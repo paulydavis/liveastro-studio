@@ -184,16 +184,24 @@ public final class SessionPipeline {
     /// Takes committed adjustments only if the display is still accepting them, with the check and
     /// the assignment in the SAME critical section. A caller that reads `acceptsDisplayUpdates` and
     /// then assigns separately can be frozen in between — it would report success for a change the
-    /// final render then overwrites. Returns whether the adjustments were taken.
+    /// final render then overwrites.
+    ///
+    /// Returns the display REVISION the resulting render will carry, or nil if the adjustments were
+    /// refused. Callers use that revision to know when the change has actually reached the screen:
+    /// the committed surfaces re-render asynchronously, and under load (full-resolution DBE while
+    /// stacking) that can take tens of seconds, during which anything labelled "currently live" is
+    /// showing the PREVIOUS look.
     @discardableResult
-    public func applyCommittedAdjustments(_ adjustments: DisplayAdjustments) -> Bool {
+    public func applyCommittedAdjustments(_ adjustments: DisplayAdjustments) -> UInt64? {
         displayAcceptanceLock.lock()
         defer { displayAcceptanceLock.unlock() }
         guard !displayContextFrozen, displayRevisionLock.withLock({ !displayFinished }) else {
-            return false
+            return nil
         }
         displayAdjustments = adjustments   // its setter schedules refreshDisplay()
-        return true
+        // Read AFTER the setter: refreshDisplay() has already claimed the revision this change
+        // will render under.
+        return displayRevisionLock.withLock { displayRevision }
     }
 
     public func isCurrentDisplay(_ update: DisplayDelivery) -> Bool {
