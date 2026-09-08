@@ -46,12 +46,13 @@ final class ImportController {
 
     /// Routes committed display adjustments to a running import. The import captures the
     /// adjustments once, when it starts, so without this an Apply during an import changed
-    /// nothing the operator could see. Returns whether they actually landed.
+    /// nothing the operator could see. Returns the display revision the change will render under,
+    /// or nil when there is no import or it has stopped accepting.
     @discardableResult
-    func applyDisplayAdjustments(_ adjustments: DisplayAdjustments) -> Bool {
+    func applyDisplayAdjustments(_ adjustments: DisplayAdjustments) -> UInt64? {
         // Atomic on the pipeline's side: checking acceptance and then assigning separately can be
         // frozen in between, which reports success for a change the final render overwrites.
-        importPipeline?.applyCommittedAdjustments(adjustments) ?? false
+        importPipeline?.applyCommittedAdjustments(adjustments)
     }
     private var importPrepareGeneration = 0
     private var importPrepareInFlight = false

@@ -21,7 +21,12 @@ struct DisplaySettingsView: View {
             VStack(spacing: 6) {
                 // This pane IS the delivered broadcast image now — not a re-render of the same
                 // source through the preview path — so the label is literally true.
+                // "Updating…" while a committed change has not yet reached a delivery. Without it
+                // this pane claims to be live while showing the PREVIOUS look — under load the gap
+                // ran to tens of seconds, and Apply looked broken because the button greyed itself
+                // out while nothing on screen changed.
                 previewPane(model.previewCompareImage, title: "Currently live",
+                            badge: model.livePaneIsUpdating ? "Updating…" : nil,
                             histogram: model.compareHistogram)
                 previewPane(model.previewImage,
                             title: "Your edit",
