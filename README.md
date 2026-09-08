@@ -143,6 +143,20 @@ For the fuller no-sky walkthrough, see [docs/beta-quickstart.md](docs/beta-quick
 
 ## Development
 
+Before merging, run the whole gate as one command:
+
+```bash
+Scripts/preflight.sh          # debug build + RELEASE build + full test suite
+```
+
+The release build matters and is easy to skip: `swift test` and `swift build` are both DEBUG, and
+`-c release` is otherwise compiled only inside the packaging scripts. A release-configuration
+warning shipped in v3.6.2 for exactly that reason — nothing in the development loop ever compiled
+that configuration, so a release-only error would have surfaced at packaging time rather than at
+review. `preflight.sh` reports release warnings prominently but does not fail on them.
+
+The individual steps, if you want them separately:
+
 ```bash
 swift test
 swift build -c release
