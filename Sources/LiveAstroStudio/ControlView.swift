@@ -60,6 +60,7 @@ struct ControlView: View {
     // DiagnosticsView's Session Health grid.
 
     var body: some View {
+        let inputRequestID = model.pendingSessionStart?.id
         @Bindable var model = model
         VStack(spacing: 0) {
             TabView(selection: $model.setupSubTab) {
@@ -89,12 +90,69 @@ struct ControlView: View {
         .alert("LiveAstro", isPresented: $model.isShowingError) {
             Button("OK") { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
+        // Subs already in the folder are a QUESTION, not a silent decision: a stale folder
+        // used to be stacked into a new session without a word.
+        .confirmationDialog("Subs are already in this folder",
+                            isPresented: Binding(
+                                get: { model.pendingSessionStart != nil },
+                                // Any dismissal path (Escape, click-away) means cancel: the
+                                // safe direction, since cancelling starts nothing. A .constant
+                                // binding here would wedge a dialog SwiftUI cannot close.
+                                set: { if !$0, let inputRequestID {
+                                    model.resolvePendingSessionStart(.cancel, requestID: inputRequestID)
+                                } }),
+                            titleVisibility: .visible) {
+            Button("Stack existing + new") {
+                if let inputRequestID { model.resolvePendingSessionStart(.stackExistingAndNew, requestID: inputRequestID) }
+            }
+            Button("New arrivals only") {
+                if let inputRequestID { model.resolvePendingSessionStart(.newArrivalsOnly, requestID: inputRequestID) }
+            }
+            Button("Cancel", role: .cancel) {
+                if let inputRequestID { model.resolvePendingSessionStart(.cancel, requestID: inputRequestID) }
+            }
+        } message: {
+            Text(model.pendingSessionStartMessage ?? "")
+        }
+    }
+
+    /// A standing statement about the session's input. Deliberately persistent: the case this
+    /// exists for — a filename filter matching nothing — is invisible in a scrolling log.
+    @ViewBuilder
+    private var sessionInputBanner: some View {
+        switch model.sessionInputStatus {
+        case .waitingForFirstSub(let folder, let filter, let unmatched):
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(filter.map { "No subs matching “\($0)” found. Waiting for new files." }
+                         ?? "No subs found. Waiting for new files.")
+                        .font(.callout)
+                    Text(unmatched > 0
+                         ? "\(folder.path) — \(unmatched) other file(s) present, none match the filter."
+                         : folder.path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+            } icon: { Image(systemName: "clock.badge.questionmark") }
+            .padding(.vertical, 4)
+        case .failed(let reason):
+            Label {
+                Text("Can't read the watch folder: \(reason)")
+                    .font(.callout)
+            } icon: { Image(systemName: "exclamationmark.triangle.fill") }
+            .foregroundStyle(.orange)
+            .padding(.vertical, 4)
+        case nil:
+            EmptyView()
+        }
     }
 
     // Fixed footer — always visible regardless of which Setup sub-tab is selected.
     @ViewBuilder
     private var controlFooter: some View {
         VStack(spacing: 8) {
+            sessionInputBanner
             HStack {
                 if model.isRunning {
                     Button("End Session", role: .destructive) { model.endSession() }

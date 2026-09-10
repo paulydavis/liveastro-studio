@@ -1,16 +1,8 @@
 import XCTest
 
 final class AppSourceRegressionTests: XCTestCase {
-    func testLiveStartCannotOverlapRestackPresentationReplacement() throws {
-        let model = try String(contentsOf: root.appendingPathComponent("Sources/LiveAstroStudio/AppModel.swift"), encoding: .utf8)
-        let footer = try String(contentsOf: root.appendingPathComponent("Sources/LiveAstroStudio/ControlView.swift"), encoding: .utf8)
-        let start = try XCTUnwrap(model.components(separatedBy: "func startSession() {").last)
-        let beforeSettings = try XCTUnwrap(start.components(separatedBy: "saveSettings()").first)
-        XCTAssertTrue(beforeSettings.contains("guard !isRestacking else"),
-                      "starting during restack lets its completion invalidate the new pipeline's display session")
-        XCTAssertTrue(footer.contains(".disabled(model.importer.isImporting || model.isRestacking)"),
-                      "the Start button must advertise the same restack exclusion as the entry point")
-    }
+    // Live-start/restack exclusion is covered behaviorally in SessionInputReportTests,
+    // including a restack claimed while the input confirmation is pending.
 
     private var root: URL {
         URL(fileURLWithPath: FileManager.default.currentDirectoryPath)

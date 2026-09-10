@@ -11,6 +11,8 @@ public enum FolderFrameSourceError: Error, Equatable {
     case stopped
     /// importOnce could not enumerate its source folder.
     case enumerationFailed(String)
+    /// The operator's exclusion decision belongs to another selection; re-preflight.
+    case exclusionSnapshotMismatch
 }
 
 /// Lock-guarded test seams for the live path (cold1 I2): a hook that fires when a LIGHT
@@ -119,6 +121,12 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
 
     private let folder: URL
     private let mode: Mode
+    /// Live mode, "New arrivals only": the subs that were already present when the operator
+    /// pressed Start. An update is dropped ONLY when its name is in this snapshot AND the
+    /// identity the watcher validated still matches what the snapshot recorded — a file that
+    /// changed since is a different version and is stacked. nil means stack everything, which
+    /// is the unchanged behaviour.
+    private let excludedPreExisting: WatchFolderInput.Snapshot?
     private let fileNamePrefix: String?
 
     private let importCursor: ImportCursor?
@@ -159,10 +167,12 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
     private let stateLock = NSLock()
     private var state: LifecycleState = .initial
 
-    public init(folder: URL, mode: Mode, fileNamePrefix: String? = nil) {
+    public init(folder: URL, mode: Mode, fileNamePrefix: String? = nil,
+                excludingPreExisting: WatchFolderInput.Snapshot? = nil) {
         self.folder = folder
         self.mode = mode
         self.fileNamePrefix = fileNamePrefix
+        self.excludedPreExisting = excludingPreExisting
         let seams = LiveDecodeSeams()
         self.liveSeams = seams
 
@@ -271,6 +281,11 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
             // never touch it again — an already-emitted identity is trusted, so
             // every poll costs one fstat per file instead of re-hashing the
             // whole (ever-growing) folder each scan.
+            if let excludedPreExisting,
+               !excludedPreExisting.covers(folder: folder, fileNamePrefix: fileNamePrefix) {
+                stateLock.withLock { if state == .starting { state = .initial } }
+                throw FolderFrameSourceError.exclusionSnapshotMismatch
+            }
             let w = StackFileWatcher(folder: folder, fileNamePrefix: fileNamePrefix,
                                      digestPolicy: .immutableAfterPublish)
             // Cold2 M2: log through the RELAY, never a snapshot of `onLog` — a sink
@@ -294,6 +309,8 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
             beforeStartCommit?(w)   // test seam: the stop-during-start window, deterministic
             let cont = liveUpdateContinuation!
             let seams = liveSeams
+            let excluded = excludedPreExisting
+            let watcherLogRelay = watcherLog
             // Revalidate + commit under the lock: watcher/liveTask become visible to stop()
             // atomically with `.running` (stop() reads them under the same lock).
             try commitRunning(onCommit: {
@@ -301,7 +318,19 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
                 self.liveTask = Task.detached {
                     // Cold1 I2: relay LIGHT updates only — NO decode here. Decode happens on
                     // the consumer's clock in LivePull.nextFrame(), one frame in flight.
+                    var skipped = 0
                     for await update in w.updates {
+                        if let excluded, excluded.recordedUnchanged(
+                            name: update.url.lastPathComponent, identity: update.identity) {
+                            skipped += 1
+                            // One line per skip would be 1000 lines on a full folder; the
+                            // running total is the honest summary and never claims a file
+                            // was stacked.
+                            if skipped == 1 || skipped % 25 == 0 {
+                                watcherLogRelay.emit("Skipping subs that were already in the folder at Start (\(skipped) so far)")
+                            }
+                            continue
+                        }
                         cont.yield(update)
                         seams.noteBuffered(update)
                     }

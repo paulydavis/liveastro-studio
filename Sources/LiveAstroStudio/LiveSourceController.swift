@@ -15,10 +15,13 @@ import LiveAstroCore
 final class LiveSourceController {
 
     private let surface: AppSurface
+    private let relayRoot: URL
 
     /// True while an auto-detect path is scanning for a share off the main
     /// thread. Gates the start*Live entry points and disables their buttons.
     var isDetecting = false
+    /// A relay remains live while its session is awaiting operator confirmation.
+    private(set) var isStarting = false
 
     /// How long relay sessions are kept before auto-prune (0 = off). Persisted
     /// via `SessionSettings.relayRetentionDays` (blob key unchanged); AppModel's
@@ -30,8 +33,10 @@ final class LiveSourceController {
     /// / app terminate.
     private var frameRelay: FrameRelay?
 
-    init(surface: AppSurface) {
+    init(surface: AppSurface, relayRoot: URL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("LiveAstro/relay", isDirectory: true)) {
         self.surface = surface
+        self.relayRoot = relayRoot
     }
 
     /// Stop the frame relay. Called by `AppModel.endSession()` (before the
@@ -44,8 +49,6 @@ final class LiveSourceController {
     /// Age-prune old relay sessions just before a new one is created (spec:
     /// relay auto-prune). `relayDir` is the incoming session — never pruned.
     private func pruneRelay(excluding relayDir: URL) {
-        let relayRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("LiveAstro/relay", isDirectory: true)
         for r in RelayPruner.prune(root: relayRoot, olderThanDays: relayRetentionDays,
                                    excluding: relayDir) {
             let size = ByteCountFormatter.string(fromByteCount: r.bytes, countStyle: .file)
@@ -54,11 +57,27 @@ final class LiveSourceController {
     }
 
     private func canApplyDetectedLiveSource() -> Bool {
-        !surface.isSessionRunning() && !surface.isImporting()
+        !surface.isSessionRunning() && !surface.isImporting() && !isStarting
+    }
+
+    private func startConfiguredSession() {
+        guard let start = surface.startSession else { stopRelay(); return }
+        isStarting = true
+        let relay = frameRelay
+        start { [weak self] started in
+            guard let self else { relay?.stop(); return }
+            self.isStarting = false
+            if !started {
+                relay?.stop()
+                if self.frameRelay === relay { self.frameRelay = nil }
+            } else {
+                self.surface.selectLiveTab?()
+            }
+        }
     }
 
     func startWatchFolderLive(source: URL, sourceMode: AppModel.SourceMode = .nativeStack) {
-        guard !surface.isSessionRunning(), !surface.isImporting(), !isDetecting else { return }
+        guard canApplyDetectedLiveSource(), !isDetecting else { return }
         surface.resetZoomPan?()
         isDetecting = true
         surface.log("Reading subs in \(source.lastPathComponent)…")
@@ -88,8 +107,7 @@ final class LiveSourceController {
         let target = currentTarget.isEmpty ? "Live" : currentTarget
         let glob = "*.\(meta?.fileExtension ?? "fit")"       // *.fit or *.fits per the folder's subs
         let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
-        let relayDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("LiveAstro/relay/\(target)-\(df.string(from: Date()))", isDirectory: true)
+        let relayDir = relayRoot.appendingPathComponent("\(target)-\(df.string(from: Date()))", isDirectory: true)
         pruneRelay(excluding: relayDir)
         let relay = FrameRelay(source: source, destination: relayDir, glob: glob)
         relay.onLog = { [weak self] msg in Task { @MainActor in self?.surface.log(msg) } }
@@ -97,13 +115,11 @@ final class LiveSourceController {
         frameRelay = relay
         surface.applyDetectedProfile?(DetectedProfile(watchFolder: relayDir))
         surface.saveSettings?()
-        surface.startSession?()
-        if !surface.isSessionRunning() { frameRelay?.stop(); frameRelay = nil; return }
-        surface.selectLiveTab?()
+        startConfiguredSession()
     }
 
     func startSeestarLive() {
-        guard !surface.isSessionRunning(), !surface.isImporting(), !isDetecting else { return }
+        guard canApplyDetectedLiveSource(), !isDetecting else { return }
         surface.resetZoomPan?()
         isDetecting = true
         surface.log("Looking for Seestar share…")
@@ -138,8 +154,8 @@ final class LiveSourceController {
         let expToken = exp.map { String(format: "%.1f", $0) }
         let glob = expToken.map { "Light_*_\($0)s_*.fit" } ?? "Light_*.fit"
         let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
-        let relayDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))\(expToken.map { "-\($0)s" } ?? "")",
+        let relayDir = relayRoot
+            .appendingPathComponent("\(found.target)-\(df.string(from: Date()))\(expToken.map { "-\($0)s" } ?? "")",
                                     isDirectory: true)
         pruneRelay(excluding: relayDir)
         let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob)
@@ -150,16 +166,11 @@ final class LiveSourceController {
         frameRelay = relay
         surface.applyDetectedProfile?(DetectedProfile(watchFolder: relayDir))
         surface.saveSettings?()
-        surface.startSession?()
-        if !surface.isSessionRunning() {
-            frameRelay?.stop(); frameRelay = nil
-            return
-        }
-        surface.selectLiveTab?()
+        startConfiguredSession()
     }
 
     func startASIAIRLive() {
-        guard !surface.isSessionRunning(), !surface.isImporting(), !isDetecting else { return }
+        guard canApplyDetectedLiveSource(), !isDetecting else { return }
         surface.resetZoomPan?()
         isDetecting = true
         surface.log("Looking for ASIAIR share…")
@@ -196,8 +207,8 @@ final class LiveSourceController {
                                                       fileNamePrefix: ""))     // accept-all: see doc comment above
         let glob = "*.\(found.subFileExtension)"
         let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
-        let relayDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("LiveAstro/relay/\(found.target)-\(df.string(from: Date()))",
+        let relayDir = relayRoot
+            .appendingPathComponent("\(found.target)-\(df.string(from: Date()))",
                                     isDirectory: true)
         pruneRelay(excluding: relayDir)
         let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob)
@@ -206,8 +217,6 @@ final class LiveSourceController {
         frameRelay = relay
         surface.applyDetectedProfile?(DetectedProfile(watchFolder: relayDir))
         surface.saveSettings?()
-        surface.startSession?()
-        if !surface.isSessionRunning() { frameRelay?.stop(); frameRelay = nil; return }
-        surface.selectLiveTab?()
+        startConfiguredSession()
     }
 }
