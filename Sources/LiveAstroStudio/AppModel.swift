@@ -804,6 +804,11 @@ final class AppModel {
     /// `refreshPreview` is unchanged there. Tests use it to control render TIMING — e.g. to hold
     /// one call open past a second, superseding call — without reimplementing or peeking at the
     /// `previewRenderSeq` guard itself.
+    /// nil in production. Reports what happened to each delivery at the main-actor handoff: a
+    /// delivery can be correctly rendered and still be DROPPED here, because this re-check runs
+    /// after a hop during which the revision may have moved on.
+    var displayDeliveryOutcomeForTest: ((UInt64, String) -> Void)?
+
     var previewRenderOverrideForTest: (@Sendable (SessionPipeline, SessionPipeline.PreviewSource, DisplayAdjustments, SessionPipeline.PreviewQuality) async -> CGImage?)?
 
     /// Test seam only: called once every `refreshPreview` render attempt has been resolved on
@@ -1315,8 +1320,19 @@ final class AppModel {
         pipeline.onDisplayUpdate = { [weak self, weak pipeline] update in
             guard let pipeline else { return }
             Task { @MainActor in
-                guard let self, pipeline.isCurrentDisplay(update),
-                      self.displayPresentation.accept(update, sessionID: sessionID) else { return }
+                guard let self else { return }
+                // Outcome probe: a delivery can be correctly rendered and still be DROPPED here,
+                // because this re-check runs after a main-actor hop during which the revision may
+                // have moved on. Instrumentation only; nil in production.
+                if !pipeline.isCurrentDisplay(update) {
+                    self.displayDeliveryOutcomeForTest?(update.revision, "rejected-stale")
+                    return
+                }
+                guard self.displayPresentation.accept(update, sessionID: sessionID) else {
+                    self.displayDeliveryOutcomeForTest?(update.revision, "rejected-presentation")
+                    return
+                }
+                self.displayDeliveryOutcomeForTest?(update.revision, "accepted")
                 self.latestImage = update.previewImage
                 self.broadcastImage = update.broadcastImage
                 // The reference pane and its histogram follow the delivered broadcast directly.
