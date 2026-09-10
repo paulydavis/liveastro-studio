@@ -123,7 +123,19 @@ public final class SessionPipeline {
     private var displayFinished = false
     private let displayQueue = DispatchQueue(label: "com.liveastro.display-transitions")
     // Guarded by displayRenderLock. Retain linear data for watcher re-renders too.
-    private var displayOnline: (image: AstroImage, count: Int, cap: Int?, generation: Int?)?
+    /// Image, crop, and provenance travel together after the engine's atomic displaySnapshot.
+    /// Within a pipeline-managed native engine, (generation, count) identifies pixels and coverage:
+    /// seedReference is startup-only (BatchImporter); callers must not replace its accumulator
+    /// directly while this pipeline owns it. Accepted
+    /// additions advance count, and manual/automatic reseeds advance generation. The fixed crop
+    /// policy is deterministic for that coverage, including same-size crops at different origins.
+    private struct OnlineDisplaySnapshot {
+        let image: AstroImage
+        let count: Int
+        let cap: Int?
+        let generation: Int?  // nil for watcher sources: never cache their saved-snapshot index
+    }
+    private var displayOnline: OnlineDisplaySnapshot?
     private struct DisplayRenderContext {
         let adjustments: DisplayAdjustments
         let wcs: WCS?
@@ -142,6 +154,76 @@ public final class SessionPipeline {
     /// was overtaken before its render started, so it did no work and consumed no memory — a
     /// measurement that counts it as a completed operation overstates what overlapped.
     public enum WorkProbeEvent: Sendable { case began, finished, superseded }
+
+    /// Phase timings for one display-render request, so waiting can be told apart from rendering
+    /// and from repeated invalidation. Instrumentation ONLY — nothing here alters scheduling.
+    public enum DisplayRenderPhase: Sendable {
+        case requested        // revision claimed by refreshDisplay()
+        case workerStarted    // the displayQueue block began executing
+        case lockAcquired     // displayRenderLock taken
+        case renderBegan      // past the supersession check
+        case renderFinished   // render returned, lock about to be released
+        case deliveryEmitted  // deliverDisplay passed isCurrentDisplay and fired the callback
+        case superseded       // the request was invalidated before rendering
+        case diskWriteBegan   // renderSnapshot's recorder.save
+        case diskWriteEnded
+        case frameLockRequested   // the FRAME path asking for displayRenderLock (revision 0)
+        case frameLockAcquired
+        case frameLockReleased
+    }
+    /// nil in production.
+    public var displayRenderPhaseProbeForTest: (@Sendable (UInt64, DisplayRenderPhase) -> Void)?
+
+    /// EXPERIMENT: cache of the pre-stretch DBE (flatten) result for the COMMITTED path.
+    ///
+    /// Keyed by the identity of the source actually rendered, its post-crop dimensions, and the
+    /// two DBE parameters. Only native online snapshots participate; watcher and clean-master
+    /// renders bypass the cache entirely.
+    ///
+    /// This cannot accelerate NEW FRAMES — each frame is a different stack, so every frame render
+    /// is a miss by construction. The win it targets is narrow and specific: an Apply re-rendering
+    /// the SAME source a frame just rendered, which currently repeats ~15 s of DBE.
+    private let committedFlattenCache = CommittedFlattenCache()
+    /// One locked snapshot; unkeyed renders (watcher, clean, preview, parity oracle) do not count
+    /// as cache misses. Individual accessors remain for the existing measurement harnesses.
+    var committedFlattenMetrics: CommittedFlattenCache.Metrics { committedFlattenCache.metrics }
+    /// Configure before start, on the same thread as start(). No cache object escapes to tests.
+    @discardableResult
+    func disableCommittedFlattenCacheBeforeStartForTesting() -> Bool {
+        guard session.state == .idle else { return false }
+        committedFlattenCache.invalidate(retiring: true)
+        return true
+    }
+    public var committedFlattenHitsForTest: Int { committedFlattenCache.metrics.hits }
+    public var committedFlattenMissesForTest: Int { committedFlattenCache.metrics.misses }
+    /// Test seam: bytes currently retained by the cache (0 when empty).
+    public var committedFlattenRetainedBytesForTest: Int {
+        committedFlattenCache.metrics.retainedBytes
+    }
+
+    /// The FACTS of what actually entered `displayCGImage` — dimensions, channels, colour space
+    /// status, and the captured DBE settings. Printing settings alone could not explain a 214 ms
+    /// render against a 19.6 s full-resolution measurement; only the actual inputs can.
+    public struct RenderInputFacts: Sendable {
+        public let revision: UInt64
+        public let origin: String
+        public let width: Int
+        public let height: Int
+        public let channels: Int
+        public let sourceIsLinear: Bool
+        public let backgroundExtraction: Bool
+        public let bgScale: Double
+        public let bgSmoothest: Double
+        public let blackPoint: Double
+    }
+    public var displayRenderInputProbeForTest: (@Sendable (RenderInputFacts) -> Void)?
+
+    /// What SETTINGS each render actually captured, and where the render came from. Supersession
+    /// alone does not explain a delay: if the superseding frame render reads the committed
+    /// adjustments, it satisfies the Apply. Deciding that needs the settings per revision and the
+    /// render's origin, not just its lifecycle.
+    public var displayRenderSettingsProbeForTest:
+        (@Sendable (UInt64, DisplayAdjustments, String) -> Void)?
 
     /// nil in production. Reports display-render lifecycle by revision.
     public var displayRenderProbeForTest: (@Sendable (UInt64, WorkProbeEvent) -> Void)?
@@ -221,16 +303,22 @@ public final class SessionPipeline {
             return displayRevision
         }
         guard let revision = requested else { return }
+        displayRenderPhaseProbeForTest?(revision, .requested)
         displayQueue.async { [weak self] in
             guard let self else { return }
+            self.displayRenderPhaseProbeForTest?(revision, .workerStarted)
             self.displayRenderLock.lock()
+            self.displayRenderPhaseProbeForTest?(revision, .lockAcquired)
             defer { self.displayRenderLock.unlock() }
             guard self.displayRevisionLock.withLock({ !self.displayFinished && revision == self.displayRevision }) else {
                 self.displayRenderProbeForTest?(revision, .superseded)
+                self.displayRenderPhaseProbeForTest?(revision, .superseded)
                 return
             }
             self.displayRenderProbeForTest?(revision, .began)
+            self.displayRenderPhaseProbeForTest?(revision, .renderBegan)
             self.withCallbackDelivery { self.renderDisplayTransition(revision: revision) }
+            self.displayRenderPhaseProbeForTest?(revision, .renderFinished)
             self.displayRenderProbeForTest?(revision, .finished)
         }
     }
@@ -244,6 +332,7 @@ public final class SessionPipeline {
                                      subExposureSeconds: profile.subExposureSeconds,
                                      record: record)
         guard isCurrentDisplay(update) else { return }
+        displayRenderPhaseProbeForTest?(revision, .deliveryEmitted)
         onDisplayUpdate?(update)
     }
 
@@ -257,8 +346,12 @@ public final class SessionPipeline {
         }
         do {
             let context = context ?? displayContext()
-            let small = online.cap.map { online.image.downsampled(maxLongEdge: $0) } ?? online.image
-            let preview = try displayCGImage(from: small, context: context)
+            // Probe the context ACTUALLY captured for this render. Reading displayAdjustments
+            // separately at the call site could log settings the render did not use, if an Apply
+            // landed between the two reads.
+            displayRenderSettingsProbeForTest?(revision, context.adjustments, "refresh")
+            let preview = try renderOnlineDisplay(online, context: context,
+                                                  revision: revision, origin: "refresh")
             if let finalBroadcast {
                 let image = online.cap.map { finalBroadcast.image.downsampled(maxLongEdge: $0) } ?? finalBroadcast.image
                 let broadcast = try displayCGImage(from: image, context: context)
@@ -1080,6 +1173,7 @@ public final class SessionPipeline {
         // By this point engine.reseed() (inside the block above) has already bumped the engine's
         // generation, so the recompute observes the POST-reseed generation.
         if result == .reseeded {
+            committedFlattenCache.invalidate(minimumGeneration: engine.currentStackGeneration)
             // Correctness-wave defect 3: recompute the freshness key FIRST, before
             // invalidatePlateSolve() fires onSolveStateChanged. onSolveStateChanged is a public
             // callback (AppModel hops it onto the main actor and calls refreshPreview) — it runs
@@ -1168,21 +1262,32 @@ public final class SessionPipeline {
     /// Renders + saves one snapshot from the current stack and pushes the preview. Shared by the
     /// throttled per-frame path and end()'s guaranteed final render. Sets lastRenderedAcceptedIndex.
     private func renderSnapshot(index: Int, sourceName: String, timestamp: Date, engine: StackEngine) {
+        // Instrumentation only: this path takes displayRenderLock DIRECTLY, without going through
+        // refreshDisplay, so its hold is invisible to the request-side phases. An Apply waiting on
+        // this lock is the starvation hypothesis, and it cannot be measured without marking here.
+        displayRenderPhaseProbeForTest?(0, .frameLockRequested)
         displayRenderLock.lock()
-        defer { displayRenderLock.unlock() }
+        displayRenderPhaseProbeForTest?(0, .frameLockAcquired)
+        defer {
+            displayRenderPhaseProbeForTest?(0, .frameLockReleased)
+            displayRenderLock.unlock()
+        }
         let revision = nextDisplayRevision()
         let context = displayContext()
+        displayRenderSettingsProbeForTest?(revision, context.adjustments, "frame")
         guard let (mean0, coverage, frameCount, generation) = engine.displaySnapshot() else {
             displayOnline = nil
             deliverDisplay(revision: revision, preview: nil, broadcast: nil, cleanCount: nil, count: 0)
             return
         }
         let mean = cropToCoverage(mean0, coverage: coverage)   // online — feeds the PREVIEW, unchanged (Task 9)
-        displayOnline = (mean, frameCount, importPreviewLongEdge, generation)
+        let online = OnlineDisplaySnapshot(image: mean, count: frameCount,
+                                           cap: importPreviewLongEdge, generation: generation)
+        displayOnline = online
         guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
         do {
-            let displaySource = mean.downsampled(maxLongEdge: importPreviewLongEdge)
-            let previewCG = try displayCGImage(from: displaySource, context: context)
+            let previewCG = try renderOnlineDisplay(online, context: context,
+                                                    revision: revision, origin: "frame")
 
             // BROADCAST/latest.png: prefer the clean published master over the online mean, with
             // the downsample applied to whichever is served (D10: see resolveBroadcastRender).
@@ -1324,19 +1429,56 @@ public final class SessionPipeline {
         DisplayRenderContext(adjustments: adjustments, wcs: currentWCS)
     }
 
-    /// `preflattened` means the caller has ALREADY applied background extraction to `linear`
-    /// (see the preview's DBE cache): the flatten step is skipped, but every downstream decision
-    /// that depends on DBE being on — notably skipping the additive neutralize — still behaves as
-    /// though it ran, because it did.
+    /// The only entry point that supplies a cache key. It derives pixels and key from the same
+    /// captured snapshot; a caller cannot separately pair a newer key with an older image.
+    private func renderOnlineDisplay(_ online: OnlineDisplaySnapshot, context: DisplayRenderContext,
+                                     revision: UInt64, origin: String) throws -> CGImage {
+        let image = online.cap.map { online.image.downsampled(maxLongEdge: $0) } ?? online.image
+        let key: CommittedFlattenCache.Key?
+        if let generation = online.generation, generation == engine?.currentStackGeneration {
+            key = CommittedFlattenCache.Key(generation: generation, count: online.count,
+                width: image.width, height: image.height, channels: image.channels,
+                scale: context.adjustments.bgScale, smoothest: context.adjustments.bgSmoothest)
+        } else {
+            key = nil
+        }
+        return try displayCGImage(from: image, context: context, probeRevision: revision,
+                                  probeOrigin: origin, flattenKey: key)
+    }
+
+    /// `preflattened` means DBE was already applied by the draft-preview cache. Skip flattening,
+    /// but preserve downstream decisions that depend on DBE being enabled.
     private func displayCGImage(from linear: AstroImage, context: DisplayRenderContext? = nil,
-                                preflattened: Bool = false) throws -> CGImage {
+                                preflattened: Bool = false,
+                                probeRevision: UInt64? = nil,
+                                probeOrigin: String? = nil,
+                                flattenKey: CommittedFlattenCache.Key? = nil) throws -> CGImage {
         let context = context ?? displayContext()
         let adj = context.adjustments
+        if let probeRevision, let probeOrigin {
+            displayRenderInputProbeForTest?(RenderInputFacts(
+                revision: probeRevision, origin: probeOrigin,
+                width: linear.width, height: linear.height, channels: linear.channels,
+                sourceIsLinear: linear.sourceIsLinear,
+                backgroundExtraction: adj.backgroundExtraction, bgScale: adj.bgScale,
+                bgSmoothest: adj.bgSmoothest, blackPoint: adj.blackPoint))
+        }
         // DBE first, on linear data. When on, it removes the per-channel spatial
         // background, so skip the additive neutralize (keep multiplicative WB).
-        let flattened = (adj.backgroundExtraction && !preflattened)
-            ? BackgroundExtraction.flattenMultiscale(linear, scale: adj.bgScale, smoothest: adj.bgSmoothest)
-            : linear
+        let flattened: AstroImage
+        if adj.backgroundExtraction && !preflattened {
+            if let key = flattenKey, key.generation == engine?.currentStackGeneration {
+                flattened = committedFlattenCache.image(for: key) {
+                    BackgroundExtraction.flattenMultiscale(
+                        linear, scale: adj.bgScale, smoothest: adj.bgSmoothest)
+                }
+            } else {
+                flattened = BackgroundExtraction.flattenMultiscale(
+                    linear, scale: adj.bgScale, smoothest: adj.bgSmoothest)
+            }
+        } else {
+            flattened = linear
+        }
         let balanced: AstroImage
         if neutralizeBackground {
             balanced = adj.backgroundExtraction
@@ -1615,6 +1757,7 @@ public final class SessionPipeline {
             let result = engine.processDetailed(frame)
             let outcome = result.outcome
             if engine.autoReseedCount != lastAutoReseedCount {
+                committedFlattenCache.invalidate(minimumGeneration: engine.currentStackGeneration)
                 lastAutoReseedCount = engine.autoReseedCount
                 // T8 review fix: an auto-reseed is a FreshnessKey mutation point (generation change)
                 // exactly like manual reseed() (see reseed()'s matching block) — refresh the
@@ -1710,8 +1853,16 @@ public final class SessionPipeline {
             }
             switch outcome {
             case .becameReference, .stacked:
+                // Instrumentation only: the native live path takes the lock directly, so its hold
+                // is invisible to the request-side phases. An Apply waiting behind THIS is the
+                // starvation hypothesis and cannot be measured without marking it.
+                displayRenderPhaseProbeForTest?(0, .frameLockRequested)
                 displayRenderLock.lock()
-                defer { displayRenderLock.unlock() }
+                displayRenderPhaseProbeForTest?(0, .frameLockAcquired)
+                defer {
+                    displayRenderPhaseProbeForTest?(0, .frameLockReleased)
+                    displayRenderLock.unlock()
+                }
                 let revision = nextDisplayRevision()
                 let context = displayContext()
                 guard let (mean0, coverage, frameCount, generation) = engine.displaySnapshot() else {
@@ -1720,13 +1871,20 @@ public final class SessionPipeline {
                     return
                 }
                 let mean = cropToCoverage(mean0, coverage: coverage)   // online — feeds the PREVIEW, unchanged (Task 9)
-                displayOnline = (mean, frameCount, nil, generation)
+                let online = OnlineDisplaySnapshot(image: mean, count: frameCount,
+                                                   cap: nil, generation: generation)
+                displayOnline = online
                 guard let recorder else {
                     onLog?("recorder missing — frame dropped (\(frame.sourceName))")
                     return
                 }
                 do {
-                    let previewCG = try displayCGImage(from: mean, context: context)
+                    // NATIVE LIVE renders inline here, not through renderSnapshot (which is the
+                    // IMPORT path). Instrumenting only renderSnapshot left live-mode frame renders
+                    // unlabelled, so the prerequisite saw deliveries but no "frame" origin.
+                    displayRenderSettingsProbeForTest?(revision, context.adjustments, "frame")
+                    let previewCG = try renderOnlineDisplay(online, context: context,
+                                                            revision: revision, origin: "frame")
 
                     // BROADCAST/latest.png: prefer the clean published master over the online
                     // mean, full-resolution (live, unlike renderSnapshot's downsampled preview) —
@@ -1736,6 +1894,8 @@ public final class SessionPipeline {
                         downsampleLongEdge: nil, context: context)
 
                     // Pass the raw un-neutralized mean as linear: stats stay raw for v1.1 cloud gate.
+                    displayRenderPhaseProbeForTest?(revision, .diskWriteBegan)
+                    defer { displayRenderPhaseProbeForTest?(revision, .diskWriteEnded) }
                     let record = try recorder.save(
                         cgImage: broadcastCG, linear: broadcastMean, sourceFile: frame.sourceName,
                         index: engine.acceptedCount, timestamp: frame.timestamp,
@@ -1780,7 +1940,8 @@ public final class SessionPipeline {
                 let revision = nextDisplayRevision()
                 let cg = try displayCGImage(from: linear)
                 let index = session.acceptedCount + 1
-                displayOnline = (linear, index, nil, nil)
+                displayOnline = OnlineDisplaySnapshot(image: linear, count: index,
+                                                      cap: nil, generation: nil)
                 let record = try recorder.save(
                     cgImage: cg, linear: linear, sourceFile: update.url.lastPathComponent,
                     index: index, timestamp: Date(),
@@ -2127,6 +2288,9 @@ public final class SessionPipeline {
             finalizationClaimed = true
             finalizationFailedAfterClaim = false
         }
+        // Includes failed shutdown/master writes. An in-flight miss cannot reattach its buffer
+        // after this retirement; a retry of end() simply renders without retaining DBE data.
+        defer { committedFlattenCache.invalidate(retiring: true) }
         do {
             if source != nil {
                 if source?.isFinite ?? false {
@@ -2277,6 +2441,7 @@ public final class SessionPipeline {
                 renderDisplayTransition(revision: revision, finalBroadcast: finalBroadcast,
                                         context: finalContext)
             }
+            committedFlattenCache.invalidate(retiring: true)
             displayRenderLock.unlock()
             guard rendersReplay else { return dir }   // test seam: skip the AVFoundation render
             return try ReplayService.regenerate(sessionDirectory: dir,

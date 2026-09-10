@@ -236,6 +236,8 @@ public final class GlobalRefiner {
     private let triggerLock = NSLock()
     private var isRunning = false
     private var dirty = false
+    /// Read-only measurement boundary: false includes both queued and executing passes.
+    var isIdleForTesting: Bool { triggerLock.withLock { !isRunning && !dirty } }
     /// F6 (cold-review minor): a TERMINAL flag distinct from per-pass `cancel()`. `cancel()` only
     /// stamps the CURRENT pass id — `runCoalescedPasses` can still start pass K+1 with a fresh,
     /// un-cancelled id, so `SessionPipeline.end()` calling `cancel()` alone does not stop the
