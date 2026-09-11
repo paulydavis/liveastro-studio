@@ -113,7 +113,8 @@ public final class SessionManager {
     }
 
     public func endSession(at date: Date = .init(),
-                           finalization: SessionFinalizationFacts? = nil) throws {
+                           finalization: SessionFinalizationFacts? = nil,
+                           intake: SourceIntake? = nil) throws {
         guard state == .running, var proposed = manifest, let dir = sessionDirectory else {
             throw SessionError.notRunning
         }
@@ -121,6 +122,12 @@ public final class SessionManager {
         // so a failed write can't leave the manager ended with an unpersisted endTime.
         proposed.endTime = date
         proposed.finalizationFacts = finalization
+        if let intake {
+            proposed.sourceExcludedPreExistingCount = intake.excludedPreExisting
+            proposed.sourceUnprocessedAtShutdownCount = intake.unprocessedAtShutdown
+            proposed.sourceReadFailureCount = intake.readFailures
+            proposed.sourceAccountingComplete = intake.accountingComplete
+        }
         try persist(proposed, to: dir)
         manifest = proposed
         state = .ended

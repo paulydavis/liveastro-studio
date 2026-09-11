@@ -55,6 +55,21 @@ public enum SessionSummaryMarkdown {
         lines.append(row("Session accepted",
                          manifest.sessionAcceptedCount.map(String.init) ?? "\(manifest.snapshots.count)"))
         lines.append(row("Session rejected", manifest.sessionRejectedCount.map(String.init) ?? "unknown"))
+        // Only shown when non-zero: a clean session should not carry rows of noise. The wording
+        // says what is true — the files are still in the watch folder, nothing was destroyed.
+        if let skipped = manifest.sourceExcludedPreExistingCount, skipped > 0 {
+            lines.append(row("Pre-existing subs skipped by choice", "\(skipped)"))
+        }
+        if let unprocessed = manifest.sourceUnprocessedAtShutdownCount, unprocessed > 0 {
+            lines.append(row("Detected but not processed before the session ended",
+                             "\(unprocessed) — this session did not delete the original files"))
+        }
+        if let failures = manifest.sourceReadFailureCount, failures > 0 {
+            lines.append(row("Could not be read", "\(failures) — neither stacked nor rejected"))
+        }
+        if manifest.sourceAccountingComplete == false {
+            lines.append(row("Source accounting", "INCOMPLETE — counts may understate what was detected"))
+        }
         lines.append("")
         lines.append("## Files to inspect")
         lines.append("")

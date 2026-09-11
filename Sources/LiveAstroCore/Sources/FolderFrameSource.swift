@@ -28,6 +28,17 @@ internal final class LiveDecodeSeams: @unchecked Sendable {
         set { lock.withLock { bufferedHook = newValue } }
     }
     func noteBuffered(_ u: StackUpdate) { onUpdateBuffered?(u) }
+
+    /// Test seam: fires on the relay task immediately after an update is ADMITTED, before
+    /// the exclusion decision. Blocking here parks the relay mid-batch, which is the only
+    /// way to exercise the accounting barrier deterministically — without it a test cannot
+    /// tell a stop() that waits for the relay from one that cancels it.
+    private var admittedHook: ((StackUpdate) -> Void)?
+    var onUpdateAdmitted: ((StackUpdate) -> Void)? {
+        get { lock.withLock { admittedHook } }
+        set { lock.withLock { admittedHook = newValue } }
+    }
+    func noteAdmitted(_ u: StackUpdate) { onUpdateAdmitted?(u) }
     func noteDecode() { lock.withLock { decodes += 1 } }
     var decodeCount: Int { lock.withLock { decodes } }
 }
@@ -76,7 +87,7 @@ internal final class ActivityRelayBox: @unchecked Sendable {
 /// decoded every emitted update eagerly into an unbounded RawFrame buffer, so a restart
 /// onto a folder holding 1000+ subs decoded multi-GB of Float planes faster than the serial
 /// consumer could stack them.
-public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting {
+public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting, FrameSourceIntakeReporting {
 
     public enum Mode { case importOnce, live }
 
@@ -118,6 +129,11 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
     private let liveUpdateContinuation: AsyncStream<StackUpdate>.Continuation?
     /// Live mode only: the pull-time decoder behind `frames`.
     private let livePull: LivePull?
+    /// Source-boundary tallies: what was excluded, delivered, and left unprocessed at stop.
+    private let intake = IntakeCounters()
+
+    /// What this source did with everything it detected. Read at `end()`.
+    public var intakeSnapshot: SourceIntake { intake.snapshot }
 
     private let folder: URL
     private let mode: Mode
@@ -231,7 +247,7 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
             // AsyncStream's init runs this closure synchronously; cont is non-nil here.
             let updates = AsyncStream<StackUpdate> { cont = $0 }
             self.liveUpdateContinuation = cont
-            let pull = LivePull(updates: updates, seams: seams)
+            let pull = LivePull(updates: updates, seams: seams, intake: intake)
             self.livePull = pull
             // Cold1 I2: the public frame stream decodes lazily — one pull, one decode.
             self.frames = AsyncStream(unfolding: { await pull.nextFrame() })
@@ -311,6 +327,7 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
             let seams = liveSeams
             let excluded = excludedPreExisting
             let watcherLogRelay = watcherLog
+            let intakeCounters = intake
             // Revalidate + commit under the lock: watcher/liveTask become visible to stop()
             // atomically with `.running` (stop() reads them under the same lock).
             try commitRunning(onCommit: {
@@ -320,9 +337,15 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
                     // the consumer's clock in LivePull.nextFrame(), one frame in flight.
                     var skipped = 0
                     for await update in w.updates {
+                        // ADMISSION IS COUNTED FIRST. Counting after the yield (or after the
+                        // exclusion branch) leaves a window in which cancellation drops an
+                        // update that no tally ever saw.
+                        intakeCounters.noteAdmitted()
+                        seams.noteAdmitted(update)
                         if let excluded, excluded.recordedUnchanged(
                             name: update.url.lastPathComponent, identity: update.identity) {
                             skipped += 1
+                            intakeCounters.noteExcluded()
                             // One line per skip would be 1000 lines on a full folder; the
                             // running total is the honest summary and never claims a file
                             // was stacked.
@@ -337,6 +360,9 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
                     // The watcher stream ended (its stop()): close the buffer as a backstop
                     // so consumers never hang on a dead stream.
                     cont.finish()
+                    // Accounting barrier: every update the watcher produced has now been
+                    // admitted, so a snapshot taken after this point is complete.
+                    intakeCounters.noteRelayFinished()
                 }
             }, tearDownOnStop: {
                 // stop() won while the watcher was being built: tear the orphan down —
@@ -378,6 +404,7 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
     /// commit revalidation and tears its watcher down instead of committing — and the
     /// watcher/task references are captured under the SAME lock that publishes them.
     public func stop(timeout: TimeInterval) {
+        let deadline = DispatchTime.now() + .milliseconds(Int(max(timeout, 0) * 1000))
         stopSeamLock.withLock { _lastStopTimeout = timeout }
         let (w, task): (StackFileWatcher?, Task<Void, Never>?) = stateLock.withLock {
             state = .stopped
@@ -385,8 +412,23 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
         }
         importCursor?.stop()
         livePull?.stop()
-        w?.stop(timeout: timeout)
-        task?.cancel()
+        // Stopping the watcher finishes its stream, so the relay loop ends on its own and
+        // signals the accounting barrier. Wait for that BEFORE cancelling: cancelling a relay
+        // mid-drain loses the admissions it had not yet counted.
+        //
+        // ONE budget covers both steps. Taken as two sequential waits each granted the full
+        // `timeout`, shutdown could take twice what the caller allowed — and a floor under the
+        // relay wait would hand a caller asking for less MORE time than it asked for. The
+        // deadline is computed once, here; the watcher gets what remains of it, and the relay
+        // wait reuses the same instant. An already-expired deadline grants nothing: the wait
+        // returns false at once, the relay is cancelled, and the accounting is marked
+        // incomplete — the honest outcome for a caller who allowed no time.
+        let remainingForWatcher = max(deadline.distanceInSeconds(from: .now()), 0)
+        w?.stop(timeout: remainingForWatcher)
+        if task != nil {
+            let complete = intake.awaitRelayCompletion(timeout: deadline)
+            if !complete { task?.cancel() }
+        }
         liveUpdateContinuation?.finish()
     }
 
@@ -402,10 +444,12 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
         private var stopped = false
         private var logSink: ((String) -> Void)?
         private let seams: LiveDecodeSeams
+        private let intake: IntakeCounters
 
-        init(updates: AsyncStream<StackUpdate>, seams: LiveDecodeSeams) {
+        init(updates: AsyncStream<StackUpdate>, seams: LiveDecodeSeams, intake: IntakeCounters) {
             self.iterator = updates.makeAsyncIterator()
             self.seams = seams
+            self.intake = intake
         }
 
         var log: ((String) -> Void)? {
@@ -413,7 +457,7 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
             set { lock.withLock { logSink = newValue } }
         }
         func stop() { lock.withLock { stopped = true } }
-        private var isStopped: Bool { lock.withLock { stopped } }
+        var isStopped: Bool { lock.withLock { stopped } }
 
         /// One consumer pull. The verified-read path (loadRawFrame(url:expectedIdentity:))
         /// is unchanged — it just runs NOW, at consumption. An identity mismatch or an
@@ -426,8 +470,15 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
                 guard let update = await iterator.next() else { return nil }
                 seams.noteDecode()
                 if let frame = FolderFrameSource.frame(for: update, log: log) {
+                    // Delivered means a frame reached the stacker, where it becomes an
+                    // accepted or rejected sub. An attempted decode is not a processed frame.
+                    intake.noteDelivered()
                     return frame
                 }
+                // Unreadable / identity mismatch / corrupt: logged inside frame(for:log:),
+                // and tallied on its own so it can never be mistaken for either a processed
+                // frame or a sub left unprocessed at shutdown.
+                intake.noteReadFailure()
             }
             return nil
         }
@@ -439,6 +490,9 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting 
     private let stopSeamLock = NSLock()
     private var _lastStopTimeout: TimeInterval?
     internal var lastStopTimeout: TimeInterval? { stopSeamLock.withLock { _lastStopTimeout } }
+
+    /// Observes the actual pull-stop flag, not merely entry into stop().
+    internal var livePullIsStopped: Bool { livePull?.isStopped ?? false }
 
     /// Lazily-advanced sorted file list for import mode. Thread-safe: pulls come from the
     /// consumer's task, stop() may come from another thread.
