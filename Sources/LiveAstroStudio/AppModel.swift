@@ -419,7 +419,10 @@ final class AppModel {
             currentTargetName: { [weak self] in MainActor.assumeIsolated { self?.targetName ?? "" } },
             resetZoomPan: { [weak self] in MainActor.assumeIsolated { self?.zoomPan = .fit } },
             selectLiveTab: { [weak self] in MainActor.assumeIsolated { self?.selectedTab = .live } },
-            startSession: { [weak self] in MainActor.assumeIsolated { self?.startSession() } },
+            startSession: { [weak self] completion in MainActor.assumeIsolated {
+                guard let self else { completion(false); return }
+                self.startSession(completion: completion)
+            } },
             saveSettings: { [weak self] in MainActor.assumeIsolated { self?.saveSettings() } }))
 
         // Import + post-processing cluster: the shared log/error/session-running
@@ -970,8 +973,14 @@ final class AppModel {
     /// A session begun on an EMPTY folder can't be matched yet — that's logged and left
     /// uncalibrated (resolve-on-first-sub is a documented follow-up). Not CI-testable
     /// (FileManager + pipeline); the pure matcher/scaler/library are unit-tested.
-    func resolveCalibration(watchFolder: URL, prefix: String?)
+    func resolveCalibration(watchFolder: URL, prefix: String?, excludingPreExisting: WatchFolderInput.Snapshot? = nil)
         -> (calibrator: Calibrator?, messages: [String], foundMetadata: Bool) {
+        // Old files were explicitly excluded. Even a newly arrived file may still be writing;
+        // resolve on the first frame the source actually ingests, using its captured metadata.
+        if excludingPreExisting != nil {
+            calibrationStatus = statusLine(dark: false, flat: false)
+            return (nil, ["Calibration: matching from the first new sub as it arrives."], false)
+        }
         // Peek a representative sub already in the folder. If none (empty-folder live
         // start), report foundMetadata: false so the caller attaches the first-sub
         // provider instead — calibration then resolves as the first sub lands.
@@ -1121,15 +1130,182 @@ final class AppModel {
         return parts.joined(separator: " · ") + " · ×\(f.frameCount)"
     }
 
+    // MARK: - What the session is about to consume
+
+    /// What the session can say about its input before any frame is stacked.
+    /// `waitingForFirstSub` is a STANDING status, not a transient log line: it is what makes
+    /// a filename filter that matches nothing distinguishable from "capture hasn't started".
+    enum SessionInputStatus: Equatable {
+        case waitingForFirstSub(folder: URL, filter: String?, unmatchedFileCount: Int)
+        /// The folder could not be read. Deliberately NOT the same case as an empty folder:
+        /// telling an operator to wait for files that can never arrive is the failure this fix exists to end.
+        case failed(String)
+    }
+
+    /// The operator's answer to "these subs are already here".
+    enum PreExistingSubsChoice: Equatable { case stackExistingAndNew, newArrivalsOnly, cancel }
+
+    /// A start held open until that question is answered. Nothing is stacked while this is set.
+    struct PendingSessionStart: Equatable {
+        let id = UUID()
+        let snapshot: WatchFolderInput.Snapshot
+    }
+
+    private(set) var sessionInputStatus: SessionInputStatus?
+    private(set) var pendingSessionStart: PendingSessionStart?
+    private var pendingStartCompletion: ((Bool) -> Void)?
+
+    /// What a start should do about the folder it was pointed at. Pure, so the decision is
+    /// testable on its own — `startSession()` itself needs an app bundle and a live pipeline.
+    enum StartDecision: Equatable {
+        /// Subs are already present: ask before stacking anything.
+        case ask(WatchFolderInput.Snapshot)
+        /// Nothing matches yet. Start, and stand up the waiting status so an empty result is
+        /// visible rather than indistinguishable from "capture hasn't begun".
+        case startWaiting(SessionInputStatus)
+        /// The folder could not be read. Start nothing.
+        case failed(String)
+    }
+
+    static func startDecision(folder: URL, fileNamePrefix: String?) -> StartDecision {
+        let filter = (fileNamePrefix?.isEmpty ?? true) ? nil : fileNamePrefix
+        let snapshot: WatchFolderInput.Snapshot
+        do {
+            snapshot = try WatchFolderInput.snapshot(folder: folder, fileNamePrefix: filter)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+        guard snapshot.isEmpty else { return .ask(snapshot) }
+        return .startWaiting(.waitingForFirstSub(folder: folder, filter: filter,
+                                                 unmatchedFileCount: snapshot.unmatchedFileCount))
+    }
+
+    /// The dialog's body: what is already there, and what each choice will do.
+    var pendingSessionStartMessage: String? {
+        guard let pending = pendingSessionStart else { return nil }
+        let n = pending.snapshot.count
+        let subs = n == 1 ? "1 sub is" : "\(n) subs are"
+        return "\(subs) already in this folder. "
+            + "“Stack existing + new” stacks them along with everything that arrives from now on. "
+            + "“New arrivals only” skips them and stacks only what lands after you start."
+    }
+
+    /// Test seam: the waiting status is normally installed by `startSession()`, which cannot
+    /// run in a unit test (it needs a bundle and a live pipeline).
+    func installSessionInputStatusForTest(_ status: SessionInputStatus?) {
+        sessionInputStatus = status
+    }
+
+    /// Which subs (if any) the session must skip, given the operator's answer.
+    ///
+    /// Only valid after the caller has checked the snapshot's selection. A mismatch is not
+    /// permission to include everything: the resolver re-prompts and the source refuses it.
+    static func exclusion(for choice: PreExistingSubsChoice,
+                          snapshot: WatchFolderInput.Snapshot,
+                          folder: URL,
+                          fileNamePrefix: String?) -> WatchFolderInput.Snapshot? {
+        guard choice == .newArrivalsOnly else { return nil }
+        let filter = (fileNamePrefix?.isEmpty ?? true) ? nil : fileNamePrefix
+        guard snapshot.covers(folder: folder, fileNamePrefix: filter) else { return nil }
+        return snapshot
+    }
+
+    /// Answers the pre-existing-subs question and starts (or abandons) the session.
+    func resolvePendingSessionStart(_ choice: PreExistingSubsChoice, requestID: UUID? = nil) {
+        guard let pending = pendingSessionStart else { return }
+        guard requestID == nil || requestID == pending.id else { return }
+        pendingSessionStart = nil
+        let completion = pendingStartCompletion ?? { _ in }
+        pendingStartCompletion = nil
+        guard choice != .cancel else {
+            log.append("Start cancelled — \(pending.snapshot.count) subs were already in the folder.")
+            completion(false)
+            return
+        }
+        guard let folder = watchFolder else { completion(false); return }
+        let filter = fileNamePrefix.isEmpty ? nil : fileNamePrefix
+        let excluding = Self.exclusion(for: choice, snapshot: pending.snapshot,
+                                       folder: folder, fileNamePrefix: filter)
+        if !pending.snapshot.covers(folder: folder, fileNamePrefix: filter) || sourceMode != .nativeStack {
+            // The selection moved under the question; say so rather than silently stacking
+            // a folder the operator has since changed to.
+            log.append("Watch folder or filename filter changed while the question was open — re-checking the folder.")
+            if pending.snapshot.folder.standardizedFileURL == folder.standardizedFileURL,
+               sourceMode == .nativeStack {
+                // A changed filter needs fresh consent, but still consumes this relay.
+                startSession(completion: completion)
+            } else {
+                // A different input no longer owns the old request's relay.
+                completion(false)
+                startSession()
+            }
+            return
+        }
+        if let excluding {
+            log.append("Ignoring \(excluding.count) subs that were already in the folder; stacking new arrivals only.")
+        } else {
+            log.append("Stacking \(pending.snapshot.count) subs already in the folder, plus new arrivals.")
+        }
+        completion(beginSession(excludingPreExisting: excluding))
+    }
+
+    /// Clears the standing "waiting" status. Called when a frame has actually been INGESTED —
+    /// not when one is merely discovered, which proves only that a file appeared.
+    func noteFrameIngested() {
+        if case .waitingForFirstSub = sessionInputStatus { sessionInputStatus = nil }
+    }
+
     /// Starts a live session watching `watchFolder`.
+    ///
+    /// Preflight first: read the folder, and either ask about subs already in it, stand up a
+    /// "waiting" status for a filter matching nothing, or report a read failure as a failure.
+    /// `beginSession` is the part that actually starts anything.
+    func startSession(completion: @escaping (Bool) -> Void = { _ in }) {
+        guard pendingSessionStart == nil else { completion(false); return }
+        guard !isRunning else { completion(false); return }
+        guard !isRestacking else {
+            errorMessage = "Finish the re-stack before starting a session."
+            completion(false)
+            return
+        }
+        sessionInputStatus = nil
+        guard sourceMode == .nativeStack else { completion(beginSession(excludingPreExisting: nil)); return }
+        guard let folder = watchFolder else {
+            errorMessage = "Pick a watch folder first."
+            completion(false)
+            return
+        }
+        switch Self.startDecision(folder: folder,
+                                  fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix) {
+        case .failed(let reason):
+            // A folder that cannot be read is a failure, never "no matching subs found".
+            sessionInputStatus = .failed(reason)
+            errorMessage = "Can't read the watch folder: \(reason)"
+            log.append("Start blocked — \(reason)")
+            completion(false)
+        case .ask(let snapshot):
+            pendingSessionStart = PendingSessionStart(snapshot: snapshot)
+            pendingStartCompletion = completion
+        case .startWaiting(let status):
+            sessionInputStatus = status
+            if case .waitingForFirstSub(_, let filter, let unmatched) = status {
+                let where_ = filter.map { "matching “\($0)”" } ?? "in the folder"
+                log.append(unmatched > 0
+                    ? "No subs \(where_) — \(unmatched) other file(s) are present. Waiting for new files."
+                    : "No subs \(where_) yet. Waiting for new files.")
+            }
+            completion(beginSession(excludingPreExisting: nil))
+        }
+    }
+
     /// Not unit-testable: needs FileManager, a live pipeline, and a real watch
     /// folder — the end-to-end test covers this path.
-    func startSession() {
-        guard !isRestacking else { errorMessage = "Finish the re-stack before starting a session."; return }
+    private func beginSession(excludingPreExisting excluded: WatchFolderInput.Snapshot?) -> Bool {
+        guard !isRestacking else { errorMessage = "Finish the re-stack before starting a session."; return false }
         saveSettings()
-        guard !isRunning else { return }
-        guard !importer.isImporting else { errorMessage = "Finish the import before starting a session."; return }
-        guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return }
+        guard !isRunning else { return false }
+        guard !importer.isImporting else { errorMessage = "Finish the import before starting a session."; return false }
+        guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return false }
         zoomPan = .fit
         let root = liveAstroRoot
 
@@ -1141,10 +1317,12 @@ final class AppModel {
                                neutralizeBackground: neutralizeBackground)
         case .nativeStack:
             let source = FolderFrameSource(folder: folder, mode: .live,
-                                            fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
+                                            fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
+                                            excludingPreExisting: excluded)
             let engine = makeStackEngine()
             let cal = resolveCalibration(
-                watchFolder: folder, prefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
+                watchFolder: folder, prefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
+                excludingPreExisting: excluded)
             cal.messages.forEach { log.append($0) }
             CalibrationStore.save(calibration, to: userDefaults)
             // Empty folder at Start → resolve calibration from the first sub that lands.
@@ -1213,8 +1391,11 @@ final class AppModel {
             updateLiveRejectionConfig()
             advisoryCheckLiveRejectionBudget()
             startCompletionTick()
+            return true
         } catch {
             errorMessage = "Start failed: \(error.localizedDescription)"
+            sessionInputStatus = .failed(error.localizedDescription)
+            return false
         }
     }
 
@@ -1363,6 +1544,7 @@ final class AppModel {
             Task { @MainActor in
                 guard self?.displayPresentation.belongs(to: sessionID) == true else { return }
                 self?.latestRecord = record
+                self?.noteFrameIngested()
                 self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false   // gate the North-up toggle
                 self?.refreshPreview(force: true)   // a new sub changed the stack
                 onAccepted?()
@@ -1558,6 +1740,14 @@ final class AppModel {
         restackOfferPending = false
     }
 
+    /// Claim exclusive ownership of the presentation before launching restack work.
+    /// Both entry points re-check ownership: a pending Start dialog can outlive its preflight.
+    func claimRestackPresentation() -> Bool {
+        guard !isRunning, !isRestacking else { return false }
+        isRestacking = true
+        return true
+    }
+
     /// The survivor set for a re-stack: the session's RECORDED subs (the exact frames the live
     /// pipeline processed), in recorded `index` order, minus user-flagged, each resolved as a
     /// basename under the session's pinned subs folder `dir` (Fix P1a).
@@ -1607,7 +1797,7 @@ final class AppModel {
         // restackOfferPending stays set until the re-stack SUCCEEDS (cleared in
         // finishRestack only after the durable master.fit write succeeds), so a failed re-stack
         // OR a failed master write leaves the offer up for retry (Fix 5 / Fix P2).
-        isRestacking = true
+        guard claimRestackPresentation() else { return }
         let engine = makeStackEngine()
         // Capture on the main actor everything the off-actor write needs: the session's metadata
         // (Fix P1b — write master.fit with the SAME header the live master had), the pinned
@@ -1814,6 +2004,7 @@ final class AppModel {
     }
 
     func endSession() {
+        sessionInputStatus = nil
         restoreMetadataAfterDemoIfNeeded()   // undo demo branding before it can be persisted
         saveSettings()
         completionTick?.cancel()

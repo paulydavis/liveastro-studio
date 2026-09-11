@@ -40,7 +40,7 @@ struct AppSurface {
     /// successful start, matching the old inline `selectedTab = .live`.
     var selectLiveTab: (() -> Void)?
     /// Starts a live session using the current draft.
-    var startSession: (() -> Void)?
+    var startSession: ((@escaping (Bool) -> Void) -> Void)?
     /// Persists current settings.
     var saveSettings: (() -> Void)?
 
@@ -98,7 +98,7 @@ struct AppSurface {
          currentTargetName: (() -> String)? = nil,
          resetZoomPan: (() -> Void)? = nil,
          selectLiveTab: (() -> Void)? = nil,
-         startSession: (() -> Void)? = nil,
+         startSession: ((@escaping (Bool) -> Void) -> Void)? = nil,
          saveSettings: (() -> Void)? = nil,
          makeStackEngine: (() -> StackEngine)? = nil,
          currentCalibration: (() -> CalibrationSelection)? = nil,

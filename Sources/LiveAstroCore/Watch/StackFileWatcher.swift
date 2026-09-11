@@ -825,13 +825,10 @@ public final class StackFileWatcher {
         onLog?("watcher alive: \(_polls) polls, \(reducer.state.generation.files.count) tracked, \(_emitted) emitted")
     }
 
+    /// The acceptance rule lives in `WatchFolderInput` so the count shown to the operator at
+    /// Start and the set this watcher actually emits can never drift apart.
     private func isTrackedFileName(_ name: String) -> Bool {
-        guard !name.hasPrefix("."), !name.lowercased().hasSuffix(".tmp") else { return false }
-        if let prefix = fileNamePrefix, !prefix.isEmpty,
-           !name.lowercased().hasPrefix(prefix.lowercased()) { return false }
-        let ext = (name as NSString).pathExtension.lowercased()
-        return ImageLoader.fitsExtensions.contains(ext)
-            || ImageLoader.bitmapExtensions.contains(ext)
+        WatchFolderInput.isTrackedFileName(name, fileNamePrefix: fileNamePrefix)
     }
 
     /// The synchronous, NON-BLOCKING decision for one file: open + fstat + readPlan only. None of

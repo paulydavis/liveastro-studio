@@ -2427,8 +2427,31 @@ public final class SessionPipeline {
                 // State the expectation once so the ended-without-master manifest reads honestly.
                 onLog?("watcher session — the stack lives with the external stacker; no master.fit")
             }
+            // Live-relay accounting only: finite imports have no watcher relay or these
+            // counters. Capture one snapshot after shutdown; its completeness flag discloses
+            // a relay timeout. This session does not delete the original inputs.
+            let intake = source?.isFinite == false
+                ? (source as? FrameSourceIntakeReporting)?.intakeSnapshot : nil
+            if let intake, !intake.isUneventful {
+                if intake.unprocessedAtShutdown > 0 {
+                    let n = intake.unprocessedAtShutdown
+                    onLog?("\(n) \(n == 1 ? "sub was" : "subs were") detected but not processed before the session ended — "
+                         + "this session did not delete the original files.")
+                }
+                if intake.readFailures > 0 {
+                    let n = intake.readFailures
+                    onLog?("\(n) \(n == 1 ? "sub" : "subs") could not be read and \(n == 1 ? "was" : "were") neither stacked nor rejected.")
+                }
+                if intake.excludedPreExisting > 0 {
+                    onLog?("\(intake.excludedPreExisting) pre-existing subs were skipped by choice at Start.")
+                }
+                if !intake.accountingComplete {
+                    onLog?("Source accounting is INCOMPLETE — the watcher relay did not stop within its budget, "
+                         + "so these counts may understate what was detected.")
+                }
+            }
             // Commit point: master.fit is durable (native mode), so stamping end_time is now honest.
-            try session.endSession(finalization: finalization)
+            try session.endSession(finalization: finalization, intake: intake)
             // Drain the display renderer and publish one final, frozen pair. Late refiner or
             // adjustment requests cannot resurrect an ended session's display.
             displayRenderLock.lock()
