@@ -45,10 +45,12 @@ public enum RestackPlanning {
     public static func encodeMaster(_ report: RestackReport, neutralize: Bool,
                                     metadata: SourceMetadata?, subExposureSeconds: Double) -> Data {
         let balanced = presentationMaster(report, neutralize: neutralize)
-        let totalExp = Double(report.stackedCount) * subExposureSeconds
+        // Parity with the live master: the subs' own EXPTIME wins, the profile is the fallback.
+        let exposure = SourceMetadata.resolvedExposureSeconds(metadata: metadata, fallback: subExposureSeconds)
+        let totalExp = Double(report.stackedCount) * exposure
         return FITSWriter.float32(width: balanced.width, height: balanced.height,
             channels: balanced.channels, pixels: balanced.pixels,
-            metadata: metadata, stackCount: report.stackedCount, totalExposureSeconds: totalExp)
+            metadata: metadata?.metadataForMaster, stackCount: report.stackedCount, totalExposureSeconds: totalExp)
     }
 
     /// The presentation master: report.master cropped to coverage and (optionally) background-neutralized —

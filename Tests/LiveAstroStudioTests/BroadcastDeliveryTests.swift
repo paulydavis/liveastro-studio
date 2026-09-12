@@ -106,7 +106,7 @@ final class BroadcastDeliveryTests: XCTestCase {
             pixels: [0.1, 0.1, 0.1, 0.1], sourceIsLinear: false), stackedCount: 2,
             skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false, coverage: nil)
         model.finishRestack(report, excludedCount: 1, writeResult: .init(ok: true, logMessage: nil),
-                            sessionDir: nil, neutralize: false)
+                            sessionDir: nil, neutralize: false, subExposureSeconds: 60)
         XCTAssertNotEqual(model.broadcastImage?.dataProvider?.data as Data?, old.dataProvider?.data as Data?)
         XCTAssertEqual(model.latestImage?.dataProvider?.data as Data?, model.broadcastImage?.dataProvider?.data as Data?)
     }

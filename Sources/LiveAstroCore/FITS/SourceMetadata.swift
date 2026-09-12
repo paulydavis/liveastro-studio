@@ -25,6 +25,23 @@ public struct SourceMetadata: Equatable {
 
     public init() {}
 
+    /// Exposure usable for integration. Unknown/invalid headers must not contradict a
+    /// profile-derived total in the exported master.
+    public var validExposureSeconds: Double? {
+        guard let e = exposureSeconds, e.isFinite, e > 0 else { return nil }
+        return e
+    }
+
+    public static func resolvedExposureSeconds(metadata: SourceMetadata?, fallback: Double) -> Double {
+        metadata?.validExposureSeconds ?? (fallback.isFinite && fallback > 0 ? fallback : 0)
+    }
+
+    public var metadataForMaster: SourceMetadata {
+        var result = self
+        result.exposureSeconds = validExposureSeconds
+        return result
+    }
+
     public init(fitsKeywords k: [String: String]) {
         func clean(_ key: String) -> String? {
             guard let raw = k[key] else { return nil }
