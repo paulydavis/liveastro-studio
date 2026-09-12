@@ -477,6 +477,44 @@ final class AppModel {
         if let v = p.watchFolder { watchFolder = v }
     }
 
+    // MARK: - What the subs say about themselves
+
+    /// Target and exposure as the subs' own headers state them. Same fields and the same
+    /// `%g` formatting as ImportController and LiveSourceController, so every path that
+    /// detects agrees on what lands in the form. Absent or zero values are left nil so a
+    /// header that carries nothing never blanks a typed value.
+    static func detectedProfile(from meta: SourceMetadata) -> DetectedProfile {
+        var d = DetectedProfile()
+        if let object = meta.object?.trimmingCharacters(in: .whitespacesAndNewlines), !object.isEmpty {
+            d.targetName = object
+        }
+        if let exp = meta.validExposureSeconds { d.subExposureText = String(format: "%g", exp) }
+        return d
+    }
+
+    /// Adopts the subs' own target and exposure into the live profile, OVERWRITING a typed
+    /// value that disagrees — the rule import and the relays already follow. A stale typed
+    /// name is exactly how "M 51" went on the air over NGC 6960 subs, and fill-if-empty would
+    /// have left that case broken. The overwrite is logged with the old value so a name that
+    /// was typed on purpose is never lost silently. Returns true when anything changed.
+    @discardableResult
+    func adoptSourceMetadata(_ meta: SourceMetadata) -> Bool {
+        let d = Self.detectedProfile(from: meta)
+        var changed = false
+        if let t = d.targetName, t != targetName {
+            log.append("Target set from the subs' headers: \(t) (was \(targetName.isEmpty ? "blank" : targetName)).")
+            targetName = t
+            changed = true
+        }
+        if let e = d.subExposureText, Double(e) != Double(subExposureText) {
+            log.append("Sub exposure set from the subs' headers: \(e) s (was \(subExposureText) s).")
+            subExposureText = e
+            changed = true
+        }
+        if changed { saveSettings() }
+        return changed
+    }
+
     // MARK: - Settings persistence
 
     private func currentSettings() -> SessionSettings {
@@ -974,26 +1012,26 @@ final class AppModel {
     /// uncalibrated (resolve-on-first-sub is a documented follow-up). Not CI-testable
     /// (FileManager + pipeline); the pure matcher/scaler/library are unit-tested.
     func resolveCalibration(watchFolder: URL, prefix: String?, excludingPreExisting: WatchFolderInput.Snapshot? = nil)
-        -> (calibrator: Calibrator?, messages: [String], foundMetadata: Bool) {
+        -> (calibrator: Calibrator?, messages: [String], foundMetadata: Bool, metadata: SourceMetadata?) {
         // Old files were explicitly excluded. Even a newly arrived file may still be writing;
         // resolve on the first frame the source actually ingests, using its captured metadata.
         if excludingPreExisting != nil {
             calibrationStatus = statusLine(dark: false, flat: false)
-            return (nil, ["Calibration: matching from the first new sub as it arrives."], false)
+            return (nil, ["Calibration: matching from the first new sub as it arrives."], false, nil)
         }
         // Peek a representative sub already in the folder. If none (empty-folder live
         // start), report foundMetadata: false so the caller attaches the first-sub
         // provider instead — calibration then resolves as the first sub lands.
         guard let meta = representativeMetadata(in: watchFolder, prefix: prefix) else {
             calibrationStatus = statusLine(dark: false, flat: false)
-            return (nil, ["Calibration: no subs yet — matching from the first sub as it arrives."], false)
+            return (nil, ["Calibration: no subs yet — matching from the first sub as it arrives."], false, nil)
         }
         let r = CalibrationResolver.resolve(
             metadata: meta, library: calibrationLibrary, scaleEnabled: scaleDarksAcrossExposures,
             flatsFolder: sessionFlatsFolder, darkFlatsFolder: sessionDarkFlatsFolder,
             legacyDarkPath: calibration.darkPath, legacyFlatPath: calibration.flatPath)
         calibrationStatus = statusLine(dark: r.hasDark, flat: r.hasFlat)
-        return (r.calibrator, r.messages, true)
+        return (r.calibrator, r.messages, true, meta)
     }
 
     /// First-sub calibrator provider for empty-folder starts: the pipeline calls this
@@ -1323,6 +1361,9 @@ final class AppModel {
             let cal = resolveCalibration(
                 watchFolder: folder, prefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
                 excludingPreExisting: excluded)
+            // Use the same peek as calibration, never a second scan whose result can race
+            // it. The first ingested sub is independently delivered through wireCallbacks.
+            if let metadata = cal.metadata { adoptSourceMetadata(metadata) }
             cal.messages.forEach { log.append($0) }
             CalibrationStore.save(calibration, to: userDefaults)
             // Empty folder at Start → resolve calibration from the first sub that lands.
@@ -1498,6 +1539,19 @@ final class AppModel {
         displayedPreviewIntegrationSeconds = nil
         displayedSubExposureSeconds = nil
         latestRecord = nil
+        pipeline.onSourceMetadata = { [weak self, weak pipeline] metadata in
+            Task { @MainActor in
+                guard let self, let pipeline,
+                      self.pipeline === pipeline, self.isRunning,
+                      !self.importer.isGeneratingReplay,
+                      self.currentDisplaySessionID == sessionID else { return }
+                self.sessionSubExposureSeconds = SourceMetadata.resolvedExposureSeconds(
+                    metadata: metadata, fallback: self.sessionSubExposureSeconds)
+                if self.adoptSourceMetadata(metadata) {
+                    self.log.append("The session folder keeps its original name; session metadata now follows the subs' headers.")
+                }
+            }
+        }
         pipeline.onDisplayUpdate = { [weak self, weak pipeline] update in
             guard let pipeline else { return }
             Task { @MainActor in
@@ -1838,7 +1892,9 @@ final class AppModel {
                 subExposureSeconds: sessionSubExposureSeconds)
             await MainActor.run { self.finishRestack(report, excludedCount: excludedCount,
                                                      writeResult: writeResult, sessionDir: sessionDir,
-                                                     neutralize: sessionNeutralizeBackground) }
+                                                     neutralize: sessionNeutralizeBackground,
+                                                     subExposureSeconds: SourceMetadata.resolvedExposureSeconds(
+                                                        metadata: sessionSourceMetadata, fallback: sessionSubExposureSeconds)) }
         }
     }
 
@@ -1893,7 +1949,8 @@ final class AppModel {
     /// basic-stretch confirmation that the restack happened, not a faithful re-render of
     /// the operator's display settings.
     func finishRestack(_ report: RestackReport, excludedCount: Int,
-                               writeResult: RestackMasterWrite, sessionDir: URL?, neutralize: Bool) {
+                               writeResult: RestackMasterWrite, sessionDir: URL?, neutralize: Bool,
+                               subExposureSeconds: Double) {
         guard writeResult.ok else {
             if let m = writeResult.logMessage { log.append(m) }
             // Durable write failed — do NOT report success: leave the offer up, don't touch the
@@ -1922,9 +1979,9 @@ final class AppModel {
             previewCompareImage = cg
             compareHistogram = DisplayHistogram.of(cg)
             displayedCleanMasterSubCount = nil
-            displayedIntegrationSeconds = Double(report.stackedCount) * sessionSubExposureSeconds
+            displayedIntegrationSeconds = Double(report.stackedCount) * subExposureSeconds
             displayedPreviewIntegrationSeconds = displayedIntegrationSeconds
-            displayedSubExposureSeconds = sessionSubExposureSeconds
+            displayedSubExposureSeconds = subExposureSeconds
         }
         if report.skippedMissing > 0 {
             log.append("Re-stack: \(report.skippedMissing) raw sub(s) missing — used the rest.")
@@ -2083,6 +2140,8 @@ final class AppModel {
                 // the exact same calibration the live master used (Fix 1).
                 self.sessionCalibrator = p.effectiveCalibrator
                 self.sessionSourceMetadata = p.capturedSourceMetadata   // stamp re-stacked master.fit like the live one (Fix P1b)
+                self.sessionSubExposureSeconds = SourceMetadata.resolvedExposureSeconds(
+                    metadata: self.sessionSourceMetadata, fallback: self.sessionSubExposureSeconds)
                 // Pending edits die with the session, and nothing from a finished session
                 // lingers on screen.
                 self.setPipeline(nil)

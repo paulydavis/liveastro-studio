@@ -145,6 +145,19 @@ public final class SessionManager {
         if manifest!.filter.isEmpty, let v = meta.filter { manifest!.filter = v }
     }
 
+    /// Called by the serial frame consumer before recording its first metadata-bearing sub.
+    /// The directory/session ID stay stable; subsequent snapshot/final writes persist these
+    /// authoritative fields together with the rest of the manifest.
+    func adoptSourceMetadata(_ meta: SourceMetadata) {
+        guard state == .running, manifest != nil else { return }
+        if let object = meta.object?.trimmingCharacters(in: .whitespacesAndNewlines), !object.isEmpty {
+            manifest!.targetName = object
+        }
+        manifest!.subExposureSeconds = SourceMetadata.resolvedExposureSeconds(
+            metadata: meta, fallback: manifest!.subExposureSeconds)
+        fillMissingMetadata(from: meta)
+    }
+
     /// Atomic write: temp file + rename via Data(.atomic). Crash loses at most the in-flight update (spec §7).
     /// Takes the manifest + directory explicitly so callers can persist a PROPOSED manifest
     /// before committing it to in-memory state (write-then-commit — see startSession/record/end).

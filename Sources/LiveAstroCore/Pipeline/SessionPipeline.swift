@@ -327,9 +327,9 @@ public final class SessionPipeline {
                                 cleanCount: Int?, count: Int, record: SnapshotRecord? = nil) {
         let update = DisplayDelivery(revision: revision, previewImage: preview,
                                      broadcastImage: broadcast, cleanMasterSubCount: cleanCount,
-                                     integrationSeconds: Double(count) * profile.subExposureSeconds,
-                                     previewIntegrationSeconds: preview == nil ? 0 : Double(displayOnline?.count ?? count) * profile.subExposureSeconds,
-                                     subExposureSeconds: profile.subExposureSeconds,
+                                     integrationSeconds: Double(count) * effectiveSubExposureSeconds,
+                                     previewIntegrationSeconds: preview == nil ? 0 : Double(displayOnline?.count ?? count) * effectiveSubExposureSeconds,
+                                     subExposureSeconds: effectiveSubExposureSeconds,
                                      record: record)
         guard isCurrentDisplay(update) else { return }
         displayRenderPhaseProbeForTest?(revision, .deliveryEmitted)
@@ -386,6 +386,8 @@ public final class SessionPipeline {
     /// Same delivery context as onUpdate/onRejected. Watcher mode does not fire this
     /// (no per-sub stacking there).
     public var onSubFrame: ((SubFrameRecord) -> Void)?
+    /// First captured source headers, independent of whether calibration needs resolving.
+    public var onSourceMetadata: ((SourceMetadata) -> Void)?
     private let cancelled = NSLock_Flag()
 
     // MARK: Reentrancy detection (review10 item 4)
@@ -417,7 +419,12 @@ public final class SessionPipeline {
     }
 
     private var processedCount = 0
-    private var sourceMetadata: SourceMetadata?
+    private let sourceMetadataLock = NSLock()
+    private var storedSourceMetadata: SourceMetadata?
+    private var sourceMetadata: SourceMetadata? {
+        get { sourceMetadataLock.withLock { storedSourceMetadata } }
+        set { sourceMetadataLock.withLock { storedSourceMetadata = newValue } }
+    }
     private var lastAutoReseedCount = 0
 
     // MARK: Plate-solve (sub-project 3a)
@@ -994,6 +1001,23 @@ public final class SessionPipeline {
     /// post-session re-stack writes a master with the SAME metadata as the live one, instead
     /// of a bare header (Fix P1b). Nil = no metadata was resolved this session.
     public var capturedSourceMetadata: SourceMetadata? { sourceMetadata }
+
+    /// The exposure every integration figure is built from. The subs' own EXPTIME wins; the
+    /// typed profile is only the fallback for headers that carry none. Before this, master.fit
+    /// took EXPTIME from the header and TOTALEXP from the profile — one file, two answers
+    /// (observed: STACKCNT=2, EXPTIME=300, TOTALEXP=360). Uniform exposure is assumed, as it
+    /// always was; mixed-exposure sessions stay approximate.
+    private var effectiveSubExposureSeconds: Double {
+        SourceMetadata.resolvedExposureSeconds(metadata: sourceMetadata, fallback: profile.subExposureSeconds)
+    }
+
+    /// Both native ingestion paths call this on their serial commit/consume task.
+    private func captureSourceMetadataIfNeeded(_ metadata: SourceMetadata?) {
+        guard sourceMetadata == nil, let metadata else { return }
+        sourceMetadata = metadata
+        session.adoptSourceMetadata(metadata)
+        onSourceMetadata?(metadata)
+    }
     /// Injectable for the master-snapshot atomic swap (FileReplace). Tests substitute a
     /// FileManager whose replace/move throws to prove a prior good master survives a
     /// failed write. Production uses `.default`.
@@ -1213,7 +1237,7 @@ public final class SessionPipeline {
     private func finalizeCommitted(index: Int, sourceName: String, timestamp: Date, metadata: SourceMetadata?, engine: StackEngine) {
         noteFrameProgress()   // cold1 I1: a finalized frame is drain progress
         withCallbackDelivery {
-            if sourceMetadata == nil, let m = metadata { sourceMetadata = m }
+            captureSourceMetadataIfNeeded(metadata)
             attemptPlateSolveIfNeeded(engine: engine)
             processedCount += 1
             bumpPreviewStackRevision()
@@ -1298,7 +1322,7 @@ public final class SessionPipeline {
             let record = try recorder.save(
                 cgImage: broadcastCG, linear: broadcastMean, sourceFile: sourceName,
                 index: index, timestamp: timestamp,
-                estimatedIntegrationSeconds: Double(integrationFrames) * profile.subExposureSeconds)
+                estimatedIntegrationSeconds: Double(integrationFrames) * effectiveSubExposureSeconds)
             try session.recordSnapshot(record)
             lastRenderedAcceptedIndex = index
             deliverDisplay(revision: revision, preview: previewCG, broadcast: broadcastCG,
@@ -1744,7 +1768,7 @@ public final class SessionPipeline {
         withCallbackDelivery {
             if cancelled.isSet { return }
             if sourceMetadata == nil, let m = rawFrame.metadata {
-                sourceMetadata = m
+                captureSourceMetadataIfNeeded(m)
                 // No explicit calibrator (empty-folder live start): resolve one now from
                 // this first frame's header. Once only; serial consume task → no lock.
                 if calibrator == nil, !providerAttempted, let provider = calibratorProvider {
@@ -1899,7 +1923,7 @@ public final class SessionPipeline {
                     let record = try recorder.save(
                         cgImage: broadcastCG, linear: broadcastMean, sourceFile: frame.sourceName,
                         index: engine.acceptedCount, timestamp: frame.timestamp,
-                        estimatedIntegrationSeconds: Double(integrationFrames) * profile.subExposureSeconds)
+                        estimatedIntegrationSeconds: Double(integrationFrames) * effectiveSubExposureSeconds)
                     try session.recordSnapshot(record)
                     deliverDisplay(revision: revision, preview: previewCG, broadcast: broadcastCG,
                                    cleanCount: cleanCount, count: integrationFrames, record: record)
@@ -1945,7 +1969,7 @@ public final class SessionPipeline {
                 let record = try recorder.save(
                     cgImage: cg, linear: linear, sourceFile: update.url.lastPathComponent,
                     index: index, timestamp: Date(),
-                    estimatedIntegrationSeconds: Double(index) * profile.subExposureSeconds)
+                    estimatedIntegrationSeconds: Double(index) * effectiveSubExposureSeconds)
                 try session.recordSnapshot(record)
                 deliverDisplay(revision: revision, preview: cg, broadcast: cg,
                                cleanCount: nil, count: index, record: record)
@@ -2032,14 +2056,14 @@ public final class SessionPipeline {
         let balanced = neutralizeBackground
             ? AutoStretch.neutralizeBackgroundAdditive(master)
             : master
-        let totalExp = Double(frameCount) * profile.subExposureSeconds
-        // THEORETICAL: cross-thread read of sourceMetadata from the idle-safeguard tick; written
-        // once on first frame, safeguard fires only on 30s idle boundaries, so a torn read is
-        // vanishingly unlikely. Left un-locked to avoid burdening the hot consume path.
+        // Read once so the header and its total share the same metadata snapshot.
+        let metadata = sourceMetadata
+        let totalExp = Double(frameCount) * SourceMetadata.resolvedExposureSeconds(
+            metadata: metadata, fallback: profile.subExposureSeconds)
         let data = FITSWriter.float32(
             width: balanced.width, height: balanced.height,
             channels: balanced.channels, pixels: balanced.pixels,
-            metadata: sourceMetadata,
+            metadata: metadata?.metadataForMaster,
             stackCount: frameCount,
             totalExposureSeconds: totalExp)
         let target = dir.appendingPathComponent("master.fit")
