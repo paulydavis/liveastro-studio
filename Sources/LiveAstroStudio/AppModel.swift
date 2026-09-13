@@ -179,6 +179,8 @@ final class AppModel {
     private var displayedIntegrationSeconds: Double?
     private var displayedPreviewIntegrationSeconds: Double?
     private var displayedSubExposureSeconds: Double?
+    private var displayedExposure: ExposureSummary?
+    private var displayedPreviewExposure: ExposureSummary?
     private let displayPresentation = DisplayPresentation()
     var latestRecord: SnapshotRecord?
     var sessionStart: Date?
@@ -423,7 +425,8 @@ final class AppModel {
                 guard let self else { completion(false); return }
                 self.startSession(completion: completion)
             } },
-            saveSettings: { [weak self] in MainActor.assumeIsolated { self?.saveSettings() } }))
+            saveSettings: { [weak self] in MainActor.assumeIsolated { self?.saveSettings() } },
+            isSessionStartPending: { [weak self] in MainActor.assumeIsolated { self?.hasPendingSessionStart ?? false } }))
 
         // Import + post-processing cluster: the shared log/error/session-running
         // seam plus the T3 reads the moved bodies need (stacker engine,
@@ -983,23 +986,23 @@ final class AppModel {
     }
 
     var integrationCaption: String {
+        if latestImage != nil, let exposure = displayedPreviewExposure { return exposure.caption }
         if let seconds = displayedPreviewIntegrationSeconds {
             guard latestImage != nil else { return "waiting for stack…" }
             return IntegrationFormat.caption(seconds: seconds, subSeconds: displayedSubExposureSeconds ?? sessionSubExposureSeconds)
         }
         guard let rec = latestRecord else { return "waiting for first stack…" }
-        return IntegrationFormat.caption(seconds: rec.estimatedIntegrationSeconds,
-                                         subSeconds: profile.subExposureSeconds)
+        return rec.integrationCaption(fallbackSubSeconds: profile.subExposureSeconds)
     }
 
     var broadcastIntegrationCaption: String {
+        if broadcastImage != nil, let exposure = displayedExposure { return exposure.caption }
         if let seconds = displayedIntegrationSeconds {
             guard broadcastImage != nil else { return "waiting for stack…" }
             return IntegrationFormat.caption(seconds: seconds, subSeconds: displayedSubExposureSeconds ?? sessionSubExposureSeconds)
         }
         guard let rec = latestRecord else { return "waiting for first stack…" }
-        return IntegrationFormat.caption(seconds: rec.estimatedIntegrationSeconds,
-                                         subSeconds: profile.subExposureSeconds)
+        return rec.integrationCaption(fallbackSubSeconds: profile.subExposureSeconds)
     }
 
     /// Resolve the session's calibration by reading a representative sub already in
@@ -1173,7 +1176,8 @@ final class AppModel {
     /// What the session can say about its input before any frame is stacked.
     /// `waitingForFirstSub` is a STANDING status, not a transient log line: it is what makes
     /// a filename filter that matches nothing distinguishable from "capture hasn't started".
-    enum SessionInputStatus: Equatable {
+    enum SessionInputStatus: Equatable, Sendable {
+        case preparingBaseline(completed: Int, total: Int)
         case waitingForFirstSub(folder: URL, filter: String?, unmatchedFileCount: Int)
         /// The folder could not be read. Deliberately NOT the same case as an empty folder:
         /// telling an operator to wait for files that can never arrive is the failure this fix exists to end.
@@ -1192,6 +1196,22 @@ final class AppModel {
     private(set) var sessionInputStatus: SessionInputStatus?
     private(set) var pendingSessionStart: PendingSessionStart?
     private var pendingStartCompletion: ((Bool) -> Void)?
+    private var inputPreparationID: UUID?
+    private var inputPreparationTask: Task<Void, Never>?
+    var isPreparingSessionInput: Bool { inputPreparationID != nil }
+    var hasPendingSessionStart: Bool { isPreparingSessionInput || pendingSessionStart != nil }
+
+    func cancelSessionInputPreparation() {
+        guard isPreparingSessionInput else { return }
+        inputPreparationID = nil // retire ownership before the worker can complete
+        inputPreparationTask?.cancel()
+        inputPreparationTask = nil
+        sessionInputStatus = nil
+        let completion = pendingStartCompletion
+        pendingStartCompletion = nil
+        log.append("Start cancelled while preparing the input baseline.")
+        completion?(false)
+    }
 
     /// What a start should do about the folder it was pointed at. Pure, so the decision is
     /// testable on its own — `startSession()` itself needs an app bundle and a live pipeline.
@@ -1280,15 +1300,15 @@ final class AppModel {
             return
         }
         if let excluding {
-            log.append("Ignoring \(excluding.count) subs that were already in the folder; stacking new arrivals only.")
+            log.append("New-arrivals policy selected for \(excluding.count) pre-existing subs; unchanged content will be ignored. Actual exclusions are recorded in the session summary.")
         } else {
             log.append("Stacking \(pending.snapshot.count) subs already in the folder, plus new arrivals.")
         }
         completion(beginSession(excludingPreExisting: excluding))
     }
 
-    /// Clears the standing "waiting" status. Called when a frame has actually been INGESTED —
-    /// not when one is merely discovered, which proves only that a file appeared.
+    /// Clears waiting when the pipeline processes an accepted OR rejected frame,
+    /// not on discovery alone. Callback wiring checks presentation ownership first.
     func noteFrameIngested() {
         if case .waitingForFirstSub = sessionInputStatus { sessionInputStatus = nil }
     }
@@ -1299,7 +1319,11 @@ final class AppModel {
     /// "waiting" status for a filter matching nothing, or report a read failure as a failure.
     /// `beginSession` is the part that actually starts anything.
     func startSession(completion: @escaping (Bool) -> Void = { _ in }) {
-        guard pendingSessionStart == nil else { completion(false); return }
+        guard !hasPendingSessionStart else {
+            log.append("Start is already awaiting input confirmation or baseline preparation.")
+            completion(false)
+            return
+        }
         guard !isRunning else { completion(false); return }
         guard !isRestacking else {
             errorMessage = "Finish the re-stack before starting a session."
@@ -1313,18 +1337,60 @@ final class AppModel {
             completion(false)
             return
         }
-        switch Self.startDecision(folder: folder,
-                                  fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix) {
-        case .failed(let reason):
+        let filter = fileNamePrefix.isEmpty ? nil : fileNamePrefix
+        let id = UUID()
+        inputPreparationID = id
+        pendingStartCompletion = completion
+        sessionInputStatus = .preparingBaseline(completed: 0, total: 0)
+        inputPreparationTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let owner = self
+            let result: Result<WatchFolderInput.Snapshot, Error>
+            do {
+                let snapshot = try WatchFolderInput.snapshot(folder: folder, fileNamePrefix: filter)
+                result = .success(try snapshot.addingContentBaseline(shouldCancel: { Task.isCancelled }) { done, total in
+                    Task { @MainActor in
+                        guard owner?.inputPreparationID == id else { return }
+                        owner?.sessionInputStatus = .preparingBaseline(completed: done, total: total)
+                    }
+                })
+            } catch { result = .failure(error) }
+            await owner?.finishInputPreparation(result, id: id, folder: folder, filter: filter)
+        }
+    }
+
+    private func finishInputPreparation(_ result: Result<WatchFolderInput.Snapshot, Error>,
+                                        id: UUID, folder: URL, filter: String?) {
+        guard inputPreparationID == id else { return }
+        inputPreparationID = nil
+        inputPreparationTask = nil
+        let completion = pendingStartCompletion ?? { _ in }
+        pendingStartCompletion = nil
+        sessionInputStatus = nil
+        guard watchFolder?.standardizedFileURL == folder.standardizedFileURL,
+              (fileNamePrefix.isEmpty ? nil : fileNamePrefix) == filter, sourceMode == .nativeStack else {
+            log.append("Watch folder or filename filter changed during baseline preparation — re-checking the folder.")
+            if watchFolder?.standardizedFileURL == folder.standardizedFileURL, sourceMode == .nativeStack {
+                startSession(completion: completion)
+            } else {
+                completion(false)
+                startSession()
+            }
+            return
+        }
+        switch result {
+        case .failure(let error):
+            let reason = error.localizedDescription
             // A folder that cannot be read is a failure, never "no matching subs found".
             sessionInputStatus = .failed(reason)
-            errorMessage = "Can't read the watch folder: \(reason)"
+            errorMessage = "Can't prepare session input: \(reason)"
             log.append("Start blocked — \(reason)")
             completion(false)
-        case .ask(let snapshot):
+        case .success(let snapshot) where !snapshot.isEmpty:
             pendingSessionStart = PendingSessionStart(snapshot: snapshot)
             pendingStartCompletion = completion
-        case .startWaiting(let status):
+        case .success(let snapshot):
+            let status = SessionInputStatus.waitingForFirstSub(folder: folder, filter: filter,
+                                                               unmatchedFileCount: snapshot.unmatchedFileCount)
             sessionInputStatus = status
             if case .waitingForFirstSub(_, let filter, let unmatched) = status {
                 let where_ = filter.map { "matching “\($0)”" } ?? "in the folder"
@@ -1538,6 +1604,8 @@ final class AppModel {
         displayedIntegrationSeconds = nil
         displayedPreviewIntegrationSeconds = nil
         displayedSubExposureSeconds = nil
+        displayedExposure = nil
+        displayedPreviewExposure = nil
         latestRecord = nil
         pipeline.onSourceMetadata = { [weak self, weak pipeline] metadata in
             Task { @MainActor in
@@ -1590,6 +1658,8 @@ final class AppModel {
                 self.displayedIntegrationSeconds = update.integrationSeconds
                 self.displayedPreviewIntegrationSeconds = update.previewIntegrationSeconds
                 self.displayedSubExposureSeconds = update.subExposureSeconds
+                self.displayedExposure = update.exposure
+                self.displayedPreviewExposure = update.previewExposure
             }
         }
         solveAvailable = false   // new session/pipeline: no solve yet — don't carry a stale gate over
@@ -1613,6 +1683,8 @@ final class AppModel {
         pipeline.onRejected = { [weak self] reason, name in
             onAnyFrame?()
             Task { @MainActor in
+                guard self?.displayPresentation.belongs(to: sessionID) == true else { return }
+                self?.noteFrameIngested()
                 self?.rejectedCount += 1
                 self?.log.append("✗ rejected \(name): \(reason)")
             }
@@ -1864,6 +1936,7 @@ final class AppModel {
             do {
                 report = try RestackCoordinator.restack(
                     subs: survivorSubs, makeEngine: { engine },
+                    fallbackExposureSeconds: sessionSubExposureSeconds,
                     prepare: { sessionCalibrator?.apply($0) ?? $0 })
             } catch let e as RestackError {
                 await MainActor.run {
@@ -1913,7 +1986,7 @@ final class AppModel {
     /// set, background-neutralized (`AutoStretch.neutralizeBackgroundAdditive`) — matching
     /// `SessionPipeline.end()`/`writeMasterSnapshot`, so a re-stack no longer replaces a good
     /// cropped/neutralized master with an uncropped/un-neutralized one.
-    nonisolated private static func writeRestackedMaster(_ report: RestackReport, to sessionDir: URL?,
+    nonisolated static func writeRestackedMaster(_ report: RestackReport, to sessionDir: URL?,
                                      metadata: SourceMetadata?,
                                      neutralize: Bool, subExposureSeconds: Double) -> RestackMasterWrite {
         guard let sessionDir else {
@@ -1926,14 +1999,28 @@ final class AppModel {
                                                 metadata: metadata, subExposureSeconds: subExposureSeconds)
         let target = sessionDir.appendingPathComponent("master.fit")
         let tmp = sessionDir.appendingPathComponent(".restacked-master-\(UUID().uuidString).fit")
+        var masterReplaced = false
         do {
+            let manifestURL = sessionDir.appendingPathComponent("manifest.json")
+            let original = try ManifestCoding.decoder().decode(SessionManifest.self, from: Data(contentsOf: manifestURL))
+            let updated = RestackPlanning.updatingMaster(in: original, report: report,
+                fallbackExposureSeconds: SourceMetadata.resolvedExposureSeconds(metadata: metadata, fallback: subExposureSeconds))
+            let manifestData = try ManifestCoding.encoder().encode(updated)
             try data.write(to: tmp)
             try FileReplace.replaceItem(at: target, withItemAt: tmp)
+            masterReplaced = true
+            try manifestData.write(to: manifestURL, options: .atomic)
+            do { try SessionSummaryMarkdown.write(manifest: updated, to: sessionDir) }
+            catch {
+                return RestackMasterWrite(ok: true, logMessage: "Re-stack: master and manifest updated, but session-summary.md could not be refreshed (\(error)).")
+            }
             return RestackMasterWrite(ok: true, logMessage: nil)
         } catch {
             try? FileManager.default.removeItem(at: tmp)
             return RestackMasterWrite(ok: false,
-                logMessage: "Re-stack: could not write master.fit (\(error)). Master unchanged; re-stack offer left up to retry.")
+                logMessage: masterReplaced
+                    ? "Re-stack: master.fit was replaced, but manifest accounting could not be updated (\(error)). Re-stack again to repair the accounting."
+                    : "Re-stack: could not write master.fit (\(error)). Master unchanged; re-stack offer left up to retry.")
         }
     }
 
@@ -1951,8 +2038,8 @@ final class AppModel {
     func finishRestack(_ report: RestackReport, excludedCount: Int,
                                writeResult: RestackMasterWrite, sessionDir: URL?, neutralize: Bool,
                                subExposureSeconds: Double) {
+        if let message = writeResult.logMessage { log.append(message) }
         guard writeResult.ok else {
-            if let m = writeResult.logMessage { log.append(m) }
             // Durable write failed — do NOT report success: leave the offer up, don't touch the
             // preview, don't log "Re-stacked…". (Fix P2)
             isRestacking = false
@@ -1979,7 +2066,9 @@ final class AppModel {
             previewCompareImage = cg
             compareHistogram = DisplayHistogram.of(cg)
             displayedCleanMasterSubCount = nil
-            displayedIntegrationSeconds = Double(report.stackedCount) * subExposureSeconds
+            displayedExposure = report.exposure ?? .estimated(count: report.stackedCount, seconds: subExposureSeconds)
+            displayedPreviewExposure = displayedExposure
+            displayedIntegrationSeconds = displayedExposure?.totalSeconds
             displayedPreviewIntegrationSeconds = displayedIntegrationSeconds
             displayedSubExposureSeconds = subExposureSeconds
         }

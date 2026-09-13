@@ -21,6 +21,7 @@ public enum RestackError: Error, Equatable {
 /// Result of a successful restack: the rebuilt master plus accounting so the caller
 /// (Task 8) can report what happened without re-deriving it.
 public struct RestackReport {
+    public var exposure: ExposureSummary? = nil
     public let master: AstroImage
     /// `engine.stackFrameCount` after processing — frames actually folded into the
     /// current stack (the seed frame plus every frame that registered against it).
@@ -70,6 +71,7 @@ public enum RestackCoordinator {
     ///   identity so existing callers/tests are unaffected.
     public static func restack(subs: [RestackSub],
                                makeEngine: () -> StackEngine,
+                               fallbackExposureSeconds: Double = 0,
                                prepare: (RawFrame) -> RawFrame = { $0 }) throws -> RestackReport {
         // Stream: load → prepare → process one frame at a time, keeping only a single
         // RawFrame resident. Buffering all survivors first cost gigabytes for 26MP × N.
@@ -77,6 +79,7 @@ public enum RestackCoordinator {
         // so a restack stays byte-identical to a fresh stack of the same survivors (the
         // golden property `testRestackEqualsFreshStackOfSurvivors` pins).
         let engine = makeEngine()
+        engine.configureExposureFallback(fallbackExposureSeconds)
         var loadedCount = 0
         var skippedMissing = 0
         var skippedMismatch = 0
@@ -96,7 +99,11 @@ public enum RestackCoordinator {
                 // Missing / unreadable / corrupt — skipped like the live pipeline logs-and-skips.
                 skippedMissing += 1; continue
             }
-            _ = engine.process(prepare(frame))
+            // Recorded exposure freezes the original fallback. Legacy records are explicitly
+            // reconstructed estimates, even when the reloaded header has an exposure.
+            let exposure = sub.exposure ?? FrameExposure(metadata: nil, fallback:
+                SourceMetadata.resolvedExposureSeconds(metadata: frame.metadata, fallback: fallbackExposureSeconds))
+            _ = engine.processDetailed(prepare(frame), exposure: exposure)
             loadedCount += 1
             // A nil recorded digest is a legacy/unverifiable record (predates content-digest
             // capture, or an old stat-only record): the loader read by path, unverified — the
@@ -113,7 +120,8 @@ public enum RestackCoordinator {
             throw RestackError.belowSeedMinimum(surviving: loadedCount, needed: engine.minimumSeedStars,
                                                 skippedMissing: skippedMissing, skippedMismatch: skippedMismatch)
         }
-        return RestackReport(master: master, stackedCount: engine.stackFrameCount,
+        return RestackReport(exposure: try engine.finalizationState().exposure,
+                             master: master, stackedCount: engine.stackFrameCount,
                              skippedMissing: skippedMissing, skippedMismatch: skippedMismatch,
                              unverifiedLegacy: sawLegacyUnverified, coverage: engine.currentCoverage())
     }

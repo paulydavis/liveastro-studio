@@ -7,7 +7,8 @@ public enum FITSWriter {
                                pixels: [Float], bottomUp: Bool = false,
                                metadata: SourceMetadata? = nil,
                                stackCount: Int? = nil,
-                               totalExposureSeconds: Double? = nil) -> Data {
+                               totalExposureSeconds: Double? = nil,
+                               estimatedExposureFrames: Int? = nil) -> Data {
         precondition(pixels.count == width * height * channels)
         precondition(channels == 1 || channels == 3)
 
@@ -65,6 +66,8 @@ public enum FITSWriter {
         }
         if let n = stackCount { cards.append(card("STACKCNT", "\(n)")) }
         if let t = totalExposureSeconds { cards.append(card("TOTALEXP", trim(t))) }
+        // Project-defined provenance: number of contributing subs with estimated exposure.
+        if let count = estimatedExposureFrames, count > 0 { cards.append(card("EXPEST", "\(count)")) }
         cards.append("HISTORY Stacked by LiveAstro Studio".padding(toLength: 80, withPad: " ", startingAt: 0))
         // Note: BAYERPAT intentionally omitted — the RGB master is already debayered.
 

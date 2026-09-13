@@ -474,10 +474,33 @@ public final class StackFileWatcher {
         return min(max(value, 0.01), 3600)
     }
 
+    private let excludedInput: WatchFolderInput.Snapshot?
+    // Session-scoped, not generation-scoped: a folder re-arm or identical replacement
+    // must not inflate the count of original exclusions on every poll.
+    private var reportedExclusions: Set<String> = []
+    internal var onPreExistingExcluded: ((StackUpdate) -> Void)?
+
+    private func exclusionDigest(name: String, identity: FileIdentity) -> String? {
+        guard let excludedInput, excludedInput.covers(folder: folder, fileNamePrefix: fileNamePrefix),
+              let recorded = excludedInput.existing[name], recorded.size == identity.size else { return nil }
+        return recorded.digest
+    }
+
+    private func excludeRecordedInput(name: String, url: URL, identity: FileIdentity) -> Bool {
+        guard let excludedInput, excludedInput.covers(folder: folder, fileNamePrefix: fileNamePrefix),
+              excludedInput.recordedUnchanged(name: name, identity: identity) else { return false }
+        if reportedExclusions.insert(name).inserted {
+            onPreExistingExcluded?(StackUpdate(url: url, fileSize: identity.size, identity: identity))
+        }
+        return true
+    }
+
     public init(folder: URL, quietPeriod: TimeInterval = 0.5, pollInterval: TimeInterval = 2.0,
                 fileNamePrefix: String? = nil,
-                digestPolicy: DigestPolicy = .mutableStackerOutput) {
+                digestPolicy: DigestPolicy = .mutableStackerOutput,
+                excludingPreExisting: WatchFolderInput.Snapshot? = nil) {
         self.folder = folder
+        self.excludedInput = excludingPreExisting
         // Review10 item 7: hostile timing values are clamped/defaulted, never trusted into
         // UInt64/DispatchTime conversions (see sanitizedInterval).
         self.quietPeriod = Self.sanitizedInterval(quietPeriod, default: 0.5)
@@ -654,7 +677,7 @@ public final class StackFileWatcher {
             self?.teardown()
             done.signal()
         }
-        if done.wait(timeout: .now() + timeout) == .timedOut {
+        if done.wait(timeout: .deadline(after: timeout)) == .timedOut {
             onLog?("watcher stop timed out behind a stalled read — abandoning the scan; descriptors close via cancel handlers")
         }
     }
@@ -777,7 +800,8 @@ public final class StackFileWatcher {
                     _digestComputations += 1
                     var obs = Self.readContentObservation(
                         handle: handle, name: n, url: u, kind: k, identity: id, isFITS: isFITS,
-                        stopFlag: stopRequested, seam: beforeContentReadForTesting)
+                        stopFlag: stopRequested, seam: beforeContentReadForTesting,
+                        exclusionDigest: exclusionDigest(name: n, identity: id))
                     try? handle.close()
                     if stopRequested.isSet { return }
                     obs.observedAtNanos = monotonicNowNanos()
@@ -846,7 +870,15 @@ public final class StackFileWatcher {
         guard let handle = Self.openFile(directoryFD: folderFD, name: name) else {
             return invalidDecision()
         }
-        guard let observed = Self.statFile(handle), observed.size > 0 else {
+        guard let observed = Self.statFile(handle) else {
+            try? handle.close()
+            return invalidDecision()
+        }
+        if excludeRecordedInput(name: name, url: url, identity: observed) {
+            try? handle.close()
+            return invalidDecision() // no header validation, content read or emission
+        }
+        guard observed.size > 0 else {
             try? handle.close()
             return invalidDecision()
         }
@@ -885,11 +917,13 @@ public final class StackFileWatcher {
         _digestComputations += 1
         let stopFlag = stopRequested
         let seam = beforeContentReadForTesting   // capture on the serial queue; run it on the reader queue
+        let baseline = exclusionDigest(name: name, identity: identity)
         readerQueue.async { [weak self] in
             defer { try? handle.close() }
             let observation = Self.readContentObservation(
                 handle: handle, name: name, url: url, kind: kind,
-                identity: identity, isFITS: isFITS, stopFlag: stopFlag, seam: seam)
+                identity: identity, isFITS: isFITS, stopFlag: stopFlag, seam: seam,
+                exclusionDigest: baseline)
             guard let self else { return }
             self.queue.async { [weak self] in
                 self?.integrateCompletedRead(name: name, observation: observation, generation: generation)
@@ -903,12 +937,23 @@ public final class StackFileWatcher {
     /// genuine failure simply retries on a later poll (identical to the old inline behavior).
     static func readContentObservation(
         handle: FileHandle, name: String, url: URL, kind: WatcherEntryKind,
-        identity: FileIdentity, isFITS: Bool, stopFlag: NSLock_Flag, seam: (() -> Void)?
+        identity: FileIdentity, isFITS: Bool, stopFlag: NSLock_Flag, seam: (() -> Void)?,
+        exclusionDigest: String? = nil
     ) -> FileObservation {
         func obs(_ outcome: ObservationOutcome) -> FileObservation {
             FileObservation(name: name, url: url, kind: kind, outcome: outcome)
         }
-        if isFITS {
+        // Baseline candidates must be compared even if not decodable (e.g. a partial
+        // FITS at Start). Matching bytes are an exclusion, never permission to decode.
+        // Other inputs retain the cheap header-validation-before-hashing path.
+        var comparedDigest: String?
+        if exclusionDigest != nil {
+            seam?()
+            guard let digest = FileIdentity.contentDigest(
+                handle: handle, size: identity.size, shouldAbort: { stopFlag.isSet }) else { return obs(.invalid) }
+            comparedDigest = digest
+        }
+        if isFITS && (comparedDigest == nil || comparedDigest != exclusionDigest) {
             guard let head = try? Self.readHead(
                     handle, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
                   let header = try? FITSReader.readHeader(head),
@@ -916,8 +961,8 @@ public final class StackFileWatcher {
                 return obs(.invalid)
             }
         }
-        seam?()   // test seam: block HERE (reader queue) to simulate a hung read — the serial queue stays free
-        guard let digest = FileIdentity.contentDigest(
+        if comparedDigest == nil { seam?() } // simulate a hung content read without blocking the serial queue
+        guard let digest = comparedDigest ?? FileIdentity.contentDigest(
                 handle: handle, size: identity.size, shouldAbort: { stopFlag.isSet }) else {
             return obs(.invalid)
         }
@@ -1005,11 +1050,13 @@ public final class StackFileWatcher {
                         outcome: .rejected)))
                     return
                 }
-                continuation.yield(StackUpdate(
-                    url: intent.candidate.url,
-                    fileSize: intent.candidate.byteCount,
-                    identity: intent.candidate.identity.withDigest(intent.candidate.digest)))
-                _emitted += 1
+                let identity = intent.candidate.identity.withDigest(intent.candidate.digest)
+                if !excludeRecordedInput(name: intent.candidate.url.lastPathComponent,
+                                         url: intent.candidate.url, identity: identity) {
+                    continuation.yield(StackUpdate(url: intent.candidate.url,
+                        fileSize: intent.candidate.byteCount, identity: identity))
+                    _emitted += 1
+                }
                 let followupEffects = reducer.reduce(.emissionFinished(EmissionResult(
                     intent: intent,
                     outcome: .yielded)))

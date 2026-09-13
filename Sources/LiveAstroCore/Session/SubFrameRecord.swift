@@ -42,14 +42,17 @@ public struct SubFrameRecord: Codable, Equatable {
     /// key as nil) — such subs re-stack unverified, exactly as before. A record whose `digest` is
     /// nil (legacy stat-only) also re-stacks unverified. Not a `sub-frames.csv` column (internal).
     public var identity: FileIdentity?
+    public var exposure: FrameExposure? = nil
 
     public init(index: Int, timestamp: Date, sourceFile: String, starCount: Int,
                 backgroundSigma: Float, weight: Float, outcome: SubFrameOutcome,
-                rejectionReason: String?, rejectedByUser: Bool, identity: FileIdentity? = nil) {
+                rejectionReason: String?, rejectedByUser: Bool, identity: FileIdentity? = nil,
+                exposure: FrameExposure? = nil) {
         self.index = index; self.timestamp = timestamp; self.sourceFile = sourceFile
         self.starCount = starCount; self.backgroundSigma = backgroundSigma
         self.weight = weight; self.outcome = outcome
         self.rejectionReason = rejectionReason; self.rejectedByUser = rejectedByUser
         self.identity = identity
+        self.exposure = exposure
     }
 }

@@ -37,8 +37,8 @@ public enum WatchFolderInput {
     public struct Snapshot: Sendable, Equatable {
         public let folder: URL
         public let fileNamePrefix: String?
-        /// name → stat identity at snapshot time (no content digest: hashing a folder of
-        /// 26 MP subs at Start would cost seconds of I/O for a question stat already answers).
+        /// name → identity at snapshot time. The app adds a content baseline off-main
+        /// before asking about exclusion; stat-only snapshots remain usable by older callers.
         public let existing: [String: FileIdentity]
         /// Files present that the filter rejected. Non-zero with an empty `existing` is the
         /// prefix-typo tell — "23 files present, none match `Light_`".
@@ -46,6 +46,37 @@ public enum WatchFolderInput {
 
         public var isEmpty: Bool { existing.isEmpty }
         public var count: Int { existing.count }
+
+        /// Content baseline work runs off the main actor; callers may cancel between chunks.
+        public func addingContentBaseline(shouldCancel: @escaping () -> Bool = { false },
+                                          progress: (Int, Int) -> Void = { _, _ in }) throws -> Snapshot {
+            var recorded: [String: FileIdentity] = [:]
+            progress(0, count)
+            for name in existing.keys.sorted() {
+                if shouldCancel() { throw CancellationError() }
+                let url = folder.appendingPathComponent(name)
+                guard let expected = existing[name],
+                      let handle = try? FileHandle(forReadingFrom: url) else {
+                    throw SnapshotFailure(folder: folder, reason: "cannot read \(name) for input baseline")
+                }
+                defer { try? handle.close() }
+                var before = Darwin.stat(), after = Darwin.stat()
+                guard fstat(handle.fileDescriptor, &before) == 0, expected.matches(stat: before) else {
+                    throw SnapshotFailure(folder: folder, reason: "\(name) changed while preparing input baseline; retry Start")
+                }
+                let digest = FileIdentity.contentDigest(handle: handle, size: expected.size, shouldAbort: shouldCancel)
+                if shouldCancel() { throw CancellationError() }
+                guard let digest, fstat(handle.fileDescriptor, &after) == 0, expected.matches(stat: after),
+                      let current = FileIdentity.capture(url: url), recordedUnchanged(name: name, identity: current) else {
+                    throw SnapshotFailure(folder: folder, reason: "could not establish a stable input baseline for \(name); retry Start")
+                }
+                recorded[name] = expected.withDigest(digest)
+                progress(recorded.count, count)
+            }
+            if shouldCancel() { throw CancellationError() }
+            return Snapshot(folder: folder, fileNamePrefix: fileNamePrefix, existing: recorded,
+                            unmatchedFileCount: unmatchedFileCount)
+        }
 
         /// True when this snapshot still describes the given selection. The confirmation is
         /// answered later; if the operator changed folder or filter meanwhile, this snapshot
@@ -56,19 +87,29 @@ public enum WatchFolderInput {
             return self.folder.standardizedFileURL == folder.standardizedFileURL && mine == theirs
         }
 
-        /// True only when `identity` is the SAME file version this snapshot recorded.
+        /// True for the same stat version, or matching content despite identity churn.
         ///
-        /// Comparison is over dev/ino/size/mtime — it detects CHANGE, which is not the same
-        /// as detecting every ongoing write. A sub that was mid-write at snapshot time is
-        /// stacked because growing moves its size and mtime; a write that leaves every stat
-        /// field identical is indistinguishable from no write at all and stays excluded.
-        /// A missing identity is never treated as a match: unprovable means stack it.
+        /// The cheap path compares dev/ino/size/mtime. If they differ, both full digests
+        /// must agree, as well as the size. Growing files and changed bytes are new input.
+        /// A write that preserves ALL stat fields remains invisible to the cheap path;
+        /// this is the same immutable-after-publication assumption as the native watcher.
+        /// Missing identity/digest is never guessed equal.
         public func recordedUnchanged(name: String, identity: FileIdentity?) -> Bool {
             guard let recorded = existing[name], let identity else { return false }
-            return recorded.dev == identity.dev && recorded.ino == identity.ino
+            let sameStat = recorded.dev == identity.dev && recorded.ino == identity.ino
                 && recorded.size == identity.size
                 && recorded.mtimeSec == identity.mtimeSec
                 && recorded.mtimeNsec == identity.mtimeNsec
+            if sameStat { return true }
+            // A zero-length file has exactly one possible byte sequence. No read is
+            // needed to certify its identity churn against a verified empty baseline.
+            if recorded.size == 0, identity.size == 0,
+               recorded.digest == FileIdentity.contentDigest(data: Data()) { return true }
+            // Same name and size alone are never evidence of equality. Only a baseline
+            // digest captured from the old version can certify identity churn.
+            guard recorded.size == identity.size, let baseline = recorded.digest,
+                  let observed = identity.digest else { return false }
+            return baseline == observed
         }
     }
 

@@ -463,8 +463,9 @@ final class LiveGlobalRejectionTests: XCTestCase {
     /// This test drives the SAME 5 fixture subs (read via the real `FolderFrameSource(.live)`
     /// path, matching the golden generation exactly) through the CURRENT (head) build with the
     /// live-rejection feature never enabled, and asserts the written `master.fit` is byte-for-byte
-    /// identical to the golden fixture — proving the feature-OFF online path is unchanged.
-    func testFeatureOffMasterIsByteIdenticalToPreBranchGolden() throws {
+    /// identical to the golden fixture apart from the explicit EXPEST provenance added for
+    /// its headerless subs. Pixel bytes and every pre-existing header card remain pinned.
+    func testFeatureOffPixelsAndExistingHeaderMatchPreBranchGolden() throws {
         guard let fixturesDir = Bundle.module.resourceURL?.appendingPathComponent("Fixtures") else {
             return XCTFail("test bundle missing Fixtures resources")
         }
@@ -496,7 +497,24 @@ final class LiveGlobalRejectionTests: XCTestCase {
         let dir = try pipeline.end()
         let writtenData = try Data(contentsOf: dir.appendingPathComponent("master.fit"))
         let goldenData = try Data(contentsOf: goldenURL)
-        XCTAssertEqual(writtenData, goldenData,
-                       "feature-OFF master.fit must be byte-identical to the pre-branch golden fixture")
+        let writtenHeader = try FITSReader.readHeader(writtenData)
+        let goldenHeader = try FITSReader.readHeader(goldenData)
+        XCTAssertEqual(writtenHeader.keywords["EXPEST"], "5")
+        // Remove ONLY the intentional provenance card, preserving every byte of all other
+        // cards (including spacing/order/HISTORY), then compare the original header prefix.
+        func cards(_ data: Data, headerBytes: Int) -> [Data] {
+            var result: [Data] = []
+            for offset in stride(from: 0, to: headerBytes, by: 80) {
+                let card = data.subdata(in: offset..<(offset + 80))
+                let key = String(decoding: card.prefix(8), as: UTF8.self).trimmingCharacters(in: .whitespaces)
+                if key != "EXPEST" { result.append(card) }
+                if key == "END" { break }
+            }
+            return result
+        }
+        XCTAssertEqual(cards(writtenData, headerBytes: writtenHeader.headerBytes),
+                       cards(goldenData, headerBytes: goldenHeader.headerBytes))
+        XCTAssertEqual(writtenData.dropFirst(writtenHeader.headerBytes), goldenData.dropFirst(goldenHeader.headerBytes),
+                       "feature-OFF pixel bytes remain pinned to the untouched pre-branch golden")
     }
 }

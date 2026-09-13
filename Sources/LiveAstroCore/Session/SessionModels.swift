@@ -21,6 +21,12 @@ public struct SessionProfile: Codable, Equatable {
 }
 
 public struct SnapshotRecord: Codable, Equatable {
+    public var exposure: ExposureSummary? = nil
+    public func integrationCaption(fallbackSubSeconds: Double) -> String {
+        if let exposure { return exposure.caption }
+        return IntegrationFormat.caption(seconds: estimatedIntegrationSeconds, frames: index,
+                                         subSeconds: fallbackSubSeconds) + " (estimated; legacy accounting)"
+    }
     public let index: Int
     public let timestamp: Date
     public let sourceFile: String
@@ -34,7 +40,8 @@ public struct SnapshotRecord: Codable, Equatable {
 
     public init(index: Int, timestamp: Date, sourceFile: String, snapshotFile: String,
                 estimatedIntegrationSeconds: Double, width: Int, height: Int,
-                mean: Double, median: Double, stddev: Double) {
+                mean: Double, median: Double, stddev: Double, exposure: ExposureSummary? = nil) {
+        self.exposure = exposure
         self.index = index; self.timestamp = timestamp
         self.sourceFile = sourceFile; self.snapshotFile = snapshotFile
         self.estimatedIntegrationSeconds = estimatedIntegrationSeconds
@@ -50,13 +57,15 @@ public enum MasterOutcome: String, Codable, Equatable {
 }
 
 public struct SessionFinalizationFacts: Codable, Equatable {
+    public var exposure: ExposureSummary? = nil
     public let masterOutcome: MasterOutcome
     public let stackFrameCount: Int
     public let sessionAcceptedCount: Int
     public let sessionRejectedCount: Int
 
     public init(masterOutcome: MasterOutcome, stackFrameCount: Int,
-                sessionAcceptedCount: Int, sessionRejectedCount: Int) {
+                sessionAcceptedCount: Int, sessionRejectedCount: Int, exposure: ExposureSummary? = nil) {
+        self.exposure = exposure
         self.masterOutcome = masterOutcome
         self.stackFrameCount = stackFrameCount
         self.sessionAcceptedCount = sessionAcceptedCount
@@ -65,6 +74,8 @@ public struct SessionFinalizationFacts: Codable, Equatable {
 }
 
 public struct SessionManifest: Codable, Equatable {
+    public var exposure: ExposureSummary? = nil
+    public var importFrameExposures: [ImportedFrameExposure]? = nil
     public let sessionId: String
     public var targetName: String
     public var startTime: Date
@@ -133,13 +144,14 @@ public struct SessionManifest: Codable, Equatable {
                 masterOutcome: masterOutcome,
                 stackFrameCount: stackFrameCount,
                 sessionAcceptedCount: sessionAcceptedCount,
-                sessionRejectedCount: sessionRejectedCount)
+                sessionRejectedCount: sessionRejectedCount, exposure: exposure)
         }
         set {
             masterOutcome = newValue?.masterOutcome
             stackFrameCount = newValue?.stackFrameCount
             sessionAcceptedCount = newValue?.sessionAcceptedCount
             sessionRejectedCount = newValue?.sessionRejectedCount
+            exposure = newValue?.exposure
         }
     }
 }

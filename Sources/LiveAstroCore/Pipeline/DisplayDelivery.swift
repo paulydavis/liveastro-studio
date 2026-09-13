@@ -12,6 +12,8 @@ public struct DisplayDelivery {
     public let previewIntegrationSeconds: Double
     public let subExposureSeconds: Double
     public let record: SnapshotRecord?
+    public var exposure: ExposureSummary? = nil
+    public var previewExposure: ExposureSummary? = nil
 }
 
 /// Main-actor delivery boundary shared by the app and integration tests.

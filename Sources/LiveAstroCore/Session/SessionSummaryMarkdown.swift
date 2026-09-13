@@ -19,7 +19,12 @@ public enum SessionSummaryMarkdown {
         lines.append(row("Target", valueOrDash(manifest.targetName)))
         lines.append(row("Started", format(manifest.startTime)))
         lines.append(row("Ended", manifest.endTime.map(format) ?? "—"))
-        lines.append(row("Sub exposure", formatSeconds(manifest.subExposureSeconds)))
+        if let exposure = manifest.exposure {
+            lines.append(row("Sub exposure", exposure.uniformSeconds.map(formatSeconds) ?? "mixed"))
+            lines.append(row("Estimated-exposure subs", "\(exposure.estimatedFrameCount)"))
+        } else {
+            lines.append(row("Sub exposure", formatSeconds(manifest.subExposureSeconds)))
+        }
         lines.append(row("Snapshots", "\(manifest.snapshots.count)"))
         lines.append("")
         lines.append("## Equipment and site")
@@ -42,13 +47,16 @@ public enum SessionSummaryMarkdown {
         lines.append("| --- | --- |")
         lines.append(row("Master expected", manifest.masterExpected.map { $0 ? "yes" : "no" } ?? "unknown"))
         lines.append(row("Master outcome", manifest.masterOutcome?.rawValue ?? "unknown"))
-        if let stackFrameCount = manifest.stackFrameCount {
+        if let exposure = manifest.exposure {
+            lines.append(row("Current-stack frames", "\(exposure.frameCount)"))
+            lines.append(row("Current-stack integration", exposure.caption))
+        } else if let stackFrameCount = manifest.stackFrameCount {
             let integration = Double(stackFrameCount) * manifest.subExposureSeconds
             lines.append(row("Current-stack frames", "\(stackFrameCount)"))
             lines.append(row("Current-stack integration",
                              IntegrationFormat.caption(seconds: integration,
                                                        frames: stackFrameCount,
-                                                       subSeconds: manifest.subExposureSeconds)))
+                                                       subSeconds: manifest.subExposureSeconds) + " (estimated; legacy accounting)"))
         } else {
             lines.append(row("Current-stack frames", "unknown"))
         }

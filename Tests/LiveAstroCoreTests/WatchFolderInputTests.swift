@@ -13,6 +13,147 @@ import XCTest
 ///   * exclusion by IDENTITY, so a file that changed after the snapshot is still stacked.
 final class WatchFolderInputTests: XCTestCase {
 
+    func testInfiniteShutdownBudgetDoesNotTrap() {
+        let source = FolderFrameSource(folder: FileManager.default.temporaryDirectory, mode: .live)
+        source.stop(timeout: .infinity)
+    }
+
+    func testRunningSourceHandlesNonFiniteAndHugeShutdownBudgets() throws {
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        for budget in [Double.infinity, Double.greatestFiniteMagnitude, .nan, -.infinity, -1, 0] {
+            let source = FolderFrameSource(folder: dir, mode: .live)
+            try source.start()
+            let started = Date()
+            source.stop(timeout: budget)
+            XCTAssertLessThan(Date().timeIntervalSince(started), 1, "empty source must stop promptly: \(budget)")
+            if budget > 0 { XCTAssertTrue(source.intakeSnapshot.accountingComplete) }
+            source.stop(timeout: 1) // retire any asynchronous teardown for zero budgets
+        }
+    }
+
+    func testBaselineCancelsBetweenContentChunks() throws {
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        try writeFITS(dir, name: "Light_large.fit", value: 0.2, width: 4096)
+        let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_")
+        var checks = 0
+        XCTAssertThrowsError(try snapshot.addingContentBaseline(shouldCancel: {
+            checks += 1
+            return checks >= 3 // first check is before open, second precedes the first chunk
+        })) { XCTAssertTrue($0 is CancellationError) }
+        XCTAssertGreaterThanOrEqual(checks, 3, "cancellation occurred inside the content read")
+    }
+
+    func testBaselineRejectsMutationDuringContentRead() throws {
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let file = try writeFITS(dir, name: "Light_large.fit", value: 0.2, width: 4096)
+        let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_")
+        var checks = 0, mutated = false
+        var writeError: Error?
+        XCTAssertThrowsError(try snapshot.addingContentBaseline(shouldCancel: {
+            checks += 1
+            if checks == 3 {
+                do {
+                    let handle = try FileHandle(forWritingTo: file)
+                    defer { try? handle.close() }
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: Data([0]))
+                    mutated = true
+                } catch { writeError = error }
+            }
+            return false
+        })) { XCTAssertTrue($0 is WatchFolderInput.SnapshotFailure) }
+        XCTAssertNil(writeError)
+        XCTAssertTrue(mutated, "fixture changed after the first chunk, not before hashing")
+    }
+
+    func testBaselineRejectsDisappearanceBetweenFiles() throws {
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        try writeFITS(dir, name: "Light_a.fit", value: 0.2)
+        let second = try writeFITS(dir, name: "Light_b.fit", value: 0.3)
+        let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_")
+        XCTAssertThrowsError(try snapshot.addingContentBaseline(progress: { done, _ in
+            if done == 1 { try? FileManager.default.removeItem(at: second) }
+        }))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: second.path))
+    }
+
+    func testEmptyPreExistingFileIsCountedAsExcluded() async throws {
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        try Data().write(to: dir.appendingPathComponent("Light_empty.fit"))
+        let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_").addingContentBaseline()
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_", excludingPreExisting: snapshot)
+        try source.start()
+        _ = await framesDelivered(from: source, within: 3)
+        XCTAssertEqual(source.intakeSnapshot.excludedPreExisting, 1)
+    }
+
+    func testIdenticalInvalidAndEmptyReplacementsRemainAccounted() async throws {
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let empty = dir.appendingPathComponent("Light_empty.fit")
+        let invalid = dir.appendingPathComponent("Light_invalid.fit")
+        try Data().write(to: empty)
+        try Data("not a FITS header".utf8).write(to: invalid)
+        let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_").addingContentBaseline()
+        for url in [empty, invalid] { try Data(contentsOf: url).write(to: url, options: .atomic) }
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_", excludingPreExisting: snapshot)
+        try source.start()
+        let delivered = await framesDelivered(from: source, within: 5)
+        XCTAssertTrue(delivered.isEmpty)
+        XCTAssertEqual(source.intakeSnapshot.excludedPreExisting, 2)
+        XCTAssertEqual(source.intakeSnapshot.admitted, 2)
+        XCTAssertEqual(source.intakeSnapshot.unprocessedAtShutdown, 0)
+    }
+
+    func testBaselineIdenticalReplacementStaysExcluded() async throws {
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let old = try writeFITS(dir, name: "Light_old.fit", value: 0.2)
+        let bytes = try Data(contentsOf: old)
+        let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_").addingContentBaseline()
+        try bytes.write(to: old, options: .atomic)
+        XCTAssertNotEqual(snapshot.existing["Light_old.fit"]?.ino, FileIdentity.capture(url: old)?.ino)
+        try writeFITS(dir, name: "Light_new.fit", value: 0.3)
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_", excludingPreExisting: snapshot)
+        try source.start()
+        let delivered = await framesDelivered(from: source, within: 5)
+        XCTAssertEqual(delivered, ["Light_new.fit"])
+        XCTAssertEqual(source.intakeSnapshot.excludedPreExisting, 1)
+        XCTAssertEqual(try Data(contentsOf: old), bytes)
+    }
+
+    func testBaselineChangedSameSizeContentIsNotExcluded() async throws {
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        try writeFITS(dir, name: "Light_old.fit", value: 0.2)
+        let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_").addingContentBaseline()
+        try writeFITS(dir, name: "Light_old.fit", value: 0.4)
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_", excludingPreExisting: snapshot)
+        try source.start()
+        let delivered = await framesDelivered(from: source, within: 5)
+        XCTAssertEqual(delivered, ["Light_old.fit"])
+        XCTAssertEqual(source.intakeSnapshot.excludedPreExisting, 0)
+    }
+
+    func testBaselineCannotCertifyAChangedOrCancelledSnapshot() throws {
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let file = try writeFITS(dir, name: "Light_old.fit", value: 0.2)
+        let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_")
+        XCTAssertThrowsError(try snapshot.addingContentBaseline(shouldCancel: { true }))
+        try Data(contentsOf: file).write(to: file, options: .atomic)
+        XCTAssertThrowsError(try snapshot.addingContentBaseline())
+    }
+
+    func testExcludedFilesBypassWatcherContentReads() async throws {
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        try writeFITS(dir, name: "Light_old.fit", value: 0.2)
+        let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_").addingContentBaseline()
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_", excludingPreExisting: snapshot)
+        let reads = NameBox()
+        source.beforeStartCommit = { watcher in watcher.beforeContentReadForTesting = { reads.append("read") } }
+        try source.start()
+        _ = await framesDelivered(from: source, within: 5)
+        XCTAssertEqual(reads.all.count, 0, "excluded unchanged files must not validate or hash again")
+        XCTAssertEqual(source.intakeSnapshot.excludedPreExisting, 1, "early exclusion remains accounted")
+    }
+
     private func makeTempDir() throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

@@ -25,21 +25,25 @@ final class MasterExposureConsistencyTests: XCTestCase {
             .write(to: dir.appendingPathComponent(name))
     }
 
-    private func runImport(headerExposure: Double?, profileExposure: Double) throws -> (header: FITSHeader, manifest: SessionManifest) {
+    private func runImport(headerExposure: Double?, profileExposure: Double, exposures: [Double?]? = nil,
+                           calibrated: Bool = false) throws -> (header: FITSHeader, manifest: SessionManifest) {
         let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let subs = sandbox.appendingPathComponent("subs")
         try FileManager.default.createDirectory(at: subs, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: sandbox) }
-        try writeSub(subs, "Light_001.fit", dx: 0, exposure: headerExposure)
-        try writeSub(subs, "Light_002.fit", dx: 1.5, exposure: headerExposure)
-        try writeSub(subs, "Light_003.fit", dx: 3.0, exposure: headerExposure)
+        let values = exposures ?? [headerExposure, headerExposure, headerExposure]
+        try writeSub(subs, "Light_001.fit", dx: 0, exposure: values[0])
+        try writeSub(subs, "Light_002.fit", dx: 1.5, exposure: values[1])
+        try writeSub(subs, "Light_003.fit", dx: 3.0, exposure: values[2])
 
         let profile = SessionProfile(targetName: "Typed", telescope: "T", camera: "C", mount: "M",
                                      filter: "F", locationLabel: "L", bortle: 5,
                                      subExposureSeconds: profileExposure, notes: "")
         let source = FolderFrameSource(folder: subs, mode: .importOnce, fileNamePrefix: "Light_")
         let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
-                                       profile: profile, rootDirectory: sandbox.appendingPathComponent("sessions"))
+                                       profile: profile, rootDirectory: sandbox.appendingPathComponent("sessions"),
+                                       calibrator: calibrated ? Calibrator(dark: nil, flat: AstroImage(width: 256, height: 256,
+                                           channels: 1, pixels: [Float](repeating: 1, count: 256 * 256), sourceIsLinear: true)) : nil)
         let processed = DispatchSemaphore(value: 0)
         pipeline.onImportProgress = { count, _, _, _ in if count == 3 { processed.signal() } }
         try pipeline.start()
@@ -55,6 +59,31 @@ final class MasterExposureConsistencyTests: XCTestCase {
         XCTAssertEqual(snapshotHeader.keywords["EXPTIME"], header.keywords["EXPTIME"])
         XCTAssertEqual(snapshotHeader.keywords["TOTALEXP"], header.keywords["TOTALEXP"])
         return (header, manifest)
+    }
+
+    func testMixedExposuresSumContributingFrames() throws {
+        let r = try runImport(headerExposure: nil, profileExposure: 180, exposures: [30, 300, 300])
+        XCTAssertEqual(Double(r.header.keywords["TOTALEXP"] ?? ""), 630)
+        XCTAssertNil(r.header.keywords["EXPTIME"], "a mixed stack has no single sub exposure")
+        XCTAssertEqual(r.manifest.snapshots.last?.estimatedIntegrationSeconds, 630)
+        XCTAssertEqual(r.manifest.subExposureSeconds, 0, "legacy scalar must not assert 30s for a mixed stack")
+        XCTAssertEqual(r.manifest.exposure?.frameCount, 3)
+        XCTAssertEqual(r.manifest.snapshots.last?.integrationCaption(fallbackSubSeconds: 180), "10m 30s · 3 subs")
+    }
+
+    func testCalibratedImportPreservesOriginalHeaderExposures() throws {
+        let r = try runImport(headerExposure: nil, profileExposure: 20, exposures: [30, 300, 300], calibrated: true)
+        XCTAssertEqual(Double(r.header.keywords["TOTALEXP"] ?? ""), 630)
+        XCTAssertEqual(r.manifest.exposure?.estimatedFrameCount, 0)
+    }
+
+    func testMissingFirstExposureFallsBackForThatFrameOnly() throws {
+        let r = try runImport(headerExposure: nil, profileExposure: 20, exposures: [nil, 300, 300])
+        XCTAssertEqual(Double(r.header.keywords["TOTALEXP"] ?? ""), 620)
+        XCTAssertEqual(r.manifest.snapshots.last?.estimatedIntegrationSeconds, 620)
+        XCTAssertEqual(Int(r.header.keywords["EXPEST"] ?? ""), 1, "FITS must disclose the fallback frame")
+        XCTAssertEqual(r.manifest.exposure?.estimatedFrameCount, 1)
+        XCTAssertEqual(r.manifest.importFrameExposures?.map(\.exposure.seconds), [20, 300, 300])
     }
 
     /// The real case: headers say 300 s, the profile still says 180 s from an earlier target.
