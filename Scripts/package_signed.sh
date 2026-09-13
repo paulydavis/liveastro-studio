@@ -76,10 +76,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# SwiftPM emits the resource bundle "flat" (resources at root, no Info.plist),
-# which codesign rejects as "bundle format unrecognized". Inject a minimal
-# Info.plist so it is a signable bundle. It stays a flat bundle (no Contents/),
-# so Bundle.module still resolves Help.md at the bundle root.
+# Older SwiftPM emitted the resource bundle "flat" (resources at root, no Info.plist),
+# which codesign rejects as "bundle format unrecognized"; newer toolchains emit a proper
+# Contents/ layout with its own Info.plist. Inject a minimal root Info.plist ONLY for the
+# flat case — adding one to a Contents/-style bundle leaves "unsealed contents present in
+# the bundle root" and codesign refuses to seal it (seen on the 3.6.3 build).
+if [ ! -f "$APP/Contents/Resources/$BUNDLE_NAME/Contents/Info.plist" ]; then
 cat > "$APP/Contents/Resources/$BUNDLE_NAME/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
@@ -88,6 +90,7 @@ cat > "$APP/Contents/Resources/$BUNDLE_NAME/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>BNDL</string>
 </dict></plist>
 PLIST
+fi
 
 # Strip any resource forks / xattrs that trip codesign.
 xattr -cr "$APP"
