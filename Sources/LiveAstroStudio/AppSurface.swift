@@ -43,6 +43,8 @@ struct AppSurface {
     var startSession: ((@escaping (Bool) -> Void) -> Void)?
     /// Persists current settings.
     var saveSettings: (() -> Void)?
+    /// A pending input question/baseline owns the selection even before a pipeline runs.
+    var isSessionStartPending: (() -> Bool)?
 
     // MARK: ImportController seam
 
@@ -100,6 +102,7 @@ struct AppSurface {
          selectLiveTab: (() -> Void)? = nil,
          startSession: ((@escaping (Bool) -> Void) -> Void)? = nil,
          saveSettings: (() -> Void)? = nil,
+         isSessionStartPending: (() -> Bool)? = nil,
          makeStackEngine: (() -> StackEngine)? = nil,
          currentCalibration: (() -> CalibrationSelection)? = nil,
          currentNeutralizeBackground: (() -> Bool)? = nil,
@@ -124,6 +127,7 @@ struct AppSurface {
         self.selectLiveTab = selectLiveTab
         self.startSession = startSession
         self.saveSettings = saveSettings
+        self.isSessionStartPending = isSessionStartPending
         self.makeStackEngine = makeStackEngine
         self.currentCalibration = currentCalibration
         self.currentNeutralizeBackground = currentNeutralizeBackground

@@ -121,6 +121,14 @@ struct ControlView: View {
     @ViewBuilder
     private var sessionInputBanner: some View {
         switch model.sessionInputStatus {
+        case .preparingBaseline(let completed, let total):
+            HStack {
+                ProgressView().controlSize(.small)
+                Text(total == 0 ? "Reading session input…" : "Preparing content baseline: \(completed)/\(total) subs…")
+                    .font(.callout)
+                Button("Cancel") { model.cancelSessionInputPreparation() }
+            }
+            .padding(.vertical, 4)
         case .waitingForFirstSub(let folder, let filter, let unmatched):
             Label {
                 VStack(alignment: .leading, spacing: 2) {
@@ -138,7 +146,7 @@ struct ControlView: View {
             .padding(.vertical, 4)
         case .failed(let reason):
             Label {
-                Text("Can't read the watch folder: \(reason)")
+                Text("Can't start session: \(reason)")
                     .font(.callout)
             } icon: { Image(systemName: "exclamationmark.triangle.fill") }
             .foregroundStyle(.orange)

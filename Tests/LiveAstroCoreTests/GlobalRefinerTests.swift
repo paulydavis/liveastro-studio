@@ -225,10 +225,10 @@ final class GlobalRefinerTests: XCTestCase {
         return AstroImage(width: w, height: h, channels: 1, pixels: px, sourceIsLinear: true)
     }
 
-    private func refinerReg(subIndex: Int, url: URL, gen: Int = 0, weight: Float = 1.0) -> SubRegistration {
+    private func refinerReg(subIndex: Int, url: URL, gen: Int = 0, weight: Float = 1.0, exposure: FrameExposure? = nil) -> SubRegistration {
         SubRegistration(subIndex: subIndex, contentDigest: nil, relayURL: url, stackGeneration: gen,
                         referenceIdentity: nil, transform: .identity, effectiveScale: 1.0,
-                        weight: weight, leveling: nil)
+                        weight: weight, leveling: nil, exposure: exposure)
     }
 
     /// Core case: the multi-frame robust combine removes a satellite-trail pixel the online
@@ -289,7 +289,10 @@ final class GlobalRefinerTests: XCTestCase {
             let url = URL(fileURLWithPath: "/tmp/globalrefiner/refine-onethrow-\(i).fit")
             urls.append(url)
             images[url] = constImage(0.3)
-            regs.append(refinerReg(subIndex: i + 1, url: url))
+            var metadata = SourceMetadata()
+            metadata.exposureSeconds = [30.0, 300, 900, 300, 60][i]
+            regs.append(refinerReg(subIndex: i + 1, url: url,
+                                   exposure: FrameExposure(metadata: metadata, fallback: 20)))
         }
         let loader = StubFrameLoader(images: images)
         loader.throwing = [urls[2]]
@@ -299,6 +302,8 @@ final class GlobalRefinerTests: XCTestCase {
         let unwrapped = try XCTUnwrap(result)
         XCTAssertEqual(unwrapped.skipped, 1)
         XCTAssertEqual(unwrapped.survivorCount, 4)
+        XCTAssertEqual(unwrapped.exposure?.totalSeconds, 690, "the failed 900s sub contributed no pixels")
+        XCTAssertEqual(unwrapped.exposure?.frameCount, 4)
     }
 
     /// A throw for the FIRST survivor's URL — sizing must fall through to the next successful

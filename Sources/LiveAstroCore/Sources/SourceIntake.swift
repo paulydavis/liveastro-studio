@@ -107,10 +107,24 @@ final class IntakeCounters: @unchecked Sendable {
 }
 
 extension DispatchTime {
+    /// Saturating conversion: .never arrives as +infinity; invalid/negative budgets
+    /// grant no time. Avoid floating-point-to-integer traps for enormous budgets.
+    static func deadline(after seconds: TimeInterval) -> DispatchTime {
+        let now = DispatchTime.now()
+        guard !seconds.isNaN, seconds > 0 else { return now }
+        guard let ns = UInt64(exactly: (seconds * 1_000_000_000).rounded(.down)) else {
+            return .distantFuture
+        }
+        let end = now.uptimeNanoseconds.addingReportingOverflow(ns)
+        return end.overflow ? .distantFuture : DispatchTime(uptimeNanoseconds: end.partialValue)
+    }
     /// Seconds remaining from `other` to this deadline; negative when already past.
     /// Used so one shutdown deadline can be split across sequential steps.
     func distanceInSeconds(from other: DispatchTime) -> TimeInterval {
-        let ns = Int64(bitPattern: uptimeNanoseconds) - Int64(bitPattern: other.uptimeNanoseconds)
-        return TimeInterval(ns) / 1_000_000_000
+        if self == .distantFuture { return .infinity }
+        if uptimeNanoseconds >= other.uptimeNanoseconds {
+            return TimeInterval(uptimeNanoseconds - other.uptimeNanoseconds) / 1_000_000_000
+        }
+        return -TimeInterval(other.uptimeNanoseconds - uptimeNanoseconds) / 1_000_000_000
     }
 }

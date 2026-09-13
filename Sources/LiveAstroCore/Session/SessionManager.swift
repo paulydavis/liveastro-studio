@@ -29,7 +29,7 @@ public final class SessionManager {
 
     public var acceptedCount: Int { manifest?.snapshots.count ?? 0 }
     public var estimatedIntegrationSeconds: Double {
-        Double(acceptedCount) * (manifest?.subExposureSeconds ?? 0)
+        manifest?.exposure?.totalSeconds ?? manifest?.snapshots.last?.estimatedIntegrationSeconds ?? 0
     }
 
     // Fixed format/locale/calendar make this formatter immutable after setup,
@@ -94,11 +94,24 @@ public final class SessionManager {
         // Write-then-commit: persist the proposed manifest first; only append in memory
         // once the write lands, so a failed write can't leave a counted-but-unpersisted frame.
         proposed.snapshots.append(record)
+        if let exposure = record.exposure {
+            // Legacy scalar is zero when there is no single exposure; exact totals live in
+            // the paired summary. Never leave the first sub's value on a mixed stack.
+            proposed.subExposureSeconds = exposure.uniformSeconds ?? 0
+        }
         try persist(proposed, to: dir)
         manifest = proposed
     }
 
     public var subFrames: [SubFrameRecord] { manifest?.subFrames ?? [] }
+
+    /// Serial batch-consumer bookkeeping. Persisted with the next snapshot or End,
+    /// so exposure recording does not defeat import snapshot-write throttling.
+    func noteImportedExposure(index: Int, sourceFile: String, exposure: FrameExposure) {
+        guard state == .running, manifest != nil else { return }
+        if manifest!.importFrameExposures == nil { manifest!.importFrameExposures = [] }
+        manifest!.importFrameExposures!.append(ImportedFrameExposure(index: index, sourceFile: sourceFile, exposure: exposure))
+    }
 
     /// Append a per-sub record and persist. Mirrors recordSnapshot's write-then-commit path.
     public func recordSubFrame(_ record: SubFrameRecord) throws {
@@ -122,6 +135,7 @@ public final class SessionManager {
         // so a failed write can't leave the manager ended with an unpersisted endTime.
         proposed.endTime = date
         proposed.finalizationFacts = finalization
+        if let exposure = finalization?.exposure { proposed.subExposureSeconds = exposure.uniformSeconds ?? 0 }
         if let intake {
             proposed.sourceExcludedPreExistingCount = intake.excludedPreExisting
             proposed.sourceUnprocessedAtShutdownCount = intake.unprocessedAtShutdown

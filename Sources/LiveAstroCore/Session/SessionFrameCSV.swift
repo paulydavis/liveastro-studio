@@ -32,7 +32,7 @@ public enum SessionFrameCSV {
                 record.sourceFile,
                 record.snapshotFile,
                 "\(record.estimatedIntegrationSeconds)",
-                "\(manifest.subExposureSeconds)",
+                record.exposure.map { $0.uniformSeconds.map { String($0) } ?? "" } ?? "\(manifest.subExposureSeconds)",
                 "\(record.width)",
                 "\(record.height)",
                 "\(record.mean)",

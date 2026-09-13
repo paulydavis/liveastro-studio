@@ -97,9 +97,10 @@ struct PublishedMaster: Equatable {
     let coverage: [Float]
     let survivorCount: Int
     let key: FreshnessKey
+    var exposure: ExposureSummary? = nil
 
     static func == (lhs: PublishedMaster, rhs: PublishedMaster) -> Bool {
-        lhs.coverage == rhs.coverage && lhs.survivorCount == rhs.survivorCount && lhs.key == rhs.key
+        lhs.coverage == rhs.coverage && lhs.survivorCount == rhs.survivorCount && lhs.key == rhs.key && lhs.exposure == rhs.exposure
             && lhs.image.width == rhs.image.width && lhs.image.height == rhs.image.height
             && lhs.image.channels == rhs.image.channels && lhs.image.sourceIsLinear == rhs.image.sourceIsLinear
     }
@@ -134,6 +135,7 @@ public final class SessionPipeline {
         let count: Int
         let cap: Int?
         let generation: Int?  // nil for watcher sources: never cache their saved-snapshot index
+        var exposure: ExposureSummary? = nil
     }
     private var displayOnline: OnlineDisplaySnapshot?
     private struct DisplayRenderContext {
@@ -324,20 +326,24 @@ public final class SessionPipeline {
     }
 
     private func deliverDisplay(revision: UInt64, preview: CGImage?, broadcast: CGImage?,
-                                cleanCount: Int?, count: Int, record: SnapshotRecord? = nil) {
+                                cleanCount: Int?, count: Int, record: SnapshotRecord? = nil,
+                                exposure: ExposureSummary? = nil) {
+        let broadcastExposure = exposure ?? .estimated(count: count, seconds: effectiveSubExposureSeconds)
+        let previewExposure = preview == nil ? ExposureSummary() : (displayOnline?.exposure
+            ?? .estimated(count: displayOnline?.count ?? count, seconds: effectiveSubExposureSeconds))
         let update = DisplayDelivery(revision: revision, previewImage: preview,
                                      broadcastImage: broadcast, cleanMasterSubCount: cleanCount,
-                                     integrationSeconds: Double(count) * effectiveSubExposureSeconds,
-                                     previewIntegrationSeconds: preview == nil ? 0 : Double(displayOnline?.count ?? count) * effectiveSubExposureSeconds,
+                                     integrationSeconds: broadcastExposure.totalSeconds,
+                                     previewIntegrationSeconds: previewExposure.totalSeconds,
                                      subExposureSeconds: effectiveSubExposureSeconds,
-                                     record: record)
+                                     record: record, exposure: broadcastExposure, previewExposure: previewExposure)
         guard isCurrentDisplay(update) else { return }
         displayRenderPhaseProbeForTest?(revision, .deliveryEmitted)
         onDisplayUpdate?(update)
     }
 
     private func renderDisplayTransition(revision: UInt64,
-        finalBroadcast: (image: AstroImage, count: Int, cleanCount: Int?)? = nil,
+        finalBroadcast: (image: AstroImage, count: Int, cleanCount: Int?, exposure: ExposureSummary?)? = nil,
         context: DisplayRenderContext? = nil) {
         guard let online = displayOnline,
               online.generation == nil || online.generation == engine?.currentStackGeneration else {
@@ -356,13 +362,13 @@ public final class SessionPipeline {
                 let image = online.cap.map { finalBroadcast.image.downsampled(maxLongEdge: $0) } ?? finalBroadcast.image
                 let broadcast = try displayCGImage(from: image, context: context)
                 deliverDisplay(revision: revision, preview: preview, broadcast: broadcast,
-                               cleanCount: finalBroadcast.cleanCount, count: finalBroadcast.count)
+                               cleanCount: finalBroadcast.cleanCount, count: finalBroadcast.count, exposure: finalBroadcast.exposure)
                 return
             }
             let resolved = try resolveBroadcastRender(onlineMean: online.image, onlinePreviewCG: preview,
                 onlineFrameCount: online.count, downsampleLongEdge: online.cap, context: context)
             deliverDisplay(revision: revision, preview: preview, broadcast: resolved.cgImage,
-                           cleanCount: resolved.cleanCount, count: resolved.integrationFrames)
+                           cleanCount: resolved.cleanCount, count: resolved.integrationFrames, exposure: resolved.exposure)
         } catch {
             onLog?("Display refresh failed: \(error)")
             // Do not keep claiming a clean image after its source has been invalidated.
@@ -938,7 +944,7 @@ public final class SessionPipeline {
             // pass ran must NOT discard its result, or a live session never publishes at all.
             guard liveRejectionActive, key.isServable(against: _freshnessKey) else { return false }
             publishedMaster = PublishedMaster(image: result.image, coverage: result.coverage,
-                                              survivorCount: result.survivorCount, key: key)
+                                              survivorCount: result.survivorCount, key: key, exposure: result.exposure)
             return true
         }
         if installed {
@@ -953,10 +959,15 @@ public final class SessionPipeline {
     /// since it was published. Both reads happen under one `regLock` acquisition so a concurrent
     /// publish/mutation can't be observed torn.
     public func publishedMasterIfCurrent() -> (image: AstroImage, coverage: [Float], survivorCount: Int)? {
+        guard let pm = resolvedPublishedMaster() else { return nil }
+        return (pm.image, pm.coverage, pm.survivorCount)
+    }
+
+    private func resolvedPublishedMaster() -> PublishedMaster? {
         regLock.withLock {
             guard liveRejectionActive, let pm = publishedMaster,
                   pm.key.isServable(against: _freshnessKey) else { return nil }
-            return (image: pm.image, coverage: pm.coverage, survivorCount: pm.survivorCount)
+            return pm
         }
     }
 
@@ -1002,11 +1013,8 @@ public final class SessionPipeline {
     /// of a bare header (Fix P1b). Nil = no metadata was resolved this session.
     public var capturedSourceMetadata: SourceMetadata? { sourceMetadata }
 
-    /// The exposure every integration figure is built from. The subs' own EXPTIME wins; the
-    /// typed profile is only the fallback for headers that carry none. Before this, master.fit
-    /// took EXPTIME from the header and TOTALEXP from the profile — one file, two answers
-    /// (observed: STACKCNT=2, EXPTIME=300, TOTALEXP=360). Uniform exposure is assumed, as it
-    /// always was; mixed-exposure sessions stay approximate.
+    /// Legacy/watcher scalar only. Native integration uses the ExposureSummary captured
+    /// with the pixels; a first-frame header must never stand in for later exposures.
     private var effectiveSubExposureSeconds: Double {
         SourceMetadata.resolvedExposureSeconds(metadata: sourceMetadata, fallback: profile.subExposureSeconds)
     }
@@ -1144,6 +1152,7 @@ public final class SessionPipeline {
         self.watcher = nil
         self.source = nativeSource
         self.engine = engine
+        engine.configureExposureFallback(profile.subExposureSeconds)
         self.profile = profile
         self.session = SessionManager(rootDirectory: rootDirectory)
         self.replaySettings = replaySettings
@@ -1238,6 +1247,11 @@ public final class SessionPipeline {
         noteFrameProgress()   // cold1 I1: a finalized frame is drain progress
         withCallbackDelivery {
             captureSourceMetadataIfNeeded(metadata)
+            let exposure = FrameExposure(metadata: metadata, fallback: profile.subExposureSeconds)
+            session.noteImportedExposure(index: index, sourceFile: sourceName, exposure: exposure)
+            if exposure.estimated {
+                onLog?("Exposure for \(sourceName): estimated \(exposure.seconds)s from the session-start profile (missing/invalid EXPTIME).")
+            }
             attemptPlateSolveIfNeeded(engine: engine)
             processedCount += 1
             bumpPreviewStackRevision()
@@ -1273,14 +1287,16 @@ public final class SessionPipeline {
         onlinePreviewCG: CGImage,
         onlineFrameCount: Int,
         downsampleLongEdge: Int?, context: DisplayRenderContext? = nil
-    ) throws -> (mean: AstroImage, cgImage: CGImage, integrationFrames: Int, cleanCount: Int?) {
-        guard let published = publishedMasterIfCurrent() else {
-            return (onlineMean, onlinePreviewCG, onlineFrameCount, nil)
+    ) throws -> (mean: AstroImage, cgImage: CGImage, integrationFrames: Int, cleanCount: Int?, exposure: ExposureSummary) {
+        guard let published = resolvedPublishedMaster() else {
+            return (onlineMean, onlinePreviewCG, onlineFrameCount, nil,
+                    displayOnline?.exposure ?? .estimated(count: onlineFrameCount, seconds: effectiveSubExposureSeconds))
         }
         let broadcastMean = cropToCoverage(published.image, coverage: published.coverage)
         let displaySource = downsampleLongEdge.map { broadcastMean.downsampled(maxLongEdge: $0) } ?? broadcastMean
         let broadcastCG = try displayCGImage(from: displaySource, context: context)
-        return (broadcastMean, broadcastCG, published.survivorCount, published.survivorCount)
+        return (broadcastMean, broadcastCG, published.survivorCount, published.survivorCount,
+                published.exposure ?? .estimated(count: published.survivorCount, seconds: effectiveSubExposureSeconds))
     }
 
     /// Renders + saves one snapshot from the current stack and pushes the preview. Shared by the
@@ -1299,14 +1315,14 @@ public final class SessionPipeline {
         let revision = nextDisplayRevision()
         let context = displayContext()
         displayRenderSettingsProbeForTest?(revision, context.adjustments, "frame")
-        guard let (mean0, coverage, frameCount, generation) = engine.displaySnapshot() else {
+        guard let (mean0, coverage, frameCount, generation, exposure) = engine.displaySnapshot() else {
             displayOnline = nil
             deliverDisplay(revision: revision, preview: nil, broadcast: nil, cleanCount: nil, count: 0)
             return
         }
         let mean = cropToCoverage(mean0, coverage: coverage)   // online — feeds the PREVIEW, unchanged (Task 9)
         let online = OnlineDisplaySnapshot(image: mean, count: frameCount,
-                                           cap: importPreviewLongEdge, generation: generation)
+                                           cap: importPreviewLongEdge, generation: generation, exposure: exposure)
         displayOnline = online
         guard let recorder else { onLog?("recorder missing — frame dropped (\(sourceName))"); return }
         do {
@@ -1315,18 +1331,18 @@ public final class SessionPipeline {
 
             // BROADCAST/latest.png: prefer the clean published master over the online mean, with
             // the downsample applied to whichever is served (D10: see resolveBroadcastRender).
-            let (broadcastMean, broadcastCG, integrationFrames, cleanCount) = try resolveBroadcastRender(
+            let (broadcastMean, broadcastCG, integrationFrames, cleanCount, broadcastExposure) = try resolveBroadcastRender(
                 onlineMean: mean, onlinePreviewCG: previewCG, onlineFrameCount: frameCount,
                 downsampleLongEdge: importPreviewLongEdge, context: context)
 
             let record = try recorder.save(
                 cgImage: broadcastCG, linear: broadcastMean, sourceFile: sourceName,
                 index: index, timestamp: timestamp,
-                estimatedIntegrationSeconds: Double(integrationFrames) * effectiveSubExposureSeconds)
+                estimatedIntegrationSeconds: broadcastExposure.totalSeconds, exposure: broadcastExposure)
             try session.recordSnapshot(record)
             lastRenderedAcceptedIndex = index
             deliverDisplay(revision: revision, preview: previewCG, broadcast: broadcastCG,
-                           cleanCount: cleanCount, count: integrationFrames, record: record)
+                           cleanCount: cleanCount, count: integrationFrames, record: record, exposure: broadcastExposure)
             onUpdate?(previewCG, record)
         } catch {
             onLog?("Skipped frame (\(sourceName)): \(error)")
@@ -1613,6 +1629,9 @@ public final class SessionPipeline {
         previewRevLock.lock(); defer { previewRevLock.unlock() }; return previewStackRevision
     }
 
+    /// Read-only diagnostic for tests asserting that an online proxy's source stayed fixed.
+    var previewStackRevisionForTesting: Int { currentPreviewStackRevision }
+
     /// The most recent rendered linear image, at FULL resolution, with the monotonic token it
     /// was retained under. Watcher / external-stacker mode has NO engine — it loads and renders
     /// each incoming file — so without this neither the preview nor Apply would have anything
@@ -1778,7 +1797,11 @@ public final class SessionPipeline {
                 }
             }
             let frame = (calibrator ?? providerCalibrator)?.apply(rawFrame) ?? rawFrame
-            let result = engine.processDetailed(frame)
+            let frameExposure = FrameExposure(metadata: rawFrame.metadata, fallback: profile.subExposureSeconds)
+            let result = engine.processDetailed(frame, exposure: frameExposure)
+            if frameExposure.estimated {
+                onLog?("Exposure for \(rawFrame.sourceName): estimated \(frameExposure.seconds)s from the session-start profile (missing/invalid EXPTIME).")
+            }
             let outcome = result.outcome
             if engine.autoReseedCount != lastAutoReseedCount {
                 committedFlattenCache.invalidate(minimumGeneration: engine.currentStackGeneration)
@@ -1845,7 +1868,8 @@ public final class SessionPipeline {
                 timestamp: frame.timestamp, sourceFile: frame.sourceName,
                 starCount: result.starCount, backgroundSigma: result.backgroundSigma,
                 weight: result.weight, outcome: subOutcome, rejectionReason: rejectionReason,
-                rejectedByUser: false, identity: frame.identity)
+                rejectedByUser: false, identity: frame.identity,
+                exposure: FrameExposure(metadata: rawFrame.metadata, fallback: profile.subExposureSeconds))
             onSubFrame?(subRecord)
             // Persist every sub (accepted AND rejected) on this same callback-delivery
             // thread — the same serial context recordSnapshot runs on below, so this is
@@ -1864,7 +1888,7 @@ public final class SessionPipeline {
                         subIndex: processedCount, contentDigest: frame.identity?.digest, relayURL: relayURL,
                         stackGeneration: reg.stackGeneration, referenceIdentity: reg.referenceIdentity,
                         transform: reg.transform, effectiveScale: reg.effectiveScale,
-                        weight: reg.weight, leveling: reg.leveling))
+                        weight: reg.weight, leveling: reg.leveling, exposure: subRecord.exposure))
                     // Task 7: a sub append changes the survivor set (and possibly the generation,
                     // on the first sub of a new reference) — refresh the cached freshness key.
                     recomputeCachedFreshnessKeyLocked()
@@ -1889,14 +1913,14 @@ public final class SessionPipeline {
                 }
                 let revision = nextDisplayRevision()
                 let context = displayContext()
-                guard let (mean0, coverage, frameCount, generation) = engine.displaySnapshot() else {
+                guard let (mean0, coverage, frameCount, generation, exposure) = engine.displaySnapshot() else {
                     displayOnline = nil
                     deliverDisplay(revision: revision, preview: nil, broadcast: nil, cleanCount: nil, count: 0)
                     return
                 }
                 let mean = cropToCoverage(mean0, coverage: coverage)   // online — feeds the PREVIEW, unchanged (Task 9)
                 let online = OnlineDisplaySnapshot(image: mean, count: frameCount,
-                                                   cap: nil, generation: generation)
+                                                   cap: nil, generation: generation, exposure: exposure)
                 displayOnline = online
                 guard let recorder else {
                     onLog?("recorder missing — frame dropped (\(frame.sourceName))")
@@ -1913,7 +1937,7 @@ public final class SessionPipeline {
                     // BROADCAST/latest.png: prefer the clean published master over the online
                     // mean, full-resolution (live, unlike renderSnapshot's downsampled preview) —
                     // D10: see resolveBroadcastRender.
-                    let (broadcastMean, broadcastCG, integrationFrames, cleanCount) = try resolveBroadcastRender(
+                    let (broadcastMean, broadcastCG, integrationFrames, cleanCount, broadcastExposure) = try resolveBroadcastRender(
                         onlineMean: mean, onlinePreviewCG: previewCG, onlineFrameCount: frameCount,
                         downsampleLongEdge: nil, context: context)
 
@@ -1923,10 +1947,10 @@ public final class SessionPipeline {
                     let record = try recorder.save(
                         cgImage: broadcastCG, linear: broadcastMean, sourceFile: frame.sourceName,
                         index: engine.acceptedCount, timestamp: frame.timestamp,
-                        estimatedIntegrationSeconds: Double(integrationFrames) * effectiveSubExposureSeconds)
+                        estimatedIntegrationSeconds: broadcastExposure.totalSeconds, exposure: broadcastExposure)
                     try session.recordSnapshot(record)
                     deliverDisplay(revision: revision, preview: previewCG, broadcast: broadcastCG,
-                                   cleanCount: cleanCount, count: integrationFrames, record: record)
+                                   cleanCount: cleanCount, count: integrationFrames, record: record, exposure: broadcastExposure)
                     onUpdate?(previewCG, record)
                 } catch {
                     onLog?("Skipped frame (\(frame.sourceName)): \(error)")
@@ -2058,14 +2082,13 @@ public final class SessionPipeline {
             : master
         // Read once so the header and its total share the same metadata snapshot.
         let metadata = sourceMetadata
-        let totalExp = Double(frameCount) * SourceMetadata.resolvedExposureSeconds(
-            metadata: metadata, fallback: profile.subExposureSeconds)
+        let totalExp = snap.exposure.totalSeconds
         let data = FITSWriter.float32(
             width: balanced.width, height: balanced.height,
             channels: balanced.channels, pixels: balanced.pixels,
-            metadata: metadata?.metadataForMaster,
+            metadata: snap.exposure.masterMetadata(metadata),
             stackCount: frameCount,
-            totalExposureSeconds: totalExp)
+            totalExposureSeconds: totalExp, estimatedExposureFrames: snap.exposure.estimatedFrameCount)
         let target = dir.appendingPathComponent("master.fit")
         let tmp = dir.appendingPathComponent(".master-snapshot-\(UUID().uuidString).fit")
         do {
@@ -2225,12 +2248,12 @@ public final class SessionPipeline {
         master0: AstroImage,
         final: StackEngine.FinalizationState
     ) -> (report: RestackReport, cleanCount: Int?) {
-        var clean: (image: AstroImage, coverage: [Float], survivorCount: Int)?
+        var clean: (image: AstroImage, coverage: [Float], survivorCount: Int, exposure: ExposureSummary?)?
         if frozen.active {
             if let pub = frozen.published, pub.key == frozen.key {
                 // A background pass already published a master computed over EXACTLY the
                 // frozen survivor set — nothing deeper is available, so no final pass.
-                clean = (pub.image, pub.coverage, pub.survivorCount)
+                clean = (pub.image, pub.coverage, pub.survivorCount, pub.exposure)
             } else {
                 // Either nothing is published, or what is published is merely SHALLOW (subs
                 // arrived after it was computed — `isServable` keeps serving it to the live
@@ -2248,7 +2271,7 @@ public final class SessionPipeline {
                         deadline: .now() + finalRefineBudget,
                         isCancelled: { false })
                     if let result {
-                        clean = (result.image, result.coverage, result.survivorCount)
+                        clean = (result.image, result.coverage, result.survivorCount, result.exposure)
                     }
                 }
                 if clean == nil, let pub = frozen.published,
@@ -2257,7 +2280,7 @@ public final class SessionPipeline {
                     // still strictly better than the online master (which rejects nothing), so
                     // fall back to it rather than dropping to `master0` and losing trail
                     // rejection entirely. Only reached when full depth was actually attempted.
-                    clean = (pub.image, pub.coverage, pub.survivorCount)
+                    clean = (pub.image, pub.coverage, pub.survivorCount, pub.exposure)
                 }
             }
         }
@@ -2271,12 +2294,12 @@ public final class SessionPipeline {
         if let clean {
             // CLEAN global result: STACKCNT/TOTALEXP reflect the count that actually
             // combined into the written pixels, not the online engine's frame count.
-            return (RestackReport(master: clean.image, stackedCount: clean.survivorCount,
+            return (RestackReport(exposure: clean.exposure, master: clean.image, stackedCount: clean.survivorCount,
                                  skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
                                  coverage: clean.coverage), clean.survivorCount)
         } else {
             // Online fallback / feature-off: EXACTLY today's counts, for byte parity.
-            return (RestackReport(master: master0, stackedCount: final.frameCount,
+            return (RestackReport(exposure: final.exposure, master: master0, stackedCount: final.frameCount,
                                  skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
                                  coverage: final.coverage), nil)
         }
@@ -2384,7 +2407,7 @@ public final class SessionPipeline {
             // would deadlock here since we already hold it).
             var finalization: SessionFinalizationFacts?
             let finalContext = freezeDisplayContextForFinalRender()
-            var finalBroadcast: (image: AstroImage, count: Int, cleanCount: Int?)?
+            var finalBroadcast: (image: AstroImage, count: Int, cleanCount: Int?, exposure: ExposureSummary?)?
             if let eng = engine {
                 let frozenGen = eng.currentStackGeneration
                 let frozen: (survivors: [SubRegistration], key: FreshnessKey, active: Bool,
@@ -2426,7 +2449,7 @@ public final class SessionPipeline {
                         metadata: sourceMetadata, subExposureSeconds: profile.subExposureSeconds)
                     try masterData.write(to: dir.appendingPathComponent("master.fit"))
                     finalBroadcast = (cropToCoverage(report.master, coverage: report.coverage),
-                                      report.stackedCount, cleanCount)
+                                      report.stackedCount, cleanCount, report.exposure)
                     outcome = .written
                 case .awaitingSeedAfterReseed:
                     onLog?("reference cleared by reseed (manual or automatic) and never re-seeded — no master available (\(final.sessionAcceptedCount) snapshots retained)")
@@ -2444,7 +2467,7 @@ public final class SessionPipeline {
                     masterOutcome: outcome,
                     stackFrameCount: final.frameCount,
                     sessionAcceptedCount: final.sessionAcceptedCount,
-                    sessionRejectedCount: final.sessionRejectedCount)
+                    sessionRejectedCount: final.sessionRejectedCount, exposure: finalBroadcast?.exposure)
             } else {
                 // Review11 finding 2, watcher mode: the stack is the external stacker's artifact;
                 // this session never promises a master (masterExpected == false since start).

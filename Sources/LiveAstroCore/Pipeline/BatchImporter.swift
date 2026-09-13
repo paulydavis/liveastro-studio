@@ -48,7 +48,7 @@ public final class BatchImporter {
             if isCancelled() { return }
             guard let frame = await iterator.next() else { return }   // stream ended before a seed
             let prepared = prepare(frame)
-            if engine.seedReference(prepared, minRows: .max) {
+            if engine.seedReference(prepared, minRows: .max, exposure: engine.resolvedExposure(frame.metadata)) {
                 seeded = true
                 onCommitted(Committed(index: engine.acceptedCount, sourceName: frame.sourceName, timestamp: frame.timestamp, metadata: frame.metadata))
             } else {
@@ -99,7 +99,7 @@ public final class BatchImporter {
                 guard let work = await group.next() else { break }
                 inFlight -= 1
                 if let w = work.warped {
-                    engine.commit(image: w.image, mask: w.mask, frameWeight: work.frameWeight, scale: work.scale, leveling: work.leveling, minRows: .max)
+                    engine.commit(image: w.image, mask: w.mask, frameWeight: work.frameWeight, scale: work.scale, leveling: work.leveling, minRows: .max, metadata: work.metadata)
                     onCommitted(Committed(index: engine.acceptedCount, sourceName: work.name, timestamp: work.timestamp, metadata: work.metadata))
                 } else {
                     engine.commitRejection()

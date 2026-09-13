@@ -6,6 +6,7 @@ import Foundation
 /// transform=identity, effectiveScale=1, weight=1, leveling=nil, referenceIdentity=its own identity.
 public struct SubRegistration {
     public let subIndex: Int                             // per-sub monotonic ID (= processedCount == SubFrameRecord.index); THE key
+    public let exposure: FrameExposure?
     public let contentDigest: String?                    // for byte re-verification only; NOT a key (byte-identical subs are distinct)
     public let relayURL: URL
     public let stackGeneration: Int
@@ -17,7 +18,9 @@ public struct SubRegistration {
                           ref: BackgroundExtraction.BackgroundModel)?
     public init(subIndex: Int, contentDigest: String?, relayURL: URL, stackGeneration: Int,
                 referenceIdentity: FileIdentity?, transform: SimilarityTransform, effectiveScale: Float,
-                weight: Float, leveling: (sub: BackgroundExtraction.BackgroundModel, ref: BackgroundExtraction.BackgroundModel)?) {
+                weight: Float, leveling: (sub: BackgroundExtraction.BackgroundModel, ref: BackgroundExtraction.BackgroundModel)?,
+                exposure: FrameExposure? = nil) {
+        self.exposure = exposure
         self.subIndex = subIndex; self.contentDigest = contentDigest; self.relayURL = relayURL
         self.stackGeneration = stackGeneration; self.referenceIdentity = referenceIdentity
         self.transform = transform; self.effectiveScale = effectiveScale; self.weight = weight; self.leveling = leveling
