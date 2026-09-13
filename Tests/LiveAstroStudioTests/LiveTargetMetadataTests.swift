@@ -104,7 +104,9 @@ final class LiveTargetMetadataTests: XCTestCase {
     func testRestackCaptionUsesTheExposureOfItsWrittenMaster() {
         let model = makeModel()
         model.subExposureText = "180"
-        let report = RestackReport(master: AstroImage(width: 2, height: 2, channels: 1,
+        var exposure = ExposureSummary()
+        for _ in 0..<3 { exposure.add(FrameExposure(metadata: meta(object: nil, exposure: 300), fallback: 180)) }
+        let report = RestackReport(exposure: exposure, master: AstroImage(width: 2, height: 2, channels: 1,
             pixels: [0.1, 0.2, 0.3, 0.4], sourceIsLinear: false), stackedCount: 3,
             skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false, coverage: nil)
         model.finishRestack(report, excludedCount: 0, writeResult: .init(ok: true, logMessage: nil),

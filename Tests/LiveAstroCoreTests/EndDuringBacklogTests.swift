@@ -239,6 +239,14 @@ final class EndDuringBacklogTests: XCTestCase {
     /// The third category: subs the operator deliberately skipped at Start. Reported
     /// separately from "not processed" — a choice is not a shortfall.
     func testExcludedPreExistingSubsAreReportedAsAChoiceNotAShortfall() throws {
+        try assertExcludedSubsReported(replaceIdentically: false)
+    }
+
+    func testIdenticalReplacementExclusionsReachManifestAndSummary() throws {
+        try assertExcludedSubsReported(replaceIdentically: true)
+    }
+
+    private func assertExcludedSubsReported(replaceIdentically: Bool) throws {
         let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let subs = sandbox.appendingPathComponent("subs")
         let sessions = sandbox.appendingPathComponent("sessions")
@@ -248,7 +256,14 @@ final class EndDuringBacklogTests: XCTestCase {
         try writeSub(subs, "Light_002.fit", dx: 1.5)
         try writeSub(subs, "Light_003.fit", dx: 3.0)
 
-        let snapshot = try WatchFolderInput.snapshot(folder: subs, fileNamePrefix: "Light_")
+        var snapshot = try WatchFolderInput.snapshot(folder: subs, fileNamePrefix: "Light_")
+        if replaceIdentically {
+            snapshot = try snapshot.addingContentBaseline()
+            for name in snapshot.existing.keys {
+                let url = subs.appendingPathComponent(name)
+                try Data(contentsOf: url).write(to: url, options: .atomic)
+            }
+        }
         let source = FolderFrameSource(folder: subs, mode: .live, fileNamePrefix: "Light_",
                                        excludingPreExisting: snapshot)
         let pipeline = SessionPipeline(nativeSource: source, engine: StackEngine(),
@@ -260,7 +275,7 @@ final class EndDuringBacklogTests: XCTestCase {
         pipeline.onLog = { logs.add($0) }
         try pipeline.start()
 
-        // Wait for the relay to have skipped all three, then end.
+        // Wait for the source to have accounted for all three exclusions, then end.
         let deadline = Date().addingTimeInterval(20)
         while source.intakeSnapshot.excludedPreExisting < 3 && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.2)
@@ -269,6 +284,12 @@ final class EndDuringBacklogTests: XCTestCase {
         let dir = try pipeline.end()
 
         let base = dir.hasDirectoryPath ? dir : dir.deletingLastPathComponent()
+        let manifest = try ManifestCoding.decoder().decode(SessionManifest.self,
+            from: Data(contentsOf: base.appendingPathComponent("manifest.json")))
+        XCTAssertEqual(manifest.sourceExcludedPreExistingCount, 3)
+        XCTAssertEqual(manifest.sourceUnprocessedAtShutdownCount, 0)
+        XCTAssertEqual(manifest.sourceAccountingComplete, true)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: subs.path).filter { $0.hasSuffix(".fit") }.count, 3)
         let summary = (try? String(contentsOf: base.appendingPathComponent("session-summary.md"), encoding: .utf8)) ?? ""
         XCTAssertTrue(summary.contains("Pre-existing subs skipped by choice | 3"),
                       "the summary must record the choice:\n\(summary)")
@@ -331,11 +352,9 @@ final class EndDuringBacklogTests: XCTestCase {
         let total = 12
         for i in 1...total { try writeSub(dir, String(format: "Light_%03d.fit", i), dx: Double(i % 3)) }
 
-        // Exclude everything: admission is then the relay's only work, so the parked relay
-        // has a well-defined amount left to do when stop() arrives.
-        let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_")
-        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_",
-                                       excludingPreExisting: snapshot)
+        // No consumer: updates reach the relay but remain undecoded. Exclusions now
+        // bypass the relay, so they cannot exercise its shutdown barrier.
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
         let parked = DispatchSemaphore(value: 0)
         let release = DispatchSemaphore(value: 0)
         let parkedOnce = UncheckedBox(false)
@@ -367,7 +386,8 @@ final class EndDuringBacklogTests: XCTestCase {
                       "stop() must wait for the relay, not cancel it mid-admission")
         XCTAssertEqual(intake.admitted, total,
                        "every update the watcher produced must be admitted before counts are final")
-        XCTAssertEqual(intake.excludedPreExisting, total)
+        XCTAssertEqual(intake.excludedPreExisting, 0)
+        XCTAssertEqual(intake.unprocessedAtShutdown, total)
     }
 
     /// Parks the relay mid-batch so a stop() must contend with an unfinished relay, then
@@ -381,9 +401,7 @@ final class EndDuringBacklogTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         for i in 1...fileCount { try writeSub(dir, String(format: "Light_%03d.fit", i), dx: Double(i % 3)) }
 
-        let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_")
-        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_",
-                                       excludingPreExisting: snapshot)
+        let source = FolderFrameSource(folder: dir, mode: .live, fileNamePrefix: "Light_")
         let parked = DispatchSemaphore(value: 0)
         let release = DispatchSemaphore(value: 0)
         let parkedOnce = UncheckedBox(false)

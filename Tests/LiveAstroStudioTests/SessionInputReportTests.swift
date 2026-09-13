@@ -10,6 +10,103 @@ import XCTest
 @MainActor
 final class SessionInputReportTests: XCTestCase {
 
+    func testStartQuestionCarriesVerifiedContentBaseline() async throws {
+        let (model, _) = makeModel()
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let file = try writeFITS(dir, name: "Light_old.fit")
+        let expectedDigest = FileIdentity.contentDigest(data: try Data(contentsOf: file))
+        model.sourceMode = .nativeStack; model.watchFolder = dir; model.fileNamePrefix = "Light_"
+        model.startSession()
+        for _ in 0..<500 where model.isPreparingSessionInput { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertFalse(model.isPreparingSessionInput)
+        XCTAssertEqual(model.pendingSessionStart?.snapshot.existing["Light_old.fit"]?.digest, expectedDigest)
+        model.resolvePendingSessionStart(.cancel)
+    }
+
+    func testCancelInputPreparationCompletesOnceAndCannotReopenQuestion() async throws {
+        let (model, _) = makeModel()
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        try writeFITS(dir, name: "Light_old.fit")
+        model.sourceMode = .nativeStack; model.watchFolder = dir; model.fileNamePrefix = "Light_"
+        var results: [Bool] = []
+        model.startSession { results.append($0) }
+        XCTAssertTrue(model.isPreparingSessionInput, "filesystem work must not block Start's main-actor caller")
+        model.cancelSessionInputPreparation()
+        model.cancelSessionInputPreparation()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(results, [false])
+        XCTAssertNil(model.pendingSessionStart)
+        XCTAssertNil(model.sessionInputStatus)
+        XCTAssertFalse(model.isRunning)
+    }
+
+    func testInputPreparationRechecksSelectionBeforeOfferingQuestion() async throws {
+        let (model, _) = makeModel()
+        let first = try makeTempDir(), second = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: first); try? FileManager.default.removeItem(at: second) }
+        try writeFITS(first, name: "Light_old.fit")
+        try writeFITS(second, name: "Light_other.fit")
+        model.sourceMode = .nativeStack; model.watchFolder = first; model.fileNamePrefix = "Light_"
+        model.startSession()
+        model.watchFolder = second
+        for _ in 0..<500 where model.isPreparingSessionInput { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(model.pendingSessionStart?.snapshot.folder, second)
+        XCTAssertFalse(model.isRunning)
+        model.resolvePendingSessionStart(.cancel)
+    }
+
+    func testRejectedFrameClearsWaitingButOldSessionCannot() async throws {
+        let (model, _) = makeModel()
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let old = SessionPipeline(watchFolder: dir, profile: model.profile, rootDirectory: dir)
+        let current = SessionPipeline(watchFolder: dir, profile: model.profile, rootDirectory: dir)
+        model.wireCallbacks(to: old)
+        model.wireCallbacks(to: current)
+        let waiting = AppModel.SessionInputStatus.waitingForFirstSub(folder: dir, filter: nil, unmatchedFileCount: 0)
+        model.installSessionInputStatusForTest(waiting)
+        old.onRejected?(.insufficientStars(found: 0), "old.fit")
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(model.sessionInputStatus, waiting)
+        XCTAssertEqual(model.rejectedCount, 0)
+        current.onRejected?(.insufficientStars(found: 0), "current.fit")
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertNil(model.sessionInputStatus)
+        XCTAssertEqual(model.rejectedCount, 1)
+    }
+
+    func testLateDetectionCannotRedirectManualStartQuestion() async throws {
+        let (model, _) = makeModel()
+        let manual = try makeTempDir(), detected = try makeTempDir(), relayRoot = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: manual); try? FileManager.default.removeItem(at: detected); try? FileManager.default.removeItem(at: relayRoot) }
+        var surface = AppSurface(log: { _ in }, presentError: { _ in }, isSessionRunning: { model.isRunning },
+            applyDetectedProfile: { if let folder = $0.watchFolder { model.watchFolder = folder } },
+            currentTargetName: { "InputTest" }, startSession: { model.startSession(completion: $0) })
+        surface.isSessionStartPending = { model.hasPendingSessionStart }
+        model.liveSource = LiveSourceController(surface: surface, relayRoot: relayRoot)
+        try writeFITS(manual, name: "Light_manual.fit")
+        model.watchFolder = manual; model.sourceMode = .nativeStack; model.fileNamePrefix = "Light_"
+        // Main actor cannot service detection's completion until after manual Start below.
+        model.liveSource.startWatchFolderLive(source: detected)
+        model.startSession()
+        XCTAssertTrue(model.hasPendingSessionStart)
+        for _ in 0..<300 where model.liveSource.isDetecting || model.isPreparingSessionInput {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(model.liveSource.isDetecting)
+        XCTAssertEqual(model.watchFolder, manual)
+        XCTAssertEqual(model.pendingSessionStart?.snapshot.folder, manual)
+        XCTAssertFalse(model.liveSource.isStarting)
+        model.resolvePendingSessionStart(.cancel)
+        model.liveSource.stopRelay()
+    }
+
+    private func waitForPreparation(_ model: AppModel) async throws {
+        for _ in 0..<500 where model.isPreparingSessionInput {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(model.isPreparingSessionInput, "input preparation timed out")
+    }
+
     /// Per-test defaults: a bare AppModel() would read and write the real user's domain.
     private func makeModel(_ name: String = #function) -> (AppModel, UserDefaults) {
         let suite = "SessionInputReportTests.\(name).\(UUID().uuidString)"
@@ -35,7 +132,7 @@ final class SessionInputReportTests: XCTestCase {
 
     // MARK: - Pre-existing subs are a question, not a silent decision
 
-    func testStartOnAFolderHoldingSubsAsksBeforeStackingAnything() throws {
+    func testStartOnAFolderHoldingSubsAsksBeforeStackingAnything() async throws {
         let (model, _) = makeModel()
         let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         try writeFITS(dir, name: "Light_001.fit")
@@ -45,13 +142,14 @@ final class SessionInputReportTests: XCTestCase {
         model.watchFolder = dir
         model.fileNamePrefix = "Light_"
         model.startSession()
+        try await waitForPreparation(model)
 
         XCTAssertFalse(model.isRunning, "nothing may be stacked until the operator answers")
         XCTAssertEqual(model.pendingSessionStart?.snapshot.count, 2)
         XCTAssertEqual(model.pendingSessionStart?.snapshot.unmatchedFileCount, 0)
     }
 
-    func testCancellingThePendingStartStartsNothing() throws {
+    func testCancellingThePendingStartStartsNothing() async throws {
         let (model, _) = makeModel()
         let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         try writeFITS(dir, name: "Light_001.fit")
@@ -60,15 +158,17 @@ final class SessionInputReportTests: XCTestCase {
         model.watchFolder = dir
         model.fileNamePrefix = "Light_"
         model.startSession()
+        try await waitForPreparation(model)
         XCTAssertNotNil(model.pendingSessionStart)
 
         model.resolvePendingSessionStart(.cancel)
+        try await waitForPreparation(model)
         XCTAssertFalse(model.isRunning)
         XCTAssertNil(model.pendingSessionStart)
     }
 
     /// The choice decides exclusion, and only "New arrivals only" excludes anything.
-    func testChoiceDeterminesExclusion() throws {
+    func testChoiceDeterminesExclusion() async throws {
         let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         try writeFITS(dir, name: "Light_001.fit")
         let snapshot = try WatchFolderInput.snapshot(folder: dir, fileNamePrefix: "Light_")
@@ -82,7 +182,7 @@ final class SessionInputReportTests: XCTestCase {
 
     /// The snapshot is answered later. If the operator changed folder or filter while the
     /// question was open, it describes something else and must not exclude anything.
-    func testStaleSnapshotIsNotUsedForExclusion() throws {
+    func testStaleSnapshotIsNotUsedForExclusion() async throws {
         let dir = try makeTempDir()
         let other = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir); try? FileManager.default.removeItem(at: other) }
@@ -99,7 +199,7 @@ final class SessionInputReportTests: XCTestCase {
 
     // MARK: - Zero matches is a standing status, and a failure is not zero matches
 
-    func testLiveStartRefusesWhileRestackOwnsPresentation() throws {
+    func testLiveStartRefusesWhileRestackOwnsPresentation() async throws {
         let (model, _) = makeModel()
         let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         try writeFITS(dir, name: "Light_001.fit")
@@ -107,43 +207,49 @@ final class SessionInputReportTests: XCTestCase {
         XCTAssertTrue(model.claimRestackPresentation())
         var result: Bool?
         model.startSession { result = $0 }
+        try await waitForPreparation(model)
         XCTAssertEqual(result, false)
         XCTAssertNil(model.pendingSessionStart, "must not offer Start while restack owns presentation")
         XCTAssertFalse(model.isRunning)
         XCTAssertTrue(model.isRestacking)
     }
 
-    func testPendingStartRechecksRestackOwnershipBeforeStarting() throws {
+    func testPendingStartRechecksRestackOwnershipBeforeStarting() async throws {
         let (model, _) = makeModel()
         let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         try writeFITS(dir, name: "Light_001.fit")
         model.sourceMode = .nativeStack; model.watchFolder = dir; model.fileNamePrefix = "Light_"
         var result: Bool?
         model.startSession { result = $0 }
+        try await waitForPreparation(model)
         XCTAssertNotNil(model.pendingSessionStart)
         XCTAssertTrue(model.claimRestackPresentation())
         model.resolvePendingSessionStart(.stackExistingAndNew)
+        try await waitForPreparation(model)
         XCTAssertEqual(result, false)
         XCTAssertFalse(model.isRunning)
         XCTAssertTrue(model.isRestacking)
     }
 
-    func testPendingStartCompletesOnlyAfterCancel() throws {
+    func testPendingStartCompletesOnlyAfterCancel() async throws {
         let (model, _) = makeModel()
         let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         try writeFITS(dir, name: "Light_001.fit")
         model.sourceMode = .nativeStack; model.watchFolder = dir; model.fileNamePrefix = "Light_"
         var results: [Bool] = []
         model.startSession { results.append($0) }
+        try await waitForPreparation(model)
         XCTAssertNotNil(model.pendingSessionStart)
         XCTAssertTrue(results.isEmpty, "pending is not failure")
         model.resolvePendingSessionStart(.cancel)
+        try await waitForPreparation(model)
         XCTAssertEqual(results, [false])
         model.resolvePendingSessionStart(.cancel)
+        try await waitForPreparation(model)
         XCTAssertEqual(results, [false], "completion is exactly once")
     }
 
-    func testExcludedSubsDoNotSelectCalibration() throws {
+    func testExcludedSubsDoNotSelectCalibration() async throws {
         let (model, _) = makeModel()
         let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         try writeFITS(dir, name: "Light_001.fit")
@@ -184,6 +290,7 @@ final class SessionInputReportTests: XCTestCase {
         if reprompt {
             model.fileNamePrefix = ""
             model.resolvePendingSessionStart(.newArrivalsOnly)
+            try await waitForPreparation(model)
             XCTAssertNotNil(model.pendingSessionStart, "changed filter needs a new question")
             XCTAssertTrue(controller.isStarting, "same-folder re-prompt still owns its live relay")
         }
@@ -193,43 +300,51 @@ final class SessionInputReportTests: XCTestCase {
         for _ in 0..<2000 where !FileManager.default.fileExists(atPath: copied.path) { try await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertTrue(FileManager.default.fileExists(atPath: copied.path), "confirmation must not stop capture forwarding")
         model.resolvePendingSessionStart(.cancel)
+        try await waitForPreparation(model)
         XCTAssertFalse(controller.isStarting)
     }
 
-    func testOldDialogDismissalCannotCancelReplacement() throws {
+    func testOldDialogDismissalCannotCancelReplacement() async throws {
         let (model, _) = makeModel()
         let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         try writeFITS(dir, name: "Light_001.fit")
         model.sourceMode = .nativeStack; model.watchFolder = dir; model.fileNamePrefix = "Light_"
         model.startSession()
+        try await waitForPreparation(model)
         let old = try XCTUnwrap(model.pendingSessionStart?.id)
         model.fileNamePrefix = ""
         model.resolvePendingSessionStart(.newArrivalsOnly, requestID: old)
+        try await waitForPreparation(model)
         let replacement = try XCTUnwrap(model.pendingSessionStart?.id)
         XCTAssertNotEqual(old, replacement)
         model.resolvePendingSessionStart(.cancel, requestID: old)
+        try await waitForPreparation(model)
         XCTAssertEqual(model.pendingSessionStart?.id, replacement)
         model.resolvePendingSessionStart(.cancel, requestID: replacement)
+        try await waitForPreparation(model)
         XCTAssertNil(model.pendingSessionStart)
     }
 
-    func testRetryOnPopulatedFolderRetiresPreviousFailure() throws {
+    func testRetryOnPopulatedFolderRetiresPreviousFailure() async throws {
         let (model, _) = makeModel()
         model.sourceMode = .nativeStack
         model.watchFolder = URL(fileURLWithPath: "/missing/\(UUID().uuidString)")
         model.startSession()
+        try await waitForPreparation(model)
         guard case .failed = model.sessionInputStatus else { return XCTFail("missing prerequisite failure") }
         let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         try writeFITS(dir, name: "Light_001.fit")
         model.watchFolder = dir
         model.fileNamePrefix = "Light_"
         model.startSession()
+        try await waitForPreparation(model)
         XCTAssertNotNil(model.pendingSessionStart)
         XCTAssertNil(model.sessionInputStatus)
         model.resolvePendingSessionStart(.cancel)
+        try await waitForPreparation(model)
     }
 
-    func testStackAllRechecksChangedFolderBeforeStarting() throws {
+    func testStackAllRechecksChangedFolderBeforeStarting() async throws {
         let (model, _) = makeModel()
         let first = try makeTempDir(), second = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: first); try? FileManager.default.removeItem(at: second) }
@@ -237,14 +352,17 @@ final class SessionInputReportTests: XCTestCase {
         try writeFITS(second, name: "Light_002.fit")
         model.sourceMode = .nativeStack; model.fileNamePrefix = "Light_"; model.watchFolder = first
         model.startSession()
+        try await waitForPreparation(model)
         XCTAssertNotNil(model.pendingSessionStart)
         model.watchFolder = second
         // Prevent the broken implementation from starting real disk/notification work.
         model.importer.isImporting = true
         model.resolvePendingSessionStart(.stackExistingAndNew)
+        try await waitForPreparation(model)
         XCTAssertEqual(model.pendingSessionStart?.snapshot.folder, second)
         XCTAssertFalse(model.isRunning)
         model.resolvePendingSessionStart(.cancel)
+        try await waitForPreparation(model)
     }
 
     func testAcceptedCallbackClearsWaitingButDiscoveryDoesNot() async throws {
@@ -268,7 +386,7 @@ final class SessionInputReportTests: XCTestCase {
         XCTAssertNil(model.sessionInputStatus)
     }
 
-    func testZeroMatchesReportsFolderAndFilterAndKeepsWaiting() throws {
+    func testZeroMatchesReportsFolderAndFilterAndKeepsWaiting() async throws {
         let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         try writeFITS(dir, name: "Sub_001.fit")   // present, but the filter rejects it
 
@@ -285,7 +403,7 @@ final class SessionInputReportTests: XCTestCase {
 
     /// An unreadable folder must never render as "no matching subs found, waiting" — that
     /// tells the operator to wait for files that can never arrive.
-    func testUnreadableFolderReportsAFailureNotAnEmptyFolder() {
+    func testUnreadableFolderReportsAFailureNotAnEmptyFolder() async throws {
         let (model, _) = makeModel()
         let missing = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -294,6 +412,7 @@ final class SessionInputReportTests: XCTestCase {
         model.watchFolder = missing
         model.fileNamePrefix = "Light_"
         model.startSession()
+        try await waitForPreparation(model)
 
         XCTAssertFalse(model.isRunning)
         if case .waitingForFirstSub = model.sessionInputStatus {

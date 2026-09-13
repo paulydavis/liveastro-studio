@@ -588,8 +588,12 @@ public final class GlobalRefiner {
             // defense-in-depth: unreachable given the sample-quorum check above (sample.count >=
             // minSubs) + loaded being monotonic across the pass, kept as a floor.
             guard contributing >= minSubs else { return nil }
+            var exposure = ExposureSummary()
+            for reg in inGen where !skippedIds.contains(reg.subIndex) {
+                exposure.add(reg.exposure ?? FrameExposure(metadata: nil, fallback: 0))
+            }
             return RefineResult(image: combined.image, coverage: combined.coverage,
-                                survivorCount: contributing, skipped: skippedIds.count)
+                                survivorCount: contributing, skipped: skippedIds.count, exposure: exposure)
         } catch {
             // Any AbortPass (cancel/deadline) thrown from the sizing or sample-build phases
             // unwinds here — never a partial publish; the caller keeps the last online master.
@@ -599,12 +603,14 @@ public final class GlobalRefiner {
 }
 
 struct RefineResult {
+    let exposure: ExposureSummary?
     let image: AstroImage
     let coverage: [Float]
     let survivorCount: Int
     let skipped: Int
 
-    init(image: AstroImage, coverage: [Float], survivorCount: Int, skipped: Int) {
+    init(image: AstroImage, coverage: [Float], survivorCount: Int, skipped: Int, exposure: ExposureSummary? = nil) {
+        self.exposure = exposure
         self.image = image
         self.coverage = coverage
         self.survivorCount = survivorCount

@@ -58,6 +58,7 @@ final class LiveSourceController {
 
     private func canApplyDetectedLiveSource() -> Bool {
         !surface.isSessionRunning() && !surface.isImporting() && !isStarting
+            && !(surface.isSessionStartPending?() ?? false)
     }
 
     private func startConfiguredSession() {

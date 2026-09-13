@@ -14,13 +14,26 @@ import Foundation
 public struct RestackSub: Equatable {
     public let url: URL
     public let expectedIdentity: FileIdentity?
-    public init(url: URL, expectedIdentity: FileIdentity?) {
+    public let exposure: FrameExposure?
+    public init(url: URL, expectedIdentity: FileIdentity?, exposure: FrameExposure? = nil) {
         self.url = url
         self.expectedIdentity = expectedIdentity
+        self.exposure = exposure
     }
 }
 
 public enum RestackPlanning {
+    /// Update current-master facts without rewriting historical snapshots or intake totals.
+    public static func updatingMaster(in manifest: SessionManifest, report: RestackReport,
+                                      fallbackExposureSeconds: Double) -> SessionManifest {
+        var result = manifest
+        let exposure = report.exposure ?? .estimated(count: report.stackedCount, seconds: fallbackExposureSeconds)
+        result.exposure = exposure
+        result.stackFrameCount = report.stackedCount
+        result.masterOutcome = .written
+        result.subExposureSeconds = exposure.uniformSeconds ?? 0
+        return result
+    }
     /// The survivor set the re-stack processes, resolved from the session's RECORDED subs
     /// (not a folder listing): recorded order (index-ascending), minus operator-flagged
     /// (`rejectedByUser`) subs. Intake-`.rejected` subs are INCLUDED — they were part of
@@ -32,7 +45,7 @@ public enum RestackPlanning {
         subFrames.sorted { $0.index < $1.index }        // recorded order (UI mirror may be out-of-order)
                  .filter { !$0.rejectedByUser }
                  .map { RestackSub(url: dir.appendingPathComponent($0.sourceFile),
-                                   expectedIdentity: $0.identity) }
+                                   expectedIdentity: $0.identity, exposure: $0.exposure) }
     }
 
     /// Encodes a re-stacked master to a full-metadata float32 FITS, matching the live
@@ -47,10 +60,12 @@ public enum RestackPlanning {
         let balanced = presentationMaster(report, neutralize: neutralize)
         // Parity with the live master: the subs' own EXPTIME wins, the profile is the fallback.
         let exposure = SourceMetadata.resolvedExposureSeconds(metadata: metadata, fallback: subExposureSeconds)
-        let totalExp = Double(report.stackedCount) * exposure
+        let totalExp = report.exposure?.totalSeconds ?? Double(report.stackedCount) * exposure
         return FITSWriter.float32(width: balanced.width, height: balanced.height,
             channels: balanced.channels, pixels: balanced.pixels,
-            metadata: metadata?.metadataForMaster, stackCount: report.stackedCount, totalExposureSeconds: totalExp)
+            metadata: report.exposure?.masterMetadata(metadata) ?? metadata?.metadataForMaster,
+            stackCount: report.stackedCount, totalExposureSeconds: totalExp,
+            estimatedExposureFrames: report.exposure?.estimatedFrameCount ?? report.stackedCount)
     }
 
     /// The presentation master: report.master cropped to coverage and (optionally) background-neutralized —

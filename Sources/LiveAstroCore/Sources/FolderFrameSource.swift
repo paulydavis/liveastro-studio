@@ -303,7 +303,8 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting,
                 throw FolderFrameSourceError.exclusionSnapshotMismatch
             }
             let w = StackFileWatcher(folder: folder, fileNamePrefix: fileNamePrefix,
-                                     digestPolicy: .immutableAfterPublish)
+                                     digestPolicy: .immutableAfterPublish,
+                                     excludingPreExisting: excludedPreExisting)
             // Cold2 M2: log through the RELAY, never a snapshot of `onLog` — a sink
             // assigned after start() (SessionPipeline wires it in startSources) must
             // still reach the watcher. The relay is seeded with the current sink and
@@ -311,6 +312,15 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting,
             let watcherLog = liveWatcherLog!
             watcherLog.current = onLog
             w.onLog = { watcherLog.emit($0) }
+            let counters = intake
+            w.onPreExistingExcluded = { _ in
+                counters.noteAdmitted()
+                counters.noteExcluded()
+                let count = counters.snapshot.excludedPreExisting
+                if count == 1 || count % 25 == 0 {
+                    watcherLog.emit("Skipping subs that were already in the folder at Start (\(count) so far)")
+                }
+            }
             let watcherStall = liveWatcherStall!
             watcherStall.current = onStall
             w.onStall = { watcherStall.fire() }
@@ -325,8 +335,6 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting,
             beforeStartCommit?(w)   // test seam: the stop-during-start window, deterministic
             let cont = liveUpdateContinuation!
             let seams = liveSeams
-            let excluded = excludedPreExisting
-            let watcherLogRelay = watcherLog
             let intakeCounters = intake
             // Revalidate + commit under the lock: watcher/liveTask become visible to stop()
             // atomically with `.running` (stop() reads them under the same lock).
@@ -335,25 +343,12 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting,
                 self.liveTask = Task.detached {
                     // Cold1 I2: relay LIGHT updates only — NO decode here. Decode happens on
                     // the consumer's clock in LivePull.nextFrame(), one frame in flight.
-                    var skipped = 0
                     for await update in w.updates {
                         // ADMISSION IS COUNTED FIRST. Counting after the yield (or after the
                         // exclusion branch) leaves a window in which cancellation drops an
                         // update that no tally ever saw.
                         intakeCounters.noteAdmitted()
                         seams.noteAdmitted(update)
-                        if let excluded, excluded.recordedUnchanged(
-                            name: update.url.lastPathComponent, identity: update.identity) {
-                            skipped += 1
-                            intakeCounters.noteExcluded()
-                            // One line per skip would be 1000 lines on a full folder; the
-                            // running total is the honest summary and never claims a file
-                            // was stacked.
-                            if skipped == 1 || skipped % 25 == 0 {
-                                watcherLogRelay.emit("Skipping subs that were already in the folder at Start (\(skipped) so far)")
-                            }
-                            continue
-                        }
                         cont.yield(update)
                         seams.noteBuffered(update)
                     }
@@ -404,7 +399,7 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting,
     /// commit revalidation and tears its watcher down instead of committing — and the
     /// watcher/task references are captured under the SAME lock that publishes them.
     public func stop(timeout: TimeInterval) {
-        let deadline = DispatchTime.now() + .milliseconds(Int(max(timeout, 0) * 1000))
+        let deadline = DispatchTime.deadline(after: timeout)
         stopSeamLock.withLock { _lastStopTimeout = timeout }
         let (w, task): (StackFileWatcher?, Task<Void, Never>?) = stateLock.withLock {
             state = .stopped

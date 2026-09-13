@@ -20,10 +20,8 @@ public enum ReplayService {
         let keyframes = picked.map { i in
             ReplayKeyframe(
                 imageURL: urls[i],
-                caption: "\(manifest.targetName) — " + IntegrationFormat.caption(
-                    seconds: survivors[i].estimatedIntegrationSeconds,
-                    frames: survivors[i].index,
-                    subSeconds: manifest.subExposureSeconds))
+                caption: "\(manifest.targetName) — " + survivors[i].integrationCaption(
+                    fallbackSubSeconds: manifest.subExposureSeconds))
         }
         try ReplayGenerator(settings: replaySettings).render(keyframes: keyframes, to: outputURL)
         return outputURL

@@ -40,7 +40,7 @@ public final class SnapshotRecorder {
     /// Saves a display-ready (post-stretch) PNG and returns its manifest record (spec §5.7).
     public func save(cgImage: CGImage, linear: AstroImage, sourceFile: String,
                      index: Int, timestamp: Date,
-                     estimatedIntegrationSeconds: Double) throws -> SnapshotRecord {
+                     estimatedIntegrationSeconds: Double, exposure: ExposureSummary? = nil) throws -> SnapshotRecord {
         let name = String(format: "snapshots/%04d.png", index)
         let url = sessionDirectory.appendingPathComponent(name)
         // Destination creation is nil only for malformed URLs/UTIs; the session
@@ -61,7 +61,7 @@ public final class SnapshotRecorder {
                               snapshotFile: name,
                               estimatedIntegrationSeconds: estimatedIntegrationSeconds,
                               width: linear.width, height: linear.height,
-                              mean: stats.mean, median: stats.median, stddev: stats.stddev)
+                              mean: stats.mean, median: stats.median, stddev: stats.stddev, exposure: exposure)
     }
 
     private func updateLatestImage(from snapshotURL: URL) {

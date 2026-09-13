@@ -77,6 +77,7 @@ public final class StackEngine {
         let stackState: CurrentStackState
         let sessionAcceptedCount: Int
         let sessionRejectedCount: Int
+        let exposure: ExposureSummary
     }
 
     private let seedMinStars: Int
@@ -130,6 +131,16 @@ public final class StackEngine {
     /// mid-frame applies before the NEXT frame (the intended UX).
     private let lock = NSLock()
     private var accumulator: StackAccumulator?
+    private var stackExposure = ExposureSummary()
+    private var exposureFallback: Double = 0
+
+    /// Configure before feeding frames; the pipeline's profile is immutable for this session.
+    func configureExposureFallback(_ seconds: Double) {
+        lock.withLock { exposureFallback = seconds }
+    }
+    func resolvedExposure(_ metadata: SourceMetadata?) -> FrameExposure {
+        lock.withLock { FrameExposure(metadata: metadata, fallback: exposureFallback) }
+    }
     private var currentStackState: CurrentStackState = .initialEmpty
     private var manualReseedCount = 0
     private var referenceStars: [Star] = []
@@ -192,6 +203,7 @@ public final class StackEngine {
     public func reseed() {
         lock.withLock {
             accumulator = nil
+            stackExposure = ExposureSummary()
             referenceStars = []
             referenceSize = nil
             referenceChannels = nil
@@ -230,7 +242,8 @@ public final class StackEngine {
                 frameCount: frameCount,
                 stackState: currentStackState,
                 sessionAcceptedCount: acceptedCount,
-                sessionRejectedCount: rejectedCount
+                sessionRejectedCount: rejectedCount,
+                exposure: stackExposure
             )
         }
     }
@@ -285,11 +298,11 @@ public final class StackEngine {
 
     /// Pixel provenance is one atomic read: a reseed cannot stamp old pixels with its new
     /// generation, and integration depth cannot describe a different accumulator revision.
-    func displaySnapshot() -> (image: AstroImage, coverage: [Float]?, count: Int, generation: Int)? {
+    func displaySnapshot() -> (image: AstroImage, coverage: [Float]?, count: Int, generation: Int, exposure: ExposureSummary)? {
         lock.withLock {
             guard let accumulator else { return nil }
             return (accumulator.mean(), accumulator.coverage(), accumulator.frameCount,
-                    currentStackGenerationLocked)
+                    currentStackGenerationLocked, stackExposure)
         }
     }
 
@@ -313,20 +326,21 @@ public final class StackEngine {
     /// `finalizationState()`: pure read, stamps nothing and changes no running state.
     /// nil when there is no live stack yet (before the seed, or after a reseed cleared
     /// the accumulator) — the caller then writes nothing.
-    public func masterSnapshotState() -> (image: AstroImage, coverage: [Float]?, frameCount: Int)? {
+    public func masterSnapshotState() -> (image: AstroImage, coverage: [Float]?, frameCount: Int, exposure: ExposureSummary)? {
         lock.withLock {
             guard let accumulator else { return nil }
-            return (accumulator.mean(), accumulator.coverage(), accumulator.frameCount)
+            return (accumulator.mean(), accumulator.coverage(), accumulator.frameCount, stackExposure)
         }
     }
 
     public func process(_ frame: RawFrame) -> StackOutcome { processDetailed(frame).outcome }
 
-    public func processDetailed(_ frame: RawFrame) -> ProcessResult {
-        lock.withLock { processDetailedLocked(frame) }
+    public func processDetailed(_ frame: RawFrame, exposure: FrameExposure? = nil) -> ProcessResult {
+        lock.withLock { processDetailedLocked(frame, exposure: exposure) }
     }
 
-    private func processDetailedLocked(_ frame: RawFrame) -> ProcessResult {
+    private func processDetailedLocked(_ frame: RawFrame, exposure: FrameExposure?) -> ProcessResult {
+        let frameExposure = exposure ?? FrameExposure(metadata: frame.metadata, fallback: exposureFallback)
         let raw = frame.image
         // Degenerate frames (a half-res luminance needs at least a 2×2 source) would
         // crash star detection / superpixel binning — reject before any luminance work.
@@ -353,6 +367,8 @@ public final class StackEngine {
             let acc = StackAccumulator(width: rgb.width, height: rgb.height, channels: rgb.channels)
             acc.add(seed, mask: ones)
             accumulator = acc
+            stackExposure = ExposureSummary()
+            stackExposure.add(frameExposure)
             referenceStars = stars
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
@@ -388,6 +404,7 @@ public final class StackEngine {
                 referenceSize = nil
                 referenceChannels = nil
                 accumulator = nil
+                stackExposure = ExposureSummary()
                 weightBaseline = nil
                 referenceBackgroundSamples = nil
                 referenceIdentity = nil
@@ -445,6 +462,7 @@ public final class StackEngine {
         // σ·effectiveScale: scaling amplifies noise too — weight must see the POST-(applied-)scale noise
         let appliedWeight = frameWeight(stars: stars.count, sigma: sigma * effectiveScale)
         accumulator.add(cleaned, mask: mask, frameWeight: appliedWeight)
+        stackExposure.add(frameExposure)
         acceptedCount += 1
         consecutiveNoTransform = 0
         return ProcessResult(outcome: .stacked(frameCount: accumulator.frameCount),
@@ -508,7 +526,7 @@ public final class StackEngine {
     /// Establish the fixed reference from `frame` if it has ≥ seedMinStars.
     /// Returns true on success (frame counts as accepted). Serial — call before
     /// any concurrent register(). Bumps rejectedCount on a too-few-stars frame.
-    public func seedReference(_ frame: RawFrame, minRows: Int) -> Bool {
+    public func seedReference(_ frame: RawFrame, minRows: Int, exposure: FrameExposure? = nil) -> Bool {
         lock.withLock {
             let raw = frame.image
             guard raw.width >= 2, raw.height >= 2 else { rejectedCount += 1; return false }
@@ -521,6 +539,8 @@ public final class StackEngine {
             let acc = StackAccumulator(width: rgb.width, height: rgb.height, channels: rgb.channels)
             acc.add(seed, mask: ones, minRows: minRows)
             accumulator = acc
+            stackExposure = ExposureSummary()
+            stackExposure.add(exposure ?? FrameExposure(metadata: frame.metadata, fallback: exposureFallback))
             referenceStars = stars
             referenceSize = (raw.width, raw.height)
             referenceChannels = rgb.channels
@@ -631,7 +651,8 @@ public final class StackEngine {
     /// stateful RejectionMethod. Call from the single serial consumer.
     public func commit(image: AstroImage, mask: [Float], frameWeight: Float = 1.0, scale: Float = 1.0,
                        leveling: (sub: BackgroundExtraction.BackgroundModel,
-                                  ref: BackgroundExtraction.BackgroundModel)? = nil, minRows: Int) {
+                                  ref: BackgroundExtraction.BackgroundModel)? = nil, minRows: Int,
+                       metadata: SourceMetadata? = nil) {
         lock.withLock {
             guard let accumulator else { return }
             // Scaling is fused into leveling with a per-pixel reference-background pivot.
@@ -646,6 +667,7 @@ public final class StackEngine {
             }
             let cleaned = rejection.apply(frame, mask: mask)
             accumulator.add(cleaned, mask: mask, frameWeight: frameWeight, minRows: minRows)
+            stackExposure.add(FrameExposure(metadata: metadata, fallback: exposureFallback))
             acceptedCount += 1
             consecutiveNoTransform = 0
         }
