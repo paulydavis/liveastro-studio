@@ -260,6 +260,12 @@ enum ObservationOutcome: Equatable {
     case invalid
     case unstable(identity: FileIdentity)
     case identityUnchanged(identity: FileIdentity)
+    /// The file exists and its identity is known, but its blocking content read has been
+    /// dispatched to the reader queue and has not completed yet. Keeps the file present and
+    /// not-ready (`.observing`) so it holds its place in numbered ordering as the blocker —
+    /// a healthy slow read then completes in order (no lost frame), and a genuinely hung read
+    /// is abandoned by the existing write-off budget instead of freezing detection.
+    case pendingRead(identity: FileIdentity)
     case digested(identity: FileIdentity, digest: String, byteCount: Int)
 }
 
@@ -988,6 +994,20 @@ struct WatcherReducer {
                settlement.identity == identity {
                 state.generation.files[observation.name] = .settled(
                     settlement.withReplacement(nil))
+            }
+            return false
+
+        case .pendingRead(let identity):
+            // A content read is in flight. For a brand-new/observing file, hold it not-ready so it
+            // keeps its ordering slot as the blocker. For a file that ALREADY has digest progress
+            // (.digestPending / .ready) — a stability re-read in flight — PRESERVE that progress:
+            // resetting it to .observing would wipe the stability gate and the file could never
+            // emit. Terminal/settled states are likewise never disturbed.
+            switch existing {
+            case .observing, nil:
+                state.generation.files[observation.name] = .observing(stat: identity)
+            case .digestPending, .ready, .settled, .droppedOutOfOrder, .writtenOff:
+                break
             }
             return false
 

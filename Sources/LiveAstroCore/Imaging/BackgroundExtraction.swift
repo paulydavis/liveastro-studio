@@ -53,6 +53,15 @@ public enum BackgroundExtraction {
     /// quadratic terms; 0.75 matches the R1 prototype threshold.
     static let minTileCoverage: Float = 0.75
 
+    /// Upper bound on pixels sorted per tile when computing the tile median
+    /// (`tileSamples`). At/below this a tile is sampled in full; above it a deterministic
+    /// strided subsample keeps the per-tile median cost bounded so large frames don't
+    /// full-sort every pixel every frame (the 2026-08-16 26MP import stall: ~25k px/tile ×
+    /// ~3k tiles × 2–3 calls/frame). 1024 samples pin a background-tile median to well
+    /// within read noise, so leveling/normalization results shift only negligibly. Small
+    /// synthetic tiles (tests, thumbnails) stay at/below the bound and are unaffected.
+    static let maxSamplesPerTile = 1024
+
     /// Per-channel tile median samples on the SHARED 32×tile grid (stage 1 of the fit,
     /// split out so two frames can be fit over the SAME masked tile subset — the R5
     /// domain-matched-fit fix). `x`/`y` are normalized tile centers (coord/dim*2 − 1),
@@ -92,8 +101,28 @@ public enum BackgroundExtraction {
             let base = c * plane
             var sv: [Double] = []; sv.reserveCapacity(ranges.count)
             for r in ranges {
-                var vals: [Float] = []; vals.reserveCapacity((r.y1-r.y0)*(r.x1-r.x0))
-                for yy in r.y0..<r.y1 { for xx in r.x0..<r.x1 { vals.append(src[base + yy*w + xx]) } }
+                let dx = r.x1 - r.x0, dy = r.y1 - r.y0
+                let total = dx * dy
+                var vals: [Float] = []
+                if total <= maxSamplesPerTile {
+                    // Small tile (e.g. 8MP Seestar frames): take every pixel — identical to
+                    // the legacy full-tile median, so those results are byte-for-byte unchanged.
+                    vals.reserveCapacity(total)
+                    for yy in r.y0..<r.y1 { for xx in r.x0..<r.x1 { vals.append(src[base + yy*w + xx]) } }
+                } else {
+                    // Large tile (26MP+): a strided subsample bounds the per-tile median cost
+                    // at O(maxSamplesPerTile·log) instead of full-sorting ~25k px (the
+                    // 2026-08-16 26MP import stall). The sky background is low-frequency, so a
+                    // deterministic evenly-spaced subsample median tracks the full-tile median
+                    // to well within read noise; stars stay a sparse minority the median ignores.
+                    let step = (total + maxSamplesPerTile - 1) / maxSamplesPerTile   // ≥ 2
+                    vals.reserveCapacity(total / step + 1)
+                    var i = 0
+                    while i < total {
+                        vals.append(src[base + (r.y0 + i / dx) * w + (r.x0 + i % dx)])
+                        i += step
+                    }
+                }
                 vals.sort()
                 sv.append(Double(vals[vals.count/2]))
             }

@@ -258,6 +258,8 @@ final class FaultMatrixLifecycleTests: XCTestCase {
         let logLock = NSLock()
         pipeline.onLog = { msg in logLock.withLock { log.append(msg) } }
         pipeline.drainPrimaryTimeout = .milliseconds(200)
+        pipeline.importPrimaryTimeout = .milliseconds(200)   // finite drain uses this window
+        pipeline.liveDrainStallTimeout = .milliseconds(200)  // live drain wedge window
         pipeline.drainGraceTimeout = .milliseconds(200)
         try pipeline.start()
 
@@ -314,6 +316,7 @@ final class FaultMatrixLifecycleTests: XCTestCase {
         let logLock = NSLock()
         pipeline.onLog = { msg in logLock.withLock { log.append(msg) } }
         pipeline.drainPrimaryTimeout = .milliseconds(200)
+        pipeline.importPrimaryTimeout = .milliseconds(200)   // finite drain uses this window
         pipeline.drainGraceTimeout = .milliseconds(200)
         try pipeline.start()
         XCTAssertEqual(consumer.entered.wait(timeout: .now() + 5), .success,

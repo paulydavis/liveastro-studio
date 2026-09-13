@@ -1,16 +1,32 @@
 import Foundation
 
+/// One list entry: its own text plus up to one level of nested sub-bullets (empty when flat).
+/// `ExpressibleByStringLiteral` so a flat list can still be written `["a", "b"]` — the literal
+/// becomes a `ListItem` with no sub-items.
+public struct ListItem: Equatable, ExpressibleByStringLiteral {
+    public let text: String
+    public var subItems: [String]
+    public init(_ text: String, subItems: [String] = []) {
+        self.text = text
+        self.subItems = subItems
+    }
+    public init(stringLiteral value: String) { self.init(value) }
+}
+
 /// A block-level element of a limited markdown subset. Inline markup
 /// (**bold**, *italic*, `code`) is preserved verbatim inside each block's
 /// text — the renderer is responsible for interpreting it.
 public enum MarkdownBlock: Equatable {
     case heading(level: Int, text: String)
     case paragraph(String)
-    case bulletList([String])
-    case numberedList([String])
+    case bulletList([ListItem])
+    case numberedList([ListItem])
     case table(headers: [String], rows: [[String]])
     case quote(String)
     case rule
+    /// Fenced code block (``` … ```). The joined RAW lines — indentation preserved, no inline markdown
+    /// interpretation — so a command or snippet renders verbatim in a monospace box.
+    case codeBlock(String)
 }
 
 /// Parses the block structure of the markdown subset used by Help.md.
@@ -24,8 +40,8 @@ public enum MarkdownBlocks {
         var blocks: [MarkdownBlock] = []
 
         var para: [String] = []
-        var bullets: [String] = []
-        var numbers: [String] = []
+        var bullets: [ListItem] = []
+        var numbers: [ListItem] = []
         var quotes: [String] = []
 
         func flushPara()    { if !para.isEmpty    { blocks.append(.paragraph(para.joined(separator: " "))); para = [] } }
@@ -39,6 +55,21 @@ public enum MarkdownBlocks {
             let line = lines[i].trimmingCharacters(in: .whitespaces)
 
             if line.isEmpty { flushAll(); i += 1; continue }
+
+            // Fenced code block: collect the RAW lines (indentation preserved, no inline markdown) up
+            // to the closing fence. An unterminated fence collects to EOF rather than dropping content.
+            if line.hasPrefix("```") {
+                flushAll()
+                var code: [String] = []
+                var j = i + 1
+                while j < lines.count, !lines[j].trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                    code.append(lines[j])
+                    j += 1
+                }
+                blocks.append(.codeBlock(code.joined(separator: "\n")))
+                i = j < lines.count ? j + 1 : j    // step past the closing fence when present
+                continue
+            }
 
             if line == "---" { flushAll(); blocks.append(.rule); i += 1; continue }
 
@@ -60,8 +91,23 @@ public enum MarkdownBlocks {
                 i = j; continue
             }
 
-            if let b = bulletMatch(line) { flushPara(); flushNumbers(); flushQuotes(); bullets.append(b); i += 1; continue }
-            if let n = numberMatch(line) { flushPara(); flushBullets(); flushQuotes(); numbers.append(n); i += 1; continue }
+            // Indentation of the RAW line decides nesting: an indented bullet is a sub-item of the
+            // current (numbered or bullet) list item, not a new top-level entry — which is what keeps a
+            // numbered list's counter continuous across its sub-bullets instead of resetting to 1.
+            let indent = lines[i].prefix { $0 == " " || $0 == "\t" }.count
+            if let b = bulletMatch(line) {
+                flushPara(); flushQuotes()
+                if indent >= 2, !numbers.isEmpty {
+                    numbers[numbers.count - 1].subItems.append(b)
+                } else if indent >= 2, !bullets.isEmpty {
+                    bullets[bullets.count - 1].subItems.append(b)
+                } else {
+                    flushNumbers()
+                    bullets.append(ListItem(b))
+                }
+                i += 1; continue
+            }
+            if let n = numberMatch(line) { flushPara(); flushBullets(); flushQuotes(); numbers.append(ListItem(n)); i += 1; continue }
             if let q = quoteMatch(line)  { flushPara(); flushBullets(); flushNumbers(); quotes.append(q); i += 1; continue }
 
             // Default: paragraph text (soft-break joins with following plain lines).

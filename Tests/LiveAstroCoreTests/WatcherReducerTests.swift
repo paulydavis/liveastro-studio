@@ -592,6 +592,36 @@ final class WatcherReducerTests: XCTestCase {
         XCTAssertEqual(emittedNames(in: effects), [two, ten])
     }
 
+    // A `.pendingRead` placeholder stands in for a file whose blocking content read has
+    // been dispatched to the reader queue but has not completed. It must land the file in
+    // the not-ready `.observing` state so it participates in numbered ordering as the
+    // blocker — otherwise a higher revision would race past an in-flight lower one and the
+    // lower one would later be dropped by the high-water mark (a lost frame).
+    func testPendingReadPlaceholderLandsInObservingAndHoldsHigherRevision() {
+        let twoFile = "live_stack_002.fit"
+        let threeFile = "live_stack_003.fit"
+        let threeCandidate = makeCandidate(
+            name: threeFile,
+            identity: makeIdentity(3),
+            digest: "three",
+            kind: .numbered(revision: "003"))
+        // 003 is already ready; 002 has never been observed — its content read is in flight.
+        var reducer = makeReducer(files: [threeFile: .ready(threeCandidate)])
+
+        let held = observeBatch([
+            observation(name: twoFile, revision: "002",
+                        outcome: .pendingRead(identity: makeIdentity(2))),
+            observation(name: threeFile, revision: "003",
+                        outcome: .identityUnchanged(identity: threeCandidate.identity)),
+        ], nowNanos: 10, reducer: &reducer)
+
+        XCTAssertEqual(emittedNames(in: held), [],
+                       "an in-flight lower revision blocks the higher revision from emitting")
+        XCTAssertEqual(reducer.state.generation.files[twoFile],
+                       .observing(stat: makeIdentity(2)),
+                       "pendingRead lands the file in the not-ready observing state")
+    }
+
     func testNumericEqualRevisionUsesRawDigitsBeforeFullNameTiebreak() {
         let rawSeven = "LIVE_STACK_7.fit"
         let paddedSeven = "live_stack_007.fit"

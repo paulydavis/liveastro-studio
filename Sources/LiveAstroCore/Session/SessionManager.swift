@@ -98,8 +98,23 @@ public final class SessionManager {
         manifest = proposed
     }
 
+    public var subFrames: [SubFrameRecord] { manifest?.subFrames ?? [] }
+
+    /// Append a per-sub record and persist. Mirrors recordSnapshot's write-then-commit path.
+    public func recordSubFrame(_ record: SubFrameRecord) throws {
+        guard state == .running, var proposed = manifest, let dir = sessionDirectory else {
+            throw SessionError.notRunning
+        }
+        var subs = proposed.subFrames ?? []
+        subs.append(record)
+        proposed.subFrames = subs
+        try persist(proposed, to: dir)
+        manifest = proposed
+    }
+
     public func endSession(at date: Date = .init(),
-                           finalization: SessionFinalizationFacts? = nil) throws {
+                           finalization: SessionFinalizationFacts? = nil,
+                           intake: SourceIntake? = nil) throws {
         guard state == .running, var proposed = manifest, let dir = sessionDirectory else {
             throw SessionError.notRunning
         }
@@ -107,11 +122,18 @@ public final class SessionManager {
         // so a failed write can't leave the manager ended with an unpersisted endTime.
         proposed.endTime = date
         proposed.finalizationFacts = finalization
+        if let intake {
+            proposed.sourceExcludedPreExistingCount = intake.excludedPreExisting
+            proposed.sourceUnprocessedAtShutdownCount = intake.unprocessedAtShutdown
+            proposed.sourceReadFailureCount = intake.readFailures
+            proposed.sourceAccountingComplete = intake.accountingComplete
+        }
         try persist(proposed, to: dir)
         manifest = proposed
         state = .ended
         try? SessionSummaryMarkdown.write(manifest: proposed, to: dir)
         try? SessionFrameCSV.write(manifest: proposed, to: dir)
+        try? SubFrameCSV.write(subFrames: proposed.subFrames ?? [], to: dir)
     }
 
     /// Fill blank manifest metadata from the source header. User-entered values always win.
@@ -121,6 +143,19 @@ public final class SessionManager {
         if manifest!.camera.isEmpty, let v = meta.instrument { manifest!.camera = v }
         if manifest!.telescope.isEmpty, let v = meta.telescope { manifest!.telescope = v }
         if manifest!.filter.isEmpty, let v = meta.filter { manifest!.filter = v }
+    }
+
+    /// Called by the serial frame consumer before recording its first metadata-bearing sub.
+    /// The directory/session ID stay stable; subsequent snapshot/final writes persist these
+    /// authoritative fields together with the rest of the manifest.
+    func adoptSourceMetadata(_ meta: SourceMetadata) {
+        guard state == .running, manifest != nil else { return }
+        if let object = meta.object?.trimmingCharacters(in: .whitespacesAndNewlines), !object.isEmpty {
+            manifest!.targetName = object
+        }
+        manifest!.subExposureSeconds = SourceMetadata.resolvedExposureSeconds(
+            metadata: meta, fallback: manifest!.subExposureSeconds)
+        fillMissingMetadata(from: meta)
     }
 
     /// Atomic write: temp file + rename via Data(.atomic). Crash loses at most the in-flight update (spec §7).

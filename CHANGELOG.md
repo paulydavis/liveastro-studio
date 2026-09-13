@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+- Fixed live trail rejection in the detached OBS broadcast window. It previously displayed
+  the operator's online stack even when a clean master was being saved to `latest.png`.
+  The captured window now receives the resolved broadcast image and matching integration
+  depth; the embedded operator pane keeps the online preview.
+- Clean-master publication, rejection changes, reseed, and display adjustments now refresh
+  the window between incoming subs. Session end displays the final selected master, and
+  stale deliveries cannot replace a newer frame or another session's image.
+
+## 3.2.3 — 2026-08-17
+
+- **Batch import of full-size (26 MP) subs is ~2× faster** — a 60-sub import drops from
+  ~13 min to ~7 min. The per-frame on-screen preview is now rendered from a 2.5K downsample
+  of the stack instead of the full 26 MP, so the background-match and stretch passes (the
+  real bottleneck) do ~1/6 the work. The stacked master (`master.fit`) is still built at full
+  26 MP, and the live view keeps full resolution for zoom — only the preview/replay image is
+  downsized (the replay is 1080p regardless). Live snapshots are likewise capped at 2.5K.
+
+## 3.2.2 — 2026-08-16
+
+Follow-up review fixes to the 3.2.1 registration and import-watchdog work:
+
+- **Registration star selection is now balanced across the whole frame in every
+  prefix.** 3.2.1 spread the star budget over the frame, but the alignment matcher
+  only uses the first ~20 stars, and those were filled top-to-bottom — still biased
+  to one region. They're now chosen in a dispersed order so the matcher always sees
+  stars from every quadrant. Reduces corner star smearing further on wide, star-poor
+  fields.
+- **Network-share dead-read timeout matches its documented bound** (~5 min, not ~15).
+  Internal only — a genuinely stuck read on a disconnected share is now abandoned
+  when expected.
+
+## 3.2.1 — 2026-08-16
+
+Native import now works on full-size (26 MP) subs from an ASIAIR / ASI2600MC Air —
+the first real-hardware test of that path, which surfaced a cluster of issues that
+only appear on large frames or a network share (every prior test used 8 MP Seestar
+subs on local disk).
+
+- **Import no longer stalls after the first frame** on 26 MP subs with the quality
+  features on. Three causes, all fixed: the background sky-match sorted every pixel
+  in every tile (now subsampled — negligible change to the result); the outlier
+  rejection paid per-pixel overhead in its inner loop (now bound to raw buffers,
+  identical output); and the import's stall-watchdog was too impatient for a large
+  frame's processing time (a batch import now tolerates slow-but-progressing frames
+  while still catching a genuine hang). A full 60×180 s M 63 set now stacks 60/60
+  with rejection, frame weighting, sky-match, and transparency all enabled.
+- **Import from a network share (SMB) no longer cancels mid-read** — a slow 50 MB
+  sub read over WiFi is treated as slow, not stalled.
+- **Rounder stars in the corners of wide, star-poor fields.** Registration picked the
+  brightest stars globally, which clustered on bright regions and left the fit
+  under-constrained at the frame edges (slight corner smearing over a long session).
+  It now spreads the same star budget across the whole frame.
+
+## 3.2.0 — 2026-08-08
+
+- Session end: idle safeguard writes the master mid-session (never lose a stack to
+  a quit) and keeps stacking; optional auto-stop at a set clock time runs a full
+  End Session; macOS notifications when either fires. The idle safeguard applies to
+  native stacking only (where the app owns the master) — in external-stacker mode
+  it is disabled in Setup and no longer advertised on the Live tab. The Live tab
+  shows a floored auto-stop countdown ("Auto-stop in N min") that switches to a
+  clock time an hour out.
 - Relicensed under the **MIT License**. Replaced the demosaic path with a
   clean-room implementation of Malvar–He–Cutler (ICASSP 2004), removing the
   previous GPL-derived RCD code so the project carries no copyleft dependency.

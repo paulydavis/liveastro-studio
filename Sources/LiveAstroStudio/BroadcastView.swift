@@ -15,7 +15,8 @@ private enum BroadcastLayout {
     static let shadowOpacity: Double = 0.8
 }
 
-/// The OBS-captured scene: dark, non-interactive, never blanks (spec §5.6).
+/// The OBS-captured scene; also embedded as the operator pane when configuresWindow is false.
+/// The overlay remains visible while a new or invalidated stack waits for its first image.
 struct BroadcastView: View {
     @Environment(AppModel.self) private var model
     var configuresWindow: Bool = true
@@ -31,13 +32,16 @@ struct BroadcastView: View {
     // Last cursor position in view coordinates (top-left origin), tracked for
     // anchoring pinch/scroll zoom at the pointer ("zoom toward cursor").
     @State private var lastHoverInView: CGPoint? = nil
+    private var displayImage: CGImage? {
+        configuresWindow ? model.broadcastImage : model.latestImage
+    }
 
     var body: some View {
         GeometryReader { geo in
             @Bindable var model = model
             let uiScale = geo.size.height / BroadcastLayout.referenceHeight
             let fitted = fittedContentSize(
-                imageSize: model.latestImage.map { CGSize(width: $0.width, height: $0.height) },
+                imageSize: displayImage.map { CGSize(width: $0.width, height: $0.height) },
                 in: geo.size)
             ZStack {
                 Color.black
@@ -48,7 +52,7 @@ struct BroadcastView: View {
                 ScrollWheelZoom(viewSize: geo.size, fittedSize: fitted, model: model)
                     .frame(width: geo.size.width, height: geo.size.height)
                     .allowsHitTesting(false)
-                if let cg = model.latestImage {
+                if let cg = displayImage {
                     Image(decorative: cg, scale: 1)
                         .resizable()
                         .interpolation(.high)
@@ -65,7 +69,10 @@ struct BroadcastView: View {
             // Track the cursor in view coordinates (untransformed ZStack space) so
             // pinch anchors at the pointer too.
             .onContinuousHover { phase in
-                if case .active(let loc) = phase { lastHoverInView = loc }
+                switch phase {
+                case .active(let loc): lastHoverInView = loc
+                case .ended: lastHoverInView = nil
+                }
             }
             .ignoresSafeArea()
             .background(configuresWindow ? AnyView(BroadcastWindowConfigurator()) : AnyView(EmptyView()))
@@ -138,7 +145,7 @@ struct BroadcastView: View {
                     }), in: 1...ZoomPanState.maxScale)
                     .frame(width: 180)
                 Button("100%") {
-                    if let img = model.wrappedValue.latestImage, fitted.width > 0 {
+                    if let img = displayImage, fitted.width > 0 {
                         model.wrappedValue.zoomPan.scale = ZoomPanState.clampScale(
                             CGFloat(img.width) / fitted.width)
                         model.wrappedValue.zoomPan.offset = ZoomPanState.clampedOffset(
@@ -178,12 +185,25 @@ struct BroadcastView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(model.targetName.isEmpty ? "LiveAstro" : model.targetName)
                         .font(.system(size: BroadcastLayout.titleSize * scale, weight: .bold, design: .rounded))
-                    Text(model.integrationCaption)
+                    Text(configuresWindow ? model.broadcastIntegrationCaption : model.integrationCaption)
                         .font(.system(size: BroadcastLayout.captionSize * scale, weight: .semibold, design: .rounded))
                         .foregroundStyle(.secondary)
                     Text(equipmentLine)
                         .font(.system(size: BroadcastLayout.equipmentSize * scale, weight: .medium, design: .rounded))
                         .foregroundStyle(.tertiary)
+                    // Session-end armed status — operator-facing only. Shown in the
+                    // embedded Live tab (configuresWindow == false), never in the
+                    // OBS-captured detached window, so it can't burn into the
+                    // broadcast. Refreshes every 30 s so the countdown ticks.
+                    if !configuresWindow, model.isRunning {
+                        TimelineView(.periodic(from: .now, by: 30)) { context in
+                            if let text = completionStatusText(now: context.date) {
+                                Text(text)
+                                    .font(.system(size: BroadcastLayout.equipmentSize * scale, weight: .medium, design: .rounded))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
                 }
                 Spacer()
                 TimelineView(.periodic(from: .now, by: 1)) { _ in
@@ -206,6 +226,28 @@ struct BroadcastView: View {
             parts.append(model.locationLabel + bortle)
         }
         return parts.joined(separator: "  ·  ")
+    }
+
+    /// Renders the armed session-end triggers, e.g. "Auto-stop 3:00 AM · idle-safe
+    /// 15 min". When the planned stop is under an hour away, its segment switches to
+    /// a live countdown ("Auto-stop in 24 min"). Uses the same next-occurrence
+    /// deadline the driver fires on (crosses midnight).
+    private func completionStatusText(now: Date) -> String? {
+        let cs = model.completionSettings
+        // Same armed-at anchor the driver fires on, so the displayed countdown and
+        // the tick agree. idle-safe is gated to native mode inside CompletionStatus.
+        let deadline = cs.plannedStopEnabled
+            ? SessionCompletionMonitor.plannedStopDeadline(
+                after: model.plannedStopAnchor, hour: cs.plannedStopHour, minute: cs.plannedStopMinute)
+            : nil
+        return CompletionStatus.line(
+            plannedStopEnabled: cs.plannedStopEnabled,
+            plannedDeadline: deadline,
+            idleSafeguardEnabled: cs.idleSafeguardEnabled,
+            idleSafeguardMinutes: cs.idleSafeguardMinutes,
+            isNativeStacking: model.sourceMode == .nativeStack,
+            now: now,
+            clockString: { d in let f = DateFormatter(); f.dateFormat = "h:mm a"; return f.string(from: d) })
     }
 
     private var elapsedLine: String {

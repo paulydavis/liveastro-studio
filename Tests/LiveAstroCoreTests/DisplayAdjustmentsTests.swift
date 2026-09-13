@@ -32,6 +32,16 @@ final class DisplayAdjustmentsTests: XCTestCase {
         XCTAssertEqual(DisplayAdjustments(), n)
     }
 
+    func testLiveDefaultIsNeutralPlusDBE() {
+        // liveDefault (fresh-install / Reset target) has DBE on; neutral (identity)
+        // stays off. They differ only by backgroundExtraction.
+        XCTAssertTrue(DisplayAdjustments.liveDefault.backgroundExtraction)
+        XCTAssertFalse(DisplayAdjustments.neutral.backgroundExtraction)
+        var expected = DisplayAdjustments.neutral
+        expected.backgroundExtraction = true
+        XCTAssertEqual(DisplayAdjustments.liveDefault, expected)
+    }
+
     func testDBERoundTrip() throws {
         let a = DisplayAdjustments(blackPoint: 0.05, midtoneStrength: 0.2, saturation: 1.3,
                                    backgroundExtraction: true, backgroundDegree: 2)
@@ -68,6 +78,25 @@ final class DisplayAdjustmentsDBEv3Tests: XCTestCase {
         XCTAssertEqual(a.bgScale, 3.0, accuracy: 1e-9)
         XCTAssertEqual(a.bgSmoothest, 0.5, accuracy: 1e-9)
         XCTAssertTrue(a.backgroundExtraction)
+    }
+}
+
+final class DisplayAdjustmentsNorthUpTests: XCTestCase {
+    func testNorthUpDefaultsOffAndRoundTrips() throws {
+        var a = DisplayAdjustments.neutral
+        XCTAssertFalse(a.northUp)                             // default OFF (3b: toggle default off)
+        a.northUp = true
+        let back = try JSONDecoder().decode(DisplayAdjustments.self,
+                                            from: JSONEncoder().encode(a))
+        XCTAssertTrue(back.northUp)
+    }
+
+    func testDecodesOldSettingsWithoutNorthUpKey() throws {
+        // A settings blob written before 3b must decode northUp as false.
+        let old = #"{"blackPoint":0.1,"midtoneStrength":-0.3,"saturation":1.5,"backgroundExtraction":true,"backgroundDegree":2,"bgScale":3.0,"bgSmoothest":0.5,"denoiseStrength":0.4}"#
+        let a = try JSONDecoder().decode(DisplayAdjustments.self, from: Data(old.utf8))
+        XCTAssertFalse(a.northUp)                             // absent -> off
+        XCTAssertEqual(a.denoiseStrength, 0.4, accuracy: 1e-9)
     }
 }
 

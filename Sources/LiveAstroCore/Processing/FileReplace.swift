@@ -7,12 +7,12 @@ import Foundation
 /// destroys the previous good `master_processed` output when the move fails
 /// after the removal. `FileManager.replaceItemAt` preserves the original on
 /// failure; a plain move is used only when no original exists (nothing to lose).
-enum FileReplace {
+public enum FileReplace {
     /// Replace `destination` with the file at `temp`.
     /// On success `temp` is consumed. On ANY failure the previous
     /// `destination` (if it existed) remains in place; the caller owns
     /// cleaning up `temp`.
-    static func replaceItem(at destination: URL, withItemAt temp: URL,
+    public static func replaceItem(at destination: URL, withItemAt temp: URL,
                             fileManager: FileManager = .default) throws {
         if fileManager.fileExists(atPath: destination.path) {
             _ = try fileManager.replaceItemAt(destination, withItemAt: temp)

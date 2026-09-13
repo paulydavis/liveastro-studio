@@ -96,6 +96,30 @@ public struct SessionManifest: Codable, Equatable {
     public internal(set) var sessionAcceptedCount: Int? = nil
     public internal(set) var sessionRejectedCount: Int? = nil
 
+    /// Source-boundary accounting, persisted with `endTime`. Flat top-level keys following the
+    /// same backward-compatibility convention as the finalization counts above: legacy manifests
+    /// decode with these absent (nil).
+    ///
+    /// `sourceExcludedPreExistingCount` — subs the operator chose to skip at Start.
+    /// `sourceUnprocessedAtShutdownCount` — subs the watcher had detected and buffered but that
+    /// were never handed to the stacker before the session ended. The files remain in the watch
+    /// folder; only the accounting was missing before this field existed.
+    /// Frames that WERE handed on are already covered by the accepted/rejected counts, so they
+    /// are not duplicated here.
+    /// `sourceReadFailureCount` — pulled but unreadable/undecodable. Kept apart from both the
+    /// processed frames and the unprocessed remainder: an attempted decode is neither.
+    /// `sourceAccountingComplete` — false when the relay could not be stopped within its budget,
+    /// so later admissions may be missing from these tallies.
+    public internal(set) var sourceExcludedPreExistingCount: Int? = nil
+    public internal(set) var sourceUnprocessedAtShutdownCount: Int? = nil
+    public internal(set) var sourceReadFailureCount: Int? = nil
+    public internal(set) var sourceAccountingComplete: Bool? = nil
+
+    /// Per-sub quality records (spec §Data model). Optional for backward compatibility:
+    /// legacy manifests decode with this absent (nil — synthesized Codable uses
+    /// decodeIfPresent). Written incrementally during a live session and at finalize.
+    public internal(set) var subFrames: [SubFrameRecord]? = nil
+
     /// Grouped view over the flat JSON schema. The manifest keeps top-level keys for backward
     /// compatibility, but production code writes them as one value so outcome/count drift has a
     /// single choke point.

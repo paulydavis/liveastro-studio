@@ -6,7 +6,7 @@ import CryptoKit
 /// mtime at nanosecond precision) pin the content version, and `digest` (when present) is the
 /// watcher's content digest over the same descriptor. Consumers use `read(url:verifying:)` to
 /// refuse a file that was replaced between the watcher's validation and their own read.
-public struct FileIdentity: Equatable, Sendable {
+public struct FileIdentity: Equatable, Sendable, Codable {
     public let dev: Int64
     public let ino: UInt64
     public let size: Int
@@ -212,6 +212,34 @@ public final class StackFileWatcher {
     private var continuation: AsyncStream<StackUpdate>.Continuation!
     private var source: DispatchSourceFileSystemObject?
     private var pollTimer: DispatchSourceTimer?
+
+    // --- Stall watchdog (M8) ---
+    // The digest read runs on `queue` with O_NONBLOCK cleared, so a hung read (dead network
+    // share / iCloud fileprovider) freezes the serial queue and the poll timer can't fire —
+    // detection silently stops (confirmed by testBlockedContentReadFreezesDetection). The
+    // watcher can't cleanly unblock a hung read() on its own confined queue, but it CAN detect
+    // the freeze from a SEPARATE queue (never touching the frozen one) and make it loud, turning
+    // a silent all-nighter data loss into a visible, actionable event.
+    private let watchdogQueue = DispatchQueue(label: "liveastro.watcher.watchdog")
+    private var watchdogTimer: DispatchSourceTimer?
+    private let livenessLock = NSLock()
+    private var lastProgressNanos: UInt64 = 0        // updated at the top of every scan tick
+    // Reader-queue liveness (all under livenessLock): the scan tick above proves the SERIAL queue is
+    // alive, but content reads run on the reader queue where the scan-tick can't see them. If every
+    // read slot is occupied by a hung read (dead share / offline iCloud) with no completions, new
+    // files are omitted at the cap and detection halts — silently, because scans keep ticking. These
+    // let the watchdog also alarm on that "all read slots stuck" case.
+    private var oldestOutstandingReadNanos: UInt64 = 0  // dispatch time of the oldest in-flight read; 0 = none
+    private var outstandingReadMirror: Int = 0       // lock-visible mirror of inFlightReads.count
+    private let stallLock = NSLock()
+    private var stallReported = false
+    /// Fired ONCE (until scans resume) when detection has been frozen past the threshold.
+    /// Called on the watchdog queue. The app surfaces it as a visible "detection stalled" alert.
+    public var onStall: (() -> Void)?
+    /// How long detection may be frozen before the watchdog reports a stall. Generous by
+    /// default so a slow-but-completing scan never false-positives; test-settable.
+    internal var stallThresholdNanos: UInt64 = 30_000_000_000
+    internal var watchdogIntervalNanos: UInt64 = 5_000_000_000
     private var debounceWork: DispatchWorkItem?
     private var folderFD: Int32 = -1
 
@@ -326,6 +354,22 @@ public final class StackFileWatcher {
     /// writes in scan().
     internal var digestComputations: Int { onQueueSync { _digestComputations } }
 
+    // Liveness heartbeat (M8 all-nighter stall diagnosis). The live watcher once quietly stopped
+    // detecting new files ~2h in, with no evidence of WHERE the pipeline stalled. A periodic heartbeat
+    // through onLog turns the next long session into a diagnosis: if the log stops advancing, the
+    // WATCHER died; if it keeps advancing (polls climbing) while `emitted` flatlines, detection
+    // desynced; if `emitted` climbs but the app stops stacking, the CONSUMER stalled. Queue-confined
+    // like all scan state; the counters feed only this log line.
+    /// Heartbeat cadence (default 60 s). Instance-settable (pre-start) so tests can force a heartbeat
+    /// on every poll without waiting a wall-clock minute.
+    internal var heartbeatIntervalNanos: UInt64 = 60_000_000_000
+    private var _polls = 0
+    private var _emitted = 0
+    private var _lastHeartbeatNanos: UInt64 = 0
+    /// Test-visible poll/emit counters (queue-synchronized snapshot).
+    internal var pollCount: Int { onQueueSync { _polls } }
+    internal var emittedCount: Int { onQueueSync { _emitted } }
+
     /// Monotonic now, in nanoseconds (review8 finding 1). DispatchTime rides
     /// CLOCK_UPTIME_RAW — never wall-adjusted, never goes backwards — which is
     /// what the digest-stability gate's separation requirement needs (Date/
@@ -346,6 +390,18 @@ public final class StackFileWatcher {
     /// The reducer is the sole semantic state owner once scan integration is complete.
     private var reducer: WatcherReducer
 
+    /// Test seam: invoked right before a file's content digest is read. A test can block here to
+    /// simulate a hung read (dead network share / iCloud fileprovider). In production reads run on
+    /// the reader queue, so this fires there — hanging it does NOT freeze the serial poll queue. nil
+    /// in production.
+    internal var beforeContentReadForTesting: (() -> Void)?
+
+    /// Test seam: when true, content reads run INLINE on the serial queue during scan() instead of
+    /// being dispatched to the reader queue, so deterministic `scanNow()` + manual-clock tests can
+    /// choreograph exact reducer state within a single scan call. The async transport is covered
+    /// separately by the real-I/O integration tests. Production always dispatches (false).
+    internal var synchronousContentReadsForTesting = false
+
     /// Deterministic integration seam: tests may replace the watched folder after a complete
     /// observation batch has reduced, but before its ordered effects execute.
     internal var afterObservationBatchForTesting: (() -> Void)?
@@ -359,6 +415,53 @@ public final class StackFileWatcher {
     internal var blockingCeilingNanos: UInt64 { reducer.blockingCeilingNanos }
 
     private static let maxHeaderBlocks = 32  // generous ceiling; real headers are 1-10 blocks
+
+    /// Concurrent queue for the ONLY blocking work in a scan: a file's content reads (FITS
+    /// header pre-read + full-file digest). Concurrent — never serial — so one hung read (dead
+    /// SMB / iCloud fileprovider) can never block another file's read the way a serial queue
+    /// would. The serial poll `queue` keeps enumerating and integrating completions throughout,
+    /// so detection never freezes. This is the structural fix for the M8 all-nighter stall.
+    private let readerQueue = DispatchQueue(label: "liveastro.watcher.reader", attributes: .concurrent)
+
+    /// Files whose content read has been dispatched to `readerQueue` and not yet integrated,
+    /// mapped to the identity captured at dispatch. Queue-confined (serial `queue` only). Two jobs:
+    /// (1) a re-scan re-presents an in-flight file as a `.pendingRead` placeholder from this
+    /// identity — no second dispatch, no fs touch — so it holds its numbered-ordering slot;
+    /// (2) its `count` bounds outstanding reads: a NEW read is dispatched only while under the cap,
+    /// so a flood of brand-new files can't spawn unbounded reader threads (excess files are simply
+    /// picked up on later polls). A genuinely hung read stays in this map, keeping its ordering slot
+    /// until the reducer's existing write-off budget abandons it.
+    private var inFlightReads: [String: FileIdentity] = [:]
+    /// Dispatch time (monotonic nanos) per in-flight read, parallel to `inFlightReads` — feeds the
+    /// watchdog's oldest-outstanding-read age. Serial-queue confined.
+    private var inFlightSince: [String: UInt64] = [:]
+    /// Cap on concurrently outstanding content reads (bounds reader-thread use under a flood).
+    /// Live capture never approaches this (one new sub per poll); it only bites on a big backlog.
+    private static let maxInFlightReads = 8
+    /// How many reads must be stuck-past-threshold before the watchdog alarms. In single-file
+    /// producer mode (`.mutableStackerOutput`, one rewritten `live_stack.fit`) ONE stuck read is a
+    /// total stall → floor 1. In multi-file mode (`.immutableAfterPublish`) a single stuck read among
+    /// free slots doesn't halt detection of other subs, so only a fully-saturated cap counts.
+    private let stuckReadAlarmFloor: Int
+
+    /// The outcome a scan records for an in-flight file: present, identity known, content pending.
+    private func pendingReadObservation(name: String, identity: FileIdentity) -> FileObservation {
+        FileObservation(
+            name: name,
+            url: folder.appendingPathComponent(name),
+            kind: reducer.entryKind(for: name),
+            outcome: .pendingRead(identity: identity),
+            observedAtNanos: monotonicNowNanos())
+    }
+
+    /// The synchronous (non-blocking) decision for one file: open + fstat + readPlan only. A file
+    /// needing a content read hands its open descriptor OUT for the reader queue; every other case
+    /// is fully resolved here and closes its own descriptor.
+    private enum ObserveDecision {
+        case observation(FileObservation)     // ready for the batch; descriptor already closed
+        case dispatchRead(name: String, url: URL, kind: WatcherEntryKind,
+                          identity: FileIdentity, isFITS: Bool, handle: FileHandle)
+    }
 
     /// Review10 item 7: `quietPeriod`/`pollInterval` are public Doubles that feed reducer
     /// nanosecond configuration and DispatchTime arithmetic — a
@@ -380,6 +483,9 @@ public final class StackFileWatcher {
         self.quietPeriod = Self.sanitizedInterval(quietPeriod, default: 0.5)
         self.pollInterval = Self.sanitizedInterval(pollInterval, default: 2.0)
         self.fileNamePrefix = fileNamePrefix
+        // Single-file producer (classic Siril live_stack.fit) → one stuck read halts everything, so
+        // alarm on a single stuck read; multi-file producer → only a saturated cap halts detection.
+        self.stuckReadAlarmFloor = (digestPolicy == .mutableStackerOutput) ? 1 : Self.maxInFlightReads
         self.reducer = WatcherReducer(
             state: WatcherState(
                 generation: GenerationState(
@@ -410,6 +516,7 @@ public final class StackFileWatcher {
         debounceWork?.cancel()
         source?.cancel()
         pollTimer?.cancel()
+        watchdogTimer?.cancel()
         continuation.finish()
     }
 
@@ -431,7 +538,53 @@ public final class StackFileWatcher {
             timer.resume()
             pollTimer = timer
             state = .running
+            startWatchdog()
         }
+    }
+
+    /// Start the stall watchdog on its own queue. It only reads a lock-guarded timestamp and
+    /// the atomic stop flag — never the (potentially frozen) watcher queue — so a hung scan
+    /// can't freeze the watchdog too.
+    private func startWatchdog() {
+        livenessLock.withLock { lastProgressNanos = monotonicNowNanos() }
+        let interval = Double(watchdogIntervalNanos) / 1_000_000_000
+        let wd = DispatchSource.makeTimerSource(queue: watchdogQueue)
+        wd.schedule(deadline: .now() + interval, repeating: interval)
+        wd.setEventHandler { [weak self] in self?.watchdogTick() }
+        wd.resume()
+        watchdogTimer = wd
+    }
+
+    private func watchdogTick() {
+        guard !stopRequested.isSet else { return }
+        let now = monotonicNowNanos()
+        let (scanLast, oldestRead, outstanding) = livenessLock.withLock {
+            (lastProgressNanos, oldestOutstandingReadNanos, outstandingReadMirror)
+        }
+        // Two independent stalls, both meaning "new subs are no longer being detected":
+        // (1) the serial poll queue itself froze (scan tick stale) — e.g. a hung readdir/open;
+        // (2) a content read has been stuck past the threshold and detection is halted by it —
+        //     the poll queue keeps ticking, so (1) alone can't see it. The alarm floor makes this
+        //     mode-aware: in single-file mode ONE stuck read is a stall; in multi-file mode a single
+        //     stuck read among free slots isn't (others still flow), so only a saturated cap counts.
+        let queueFrozen = scanLast != 0 && now > scanLast && now &- scanLast >= stallThresholdNanos
+        let readsStuck = outstanding >= stuckReadAlarmFloor
+            && oldestRead != 0 && now > oldestRead && now &- oldestRead >= stallThresholdNanos
+        guard queueFrozen || readsStuck else {
+            stallLock.withLock { stallReported = false }   // healthy → re-arm the one-shot
+            return
+        }
+        let fire = stallLock.withLock { () -> Bool in
+            if stallReported { return false }
+            stallReported = true
+            return true
+        }
+        guard fire else { return }
+        let detail = queueFrozen
+            ? "folder detection has been frozen for ~\((now &- scanLast) / 1_000_000_000)s (likely a hung read on the poll queue)"
+            : "a content read has been stuck for ~\((now &- oldestRead) / 1_000_000_000)s (\(outstanding) in flight — dead share / offline iCloud)"
+        onLog?("⚠️ Watcher STALLED — \(detail). New subs are NOT being detected — End and restart the session.")
+        onStall?()
     }
 
     /// Open the folder fd and arm the DispatchSource.
@@ -521,9 +674,16 @@ public final class StackFileWatcher {
         // emit, no re-scheduled scan.
         state = .stopped
         debounceWork?.cancel(); debounceWork = nil
+        // In-flight reader tasks observe the stop flag (contentDigest.shouldAbort) and return
+        // promptly, closing their own descriptors; their integration hop then no-ops on .stopped.
+        // Clear the map so no phantom placeholder survives a restart.
+        inFlightReads.removeAll()
+        inFlightSince.removeAll()
+        refreshReadLiveness()
         // The fd is closed by the source's cancel handler, never here (see armSource()).
         cancelSource()
         pollTimer?.cancel(); pollTimer = nil
+        watchdogTimer?.cancel(); watchdogTimer = nil
         continuation.finish()
     }
 
@@ -539,6 +699,11 @@ public final class StackFileWatcher {
         // A queued/debounced scan may outlive stop(). The atomic flag also covers a stop whose
         // queue-confined teardown is waiting behind this scan.
         guard state == .running, !stopRequested.isSet else { return }
+        _polls += 1
+        emitHeartbeatIfDue()
+        // Liveness for the stall watchdog: a scan that blocks (hung read) never reaches the
+        // NEXT tick, so this timestamp goes stale and the watchdog (separate queue) fires.
+        livenessLock.withLock { lastProgressNanos = monotonicNowNanos() }
         let fm = FileManager.default
 
         var isDirectory: ObjCBool = false
@@ -593,9 +758,40 @@ public final class StackFileWatcher {
 
         for name in trackedNames {
             if stopRequested.isSet { return }
-            guard var observation = observeFile(named: name) else { return }
-            observation.observedAtNanos = monotonicNowNanos()
-            observations.append(observation)
+            // An in-flight read holds its ordering slot via a placeholder — no fs touch, no
+            // second dispatch. This branch runs BEFORE the cap check so a file already reading
+            // is always re-presented.
+            if let identity = inFlightReads[name] {
+                observations.append(pendingReadObservation(name: name, identity: identity))
+                continue
+            }
+            switch observeFileSyncDecision(named: name) {
+            case .observation(var observation):
+                observation.observedAtNanos = monotonicNowNanos()
+                observations.append(observation)
+            case .dispatchRead(let n, let u, let k, let id, let isFITS, let handle):
+                if synchronousContentReadsForTesting {
+                    // Test seam: read inline and add the result to THIS batch — the same observation
+                    // the async path would integrate, minus the queue hop. Reproduces the old
+                    // single-reduce-per-scan flow so deterministic tests stay choreographable.
+                    _digestComputations += 1
+                    var obs = Self.readContentObservation(
+                        handle: handle, name: n, url: u, kind: k, identity: id, isFITS: isFITS,
+                        stopFlag: stopRequested, seam: beforeContentReadForTesting)
+                    try? handle.close()
+                    if stopRequested.isSet { return }
+                    obs.observedAtNanos = monotonicNowNanos()
+                    observations.append(obs)
+                } else if inFlightReads.count < Self.maxInFlightReads {
+                    dispatchContentRead(name: n, url: u, kind: k, identity: id, isFITS: isFITS,
+                                        handle: handle, generation: reducer.state.generation.id)
+                    observations.append(pendingReadObservation(name: n, identity: id))
+                } else {
+                    // At capacity — omit this brand-new file; a later poll dispatches it once a
+                    // read slot frees. It is unknown to the reducer, so omission is invisible.
+                    try? handle.close()
+                }
+            }
         }
 
         let present = Set(trackedNames)
@@ -619,34 +815,40 @@ public final class StackFileWatcher {
         execute(effects)
     }
 
-    private func isTrackedFileName(_ name: String) -> Bool {
-        guard !name.hasPrefix("."), !name.lowercased().hasSuffix(".tmp") else { return false }
-        if let prefix = fileNamePrefix, !prefix.isEmpty,
-           !name.lowercased().hasPrefix(prefix.lowercased()) { return false }
-        let ext = (name as NSString).pathExtension.lowercased()
-        return ImageLoader.fitsExtensions.contains(ext)
-            || ImageLoader.bitmapExtensions.contains(ext)
+    /// Heartbeat through onLog every `heartbeatIntervalNanos`, at the top of a scan on the watcher
+    /// queue. See the counter declarations: a log that stops advancing means the watcher died; polls
+    /// climbing while `emitted` flatlines means detection desynced.
+    private func emitHeartbeatIfDue() {
+        let now = monotonicNowNanos()
+        guard now &- _lastHeartbeatNanos >= heartbeatIntervalNanos else { return }
+        _lastHeartbeatNanos = now
+        onLog?("watcher alive: \(_polls) polls, \(reducer.state.generation.files.count) tracked, \(_emitted) emitted")
     }
 
-    /// Build exactly one immutable observation from one pinned descriptor. A nil return means
-    /// the streaming digest observed stopRequested and the entire scan must abort.
-    private func observeFile(named name: String) -> FileObservation? {
+    /// The acceptance rule lives in `WatchFolderInput` so the count shown to the operator at
+    /// Start and the set this watcher actually emits can never drift apart.
+    private func isTrackedFileName(_ name: String) -> Bool {
+        WatchFolderInput.isTrackedFileName(name, fileNamePrefix: fileNamePrefix)
+    }
+
+    /// The synchronous, NON-BLOCKING decision for one file: open + fstat + readPlan only. None of
+    /// these materialize an iCloud-evicted file, so they are safe on the serial poll queue. A file
+    /// that needs a content read hands its OPEN descriptor out (ownership transfers to the reader
+    /// queue via `dispatchContentRead`); every other case is fully resolved here and closes its own
+    /// descriptor. No content read — not even the FITS header pre-read — happens on this path.
+    private func observeFileSyncDecision(named name: String) -> ObserveDecision {
         let url = folder.appendingPathComponent(name)
-        let invalid: () -> FileObservation = {
-            FileObservation(
-                name: name,
-                url: url,
-                kind: self.reducer.entryKind(for: name),
-                outcome: .invalid)
+        func invalidDecision() -> ObserveDecision {
+            .observation(FileObservation(
+                name: name, url: url, kind: reducer.entryKind(for: name), outcome: .invalid))
         }
 
         guard let handle = Self.openFile(directoryFD: folderFD, name: name) else {
-            return invalid()
+            return invalidDecision()
         }
-        defer { try? handle.close() }
-
         guard let observed = Self.statFile(handle), observed.size > 0 else {
-            return invalid()
+            try? handle.close()
+            return invalidDecision()
         }
         let ext = (name as NSString).pathExtension.lowercased()
         let entry = EnumeratedEntry(
@@ -655,68 +857,124 @@ public final class StackFileWatcher {
             identity: observed,
             isFITS: ImageLoader.fitsExtensions.contains(ext))
         guard let request = reducer.readPlan(for: [entry]).first else {
-            return invalid()
+            try? handle.close()
+            return invalidDecision()
         }
 
         switch request {
-        case .acceptIdentity(let observation):
-            return observation
-
-        case .observeWithoutContent(let observation):
-            return observation
-
-        case .readContent(let requestName, let requestURL, let kind,
-                          let identity, let isFITS):
-            if isFITS {
-                guard let head = try? Self.readHead(
-                    handle, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
-                      let header = try? FITSReader.readHeader(head),
-                      identity.size >= header.minimumFileSize else {
-                    return FileObservation(
-                        name: requestName,
-                        url: requestURL,
-                        kind: kind,
-                        outcome: .invalid)
-                }
-            }
-
-            _digestComputations += 1
-            let stopFlag = stopRequested
-            guard let digest = FileIdentity.contentDigest(
-                handle: handle,
-                size: identity.size,
-                shouldAbort: { stopFlag.isSet }) else {
-                if stopRequested.isSet { return nil }
-                return FileObservation(
-                    name: requestName,
-                    url: requestURL,
-                    kind: kind,
-                    outcome: .invalid)
-            }
-
-            guard let finalStat = Self.statFile(handle) else {
-                return FileObservation(
-                    name: requestName,
-                    url: requestURL,
-                    kind: kind,
-                    outcome: .invalid)
-            }
-            guard finalStat == identity else {
-                return FileObservation(
-                    name: requestName,
-                    url: requestURL,
-                    kind: kind,
-                    outcome: .unstable(identity: finalStat))
-            }
-            return FileObservation(
-                name: requestName,
-                url: requestURL,
-                kind: kind,
-                outcome: .digested(
-                    identity: identity,
-                    digest: digest,
-                    byteCount: identity.size))
+        case .acceptIdentity(let observation), .observeWithoutContent(let observation):
+            try? handle.close()   // no content needed — done synchronously
+            return .observation(observation)
+        case .readContent(let requestName, let requestURL, let kind, let identity, let isFITS):
+            // Transfer descriptor ownership to the reader queue — do NOT close here.
+            return .dispatchRead(name: requestName, url: requestURL, kind: kind,
+                                 identity: identity, isFITS: isFITS, handle: handle)
         }
+    }
+
+    /// Hand a file's blocking content read to `readerQueue`. Called on the serial queue: records the
+    /// in-flight identity and bumps the digest counter (queue-confined), then performs the read off
+    /// the serial queue and hops the resulting observation back for integration. The reader task OWNS
+    /// `handle` and closes it on every path.
+    private func dispatchContentRead(name: String, url: URL, kind: WatcherEntryKind,
+                                     identity: FileIdentity, isFITS: Bool,
+                                     handle: FileHandle, generation: FolderGeneration) {
+        inFlightReads[name] = identity
+        inFlightSince[name] = monotonicNowNanos()   // start this read's age clock for the watchdog
+        refreshReadLiveness()
+        _digestComputations += 1
+        let stopFlag = stopRequested
+        let seam = beforeContentReadForTesting   // capture on the serial queue; run it on the reader queue
+        readerQueue.async { [weak self] in
+            defer { try? handle.close() }
+            let observation = Self.readContentObservation(
+                handle: handle, name: name, url: url, kind: kind,
+                identity: identity, isFITS: isFITS, stopFlag: stopFlag, seam: seam)
+            guard let self else { return }
+            self.queue.async { [weak self] in
+                self?.integrateCompletedRead(name: name, observation: observation, generation: generation)
+            }
+        }
+    }
+
+    /// Perform the blocking content read on the reader queue and build the resulting observation.
+    /// Pure/static — touches no instance state — so it is safe to run off the serial queue.
+    /// A stop or read failure yields `.invalid`; `integrateCompletedRead` drops it under stop, and a
+    /// genuine failure simply retries on a later poll (identical to the old inline behavior).
+    static func readContentObservation(
+        handle: FileHandle, name: String, url: URL, kind: WatcherEntryKind,
+        identity: FileIdentity, isFITS: Bool, stopFlag: NSLock_Flag, seam: (() -> Void)?
+    ) -> FileObservation {
+        func obs(_ outcome: ObservationOutcome) -> FileObservation {
+            FileObservation(name: name, url: url, kind: kind, outcome: outcome)
+        }
+        if isFITS {
+            guard let head = try? Self.readHead(
+                    handle, bytes: Self.maxHeaderBlocks * FITSReader.blockSize),
+                  let header = try? FITSReader.readHeader(head),
+                  identity.size >= header.minimumFileSize else {
+                return obs(.invalid)
+            }
+        }
+        seam?()   // test seam: block HERE (reader queue) to simulate a hung read — the serial queue stays free
+        guard let digest = FileIdentity.contentDigest(
+                handle: handle, size: identity.size, shouldAbort: { stopFlag.isSet }) else {
+            return obs(.invalid)
+        }
+        guard let finalStat = Self.statFile(handle) else { return obs(.invalid) }
+        guard finalStat == identity else { return obs(.unstable(identity: finalStat)) }
+        return obs(.digested(identity: identity, digest: digest, byteCount: identity.size))
+    }
+
+    /// Integrate a completed content read back on the serial queue as a single-entry observation
+    /// batch. Guards: a stale generation (folder replaced mid-read) or a stop drops the result. This
+    /// one-entry batch is safe by the reducer contract — the reducer never infers absence from
+    /// omission, and a one-entry batch cannot charge the ordering ledgers.
+    /// Refresh the watchdog's lock-visible view of outstanding reads: the count (for the alert text)
+    /// and the OLDEST outstanding read's dispatch time (0 = none in flight). The watchdog compares
+    /// that dispatch time to now, so a read stuck past the threshold trips the alarm even when it's
+    /// the only one — which is the whole point in single-file (classic Siril) mode, where one hung
+    /// read is a total stall that never reaches the cap. Serial-queue confined (called after every
+    /// `inFlightReads`/`inFlightSince` mutation).
+    private func refreshReadLiveness() {
+        let oldest = inFlightSince.values.min() ?? 0
+        let count = inFlightReads.count
+        livenessLock.withLock { oldestOutstandingReadNanos = oldest; outstandingReadMirror = count }
+    }
+
+    private func integrateCompletedRead(name: String, observation: FileObservation,
+                                        generation: FolderGeneration) {
+        guard state == .running, !stopRequested.isSet else { return }
+        // Stale read from a superseded generation (folder swapped while it was in flight): drop it
+        // and DO NOT clear inFlightReads[name] — a fresh read for the same name may already be in
+        // flight under the current generation, and clearing here would wipe its live marker (letting
+        // a redundant third read dispatch). Only the current generation's completion frees the slot.
+        guard generation == reducer.state.generation.id else { return }
+        // A current-generation read completed → free its slot and clear its age clock. A stale
+        // old-generation completion is intentionally NOT counted (guard above): it doesn't mean the
+        // current generation's detection is advancing.
+        inFlightReads[name] = nil
+        inFlightSince[name] = nil
+        refreshReadLiveness()
+        let now = monotonicNowNanos()
+        livenessLock.withLock { lastProgressNanos = now }   // a completion also proves the serial queue is alive
+        var entry = observation
+        entry.observedAtNanos = now
+        // Carry the full ordering context: the completed file PLUS a placeholder for every OTHER
+        // still-in-flight read. Without the placeholders a higher revision completing first would
+        // emit past an in-flight lower one (whose placeholder is absent from a bare single-entry
+        // batch), and the lower one would later be high-water-dropped — the exact frame loss the
+        // placeholder exists to prevent. With them, the reducer holds the higher file behind the
+        // in-flight lower blocker, and the normal emit/emissionFinished cycle stays intact.
+        var entries = [entry]
+        for (pendingName, pendingIdentity) in inFlightReads {
+            entries.append(pendingReadObservation(name: pendingName, identity: pendingIdentity))
+        }
+        let effects = reducer.reduce(.observe(ObservationBatch(
+            generation: generation,
+            entries: entries,
+            nowNanos: now)))
+        execute(effects)
     }
 
     private func execute(_ effects: [WatcherEffect]) {
@@ -751,6 +1009,7 @@ public final class StackFileWatcher {
                     url: intent.candidate.url,
                     fileSize: intent.candidate.byteCount,
                     identity: intent.candidate.identity.withDigest(intent.candidate.digest)))
+                _emitted += 1
                 let followupEffects = reducer.reduce(.emissionFinished(EmissionResult(
                     intent: intent,
                     outcome: .yielded)))
@@ -763,6 +1022,13 @@ public final class StackFileWatcher {
         let current = reducer.state.generation.id.rawValue
         precondition(current < UInt64.max, "watcher folder generation exhausted")
         _ = reducer.reduce(.replaceGeneration(FolderGeneration(rawValue: current + 1)))
+        // Drop placeholders for the OLD generation: any read still in flight belongs to the folder
+        // we just left, so its completion will be dropped by the generation guard in
+        // integrateCompletedRead. Clearing here stops a re-scan from re-presenting a phantom
+        // in-flight file that may not exist in the new folder. (The read task still closes its own fd.)
+        inFlightReads.removeAll()
+        inFlightSince.removeAll()
+        refreshReadLiveness()
     }
 
     /// Mid-tick replacement handling shared by the top-of-scan and pre-yield identity checks.

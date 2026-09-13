@@ -50,6 +50,106 @@ final class MasterBuilderTests: XCTestCase {
         }
     }
 
+    /// combineDetailed reports frames that ACTUALLY contributed (not the input count) and whether
+    /// the flat offset was truly subtracted — so callers can't record ×N or claim "offset subtracted"
+    /// when a file was skipped or the offset size-mismatched.
+    func testCombineDetailedReportsContributingCountAndOffset() throws {
+        let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
+        let a = try writeConst(dir, "d1.fit", 0.4, w: 2, h: 2)
+        let b = try writeConst(dir, "d2.fit", 0.6, w: 2, h: 2)
+        let odd = try writeConst(dir, "d3.fit", 0.9, w: 4, h: 4)      // skipped (wrong size)
+        let dark = try MasterBuilder.combineDetailed(fitsURLs: [a, b, odd], kind: .dark, bias: nil)
+        XCTAssertEqual(dark.contributingCount, 2, "the odd-sized frame must not inflate the count")
+        XCTAssertFalse(dark.offsetApplied)
+
+        let f = try writeConst(dir, "f1.fit", 0.6, w: 2, h: 2)
+        let biasWrong = AstroImage(width: 4, height: 4, channels: 1,
+                                   pixels: [Float](repeating: 0.1, count: 16), sourceIsLinear: true)
+        let mismatched = try MasterBuilder.combineDetailed(fitsURLs: [f], kind: .flat, bias: biasWrong)
+        XCTAssertFalse(mismatched.offsetApplied, "a size-mismatched offset must NOT be silently applied")
+
+        let biasRight = AstroImage(width: 2, height: 2, channels: 1,
+                                   pixels: [0.1, 0.1, 0.1, 0.1], sourceIsLinear: true)
+        let applied = try MasterBuilder.combineDetailed(fitsURLs: [f], kind: .flat, bias: biasRight)
+        XCTAssertTrue(applied.offsetApplied)
+    }
+
+    /// With `expected` dimensions, a stray wrong-size frame that sorts first must NOT hijack the
+    /// reference and discard the valid same-size frames.
+    func testExpectedDimensionsIgnoreOddSortedFirstFrame() throws {
+        let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
+        _ = try writeConst(dir, "00_odd.fit", 0.9, w: 8, h: 8)   // sorts first, wrong size
+        _ = try writeConst(dir, "a.fit", 0.4, w: 2, h: 2)
+        _ = try writeConst(dir, "b.fit", 0.6, w: 2, h: 2)
+        let urls = [dir.appendingPathComponent("00_odd.fit"),
+                    dir.appendingPathComponent("a.fit"), dir.appendingPathComponent("b.fit")]
+        let r = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .dark, bias: nil, expected: (2, 2, 1))
+        XCTAssertEqual(r.image.width, 2); XCTAssertEqual(r.image.height, 2)
+        XCTAssertEqual(r.contributingCount, 2, "only the target-size frames contribute")
+        for p in r.image.pixels { XCTAssertEqual(p, 0.5, accuracy: 1e-5) }   // mean(0.4, 0.6)
+    }
+
+    /// A hostile/corrupt `expected` size (e.g. 1e6×1e6 from a bad FITS header) must NOT force a
+    /// multi-terabyte allocation: the buffer is allocated only when a real frame matches, so with no
+    /// matching frame it throws noValidFrames instead of OOM-ing.
+    func testHostileExpectedDimensionsDoNotForceGiantAllocation() throws {
+        let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
+        _ = try writeConst(dir, "a.fit", 0.5, w: 2, h: 2)
+        let urls = [dir.appendingPathComponent("a.fit")]
+        XCTAssertThrowsError(try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .dark, bias: nil,
+                                                               expected: (1_000_000, 1_000_000, 1))) {
+            XCTAssertEqual($0 as? MasterBuilder.BuildError, .noValidFrames)
+        }
+    }
+
+    /// The element-count guard must be OVERFLOW-safe (not just ceiling-checked) so a public caller
+    /// with hostile dimensions gets nil, not an arithmetic trap.
+    func testCheckedElementCountRejectsOverflowAndCeiling() {
+        XCTAssertNil(MasterBuilder.checkedElementCount(Int.max, 2, 1))             // multiply overflow
+        XCTAssertNil(MasterBuilder.checkedElementCount(1_000_000, 1_000_000, 4))   // exceeds 500M ceiling
+        XCTAssertNil(MasterBuilder.checkedElementCount(0, 2, 1))                   // nonpositive
+        XCTAssertEqual(MasterBuilder.checkedElementCount(6248, 4176, 1), 6248 * 4176)   // real 26 MP
+    }
+
+    /// A frame whose HEADER declares a pixel count above the ceiling (here 25001×20000 = 500,020,000
+    /// > 500M) must be rejected from the header — without a full multi-GB decode — while the valid
+    /// neighbors still build. The header (BITPIX=8, axes ≤ 100k) is itself valid, so it passes
+    /// readHeader; MasterBuilder's element-count ceiling is what skips it, before FITSReader.read.
+    func testOversizedHeaderFrameSkippedAndNeighborsBuild() throws {
+        let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
+        let hostile = FITSTestBuilder.header(cards: [("SIMPLE", "T"), ("BITPIX", "8"), ("NAXIS", "2"),
+                                                     ("NAXIS1", "25001"), ("NAXIS2", "20000")])
+        try hostile.write(to: dir.appendingPathComponent("00_hostile.fit"))
+        _ = try writeConst(dir, "a.fit", 0.4, w: 2, h: 2)
+        _ = try writeConst(dir, "b.fit", 0.6, w: 2, h: 2)
+        let urls = [dir.appendingPathComponent("00_hostile.fit"),
+                    dir.appendingPathComponent("a.fit"), dir.appendingPathComponent("b.fit")]
+        FITSReader.decodeCountForTesting = 0
+        let r = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .dark, bias: nil)
+        XCTAssertEqual(r.contributingCount, 2, "oversized frame skipped; valid neighbors contribute")
+        XCTAssertEqual(r.image.width, 2)
+        for p in r.image.pixels { XCTAssertEqual(p, 0.5, accuracy: 1e-5) }   // mean(0.4, 0.6)
+        // PROOF the over-ceiling frame is skipped BEFORE decode: only the two valid frames are decoded.
+        XCTAssertEqual(FITSReader.decodeCountForTesting, 2, "over-ceiling frame rejected before decode")
+    }
+
+    /// A COMPLETE (non-truncated) wrong-size frame under the ceiling must be skipped from its header —
+    /// before decode — when it doesn't match the target/reference dimensions, so it can't force a big
+    /// decode allocation just to be discarded for size. The decode counter proves read was not called
+    /// on it (2 decodes for the valid neighbors, not 3).
+    func testWrongSizeFrameRejectedBeforeDecodeAgainstReference() throws {
+        let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
+        _ = try writeConst(dir, "00_wrong.fit", 0.9, w: 8, h: 8)   // complete 8×8 — truncation can't skip it
+        _ = try writeConst(dir, "a.fit", 0.4, w: 2, h: 2)
+        _ = try writeConst(dir, "b.fit", 0.6, w: 2, h: 2)
+        let urls = [dir.appendingPathComponent("00_wrong.fit"),
+                    dir.appendingPathComponent("a.fit"), dir.appendingPathComponent("b.fit")]
+        FITSReader.decodeCountForTesting = 0
+        let r = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .dark, bias: nil, expected: (2, 2, 1))
+        XCTAssertEqual(r.contributingCount, 2)
+        XCTAssertEqual(FITSReader.decodeCountForTesting, 2, "wrong-size frame rejected before decode (was 3)")
+    }
+
     func testFlatBiasSubtractedAndNormalizedToMedianOne() throws {
         let dir = try sandbox(); defer { try? FileManager.default.removeItem(at: dir) }
         // flat frames constant 0.6; bias constant 0.1 → (0.6-0.1)=0.5 everywhere;

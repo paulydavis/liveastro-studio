@@ -55,6 +55,13 @@ swift run LiveAstroStudio
 7. Click **Go Live** if OBS automation is configured, or start streaming manually in OBS.
 8. Click **End Session** when finished. LiveAstro writes the session folder under `~/Documents/LiveAstro/`.
 
+With live trail rejection enabled, the detached broadcast window shows the current clean
+master when one is available. The embedded operator pane shows the online stack so you can
+inspect incoming data. Each view's integration caption reflects its own image depth.
+The broadcast window refreshes when a clean master publishes or becomes invalid, even
+between subs. `latest.png` updates when a snapshot is saved; it is not the source of the
+Window Capture workflow above.
+
 ## OBS Automation
 
 LiveAstro can control OBS through the OBS WebSocket server.
@@ -135,6 +142,29 @@ Then point LiveAstro's stacker-output workflow at `/tmp/liveastro-demo-stack`.
 For the fuller no-sky walkthrough, see [docs/beta-quickstart.md](docs/beta-quickstart.md).
 
 ## Development
+
+Before merging, run the whole gate as one command:
+
+```bash
+Scripts/preflight.sh          # debug build + RELEASE build + full test suite
+```
+
+The release build matters and is easy to skip: `swift test` and `swift build` are both DEBUG, and
+`-c release` is otherwise compiled only inside the packaging scripts. A release-configuration
+warning shipped in v3.6.2 for exactly that reason — nothing in the development loop ever compiled
+that configuration, so a release-only error would have surfaced at packaging time rather than at
+review.
+
+The release step compiles into a throwaway scratch directory (so it cannot report "clean" by
+reusing existing output) and builds with `-Xswiftc -warnings-as-errors`. **A new Swift compiler
+warning in the release build fails the gate.** That is enforced by the compiler rather than by matching the build log,
+which would depend on message formatting and could not tell a real warning from the word "warning"
+in a path. Warnings from SwiftPM, the linker or other tools are outside that flag's reach; the gate
+reports those without failing. If a
+warning is genuinely acceptable, fix it or silence it deliberately at the source — do not weaken
+the gate.
+
+The individual steps, if you want them separately:
 
 ```bash
 swift test

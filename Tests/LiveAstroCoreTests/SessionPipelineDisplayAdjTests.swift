@@ -99,4 +99,37 @@ final class SessionPipelineDisplayAdjTests: XCTestCase {
         // DBE actually flattened the ramp → output bytes must differ.
         XCTAssertNotEqual(pixelData(off!), pixelData(on!))
     }
+
+    /// Regression: the slider re-render path (renderCurrentDisplay) must crop to the covered
+    /// region too, like renderSnapshot/handleNative — otherwise dragging a slider snaps the
+    /// preview back to the ragged full 256px union. Drifting subs (32px total) → the covered
+    /// core is smaller than a full frame; the re-render must match the cropped latest.png.
+    func testRenderCurrentDisplayCropsToCoveredRegion() throws {
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let subsDir = sandbox.appendingPathComponent("subs")
+        try FileManager.default.createDirectory(at: subsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        // Stars clustered in the centre so they stay in-bounds after the drift.
+        var field: [(Double, Double)] = []
+        for i in 0..<20 { field.append((Double((i*47)%100+78), Double((i*83)%100+78))) }
+        let drifts: [(Double, Double)] = [(0,0),(8,8),(16,16),(24,24),(32,32)]
+        for (idx, d) in drifts.enumerated() {
+            try writeSub(subsDir, String(format: "Light_%03d.fit", idx+1), stars: field.map { ($0.0+d.0, $0.1+d.1) })
+        }
+        let pipeline = makePipeline(sandbox, subsDir)
+        pipeline.rendersReplay = false          // end() returns the session dir (not the replay URL)
+        try pipeline.start()
+        let dir = try pipeline.end()
+
+        guard let cg = pipeline.renderCurrentDisplay(adjustments: .neutral) else {
+            return XCTFail("expected a stack to render after import")
+        }
+        XCTAssertLessThan(cg.width, 256, "slider re-render must be cropped, not the full 256 union (got \(cg.width))")
+        // Matches the cropped master.fit the same coverage produces (WYSIWYG).
+        let hdr = try FITSReader.readHeader(Data(contentsOf: dir.appendingPathComponent("master.fit")))
+        let mw = Int(hdr.keywords["NAXIS1"]!.trimmingCharacters(in: .whitespaces))!
+        let mh = Int(hdr.keywords["NAXIS2"]!.trimmingCharacters(in: .whitespaces))!
+        XCTAssertEqual(cg.width, mw, "re-render crop matches master.fit crop width")
+        XCTAssertEqual(cg.height, mh, "re-render crop matches master.fit crop height")
+    }
 }

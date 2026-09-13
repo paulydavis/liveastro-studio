@@ -76,6 +76,21 @@ final class CalibratorTests: XCTestCase {
         XCTAssertTrue(out.bottomUp)   // orientation preserved for the engine
     }
 
+    /// Task 5: `apply()` rebuilds RawFrame — it must preserve `sourceURL`, or every calibrated
+    /// live frame lands with `sourceURL == nil` and is silently dropped from the SessionPipeline
+    /// registration cache (which keys its cache insertion on `frame.sourceURL != nil`).
+    func testApplyPreservesSourceURL() {
+        let dark = AstroImage(width: 2, height: 2, channels: 1,
+                              pixels: [0.1, 0.1, 0.1, 0.1], sourceIsLinear: true)
+        let url = URL(fileURLWithPath: "/tmp/light-0001.fit")
+        let f = RawFrame(image: AstroImage(width: 2, height: 2, channels: 1,
+                                           pixels: [0.3, 0.4, 0.5, 0.6], sourceIsLinear: true),
+                         bayerPattern: nil, bottomUp: false, timestamp: Date(), sourceName: "L.fit",
+                         sourceURL: url)
+        let out = Calibrator(dark: dark, flat: nil).apply(f)
+        XCTAssertEqual(out.sourceURL, url, "Calibrator.apply must preserve sourceURL through calibration")
+    }
+
     // apply() is called concurrently by the import worker pool; every concurrent
     // result must equal the serial calibration (the alignment/logging prefix is
     // now lock-guarded). Exercises a FRESH calibrator so alignment is computed

@@ -29,6 +29,42 @@ public struct AstroImage {
         }
     }
 
+    /// Area-averaging downsample so the long edge ≤ `maxLongEdge`. Used to render the
+    /// preview/snapshot display from a huge stacked frame fast (the per-pixel neutralize +
+    /// stretch cost scales with pixel count, ~6× at 26MP): downsample once, then those
+    /// passes run on ~1/6 the pixels. The full-res image stays the source of truth for
+    /// `master.fit`. Returns `self` when already within bounds. Each output pixel is the
+    /// mean of the source pixels mapping to it (anti-aliased, single O(pixels) pass).
+    public func downsampled(maxLongEdge: Int) -> AstroImage {
+        let longEdge = max(width, height)
+        guard maxLongEdge > 0, longEdge > maxLongEdge else { return self }
+        let scale = Double(maxLongEdge) / Double(longEdge)
+        let nw = max(1, Int((Double(width) * scale).rounded()))
+        let nh = max(1, Int((Double(height) * scale).rounded()))
+        let srcPlane = width * height, dstPlane = nw * nh
+        var out = [Float](repeating: 0, count: dstPlane * channels)
+        var count = [Float](repeating: 0, count: dstPlane)
+        let w = width, h = height, ch = channels
+        pixels.withUnsafeBufferPointer { src in
+        out.withUnsafeMutableBufferPointer { o in
+        count.withUnsafeMutableBufferPointer { cnt in
+            for y in 0..<h {
+                let oy = min(nh - 1, y * nh / h)
+                for x in 0..<w {
+                    let di = oy * nw + min(nw - 1, x * nw / w)
+                    cnt[di] += 1                                   // one bin count per source pixel
+                    let si = y * w + x
+                    for c in 0..<ch { o[c * dstPlane + di] += src[c * srcPlane + si] }
+                }
+            }
+            for i in 0..<dstPlane where cnt[i] > 0 {
+                let inv = 1 / cnt[i]
+                for c in 0..<ch { o[c * dstPlane + i] *= inv }
+            }
+        }}}
+        return AstroImage(width: nw, height: nh, channels: ch, pixels: out, sourceIsLinear: sourceIsLinear)
+    }
+
     /// Stride that caps statistical samples at `maxSamples` (256K default) so stats
     /// stay O(1) on huge frames. Ceiling division: any count above the cap gets
     /// stride ≥ 2, keeping the sample count at or below the cap.

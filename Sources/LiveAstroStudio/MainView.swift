@@ -12,6 +12,14 @@ struct MainView: View {
                     ForEach(AppModel.MainTab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 300)
                 Spacer()
+                Button {
+                    model.nightVisionOn.toggle()
+                    model.applyNightVision()
+                } label: {
+                    Image(systemName: model.nightVisionOn ? "moon.fill" : "moon")
+                        .foregroundStyle(model.nightVisionOn ? Color.red : Color.primary)
+                }
+                .help("Red night-vision screen tint (whole display) — for dark-adapted viewing at the scope. Fine-tune brightness under Setup ▸ Night vision.")
                 if model.selectedTab == .live {
                     Button { openWindow(id: "broadcast"); model.isDetached = true } label: {
                         Image(systemName: "rectangle.portrait.and.arrow.right")
@@ -20,11 +28,17 @@ struct MainView: View {
                 }
             }.padding(8)
             Divider()
-            switch model.selectedTab {
-            case .live:  model.isDetached ? AnyView(detachedPlaceholder) : AnyView(BroadcastView(configuresWindow: false))
-            case .setup: AnyView(ControlView())
-            case .help:  AnyView(HelpView())
+            // Give the active tab the full remaining window height — otherwise a scrolling
+            // tab (Help) sizes to its content's ideal height and its overflow is clipped
+            // instead of scrolling.
+            Group {
+                switch model.selectedTab {
+                case .live:  model.isDetached ? AnyView(detachedPlaceholder) : AnyView(BroadcastView(configuresWindow: false))
+                case .setup: AnyView(ControlView())
+                case .help:  AnyView(HelpView())
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .onAppear {
             // Wires BroadcastDeps.openBroadcastWindow (AppModel can't touch

@@ -67,6 +67,43 @@ final class SnapshotRecorderTests: XCTestCase {
         XCTAssertEqual(latest.height, 3)
     }
 
+    private func filledCGImage(w: Int, h: Int) -> CGImage {
+        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                            bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.setFillColor(CGColor(red: 0.2, green: 0.3, blue: 0.4, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()!
+    }
+
+    func testLargeSnapshotDownscaledButRecordKeepsFullDims() throws {
+        // 26MP display image → snapshot PNG capped at 2560px long edge (2.5K preview),
+        // but the manifest record still reports the true stacked size from `linear`.
+        let big = filledCGImage(w: 6248, h: 4176)
+        let linear = AstroImage(width: 120, height: 80, channels: 1,
+                                pixels: [Float](repeating: 0.1, count: 120 * 80), sourceIsLinear: true)
+        let rec = try SnapshotRecorder(sessionDirectory: tmp).save(
+            cgImage: big, linear: linear, sourceFile: "big.fit",
+            index: 5, timestamp: Date(), estimatedIntegrationSeconds: 100)
+        let decoded = try ImageLoader.load(url: tmp.appendingPathComponent(rec.snapshotFile))
+        XCTAssertEqual(decoded.width, 2560, "snapshot long edge capped at 2560")
+        XCTAssertTrue((1709...1713).contains(decoded.height), "aspect preserved, got \(decoded.height)")
+        XCTAssertEqual(rec.width, 120); XCTAssertEqual(rec.height, 80)   // record from linear, not the preview
+        let latest = try ImageLoader.load(url: tmp.appendingPathComponent("latest.png"))
+        XCTAssertEqual(latest.width, 2560, "latest.png is the same downscaled preview")
+    }
+
+    func testSnapshotAtOrBelowCapNotResized() throws {
+        let small = filledCGImage(w: 1920, h: 1280)   // <= 2560 → passthrough, exact dims
+        let linear = AstroImage(width: 1920, height: 1280, channels: 1,
+                                pixels: [Float](repeating: 0.1, count: 1920 * 1280), sourceIsLinear: true)
+        let rec = try SnapshotRecorder(sessionDirectory: tmp).save(
+            cgImage: small, linear: linear, sourceFile: "s.fit",
+            index: 1, timestamp: Date(), estimatedIntegrationSeconds: 20)
+        let decoded = try ImageLoader.load(url: tmp.appendingPathComponent(rec.snapshotFile))
+        XCTAssertEqual(decoded.width, 1920); XCTAssertEqual(decoded.height, 1280)
+    }
+
     func testSaveThrowsWhenSnapshotsSubdirectoryMissing() throws {
         let bare = FileManager.default.temporaryDirectory
             .appendingPathComponent("rec-bare-\(UUID().uuidString)", isDirectory: true)

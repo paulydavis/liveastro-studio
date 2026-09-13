@@ -213,6 +213,31 @@ final class FITSReaderTests: XCTestCase {
         XCTAssertEqual(h.keywords["OBJECT"], "M 101 / Pinwheel")
         XCTAssertEqual(h.keywords["EXPTIME"], "30.0")
     }
+
+    /// The FITSHeader init is failable + validating: it REJECTS hostile values at construction (the
+    /// whole class of overflow/negative/trap edges from prior rounds), so a FITSHeader can never hold
+    /// them and the accessors stay simple. Valid headers construct and compute normally.
+    func testFITSHeaderInitValidatesAndRejectsHostileValues() {
+        func make(_ bitpix: Int, _ dims: [Int], headerBytes: Int = 2880) -> FITSHeader? {
+            FITSHeader(bitpix: bitpix, dims: dims, bscale: 1, bzero: 0, bottomUp: false, headerBytes: headerBytes)
+        }
+        XCTAssertNil(make(32, [Int.max, 2]))        // oversized axis (would overflow the product)
+        XCTAssertNil(make(32, [-100, 100]))         // non-positive
+        XCTAssertNil(make(32, [0, 100]))
+        XCTAssertNil(make(32, []))                  // not 2-D/3-D
+        XCTAssertNil(make(32, [100]))
+        XCTAssertNil(make(32, [100, 100, 4]))       // a 3-D cube's 3rd axis must be 3 channels
+        XCTAssertNil(make(Int.min, [100, 100]))     // unsupported BITPIX (and abs(Int.min) would trap)
+        XCTAssertNil(make(7, [100, 100]))           // unsupported BITPIX
+        XCTAssertNil(make(32, [100, 100], headerBytes: -1))
+
+        let h = make(32, [100, 100])
+        XCTAssertNotNil(h)
+        XCTAssertEqual(h?.width, 100); XCTAssertEqual(h?.height, 100)
+        XCTAssertEqual(h?.dataBytes, 100 * 100 * 4)
+        XCTAssertEqual(h?.minimumFileSize, 2880 + 100 * 100 * 4)
+        XCTAssertEqual(make(16, [100, 100, 3])?.channels, 3)
+    }
 }
 
 /// Builds raw FITS headers for edge-case tests (FITSWriter covers the happy path).

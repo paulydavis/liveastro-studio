@@ -37,13 +37,14 @@ Math (anchor point stays under the cursor):
 - Return `ZoomPanState(scale: s1, offset: clampedOffset(offset1, scale: s1, viewSize:, fittedContentSize:))`.
 
 Properties (become the tests):
-- When `P == viewCenter` (cursor at center), `offset1 == current.offset * (s1/s0)` →
-  reduces to today's center-anchored zoom (no regression).
+- When `P == 0` (cursor at center), `offset1 == current.offset * (s1/s0)`:
+  the content point at the view centre stays fixed. This differs from the unchanged
+  slider's direct scale write when an existing pan is nonzero.
 - With no clamping active, the content point under the cursor before the zoom is under
   the cursor after (target stays put).
 - `s0 == 0` guard (shouldn't occur; scale ≥ 1) returns `current` unchanged.
-- Degenerate `viewSize`/`fittedContentSize` → return `current` (clamp already yields
-  `.zero`, but guard so we never divide by a zero view).
+- Degenerate `viewSize` or non-positive starting scale → return `current`.
+  Degenerate fitted content size clamps the resulting offset to `.zero`.
 
 ### 2. Wiring (`BroadcastView`)
 
@@ -52,16 +53,20 @@ Properties (become the tests):
   top-left origin to match SwiftUI) and call `zoomed(about: thatPoint)` with
   `newScale = current.scale * zoomFactor(from: event.scrollingDeltaY)`. Replaces the
   current center-anchored scale write.
-- **Pinch** (`MagnificationGesture`) and **slider**: `MagnificationGesture` gives no
+- **Pinch** (`MagnificationGesture`): `MagnificationGesture` gives no
   location, so anchor at the **last hover point**. Track it: `@State var lastHoverInView:
   CGPoint?` set from the existing `.onContinuousHover` (it already fires for the
-  controls auto-hide). Pinch/slider call `zoomed(about: lastHoverInView ?? viewCenter)`.
-  Absent hover → center (identical to today).
-- **Fit / 100% / drag-pan**: unchanged.
+  controls auto-hide). Pinch calls `zoomed(about: lastHoverInView ?? viewCenter)`.
+  Clear the hover point on `.ended`; absent hover uses the view centre.
+- **Slider / Fit / 100% / drag-pan**: unchanged. Slider scale changes remain
+  centre-anchored with the existing offset re-clamp; a slider interaction has no
+  pointer location on the image to preserve.
+- Both fitting and rendering use the resolved display image: the detached OBS
+  window consumes `broadcastImage`, while the embedded view consumes `latestImage`.
 
 ## Testing
 
-- New `ZoomPanStateZoomAboutTests`: center-point reduces to center-anchor; off-center
+- `ZoomPanStateTests`: center-point reduces to center-anchor; off-center
   point keeps the target content-point stationary (unclamped regime); clamp still holds
   (offset within ±maxOffset); zoom-out toward a corner re-centers toward `.fit` as scale
   → 1; degenerate sizes/`s0` guarded.

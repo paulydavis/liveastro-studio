@@ -86,6 +86,31 @@ final class SessionSettingsTests: XCTestCase {
                                              from: JSONEncoder().encode(s))
         XCTAssertEqual(round.processorBackend, .nativeDenoise)
     }
+
+    func testCompletionDefaults() {
+        let s = SessionSettings.defaults
+        XCTAssertTrue(s.idleSafeguardEnabled)
+        XCTAssertEqual(s.idleSafeguardMinutes, 15)
+        XCTAssertFalse(s.plannedStopEnabled)
+        XCTAssertEqual(s.plannedStopHour, 3)
+        XCTAssertEqual(s.plannedStopMinute, 0)
+    }
+    func testCompletionSettingsBridge() {
+        var s = SessionSettings.defaults
+        s.plannedStopEnabled = true; s.plannedStopHour = 2; s.plannedStopMinute = 30
+        let c = s.completionSettings
+        XCTAssertTrue(c.plannedStopEnabled); XCTAssertEqual(c.plannedStopHour, 2); XCTAssertEqual(c.plannedStopMinute, 30)
+        XCTAssertTrue(c.idleSafeguardEnabled); XCTAssertEqual(c.idleSafeguardMinutes, 15)
+    }
+    func testCompletionBackCompatOldBlobDecodesToDefaults() throws {
+        // A JSON blob WITHOUT the new keys must decode with the defaults, not throw.
+        // (calibration is a non-optional key in SessionSettings' decoder, so it must be
+        // present — mirrors the "calibration":{} shape used by sibling back-compat tests.)
+        let json = "{\"sourceModeRaw\":\"nativeStack\",\"filePrefix\":\"Light_\",\"neutralizeBackground\":true,\"subExposureSeconds\":30,\"targetName\":\"\",\"calibration\":{}}"
+        let s = try JSONDecoder().decode(SessionSettings.self, from: Data(json.utf8))
+        XCTAssertTrue(s.idleSafeguardEnabled); XCTAssertEqual(s.idleSafeguardMinutes, 15)
+        XCTAssertFalse(s.plannedStopEnabled); XCTAssertEqual(s.plannedStopHour, 3)
+    }
 }
 
 final class SessionSettingsDisplayAdjTests: XCTestCase {

@@ -12,6 +12,51 @@ public enum RejectionReason: Equatable {
     case dimensionMismatch
 }
 
+/// `process` outcome plus the per-sub quality metrics the stacker measured while
+/// deciding it (spec §Data flow). Surfaced so the session can retain per-sub stats
+/// without recomputation. Weight is the value actually applied (1.0 for the reference,
+/// 0 for a rejected sub).
+public struct ProcessResult: Equatable {
+    public let outcome: StackOutcome
+    public let starCount: Int
+    public let backgroundSigma: Float
+    public let weight: Float
+    /// Per-sub registration payload (nil for a rejected sub), purely additive so an off-thread
+    /// background refiner can reuse each sub's transform/leveling/scale without re-registering.
+    public let registration: RegistrationPayload?
+
+    public init(outcome: StackOutcome, starCount: Int, backgroundSigma: Float, weight: Float,
+                registration: RegistrationPayload? = nil) {
+        self.outcome = outcome
+        self.starCount = starCount
+        self.backgroundSigma = backgroundSigma
+        self.weight = weight
+        self.registration = registration
+    }
+}
+
+/// Everything a later background refiner needs to reuse a sub's registration without
+/// re-running detection/matching. `stackGeneration` + `referenceIdentity` let the refiner
+/// group subs by which reference/reseed epoch produced them.
+public struct RegistrationPayload {
+    public let transform: SimilarityTransform
+    public let effectiveScale: Float
+    public let weight: Float
+    public let leveling: (sub: BackgroundExtraction.BackgroundModel, ref: BackgroundExtraction.BackgroundModel)?
+    public let stackGeneration: Int
+    public let referenceIdentity: FileIdentity?
+}
+
+extension RegistrationPayload: Equatable {
+    /// `leveling`'s tuple isn't Equatable for free (the models are large); identity of
+    /// presence is enough for the payload's equality, which exists only for test assertions.
+    public static func == (l: Self, r: Self) -> Bool {
+        l.transform == r.transform && l.effectiveScale == r.effectiveScale && l.weight == r.weight
+            && l.stackGeneration == r.stackGeneration && l.referenceIdentity == r.referenceIdentity
+            && (l.leveling == nil) == (r.leveling == nil)
+    }
+}
+
 /// Native stacking core (spec §4.2): registration on half-res superpixel luminance,
 /// full-res accumulation. Rejection is registration-failure only (spec §3).
 public final class StackEngine {
@@ -100,6 +145,27 @@ public final class StackEngine {
     public private(set) var autoReseedCount = 0
     private let autoReseedThreshold: Int
     private var consecutiveNoTransform = 0
+    /// The current generation's reference FileIdentity (nil for an in-memory/synthetic frame),
+    /// set when a frame becomes the reference. Stacked subs of that generation carry the SAME
+    /// value, so a consumer can group registration payloads by which reference produced them.
+    private var referenceIdentity: FileIdentity?
+
+    /// Generation key = manualReseedCount + autoReseedCount, both already mutated/read under
+    /// `lock`. LOCKING — for a background refiner reading this off the engine's own thread.
+    public var currentStackGeneration: Int {
+        lock.withLock { manualReseedCount + autoReseedCount }
+    }
+
+    /// Same generation key, NO lock. Used only when building a registration payload INSIDE
+    /// `processDetailedLocked` (already under `lock.withLock`) — calling the public locking
+    /// accessor there would re-enter the non-recursive NSLock and deadlock.
+    private var currentStackGenerationLocked: Int { manualReseedCount + autoReseedCount }
+
+    /// The `DemosaicMethod` this engine was built with — a plain `let`, so no locking needed.
+    /// Task 8: `SessionPipeline` reads this once when lazily building the `GlobalRefiner`'s
+    /// production `FrameLoader`, so the refiner's `DisplayRGB.make` call matches the online
+    /// engine's debayer exactly (no drift between the online and refine domains).
+    public var demosaicMethod: DemosaicMethod { demosaic }
 
     /// seedMinStars: must comfortably exceed minMatches (8); 15 gives
     /// C(15,3)=455 triangles for reliable initial matching.
@@ -131,6 +197,7 @@ public final class StackEngine {
             referenceChannels = nil
             weightBaseline = nil
             referenceBackgroundSamples = nil
+            referenceIdentity = nil
             rejection.reset()
             manualReseedCount += 1
             currentStackState = .awaitingSeedAfterReseed(
@@ -191,6 +258,10 @@ public final class StackEngine {
         lock.withLock { accumulator?.mean() }
     }
 
+    /// Read-only view of the seed threshold (RestackCoordinator reports this as the
+    /// `needed` count in `.belowSeedMinimum` — the stored `seedMinStars` stays private).
+    public var minimumSeedStars: Int { seedMinStars }
+
     /// Frames in the CURRENT stack (resets on reseed, unlike acceptedCount).
     public var stackFrameCount: Int {
         lock.withLock { accumulator?.frameCount ?? 0 }
@@ -201,21 +272,71 @@ public final class StackEngine {
         lock.withLock { accumulator?.coverage() }
     }
 
-    public func process(_ frame: RawFrame) -> StackOutcome {
-        lock.withLock { processLocked(frame) }
+    /// One-lock read of the current mean AND coverage together, so a consumer (the display
+    /// crop) computes its rect from a coverage map consistent with the mean — no frame can
+    /// commit between two separate `currentStack()` / `currentCoverage()` reads. Nil when
+    /// there is no active stack. (Same atomic pattern as `masterSnapshotState`.)
+    public func currentStackAndCoverage() -> (image: AstroImage, coverage: [Float]?)? {
+        lock.withLock {
+            guard let accumulator else { return nil }
+            return (accumulator.mean(), accumulator.coverage())
+        }
     }
 
-    private func processLocked(_ frame: RawFrame) -> StackOutcome {
+    /// Pixel provenance is one atomic read: a reseed cannot stamp old pixels with its new
+    /// generation, and integration depth cannot describe a different accumulator revision.
+    func displaySnapshot() -> (image: AstroImage, coverage: [Float]?, count: Int, generation: Int)? {
+        lock.withLock {
+            guard let accumulator else { return nil }
+            return (accumulator.mean(), accumulator.coverage(), accumulator.frameCount,
+                    currentStackGenerationLocked)
+        }
+    }
+
+    /// The reference frame's detected stars + dimensions for plate-solving (sub-project 3a). nil until
+    /// a reference is seeded. Coordinates are HALF-RES — star detection runs on the half-res luminance
+    /// (`halfResLuminance`), so the reported size is the full-res `referenceSize` halved (exactly `hw`,
+    /// `hh`). A consumer solving against a sky catalog must double the pixel scale to match this
+    /// half-res space (a half-res pixel subtends 2× the sky).
+    public func referenceSolveInput() -> (stars: [Star], width: Int, height: Int)? {
+        lock.withLock {
+            guard !referenceStars.isEmpty, let s = referenceSize else { return nil }
+            return (referenceStars, s.w / 2, s.h / 2)
+        }
+    }
+
+    /// One-lock read of the live stack for the idle-safeguard master snapshot
+    /// (`SessionPipeline.writeMasterSnapshot`). Returns image, coverage, and frameCount
+    /// from a SINGLE lock acquisition so a frame commit or `reseed()` landing between
+    /// reads can't tear the snapshot (master pixels from one stack state, STACKCNT/
+    /// TOTALEXP from another). A non-throwing, non-mutating sibling of
+    /// `finalizationState()`: pure read, stamps nothing and changes no running state.
+    /// nil when there is no live stack yet (before the seed, or after a reseed cleared
+    /// the accumulator) — the caller then writes nothing.
+    public func masterSnapshotState() -> (image: AstroImage, coverage: [Float]?, frameCount: Int)? {
+        lock.withLock {
+            guard let accumulator else { return nil }
+            return (accumulator.mean(), accumulator.coverage(), accumulator.frameCount)
+        }
+    }
+
+    public func process(_ frame: RawFrame) -> StackOutcome { processDetailed(frame).outcome }
+
+    public func processDetailed(_ frame: RawFrame) -> ProcessResult {
+        lock.withLock { processDetailedLocked(frame) }
+    }
+
+    private func processDetailedLocked(_ frame: RawFrame) -> ProcessResult {
         let raw = frame.image
         // Degenerate frames (a half-res luminance needs at least a 2×2 source) would
         // crash star detection / superpixel binning — reject before any luminance work.
         guard raw.width >= 2, raw.height >= 2 else {
             rejectedCount += 1
-            return .rejected(.dimensionMismatch)
+            return ProcessResult(outcome: .rejected(.dimensionMismatch), starCount: 0, backgroundSigma: 0, weight: 0)
         }
         if let size = referenceSize, size != (raw.width, raw.height) {
             rejectedCount += 1
-            return .rejected(.dimensionMismatch)
+            return ProcessResult(outcome: .rejected(.dimensionMismatch), starCount: 0, backgroundSigma: 0, weight: 0)
         }
         let (lum, hw, hh) = Self.halfResLuminance(frame: frame)
         let (stars, sigma) = StarDetector.detectWithStats(luminance: lum, width: hw, height: hh)
@@ -223,7 +344,8 @@ public final class StackEngine {
         if referenceSize == nil {
             guard stars.count >= seedMinStars else {
                 rejectedCount += 1
-                return .rejected(.insufficientStars(found: stars.count))
+                return ProcessResult(outcome: .rejected(.insufficientStars(found: stars.count)),
+                                     starCount: stars.count, backgroundSigma: sigma, weight: 0)
             }
             let rgb = displayRGB(frame)
             let ones = [Float](repeating: 1, count: rgb.width * rgb.height)
@@ -240,14 +362,18 @@ public final class StackEngine {
             acceptedCount += 1
             consecutiveNoTransform = 0
             currentStackState = .active
-            return .becameReference
+            referenceIdentity = frame.identity          // the generation's shared reference identity
+            return ProcessResult(outcome: .becameReference, starCount: stars.count, backgroundSigma: sigma, weight: 1.0,
+                registration: RegistrationPayload(transform: .identity, effectiveScale: 1.0, weight: 1.0,
+                    leveling: nil, stackGeneration: currentStackGenerationLocked, referenceIdentity: frame.identity))
         }
 
         // 3 = TriangleMatcher minimum (one triangle); RANSAC's minMatches is
         // enforced later by TransformSolver.
         guard stars.count >= 3 else {
             rejectedCount += 1
-            return .rejected(.insufficientStars(found: stars.count))
+            return ProcessResult(outcome: .rejected(.insufficientStars(found: stars.count)),
+                                 starCount: stars.count, backgroundSigma: sigma, weight: 0)
         }
         let pairs = TriangleMatcher.correspondences(source: stars, target: referenceStars)
         guard let half = TransformSolver.solve(source: stars, target: referenceStars, pairs: pairs,
@@ -264,6 +390,7 @@ public final class StackEngine {
                 accumulator = nil
                 weightBaseline = nil
                 referenceBackgroundSamples = nil
+                referenceIdentity = nil
                 rejection.reset()   // else the new field's seed is sigma-clipped against the old field's stats
                 consecutiveNoTransform = 0
                 autoReseedCount += 1
@@ -272,7 +399,7 @@ public final class StackEngine {
                     auto: autoReseedCount
                 )
             }
-            return .rejected(.noTransform)
+            return ProcessResult(outcome: .rejected(.noTransform), starCount: stars.count, backgroundSigma: sigma, weight: 0)
         }
         var scale: Float = 1.0
         if scaleNormalization {
@@ -283,7 +410,7 @@ public final class StackEngine {
         let rgb = displayRGB(frame)
         guard rgb.channels == referenceChannels else {
             rejectedCount += 1
-            return .rejected(.dimensionMismatch)
+            return ProcessResult(outcome: .rejected(.dimensionMismatch), starCount: stars.count, backgroundSigma: sigma, weight: 0)
         }
         // Invariant: referenceSize != nil (checked above) implies the accumulator was
         // created when the reference seeded. Guard rather than trap so a violated
@@ -293,7 +420,7 @@ public final class StackEngine {
         // count toward auto-reseed (would only ever under-count, never spuriously trip).
         guard let accumulator else {
             rejectedCount += 1
-            return .rejected(.noTransform)
+            return ProcessResult(outcome: .rejected(.noTransform), starCount: stars.count, backgroundSigma: sigma, weight: 0)
         }
         let (warped, mask) = Warp.apply(rgb, transform: half.liftedToFullResolution())
         // R5: solve BOTH the sub and reference models over the SAME masked tile subset of the
@@ -308,17 +435,23 @@ public final class StackEngine {
         // Pass the same effectiveScale to apply so its internal guard and the weight can't disagree.
         var frame = warped
         var effectiveScale: Float = 1.0
-        if let pair = levelingModels(image: warped, mask: mask) {
+        let pair = levelingModels(image: warped, mask: mask)          // computed ONCE
+        if let pair {
             effectiveScale = GradientLeveler.scalingApplies(
                 subModel: pair.sub, refModel: pair.ref, channels: warped.channels) ? scale : 1.0
             frame = GradientLeveler.apply(warped, subModel: pair.sub, refModel: pair.ref, scale: effectiveScale)
         }
         let cleaned = rejection.apply(frame, mask: mask)
         // σ·effectiveScale: scaling amplifies noise too — weight must see the POST-(applied-)scale noise
-        accumulator.add(cleaned, mask: mask, frameWeight: frameWeight(stars: stars.count, sigma: sigma * effectiveScale))
+        let appliedWeight = frameWeight(stars: stars.count, sigma: sigma * effectiveScale)
+        accumulator.add(cleaned, mask: mask, frameWeight: appliedWeight)
         acceptedCount += 1
         consecutiveNoTransform = 0
-        return .stacked(frameCount: accumulator.frameCount)
+        return ProcessResult(outcome: .stacked(frameCount: accumulator.frameCount),
+                             starCount: stars.count, backgroundSigma: sigma, weight: appliedWeight,
+                             registration: RegistrationPayload(transform: half, effectiveScale: effectiveScale,
+                                 weight: appliedWeight, leveling: pair,
+                                 stackGeneration: currentStackGenerationLocked, referenceIdentity: referenceIdentity))
     }
 
     /// Half-res superpixel luminance in DISPLAY orientation (flip rows if bottom-up).
@@ -348,32 +481,11 @@ public final class StackEngine {
     }
 
     /// Debayer in stored order (never flip the CFA), then flip rows to top-down display.
-    /// RawFrame contract: bayerPattern != nil implies channels == 1 (a violated
-    /// contract traps in Debayer.bilinear rather than silently mis-rendering).
+    /// Delegates to the shared `DisplayRGB.make` (Task 6) so the online engine and the
+    /// live-rejection `GlobalRefiner`'s production `FrameLoader` stay byte-identical —
+    /// one implementation, no drift.
     private func displayRGB(_ frame: RawFrame, minRows: Int = 64) -> AstroImage {
-        var rgb: AstroImage
-        if let pattern = frame.bayerPattern, frame.image.channels == 1 {
-            switch demosaic {
-            case .bilinear:
-                rgb = Debayer.bilinear(cfa: frame.image, pattern: pattern, minRows: minRows)
-            case .malvar:
-                rgb = Debayer.malvar(cfa: frame.image, pattern: pattern, minRows: minRows)
-            }
-        } else {
-            rgb = frame.image
-        }
-        guard frame.bottomUp else { return rgb }
-        let w = rgb.width, h = rgb.height, plane = w * h
-        var flipped = [Float](repeating: 0, count: rgb.pixels.count)
-        for c in 0..<rgb.channels {
-            for y in 0..<h {
-                let src = c * plane + (h - 1 - y) * w
-                let dst = c * plane + y * w
-                flipped.replaceSubrange(dst..<(dst + w), with: rgb.pixels[src..<(src + w)])
-            }
-        }
-        return AstroImage(width: w, height: h, channels: rgb.channels,
-                          pixels: flipped, sourceIsLinear: rgb.sourceIsLinear)
+        DisplayRGB.make(frame, demosaic: demosaic, minRows: minRows)
     }
 
     /// A frame that registered against the current reference; ready to warp+commit.
@@ -387,7 +499,7 @@ public final class StackEngine {
         // ACTUALLY-APPLIED scale, which is only known after the leveling pair is fit and the
         // all-or-nothing scalingApplies guard is evaluated (a suppressed scale must weight σ·1,
         // not σ·s). Callers compute weight via frameWeight(stars:sigma:) once effectiveScale is
-        // known (BatchImporter worker / processLocked). frameWeight reads only weightBaseline
+        // known (BatchImporter worker / processDetailedLocked). frameWeight reads only weightBaseline
         // (immutable during a batch — same lock-free contract as referenceStars).
         // R4/R5: backgroundModel removed from RegisteredFrame — fits are now done on the WARPED
         // frame (see levelingModels). Fitting pre-warp injected rotation-induced gradient error (C1).
@@ -479,7 +591,7 @@ public final class StackEngine {
     /// Pure and lock-free: reads only `normalization` (immutable) + `referenceBackgroundSamples`,
     /// which is set at seed (serial, before the concurrent register/warp phase per the batch
     /// contract) and treated as immutable for the batch — same contract as `referenceStars`.
-    /// The live path calls this inside `processLocked` (under the lock).
+    /// The live path calls this inside `processDetailedLocked` (under the lock).
     public func levelingModels(image: AstroImage, mask: [Float])
         -> (sub: BackgroundExtraction.BackgroundModel, ref: BackgroundExtraction.BackgroundModel)? {
         guard normalization, let refSamples = referenceBackgroundSamples else { return nil }

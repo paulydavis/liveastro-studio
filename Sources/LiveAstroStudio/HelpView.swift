@@ -12,6 +12,10 @@ struct HelpView: View {
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding()
+            // Same permanent, space-reserving scroller as the Setup panels — walks up to the
+            // enclosing NSScrollView and pins a legacy always-visible vertical scroller (and
+            // sets hasVerticalScroller, so the page reliably scrolls all the way to the bottom).
+            .background(AlwaysVisibleScroller())
         }
         .scrollIndicators(.visible)
     }
@@ -38,39 +42,26 @@ struct HelpView: View {
         case let .bulletList(items):
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text("•")
-                        Text(inline(item)).fixedSize(horizontal: false, vertical: true)
-                    }
+                    listRow(marker: "•", item: item)
                 }
             }
 
         case let .numberedList(items):
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(items.enumerated()), id: \.offset) { idx, item in
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text("\(idx + 1).").monospacedDigit()
-                        Text(inline(item)).fixedSize(horizontal: false, vertical: true)
-                    }
+                    listRow(marker: "\(idx + 1).", item: item)
                 }
             }
 
         case let .table(headers, rows):
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
-                GridRow {
-                    ForEach(Array(headers.enumerated()), id: \.offset) { _, h in
-                        Text(inline(h)).bold()
-                    }
-                }
-                GridRow {
-                    Divider().gridCellColumns(headers.count)
-                }
+            // Plain VStack/HStack layout — deliberately NOT SwiftUI `Grid`, which hangs the
+            // whole app when laid out inside this ScrollView (found by smoke-testing the Help
+            // tab). Columns get equal width and cells wrap; fine for Help's small tables.
+            VStack(alignment: .leading, spacing: 6) {
+                tableRow(headers, bold: true)
+                Divider()
                 ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                    GridRow {
-                        ForEach(Array(row.enumerated()), id: \.offset) { _, cell in
-                            Text(inline(cell)).fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
+                    tableRow(row, bold: false)
                 }
             }
             .padding(.vertical, 4)
@@ -86,8 +77,49 @@ struct HelpView: View {
             .background(Color.secondary.opacity(0.08))
             .clipShape(RoundedRectangle(cornerRadius: 4))
 
+        case let .codeBlock(code):
+            // Verbatim monospace — no inline() so backticks/asterisks in a command stay literal.
+            Text(code)
+                .font(.system(.callout, design: .monospaced))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(Color.secondary.opacity(0.10))
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+
         case .rule:
             Divider().padding(.vertical, 4)
+        }
+    }
+
+    /// One list entry: its marker + text, then any nested sub-bullets indented beneath it.
+    @ViewBuilder
+    private func listRow(marker: String, item: ListItem) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(marker).monospacedDigit()
+                Text(inline(item.text)).fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(Array(item.subItems.enumerated()), id: \.offset) { _, sub in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("◦")
+                    Text(inline(sub)).fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.leading, 18)
+            }
+        }
+    }
+
+    /// One table row rendered without `Grid`: equal-width columns, wrapping cells.
+    @ViewBuilder
+    private func tableRow(_ cells: [String], bold: Bool) -> some View {
+        HStack(alignment: .top, spacing: 16) {
+            ForEach(Array(cells.enumerated()), id: \.offset) { _, cell in
+                Text(inline(cell))
+                    .bold(bold)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
 

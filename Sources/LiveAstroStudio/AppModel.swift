@@ -18,6 +18,9 @@ final class AppModel {
     var selectedTab: MainTab = .setup
     var isDetached = false
 
+    enum SetupSubTab: Hashable { case capture, display, stats, broadcast, diagnostics }
+    var setupSubTab: SetupSubTab = .capture
+
     enum SourceMode: String, CaseIterable {
         case stackerOutput = "Stacker output (Siril)"
         case nativeStack   = "Raw subs (native stacking)"
@@ -45,13 +48,77 @@ final class AppModel {
 
     var fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
     var neutralizeBackground = false
+
+    // Session completion draft (bound to the Setup "Session end" group; assembled
+    // into SessionSettings by currentSettings() and restored by loadSettings()).
+    // These are the LIVE values the completion tick reads via
+    // currentSettings().completionSettings — without them the tick would only ever
+    // see SessionSettings defaults (planned stop unreachable in production).
+    var idleSafeguardEnabled = true
+    var idleSafeguardMinutes = 15
+    var plannedStopEnabled = false {
+        didSet {
+            // Arm/disarm on the enable flip. The armed-at timestamp anchors the
+            // planned-stop deadline (both the tick driver and the Live-tab display),
+            // so a mid-session enable at 11:30 PM with a 10 PM stop resolves to 10 PM
+            // the NEXT day instead of firing immediately.
+            guard plannedStopEnabled != oldValue else { return }
+            plannedStopArmedAt = plannedStopEnabled ? Date() : nil
+        }
+    }
+    var plannedStopHour = 3 {
+        didSet { rearmPlannedStopIfEnabled(changed: plannedStopHour != oldValue) }
+    }
+    var plannedStopMinute = 0 {
+        didSet { rearmPlannedStopIfEnabled(changed: plannedStopMinute != oldValue) }
+    }
+    /// When planned-stop was last enabled or its time last changed — the anchor for
+    /// the planned-stop deadline. nil while disabled. loadSettings() assigns the
+    /// draft on launch, so this becomes launch time (deadline = next occurrence
+    /// after launch, which is the intended behavior).
+    var plannedStopArmedAt: Date?
+    /// Re-arm (reset armed-at to now) when the stop time changes while enabled.
+    private func rearmPlannedStopIfEnabled(changed: Bool) {
+        guard changed, plannedStopEnabled else { return }
+        plannedStopArmedAt = Date()
+    }
     var rejectionEnabled = true
     var rejectionStrength: RejectionStrength = .medium
+    /// Live trail-rejection (Task 11): a background pass recombines survivors with global
+    /// (whole-frame) outlier rejection so satellite/plane trails drop out of the BROADCAST
+    /// master, distinct from `rejectionEnabled`'s per-pixel online σ-clip. Defaults on; only
+    /// actually engages for a local native `.live` relay with enough subs (see
+    /// `sourceIsLocalLiveRelay` / `liveRejectionStatus`) — off (with the reason shown) for
+    /// network/watcher/import sources. Pushed to the pipeline immediately on toggle so a
+    /// mid-session OFF reverts broadcast/`latest.png`/`end()` to the online master right away
+    /// (`SessionPipeline.configureLiveRejection`, P2).
+    var liveTrailRejection = true {
+        didSet {
+            guard liveTrailRejection != oldValue else { return }
+            updateLiveRejectionConfig()
+        }
+    }
     var frameWeightingEnabled = true
     var backgroundNormalizationEnabled = true
     var scaleNormalizationEnabled = true
     var demosaic: DemosaicMethod = .malvar
-    var calibration = CalibrationStore.load(.standard)
+    var calibration: CalibrationSelection
+
+    /// Reusable master darks/bias, matched to a session by camera + settings.
+    let calibrationLibrary = CalibrationLibrary()
+    /// Per-session flat frames (shot fresh each night) — a folder of raw flats built now.
+    var sessionFlatsFolder: URL?
+    /// Optional per-session dark-flats folder (offset subtracted when building the flat).
+    var sessionDarkFlatsFolder: URL?
+    /// Scale a library dark across exposures using bias when no exact-exposure dark exists.
+    var scaleDarksAcrossExposures = true
+    /// Latest auto-match status line, shown in the Calibration section.
+    var calibrationStatus = ""
+    /// Observable mirror of the on-disk library, for the Calibration list UI.
+    var libraryEntries: [MasterFrame] = []
+    /// True while a master is building/rebuilding (disables the add buttons).
+    var calibrationBusy = false
+
     var watchFolder: URL?
     var sourceMode: SourceMode = .stackerOutput {
         didSet {
@@ -67,14 +134,149 @@ final class AppModel {
     /// (watcher mode reads 0 — use latestRecord?.index instead).
     var acceptedCount = 0
     var rejectedCount = 0
+    /// Main-actor mirror of the per-sub quality records the pipeline persists to the
+    /// session manifest (Task 8a). Source of truth for the Stats UI and the re-stack
+    /// excluded set. Appended from `pipeline.onSubFrame`; the pipeline itself already
+    /// wrote the record to `session.subFrames` on its own callback thread, so this
+    /// handler is UI-mirror only (no manifest write here — that would race the
+    /// consume task; see Task 8 Refinement in the sub-stats plan).
+    private(set) var subFrames: [SubFrameRecord] = []
+    /// True while a re-stack (Task 8b) is rebuilding the master off the main actor.
+    /// Guards against concurrent restack runs; also usable to disable the re-stack
+    /// button in the Stats UI (Task 10).
+    private(set) var isRestacking = false
+    /// True right after a session ends with flagged subs on record — surfaces a non-blocking
+    /// "re-stack for a clean final master?" confirm in StatsView (Task 11). Never triggers a
+    /// re-stack automatically; the operator must tap "Re-stack now".
+    var restackOfferPending = false
+    /// The calibrator the just-ended session's pipeline actually applied (explicit or
+    /// auto-resolved from the first frame). Captured in `endSession` before the pipeline is
+    /// released so a post-session re-stack reuses the SAME calibration the live master used —
+    /// rebuilding from legacy config paths (usually nil) would overwrite a calibrated
+    /// master.fit with an uncalibrated one (Fix 1). Nil = an uncalibrated session → identity.
+    private var sessionCalibrator: Calibrator?
+    /// The source metadata (RA/DEC/FOCALLEN/…) the just-ended session's pipeline resolved.
+    /// Captured in `endSession` beside `sessionCalibrator` (before the pipeline is released)
+    /// so a post-session re-stack writes master.fit with the SAME metadata the live master
+    /// had, not a bare header (Fix P1b). Nil = no metadata resolved this session.
+    private var sessionSourceMetadata: SourceMetadata?
+    /// The watch folder captured at session START, so a re-stack resolves the session's own
+    /// recorded subs under it even if the operator changed the live `watchFolder` (or source
+    /// mode) after End but before Re-stack (Fix 4). (Re-stack now selects frames from the
+    /// recorded `subFrames`, not a folder listing, so no file-name prefix is needed — Fix P1a.)
+    private var restackSourceDir: URL?
+    /// The neutralize-background flag captured at NATIVE session START, so a post-session
+    /// re-stack writes `master.fit` with the SAME background treatment the live master had
+    /// (the toggle is disabled while running, so this is stable across the session).
+    private var sessionNeutralizeBackground = false
+    /// The sub-exposure (seconds) captured at NATIVE session START, so a re-stack's TOTALEXP
+    /// uses the value the session actually ran at — not a live `profile.subExposureSeconds`
+    /// that the operator may have edited after End but before Re-stack.
+    private var sessionSubExposureSeconds: Double = 60
     var latestImage: CGImage?
+    var broadcastImage: CGImage?
+    private var displayedCleanMasterSubCount: Int?
+    private var displayedIntegrationSeconds: Double?
+    private var displayedPreviewIntegrationSeconds: Double?
+    private var displayedSubExposureSeconds: Double?
+    private let displayPresentation = DisplayPresentation()
     var latestRecord: SnapshotRecord?
     var sessionStart: Date?
     var sessionEnd: Date?
     var log: [String] = []
     var replayURL: URL?
     var processorBackend: ProcessorBackend = .none
-    var displayAdjustments = DisplayAdjustments.neutral
+    /// Committed vs pending display adjustments. Sliders bind to `staged.pending`; only
+    /// `applyAdjustments()` promotes it and pushes to the pipeline. See StagedAdjustments.
+    var staged = StagedAdjustments(committed: .liveDefault)
+    /// The staged preview image (pending adjustments, proxy-sized). Distinct from
+    /// `latestImage`, which stays on the COMMITTED render so the main view always shows what
+    /// the audience sees.
+    var previewImage: CGImage?
+    /// True only while the blink control is held down. NOT a stored source: defaulting a
+    /// source to `.clean` would blank the preview entirely whenever rejection is off (there
+    /// is no published master, so `renderPreview(source: .clean)` returns nil) — which is
+    /// every import session. `previewSource` below resolves it instead.
+    /// The reference pane: the SAME source rendered with the COMMITTED adjustments — i.e. what
+    /// the audience is seeing right now. Turning a dial moves `previewImage` and leaves this one
+    /// still, so the comparison isolates the operator's edit rather than putting two moving
+    /// targets side by side.
+    ///
+    /// (It previously showed the un-rejected master, comparing rejection instead of the edit.
+    /// That answered a different question, and answered it badly: the two masters differ over
+    /// 0.13% of the frame, so both panes looked identical while both moved together.)
+    /// The reference pane. This is the DELIVERED BROADCAST IMAGE itself, not a re-render of the
+    /// same source through the preview path — so the pane labelled as what is live genuinely is
+    /// what is live, at the resolution and through the exact render the audience received. It also
+    /// removes a whole render from every preview refresh.
+    var previewCompareImage: CGImage?
+
+    /// Luminance histograms of the two panes, computed from the rendered images. Shown under each
+    /// pane so an adjustment can be judged against the DATA rather than by feel on a bare slider —
+    /// the background of a real M51 stack sits near 0.0095 with a MADN of 0.00007, so the useful
+    /// travel of the black-point slider is a sliver the eye cannot place without this.
+    var previewHistogram: [Int] = []
+    var compareHistogram: [Int] = []
+
+    /// What the cached reference-pane ("Current settings") render was made from. That pane depends only on the
+    /// COMMITTED adjustments and the source — never on the pending edit — so re-rendering it on
+    /// every slider tick doubled the work of a drag (two renders and two histograms per tick)
+    /// to produce an identical image. Dragging felt slow because half the work was wasted.
+    /// Set by Apply to the display revision its change will render under, and cleared by the
+    /// first delivery that carries that revision or a later one. While it is set, the live pane is
+    /// known to be BEHIND the committed adjustments and says so.
+    ///
+    /// SCOPED TO ITS SESSION. A revision is only meaningful within the pipeline that issued it: a
+    /// new pipeline starts counting from zero, so a value left over from a previous session or
+    /// import can sit ABOVE everything the new one will ever deliver, and the badge would stick
+    /// forever. Reachable without any race: Apply during an import that accepts no frames leaves
+    /// this set (image-less deliveries deliberately do not clear it), the import releases its
+    /// pipeline, and the next short import restarts revisions below it.
+    private(set) var pendingLiveRevision: UInt64?
+    /// The presentation the pending revision belongs to. Compared on every read and every clear.
+    private var pendingLiveSessionID: UUID?
+    /// The presentation currently bound by `wireCallbacks`.
+    private var currentDisplaySessionID: UUID?
+
+    /// True when the live pane is showing a render older than the committed adjustments — and only
+    /// for the session that is actually on screen.
+    var livePaneIsUpdating: Bool {
+        pendingLiveRevision != nil && pendingLiveSessionID == currentDisplaySessionID
+    }
+
+    /// The edit pane is ALWAYS approximate, and says so unconditionally.
+    ///
+    /// It renders from a downsampled proxy and derives its stretch from that proxy, so its curve
+    /// is not the broadcast's. A mechanism to reuse the broadcast's statistics was built and then
+    /// removed: measured on a noise-dominated fixture it made agreement WORSE, not better (the
+    /// rendered percentiles moved further from the broadcast, and further still after a new
+    /// frame), because matching the curve does not match the output once downsampling has changed
+    /// the pixel distribution the curve is applied to. Labelling every proxy preview approximate
+    /// is the honest position, and it does not depend on cache state that could silently go stale.
+    let previewIsApproximate = true
+
+    /// Red night-vision tint of the *whole Mac display* (not just the astro image).
+    /// In-memory only — defaults off each launch so the app never opens unexpectedly red.
+    var nightVisionOn = false
+    /// Tint brightness 1...100 (Double for the slider); lower is dimmer.
+    var nightVisionLevel = Double(NightVision.defaultLevel)
+    private let nightMode = NightModeController()
+
+    /// Apply the current night-vision on/off + level to the display. Called from the
+    /// control-panel toggle and slider.
+    func applyNightVision() {
+        if nightVisionOn { nightMode.enable(level: Int(nightVisionLevel)) }
+        else { nightMode.disable() }
+    }
+
+    /// True once the reference frame has been plate-solved — gates the "North up" toggle. Refreshed on
+    /// each display update from `pipeline.hasSolvedWCS`.
+    private(set) var solveAvailable = false
+
+    /// Whether the (download-on-demand) star catalog needed for plate-solving / north-up is present.
+    enum CatalogState: Equatable { case notInstalled, downloading(Double), installed, failed(String) }
+    private(set) var catalogState: CatalogState = CatalogInstaller.isInstalled() ? .installed : .notInstalled
+
     private(set) var lastSessionDirectory: URL?
     var errorMessage: String?
     var zoomPan = ZoomPanState.fit
@@ -128,7 +330,48 @@ final class AppModel {
     private var pipeline: SessionPipeline?
     private var demoTask: Task<Void, Never>?
 
-    init() {
+    /// Where session/calibration settings persist. Defaults to `.standard` (production); tests
+    /// inject a per-test temporary suite (`UserDefaults(suiteName:)`) so a test run never reads
+    /// OR writes the real user's `com.pauldavis.liveastrostudio` domain — `init()`'s calls to
+    /// `CalibrationStore.load`/`SessionSettingsStore.load` (below) read through this SAME
+    /// property, not `.standard` directly, precisely so an injected suite is honestly isolated
+    /// on both the read and the write path, not just the write path.
+    private let userDefaults: UserDefaults
+
+    /// Snapshot of the user's real session settings, captured when a Try-Demo
+    /// session overrides them with demo values (branding: "Demo Nebula", 30 s,
+    /// "Demo Stack Generator", …; and source config: stacker-output mode, the
+    /// DemoInput folder, the demo prefix). Restored when the demo session ends so
+    /// a later real session — and the persisted settings — never inherit the demo
+    /// branding OR point at the demo folder/prefix. nil when no demo override is active.
+    private struct DemoMetadataSnapshot {
+        var targetName, telescope, camera, mount, filter, locationLabel: String
+        var bortleText, subExposureText, notes: String
+        var sourceMode: SourceMode
+        var watchFolder: URL?
+        var fileNamePrefix: String
+    }
+    private var metadataBeforeDemo: DemoMetadataSnapshot?
+
+    // MARK: - Session completion (spec §2)
+
+    /// Per-session completion state (idle safeguard + planned stop flags, re-arm).
+    private var completionDriver = SessionCompletionDriver()
+    /// Timestamp of the most recent accepted frame; drives the idle safeguard.
+    /// Updated on every accepted frame in both source modes (the `onAccepted`
+    /// hook fires for each accepted update regardless of mode).
+    private(set) var lastAcceptedFrame: Date?
+    /// The 30 s tick that polls `completionDriver`; started on a successful
+    /// `startSession()` and cancelled in `endSession()`.
+    private var completionTick: Task<Void, Never>?
+    private let notifier = SessionNotifier()
+
+    /// `userDefaults` defaults to `.standard` for every production call site (`AppModel()`
+    /// unchanged). Tests pass a temporary suite so no test run reads or writes the real user's
+    /// persisted settings.
+    init(userDefaults: UserDefaults = .standard) {
+        self.userDefaults = userDefaults
+        self.calibration = CalibrationStore.load(userDefaults)
         // Build the seam bundle and the Broadcast controller first. The closures
         // capture `self` (safe: they only fire after init completes), and
         // `broadcast` must exist before loadSettings()/session hooks reference it.
@@ -176,7 +419,10 @@ final class AppModel {
             currentTargetName: { [weak self] in MainActor.assumeIsolated { self?.targetName ?? "" } },
             resetZoomPan: { [weak self] in MainActor.assumeIsolated { self?.zoomPan = .fit } },
             selectLiveTab: { [weak self] in MainActor.assumeIsolated { self?.selectedTab = .live } },
-            startSession: { [weak self] in MainActor.assumeIsolated { self?.startSession() } },
+            startSession: { [weak self] completion in MainActor.assumeIsolated {
+                guard let self else { completion(false); return }
+                self.startSession(completion: completion)
+            } },
             saveSettings: { [weak self] in MainActor.assumeIsolated { self?.saveSettings() } }))
 
         // Import + post-processing cluster: the shared log/error/session-running
@@ -193,7 +439,7 @@ final class AppModel {
             makeStackEngine: { [weak self] in MainActor.assumeIsolated { self!.makeStackEngine() } },
             currentCalibration: { [weak self] in MainActor.assumeIsolated { self!.calibration } },
             currentNeutralizeBackground: { [weak self] in MainActor.assumeIsolated { self?.neutralizeBackground ?? false } },
-            currentDisplayAdjustments: { [weak self] in MainActor.assumeIsolated { self?.displayAdjustments ?? .neutral } },
+            currentDisplayAdjustments: { [weak self] in MainActor.assumeIsolated { self?.staged.committed ?? .neutral } },
             currentFileNamePrefix: { [weak self] in MainActor.assumeIsolated { self?.fileNamePrefix ?? "" } },
             currentLiveAstroRoot: { [weak self] in MainActor.assumeIsolated { self!.liveAstroRoot } },
             currentProfile: { [weak self] in MainActor.assumeIsolated { self!.profile } },
@@ -202,6 +448,8 @@ final class AppModel {
                 MainActor.assumeIsolated { self?.wireCallbacks(to: pipeline, onAnyFrame: onAnyFrame) } },
             setAcceptedRejectedCounts: { [weak self] accepted, rejected in
                 MainActor.assumeIsolated { self?.acceptedCount = accepted; self?.rejectedCount = rejected } },
+            resetSessionStatsForImport: { [weak self] in MainActor.assumeIsolated { self?.resetSessionStatsForImport() } },
+            isRestacking: { [weak self] in MainActor.assumeIsolated { self?.isRestacking ?? false } },
             setReplayURL: { [weak self] url in MainActor.assumeIsolated { self?.replayURL = url } },
             setLastSessionDirectory: { [weak self] url in MainActor.assumeIsolated { self?.lastSessionDirectory = url } }))
         loadSettings()
@@ -229,6 +477,44 @@ final class AppModel {
         if let v = p.watchFolder { watchFolder = v }
     }
 
+    // MARK: - What the subs say about themselves
+
+    /// Target and exposure as the subs' own headers state them. Same fields and the same
+    /// `%g` formatting as ImportController and LiveSourceController, so every path that
+    /// detects agrees on what lands in the form. Absent or zero values are left nil so a
+    /// header that carries nothing never blanks a typed value.
+    static func detectedProfile(from meta: SourceMetadata) -> DetectedProfile {
+        var d = DetectedProfile()
+        if let object = meta.object?.trimmingCharacters(in: .whitespacesAndNewlines), !object.isEmpty {
+            d.targetName = object
+        }
+        if let exp = meta.validExposureSeconds { d.subExposureText = String(format: "%g", exp) }
+        return d
+    }
+
+    /// Adopts the subs' own target and exposure into the live profile, OVERWRITING a typed
+    /// value that disagrees — the rule import and the relays already follow. A stale typed
+    /// name is exactly how "M 51" went on the air over NGC 6960 subs, and fill-if-empty would
+    /// have left that case broken. The overwrite is logged with the old value so a name that
+    /// was typed on purpose is never lost silently. Returns true when anything changed.
+    @discardableResult
+    func adoptSourceMetadata(_ meta: SourceMetadata) -> Bool {
+        let d = Self.detectedProfile(from: meta)
+        var changed = false
+        if let t = d.targetName, t != targetName {
+            log.append("Target set from the subs' headers: \(t) (was \(targetName.isEmpty ? "blank" : targetName)).")
+            targetName = t
+            changed = true
+        }
+        if let e = d.subExposureText, Double(e) != Double(subExposureText) {
+            log.append("Sub exposure set from the subs' headers: \(e) s (was \(subExposureText) s).")
+            subExposureText = e
+            changed = true
+        }
+        if changed { saveSettings() }
+        return changed
+    }
+
     // MARK: - Settings persistence
 
     private func currentSettings() -> SessionSettings {
@@ -246,15 +532,68 @@ final class AppModel {
             backgroundNormalizationEnabled: backgroundNormalizationEnabled,
             scaleNormalizationEnabled: scaleNormalizationEnabled,
             processorBackend: processorBackend,
-            displayAdjustments: displayAdjustments,
+            displayAdjustments: staged.committed,
             relayRetentionDays: liveSource.relayRetentionDays,
-            demosaic: demosaic)
+            demosaic: demosaic,
+            idleSafeguardEnabled: idleSafeguardEnabled,
+            idleSafeguardMinutes: idleSafeguardMinutes,
+            plannedStopEnabled: plannedStopEnabled,
+            plannedStopHour: plannedStopHour,
+            plannedStopMinute: plannedStopMinute)
     }
 
-    func saveSettings() { SessionSettingsStore.save(currentSettings(), to: .standard) }
+    /// The live completion subset (idle safeguard + planned stop) read from the
+    /// draft properties — the same values `currentSettings().completionSettings`
+    /// assembles, exposed cheaply for the Live-tab armed status without building a
+    /// whole SessionSettings each render.
+    var completionSettings: CompletionSettings {
+        CompletionSettings(idleSafeguardEnabled: idleSafeguardEnabled,
+                           idleSafeguardMinutes: idleSafeguardMinutes,
+                           plannedStopEnabled: plannedStopEnabled,
+                           plannedStopHour: plannedStopHour,
+                           plannedStopMinute: plannedStopMinute)
+    }
+
+    /// The planned-stop deadline anchor: the armed-at timestamp, but never earlier
+    /// than session start (handles arm-before-then-start-after-the-time edge without
+    /// an immediate fire on start). Used by BOTH the completion tick driver and the
+    /// Live-tab countdown so display and driver agree on the deadline.
+    var plannedStopAnchor: Date {
+        let floor = sessionStart ?? Date()
+        return max(plannedStopArmedAt ?? floor, floor)
+    }
+
+    func saveSettings() {
+        var settings = currentSettings()
+        // While a Try-Demo override is active, never persist its transient branding
+        // OR its source config. Any saveSettings during a demo (start, display-adjust,
+        // end) keeps the user's real target/exposure AND real source mode/watch
+        // folder/prefix on disk — so a crash or force-quit mid-demo can't leave
+        // "Demo Nebula"/30 s or the DemoInput folder/demo prefix in saved settings.
+        if let snap = metadataBeforeDemo {
+            settings.targetName = snap.targetName
+            settings.subExposureSeconds = Double(snap.subExposureText) ?? settings.subExposureSeconds
+            settings.sourceModeRaw = snap.sourceMode.rawValue
+            settings.watchFolderPath = snap.watchFolder?.path
+            settings.filePrefix = snap.fileNamePrefix
+        }
+        SessionSettingsStore.save(settings, to: userDefaults)
+    }
+
+    /// Restore the user's real metadata captured before a Try-Demo session, so the
+    /// demo leaves no residue in the fields (or, via saveSettings, on disk). No-op
+    /// when no demo override is active.
+    private func restoreMetadataAfterDemoIfNeeded() {
+        guard let snap = metadataBeforeDemo else { return }
+        targetName = snap.targetName; telescope = snap.telescope; camera = snap.camera
+        mount = snap.mount; filter = snap.filter; locationLabel = snap.locationLabel
+        bortleText = snap.bortleText; subExposureText = snap.subExposureText; notes = snap.notes
+        sourceMode = snap.sourceMode; watchFolder = snap.watchFolder; fileNamePrefix = snap.fileNamePrefix
+        metadataBeforeDemo = nil
+    }
 
     func loadSettings() {
-        let s = SessionSettingsStore.load(.standard)
+        let s = SessionSettingsStore.load(userDefaults)
         sourceMode = SourceMode(rawValue: s.sourceModeRaw) ?? .stackerOutput
         watchFolder = s.watchFolderPath.map { URL(fileURLWithPath: $0) }
         fileNamePrefix = s.filePrefix
@@ -270,35 +609,353 @@ final class AppModel {
         liveSource.relayRetentionDays = s.relayRetentionDays
         demosaic = s.demosaic
         processorBackend = s.processorBackend
-        displayAdjustments = s.displayAdjustments
+        // Fresh install (no saved settings) starts with the recommended DBE-on look;
+        // a returning user keeps whatever they last had.
+        staged = StagedAdjustments(committed: SessionSettingsStore.exists(userDefaults) ? s.displayAdjustments : .liveDefault)
+        idleSafeguardEnabled = s.idleSafeguardEnabled
+        idleSafeguardMinutes = s.idleSafeguardMinutes
+        plannedStopEnabled = s.plannedStopEnabled
+        plannedStopHour = s.plannedStopHour
+        plannedStopMinute = s.plannedStopMinute
     }
 
-    private var lastAdjustmentRender = Date.distantPast
-
-    /// Called when a slider changes: persist, push adjustments to the pipeline so
-    /// the next frame's snapshot matches, and re-render the current stack off-main
-    /// (throttled to ~12 fps so dragging a 26MP stretch stays smooth).
-    func applyDisplayAdjustments() {
-        saveSettings()
-        guard let pipeline else { return }
-        let adj = displayAdjustments
-        pipeline.displayAdjustments = adj
-        let now = Date()
-        guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else {
-            return   // throttle re-render only; the pipeline state was already updated above
-        }
-        lastAdjustmentRender = now
-        Task.detached { [weak self] in
-            // Swift 6: rebind weak self to an immutable strong let up front — nested
-            // @Sendable closures may not reference a captured *var* (a weak binding).
-            // Lifetime extension is task-scoped (one-shot render); no retain cycle.
-            guard let self else { return }
-            let cg = pipeline.renderCurrentDisplay(adjustments: adj)
-            await MainActor.run {
-                guard let cg else { return }
-                self.latestImage = cg
+    /// Download the star catalog on demand (3c). The download itself runs off-main (CatalogInstaller
+    /// .download is nonisolated), so the UI never blocks; progress streams into `catalogState`, and on
+    /// success it's applied to the live pipeline via reloadCatalog() so North-up can enable without a
+    /// restart. Callable from `.notInstalled` or `.failed` (retry); a no-op while already downloading.
+    func downloadCatalog() {
+        if case .downloading = catalogState { return }
+        catalogState = .downloading(0)
+        Task { [weak self] in
+            do {
+                try await CatalogInstaller.download(progress: { p in
+                    Task { @MainActor [weak self] in
+                        if case .downloading = self?.catalogState { self?.catalogState = .downloading(p) }
+                    }
+                })
+                self?.catalogState = .installed
+                self?.pipeline?.reloadCatalog()
+                self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false
+            } catch {
+                self?.catalogState = .failed(Self.catalogErrorText(error))
             }
         }
+    }
+
+    private static func catalogErrorText(_ error: Error) -> String {
+        switch error {
+        case CatalogInstaller.InstallError.checksumMismatch: return "Catalog failed verification — try again."
+        case CatalogInstaller.InstallError.invalidCatalog:   return "Downloaded file wasn't a valid catalog."
+        case CatalogInstaller.InstallError.http(let code):   return "Download failed (HTTP \(code))."
+        default: return "Download failed — check your connection and try again."
+        }
+    }
+
+    /// Monotonic stamp for preview render requests. Renders run on detached tasks, so without
+    /// it a slow EARLIER render can finish after a newer one and overwrite the preview with a
+    /// stale image — visible as the preview snapping back to a setting you already moved past.
+    private var previewRenderSeq = 0
+
+    /// How many draft renders are in flight. The sequence stamp rejects stale RESULTS but does
+    /// nothing to BOUND the WORK: measured 6 concurrent renders outstanding when each render
+    /// outlasts the throttle window, and on a real 26 MP session a proxy-cache miss makes each of
+    /// those a full-resolution crop + downsample. One render plus one queued is all that can ever
+    /// be useful, since anything older is discarded on completion anyway.
+    private var draftRendersInFlight = 0
+    private static let maxDraftRendersInFlight = 2
+
+    /// Throttle clock for the PENDING draft render only. Main's pipeline coalesces the COMMITTED
+    /// renders itself (DisplayDelivery), so the old shared `lastAdjustmentRender` went away with
+    /// the old push-on-every-tick path; the operator-only draft preview still needs its own, since
+    /// DisplayDelivery does not own it.
+    private var lastAdjustmentRender = Date.distantPast
+
+
+    /// True while a coalesced trailing render (see refreshPreview) is scheduled but hasn't fired yet.
+    private var previewTrailingScheduled = false
+
+    /// Clears the preview and invalidates any in-flight render. Bumping the stamp is the point:
+    /// a detached render that started before the clear would otherwise pass the seq guard on
+    /// completion and put the old session's image back, where it would then be frozen because
+    /// `pipeline` is nil and every later refresh returns early.
+    private func clearPreview() {
+        previewRenderSeq &+= 1
+        // A session switch retires any pending Apply: its revision belongs to the old pipeline and
+        // no delivery from the new one would ever clear it.
+        pendingLiveRevision = nil
+        pendingLiveSessionID = nil
+        previewImage = nil
+        previewCompareImage = nil
+        previewHistogram = []
+        compareHistogram = []
+
+    }
+
+    /// Called when a slider changes: re-render the PREVIEW only. Nothing reaches the pipeline
+    /// here — that is what makes tuning mid-broadcast safe.
+    ///
+    /// `force` marks a DISCRETE action (Apply, Revert, Reset, blink press/release, a new frame, a
+    /// session boundary): it bypasses the drag throttle and renders at full quality. Those must
+    /// never be silently dropped for landing inside an 80 ms window — a swallowed blink release
+    /// would leave the panel showing the online master and quietly misrepresent rejection.
+    func refreshPreview(force: Bool = false) {
+        performPreviewRefresh(bypassThrottle: force, quality: force ? .settled : .draft)
+    }
+
+    /// Debounce generation for the settle. Each edit invalidates the pending settle by bumping it.
+    private var settleGeneration: UInt64 = 0
+
+    /// Arms the settled render that follows a drag, RESETTING any settle already pending.
+    ///
+    /// A fixed one-shot timer is wrong here, and was the bug: armed 90 ms after the FIRST draft
+    /// and not postponed by later edits, it fired a full-resolution render in the middle of a
+    /// continuous drag, then re-armed on the next draft — so a long drag paid for a settled render
+    /// roughly every 90 ms. That is the exact cost the draft tier exists to avoid. Resetting on
+    /// every edit means a drag settles exactly once, after it stops.
+    private func scheduleSettle() {
+        settleGeneration &+= 1
+        let generation = settleGeneration
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 90_000_000)
+            guard let self, self.settleGeneration == generation else { return }
+            self.performPreviewRefresh(bypassThrottle: true, quality: .settled, isRetry: true)
+        }
+    }
+
+    /// Generation of the settled render currently in flight, if any. A draft retry while this
+    /// matches `settleGeneration` would re-render values the settle is already rendering, at lower
+    /// quality — and bumping `previewRenderSeq` would make the settle's result unpublishable, so
+    /// the expensive work would be thrown away.
+    /// The settled render currently in flight, identified by its render sequence number as well
+    /// as its settle generation. The token is what makes clearing safe: completions are not
+    /// ordered, so an OLDER settled render finishing while a newer one is still rendering used to
+    /// clear the newer one's protection, after which a queued draft retry could supersede it and
+    /// leave draft pixels on screen. Two forced renders can share a generation, so the generation
+    /// alone cannot identify the owner.
+    private var settledRenderInFlight: (token: Int, generation: UInt64)?
+
+    /// Generation of the newest settle that actually PUBLISHED. Without this, a draft retry queued
+    /// before a settle could run after it: the in-flight marker is cleared on completion, so the
+    /// retry's guard passed, it published lower-resolution pixels over the settled ones, and
+    /// because a retry never re-arms the settle nothing upgraded them again — the preview stayed
+    /// draft permanently. Compared against the CURRENT generation, so a genuine new edit (which
+    /// bumps it) still gets its draft.
+    private var lastPublishedSettleGeneration: UInt64?
+
+    /// Schedules one coalesced DRAFT retry, unless one is already pending. Used by the drop paths,
+    /// which must not swallow the operator's last edit — the preview would then disagree with what
+    /// Apply publishes. Settled work is never retried this way: it goes through `scheduleSettle`,
+    /// whose generation check is what keeps full-resolution renders out of an active drag.
+    private func scheduleCoalescedRetry() {
+        guard !previewTrailingScheduled else { return }
+        previewTrailingScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 90_000_000)
+            self?.previewTrailingScheduled = false
+            self?.performPreviewRefresh(bypassThrottle: true, quality: .draft, isRetry: true)
+        }
+    }
+
+    /// `isRetry` marks a call that came from a timer rather than from the operator. Retries must
+    /// not re-arm the settle (the edit that caused them already did) and must re-check that they
+    /// are still wanted, since the world may have moved on during their 90 ms wait.
+    private func performPreviewRefresh(bypassThrottle: Bool,
+                                       quality: SessionPipeline.PreviewQuality,
+                                       isRetry: Bool = false) {
+        guard let pipeline else { return }
+        // Re-arm the settle for EVERY operator draft request, including ones about to be dropped:
+        // the last edit must settle even when its own render never ran.
+        if quality == .draft && !isRetry { scheduleSettle() }
+        // A draft retry is pointless once the settle for these same values is already rendering:
+        // no edit has arrived since (the generation is unchanged), so it would render identical
+        // values more cheaply AND invalidate the settle's result through the sequence guard.
+        if quality == .draft, isRetry,
+           settledRenderInFlight?.generation == settleGeneration
+               || lastPublishedSettleGeneration == settleGeneration { return }
+        let now = Date()
+        if !bypassThrottle {
+            guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else {
+                // The retry is a DRAFT, deliberately. It exists to keep the preview showing the
+                // newest pending value during a drag, which is cheap work; the settle above is
+                // what eventually renders it at full preview quality. "Full quality" is not the
+                // same as matching the broadcast — every proxy preview is approximate; see
+                // `previewIsApproximate`.
+                scheduleCoalescedRetry()
+                return
+            }
+        }
+        lastAdjustmentRender = now
+        previewRenderSeq &+= 1
+        let seq = previewRenderSeq
+        let adj = staged.pending
+        let source = previewSource
+        // Test seam: when set, this stands in for `pipeline.renderPreview(source:adjustments:)`.
+        // Captured here (not read again inside the detached task) so a test can gate ONE
+        // specific in-flight call — e.g. block the render this refreshPreview() started while a
+        // later refreshPreview() call captures its own (different) override or none at all — to
+        // build a real completion race rather than asserting on `previewRenderSeq`'s value.
+        // nil in production; refreshPreview then behaves exactly as before this seam existed.
+        let renderOverride = previewRenderOverrideForTest
+        guard draftRendersInFlight < Self.maxDraftRendersInFlight else {
+            // Saturated. Do not pile on: the newest pending values are already captured by
+            // `previewRenderSeq`, so schedule one coalesced retry instead of another render.
+            //
+            // A dropped SETTLE must come back through `scheduleSettle`, not as a fixed-quality
+            // retry. A fixed retry carried no generation, so if the operator resumed dragging
+            // during its 90 ms wait it still started a full-resolution render mid-drag — the same
+            // defect the debounce was added to fix, re-entering through the drop path.
+            if quality == .settled { scheduleSettle() } else { scheduleCoalescedRetry() }
+            return
+        }
+        draftRendersInFlight += 1
+        let dispatchedSettleGeneration = settleGeneration
+        if quality == .settled { settledRenderInFlight = (token: seq, generation: dispatchedSettleGeneration) }
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let cg: CGImage?
+            if let renderOverride {
+                cg = await renderOverride(pipeline, source, adj, quality)
+            } else {
+                cg = pipeline.renderPreview(source: source, adjustments: adj, quality: quality)
+            }
+            await MainActor.run {
+                self.draftRendersInFlight -= 1
+                // Clear ONLY if this render still owns the marker; an out-of-order completion
+                // must not release a newer render's protection.
+                if quality == .settled, self.settledRenderInFlight?.token == seq {
+                    self.settledRenderInFlight = nil
+                }
+                // Only the newest request may publish; a slower earlier render is discarded.
+                let published = seq == self.previewRenderSeq
+                if published {
+                    // Record the settle only when it actually reached the screen; a settle whose
+                    // result was discarded leaves the preview un-settled, so a draft retry for
+                    // those values is still legitimate.
+                    if quality == .settled { self.lastPublishedSettleGeneration = dispatchedSettleGeneration }
+                    self.previewImage = cg
+                    self.previewHistogram = cg.map { DisplayHistogram.of($0) } ?? []
+                }
+                self.previewRenderCompletionForTest?(seq, published)
+            }
+        }
+    }
+
+    /// Test seam only: substitutes for `pipeline.renderPreview(source:adjustments:)` inside
+    /// `refreshPreview`'s detached render task. Production never sets this (stays nil), so
+    /// `refreshPreview` is unchanged there. Tests use it to control render TIMING — e.g. to hold
+    /// one call open past a second, superseding call — without reimplementing or peeking at the
+    /// `previewRenderSeq` guard itself.
+    /// nil in production. Reports what happened to each delivery at the main-actor handoff: a
+    /// delivery can be correctly rendered and still be DROPPED here, because this re-check runs
+    /// after a hop during which the revision may have moved on.
+    var displayDeliveryOutcomeForTest: ((UInt64, String) -> Void)?
+
+    var previewRenderOverrideForTest: (@Sendable (SessionPipeline, SessionPipeline.PreviewSource, DisplayAdjustments, SessionPipeline.PreviewQuality) async -> CGImage?)?
+
+    /// Test seam only: called once every `refreshPreview` render attempt has been resolved on
+    /// the main actor, AFTER the `previewRenderSeq` guard ran — with that render's `seq` and
+    /// whether it actually published. Reports the guard's OUTCOME; never computes its own. Lets
+    /// a test await a specific render's resolution deterministically instead of polling
+    /// `previewImage` or sleeping a guessed duration. Production never sets this.
+    var previewRenderCompletionForTest: ((_ seq: Int, _ published: Bool) -> Void)?
+
+    /// Which master the preview shows. Held → the un-rejected online master. Otherwise the
+    /// clean master when one is actually being served, else online — so the panel still shows
+    /// a picture when rejection is off, building, or unavailable, rather than going blank.
+    /// The PRIMARY preview source: the clean master when one is being served, else the online
+    /// stack. No blink branch any more — the comparison is rendered as a second image rather than
+    /// by swapping this one.
+    var previewSource: SessionPipeline.PreviewSource {
+        pipeline?.publishedMasterSurvivorCount() != nil ? .clean : .online
+    }
+
+    /// True when a clean master is being served, i.e. when there are two different things to show.
+    var canCompare: Bool { pipeline?.publishedMasterSurvivorCount() != nil }
+
+    /// Promotes the pending adjustments to committed and hands them to the pipeline, which
+    /// coalesces the render and delivers the operator preview and the resolved BROADCAST image
+    /// together through `DisplayDelivery`. This is the ONLY path by which a slider reaches the
+    /// audience.
+    ///
+    /// There is deliberately no sequence stamp here any more. Ordering and session freshness for
+    /// the COMMITTED surfaces are owned by `DisplayDelivery` (its revision + `isCurrentDisplay`
+    /// guard), and the bespoke `applyRenderSeq` that used to live here was a narrower
+    /// reimplementation of the same thing — two competing ordering systems in one display path is
+    /// what produced this feature's stale-image bugs. `previewRenderSeq` below still guards the
+    /// PENDING draft render, which `DisplayDelivery` does not own.
+    func applyAdjustments() {
+        // Place the adjustments FIRST, atomically, and commit only if they landed.
+        //
+        // A separate "is it accepting?" check followed by an assignment is not enough: `end()` can
+        // freeze the display between the two, and the edit is then committed, its badge cleared,
+        // and the change silently overwritten by the final render. `applyCommittedAdjustments`
+        // does the check and the assignment in one critical section and says whether it took.
+        let candidate = staged.pending
+        let sessionRevision = pipeline?.applyCommittedAdjustments(candidate)
+        let landedOnSession = sessionRevision != nil
+        // An IMPORT owns its own pipeline (ImportController), not `pipeline`, which is nil while
+        // one runs.
+        let importRevision = importer.applyDisplayAdjustments(candidate)
+        let landedOnImport = importRevision != nil
+        let hadSomewhereToLand = pipeline != nil || importer.hasActivePipeline
+
+        if hadSomewhereToLand, !landedOnSession, !landedOnImport {
+            // Deliberately does NOT commit. Leaving the edit pending keeps the badge honest —
+            // clearing it is exactly what made this a silent failure.
+            errorMessage = "The session is finalising — writing the master and building the replay "
+                + "— so its display is already closed and this change cannot reach it. Your edit "
+                + "is still pending; press Apply again once it finishes."
+            return
+        }
+
+        // Either it landed, or there was nothing live to land on — in which case committing is
+        // right: it is a persisted preference for the next render, with no live image to
+        // misrepresent.
+        _ = staged.apply()
+        saveSettings()
+        // The committed surfaces re-render ASYNCHRONOUSLY. Until a delivery carrying this revision
+        // arrives, anything labelled "currently live" is showing the PREVIOUS look — under load
+        // (full-resolution DBE while stacking) that gap ran to tens of seconds, which reads as
+        // "Apply did nothing" while the button greys itself out.
+        pendingLiveRevision = sessionRevision ?? importRevision
+        pendingLiveSessionID = pendingLiveRevision == nil ? nil : currentDisplaySessionID
+        // The two PREVIEW panes are ours, not the pipeline's, and nothing else re-renders them:
+        // without this the bottom pane keeps its pending image, so Apply appears to do nothing.
+        refreshPreview(force: true)
+    }
+
+    /// Throws the pending edits away and puts the preview back on the committed look.
+    func revertAdjustments() {
+        staged.revert()
+        refreshPreview(force: true)
+    }
+
+    /// Restores the shipped defaults as a PENDING edit — Reset must not reach the broadcast on
+    /// its own, or it would be the one control that bypasses staging entirely. Apply commits it
+    /// like any other change.
+    func resetAdjustments() {
+        staged.pending = .liveDefault
+        refreshPreview(force: true)
+    }
+
+    /// The session-transition step shared by `startSession()` and `endSession()`: assign the
+    /// (possibly nil) active pipeline and invalidate any draft render in flight. This must stay
+    /// the ONE place that pairing happens — `attach(pipeline:)` below (the test seam) calls this
+    /// SAME method rather than repeating the assignment+invalidation itself, so a test exercising
+    /// "a session switch must reject a stale draft" is exercising this real method, not a
+    /// parallel re-implementation of it that could pass even if this one were broken.
+    private func setPipeline(_ pipeline: SessionPipeline?) {
+        self.pipeline = pipeline
+        clearPreview()
+    }
+
+    /// Test seam only: attaches `pipeline` through the SAME `setPipeline(_:)` `startSession()`/
+    /// `endSession()` use, so tests can drive the REAL `applyAdjustments()` / `revertAdjustments()`
+    /// / `resetAdjustments()` / `refreshPreview()` code paths — and the real session-transition
+    /// invalidation — against a real `SessionPipeline` without going through file-watching/
+    /// `startSession()`. `pipeline` itself stays `private`; this is the only other writer.
+    func attach(pipeline: SessionPipeline) {
+        setPipeline(pipeline)
     }
 
     private func makeStackEngine() -> StackEngine {
@@ -326,19 +983,367 @@ final class AppModel {
     }
 
     var integrationCaption: String {
+        if let seconds = displayedPreviewIntegrationSeconds {
+            guard latestImage != nil else { return "waiting for stack…" }
+            return IntegrationFormat.caption(seconds: seconds, subSeconds: displayedSubExposureSeconds ?? sessionSubExposureSeconds)
+        }
         guard let rec = latestRecord else { return "waiting for first stack…" }
         return IntegrationFormat.caption(seconds: rec.estimatedIntegrationSeconds,
                                          subSeconds: profile.subExposureSeconds)
     }
 
+    var broadcastIntegrationCaption: String {
+        if let seconds = displayedIntegrationSeconds {
+            guard broadcastImage != nil else { return "waiting for stack…" }
+            return IntegrationFormat.caption(seconds: seconds, subSeconds: displayedSubExposureSeconds ?? sessionSubExposureSeconds)
+        }
+        guard let rec = latestRecord else { return "waiting for first stack…" }
+        return IntegrationFormat.caption(seconds: rec.estimatedIntegrationSeconds,
+                                         subSeconds: profile.subExposureSeconds)
+    }
+
+    /// Resolve the session's calibration by reading a representative sub already in
+    /// the watch folder, auto-matching a master dark/bias from the library (scaling
+    /// by exposure when needed), and building the session flat. Returns the Calibrator
+    /// (nil if nothing applies) plus log lines.
+    ///
+    /// Peek-at-Start: real captures (ASIAIR/Seestar/NINA) have subs present at Start.
+    /// A session begun on an EMPTY folder can't be matched yet — that's logged and left
+    /// uncalibrated (resolve-on-first-sub is a documented follow-up). Not CI-testable
+    /// (FileManager + pipeline); the pure matcher/scaler/library are unit-tested.
+    func resolveCalibration(watchFolder: URL, prefix: String?, excludingPreExisting: WatchFolderInput.Snapshot? = nil)
+        -> (calibrator: Calibrator?, messages: [String], foundMetadata: Bool, metadata: SourceMetadata?) {
+        // Old files were explicitly excluded. Even a newly arrived file may still be writing;
+        // resolve on the first frame the source actually ingests, using its captured metadata.
+        if excludingPreExisting != nil {
+            calibrationStatus = statusLine(dark: false, flat: false)
+            return (nil, ["Calibration: matching from the first new sub as it arrives."], false, nil)
+        }
+        // Peek a representative sub already in the folder. If none (empty-folder live
+        // start), report foundMetadata: false so the caller attaches the first-sub
+        // provider instead — calibration then resolves as the first sub lands.
+        guard let meta = representativeMetadata(in: watchFolder, prefix: prefix) else {
+            calibrationStatus = statusLine(dark: false, flat: false)
+            return (nil, ["Calibration: no subs yet — matching from the first sub as it arrives."], false, nil)
+        }
+        let r = CalibrationResolver.resolve(
+            metadata: meta, library: calibrationLibrary, scaleEnabled: scaleDarksAcrossExposures,
+            flatsFolder: sessionFlatsFolder, darkFlatsFolder: sessionDarkFlatsFolder,
+            legacyDarkPath: calibration.darkPath, legacyFlatPath: calibration.flatPath)
+        calibrationStatus = statusLine(dark: r.hasDark, flat: r.hasFlat)
+        return (r.calibrator, r.messages, true, meta)
+    }
+
+    /// First-sub calibrator provider for empty-folder starts: the pipeline calls this
+    /// with the first frame's header on the consume task; it resolves calibration and
+    /// hops to the main actor to log + update the status line.
+    private func makeCalibratorProvider() -> ((SourceMetadata) -> Calibrator?) {
+        let library = calibrationLibrary
+        let scale = scaleDarksAcrossExposures
+        let flats = sessionFlatsFolder, darkFlats = sessionDarkFlatsFolder
+        let legacyDark = calibration.darkPath, legacyFlat = calibration.flatPath
+        return { [weak self] meta in
+            let r = CalibrationResolver.resolve(
+                metadata: meta, library: library, scaleEnabled: scale,
+                flatsFolder: flats, darkFlatsFolder: darkFlats,
+                legacyDarkPath: legacyDark, legacyFlatPath: legacyFlat)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                r.messages.forEach { self.log.append($0) }
+                self.calibrationStatus = self.statusLine(dark: r.hasDark, flat: r.hasFlat)
+            }
+            return r.calibrator
+        }
+    }
+
+
+    private func representativeMetadata(in folder: URL, prefix: String?) -> SourceMetadata? {
+        var files = CalibrationLibrary.fitsFiles(in: folder)
+        if let prefix, !prefix.isEmpty { files = files.filter { $0.lastPathComponent.hasPrefix(prefix) } }
+        for url in files.sorted(by: { $0.lastPathComponent > $1.lastPathComponent }) {   // newest first
+            guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
+            defer { try? fh.close() }
+            guard let head = try? fh.read(upToCount: 256 * 1024),   // header only, not pixels
+                  let header = try? FITSReader.readHeader(head) else { continue }
+            return SourceMetadata(fitsKeywords: header.keywords)
+        }
+        return nil
+    }
+
+
+    private func statusLine(dark: Bool, flat: Bool) -> String {
+        switch (dark, flat) {
+        case (true, true):  return "Calibrating with dark + flat ✓"
+        case (true, false): return "Calibrating with dark ✓"
+        case (false, true): return "Calibrating with flat ✓"
+        case (false, false):
+            // Gentle, actionable — a raw stack looks noisy without calibration, and that's
+            // often mistaken for the app rather than missing darks/flats.
+            return libraryEntries.isEmpty
+                ? "No calibration — add darks/bias to the library for a cleaner stack"
+                : "No calibration applied"
+        }
+    }
+
+    // MARK: - Calibration library management
+
+    func refreshLibraryEntries() { libraryEntries = calibrationLibrary.all() }
+
+    /// Build a master (dark or bias) from a folder of raw frames, keyed automatically
+    /// from the first frame's FITS header, and add it to the library. Off the main thread.
+    func addMasterFromFolder(_ folder: URL, kind: MasterKind) {
+        let urls = CalibrationLibrary.fitsFiles(in: folder)
+        guard !urls.isEmpty else { log.append("Calibration: no FITS frames in that folder."); return }
+        calibrationBusy = true
+        log.append("Calibration: building \(kind.rawValue) master from \(urls.count) frames…")
+        let lib = calibrationLibrary
+        Task.detached { [weak self] in
+            // Swift 6: rebind weak self to a strong immutable up front — nested
+            // @Sendable closures may not reference a captured weak *var*.
+            guard let self else { return }
+            // Key the master from the first READABLE frame's header — not urls[0], which may be the
+            // corrupt/unreadable file MasterBuilder silently skips. Keying off a skipped file would
+            // stamp the master with generic/nil camera+gain so it never matches lights later.
+            var meta = SourceMetadata()
+            for url in urls {
+                guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
+                defer { try? fh.close() }
+                if let head = try? fh.read(upToCount: 256 * 1024),
+                   let header = try? FITSReader.readHeader(head) {
+                    meta = SourceMetadata(fitsKeywords: header.keywords)
+                    break
+                }
+            }
+            do {
+                let frame = try lib.add(kind: kind, camera: meta.instrument ?? "Camera",
+                    gain: meta.gain, exposureSeconds: kind == .bias ? nil : meta.exposureSeconds,
+                    // Store only the controlled SET-TEMP as the master's setpoint. CCD-TEMP (actual,
+                    // uncontrolled) must not masquerade as a setpoint — that made uncooled darks carry
+                    // a spurious temperature that then false-rejected uncooled lights.
+                    setTempC: meta.setTempC, binning: meta.binning, fitsURLs: urls)
+                await MainActor.run {
+                    self.calibrationBusy = false
+                    self.refreshLibraryEntries()
+                    self.log.append("Calibration: added \(frame.camera) \(kind.rawValue).")
+                }
+            } catch {
+                await MainActor.run {
+                    self.calibrationBusy = false
+                    self.log.append("Calibration: build failed — \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func removeMaster(_ id: UUID) {
+        try? calibrationLibrary.remove(id: id)
+        refreshLibraryEntries()
+    }
+
+    func rebuildMaster(_ id: UUID) {
+        calibrationBusy = true
+        let lib = calibrationLibrary
+        Task.detached { [weak self] in
+            guard let self else { return }   // Swift 6: strong immutable for nested closures
+            let message: String
+            do { try lib.rebuild(id: id); message = "Calibration: rebuilt master." }
+            catch { message = "Calibration: rebuild failed — \(error.localizedDescription)" }
+            await MainActor.run {
+                self.calibrationBusy = false
+                self.refreshLibraryEntries()
+                self.log.append(message)
+            }
+        }
+    }
+
+    /// A one-line description of a library entry for the list UI.
+    func summary(of f: MasterFrame) -> String {
+        // Int(_:) traps on a finite-but-huge Double (corrupt index value); Int(exactly:) is safe.
+        func intStr(_ v: Double) -> String { Int(exactly: v.rounded()).map(String.init) ?? String(format: "%.2g", v) }
+        var parts: [String] = [f.camera, f.kind.rawValue]
+        if let e = f.exposureSeconds { parts.append("\(intStr(e))s") }
+        if let g = f.gain { parts.append("gain \(intStr(g))") }
+        if let t = f.setTempC { parts.append("\(intStr(t))°C") }
+        if let b = f.binning { parts.append("bin\(b)") }
+        return parts.joined(separator: " · ") + " · ×\(f.frameCount)"
+    }
+
+    // MARK: - What the session is about to consume
+
+    /// What the session can say about its input before any frame is stacked.
+    /// `waitingForFirstSub` is a STANDING status, not a transient log line: it is what makes
+    /// a filename filter that matches nothing distinguishable from "capture hasn't started".
+    enum SessionInputStatus: Equatable {
+        case waitingForFirstSub(folder: URL, filter: String?, unmatchedFileCount: Int)
+        /// The folder could not be read. Deliberately NOT the same case as an empty folder:
+        /// telling an operator to wait for files that can never arrive is the failure this fix exists to end.
+        case failed(String)
+    }
+
+    /// The operator's answer to "these subs are already here".
+    enum PreExistingSubsChoice: Equatable { case stackExistingAndNew, newArrivalsOnly, cancel }
+
+    /// A start held open until that question is answered. Nothing is stacked while this is set.
+    struct PendingSessionStart: Equatable {
+        let id = UUID()
+        let snapshot: WatchFolderInput.Snapshot
+    }
+
+    private(set) var sessionInputStatus: SessionInputStatus?
+    private(set) var pendingSessionStart: PendingSessionStart?
+    private var pendingStartCompletion: ((Bool) -> Void)?
+
+    /// What a start should do about the folder it was pointed at. Pure, so the decision is
+    /// testable on its own — `startSession()` itself needs an app bundle and a live pipeline.
+    enum StartDecision: Equatable {
+        /// Subs are already present: ask before stacking anything.
+        case ask(WatchFolderInput.Snapshot)
+        /// Nothing matches yet. Start, and stand up the waiting status so an empty result is
+        /// visible rather than indistinguishable from "capture hasn't begun".
+        case startWaiting(SessionInputStatus)
+        /// The folder could not be read. Start nothing.
+        case failed(String)
+    }
+
+    static func startDecision(folder: URL, fileNamePrefix: String?) -> StartDecision {
+        let filter = (fileNamePrefix?.isEmpty ?? true) ? nil : fileNamePrefix
+        let snapshot: WatchFolderInput.Snapshot
+        do {
+            snapshot = try WatchFolderInput.snapshot(folder: folder, fileNamePrefix: filter)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+        guard snapshot.isEmpty else { return .ask(snapshot) }
+        return .startWaiting(.waitingForFirstSub(folder: folder, filter: filter,
+                                                 unmatchedFileCount: snapshot.unmatchedFileCount))
+    }
+
+    /// The dialog's body: what is already there, and what each choice will do.
+    var pendingSessionStartMessage: String? {
+        guard let pending = pendingSessionStart else { return nil }
+        let n = pending.snapshot.count
+        let subs = n == 1 ? "1 sub is" : "\(n) subs are"
+        return "\(subs) already in this folder. "
+            + "“Stack existing + new” stacks them along with everything that arrives from now on. "
+            + "“New arrivals only” skips them and stacks only what lands after you start."
+    }
+
+    /// Test seam: the waiting status is normally installed by `startSession()`, which cannot
+    /// run in a unit test (it needs a bundle and a live pipeline).
+    func installSessionInputStatusForTest(_ status: SessionInputStatus?) {
+        sessionInputStatus = status
+    }
+
+    /// Which subs (if any) the session must skip, given the operator's answer.
+    ///
+    /// Only valid after the caller has checked the snapshot's selection. A mismatch is not
+    /// permission to include everything: the resolver re-prompts and the source refuses it.
+    static func exclusion(for choice: PreExistingSubsChoice,
+                          snapshot: WatchFolderInput.Snapshot,
+                          folder: URL,
+                          fileNamePrefix: String?) -> WatchFolderInput.Snapshot? {
+        guard choice == .newArrivalsOnly else { return nil }
+        let filter = (fileNamePrefix?.isEmpty ?? true) ? nil : fileNamePrefix
+        guard snapshot.covers(folder: folder, fileNamePrefix: filter) else { return nil }
+        return snapshot
+    }
+
+    /// Answers the pre-existing-subs question and starts (or abandons) the session.
+    func resolvePendingSessionStart(_ choice: PreExistingSubsChoice, requestID: UUID? = nil) {
+        guard let pending = pendingSessionStart else { return }
+        guard requestID == nil || requestID == pending.id else { return }
+        pendingSessionStart = nil
+        let completion = pendingStartCompletion ?? { _ in }
+        pendingStartCompletion = nil
+        guard choice != .cancel else {
+            log.append("Start cancelled — \(pending.snapshot.count) subs were already in the folder.")
+            completion(false)
+            return
+        }
+        guard let folder = watchFolder else { completion(false); return }
+        let filter = fileNamePrefix.isEmpty ? nil : fileNamePrefix
+        let excluding = Self.exclusion(for: choice, snapshot: pending.snapshot,
+                                       folder: folder, fileNamePrefix: filter)
+        if !pending.snapshot.covers(folder: folder, fileNamePrefix: filter) || sourceMode != .nativeStack {
+            // The selection moved under the question; say so rather than silently stacking
+            // a folder the operator has since changed to.
+            log.append("Watch folder or filename filter changed while the question was open — re-checking the folder.")
+            if pending.snapshot.folder.standardizedFileURL == folder.standardizedFileURL,
+               sourceMode == .nativeStack {
+                // A changed filter needs fresh consent, but still consumes this relay.
+                startSession(completion: completion)
+            } else {
+                // A different input no longer owns the old request's relay.
+                completion(false)
+                startSession()
+            }
+            return
+        }
+        if let excluding {
+            log.append("Ignoring \(excluding.count) subs that were already in the folder; stacking new arrivals only.")
+        } else {
+            log.append("Stacking \(pending.snapshot.count) subs already in the folder, plus new arrivals.")
+        }
+        completion(beginSession(excludingPreExisting: excluding))
+    }
+
+    /// Clears the standing "waiting" status. Called when a frame has actually been INGESTED —
+    /// not when one is merely discovered, which proves only that a file appeared.
+    func noteFrameIngested() {
+        if case .waitingForFirstSub = sessionInputStatus { sessionInputStatus = nil }
+    }
+
     /// Starts a live session watching `watchFolder`.
+    ///
+    /// Preflight first: read the folder, and either ask about subs already in it, stand up a
+    /// "waiting" status for a filter matching nothing, or report a read failure as a failure.
+    /// `beginSession` is the part that actually starts anything.
+    func startSession(completion: @escaping (Bool) -> Void = { _ in }) {
+        guard pendingSessionStart == nil else { completion(false); return }
+        guard !isRunning else { completion(false); return }
+        guard !isRestacking else {
+            errorMessage = "Finish the re-stack before starting a session."
+            completion(false)
+            return
+        }
+        sessionInputStatus = nil
+        guard sourceMode == .nativeStack else { completion(beginSession(excludingPreExisting: nil)); return }
+        guard let folder = watchFolder else {
+            errorMessage = "Pick a watch folder first."
+            completion(false)
+            return
+        }
+        switch Self.startDecision(folder: folder,
+                                  fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix) {
+        case .failed(let reason):
+            // A folder that cannot be read is a failure, never "no matching subs found".
+            sessionInputStatus = .failed(reason)
+            errorMessage = "Can't read the watch folder: \(reason)"
+            log.append("Start blocked — \(reason)")
+            completion(false)
+        case .ask(let snapshot):
+            pendingSessionStart = PendingSessionStart(snapshot: snapshot)
+            pendingStartCompletion = completion
+        case .startWaiting(let status):
+            sessionInputStatus = status
+            if case .waitingForFirstSub(_, let filter, let unmatched) = status {
+                let where_ = filter.map { "matching “\($0)”" } ?? "in the folder"
+                log.append(unmatched > 0
+                    ? "No subs \(where_) — \(unmatched) other file(s) are present. Waiting for new files."
+                    : "No subs \(where_) yet. Waiting for new files.")
+            }
+            completion(beginSession(excludingPreExisting: nil))
+        }
+    }
+
     /// Not unit-testable: needs FileManager, a live pipeline, and a real watch
     /// folder — the end-to-end test covers this path.
-    func startSession() {
+    private func beginSession(excludingPreExisting excluded: WatchFolderInput.Snapshot?) -> Bool {
+        guard !isRestacking else { errorMessage = "Finish the re-stack before starting a session."; return false }
         saveSettings()
-        guard !isRunning else { return }
-        guard !importer.isImporting else { errorMessage = "Finish the import before starting a session."; return }
-        guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return }
+        guard !isRunning else { return false }
+        guard !importer.isImporting else { errorMessage = "Finish the import before starting a session."; return false }
+        guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return false }
         zoomPan = .fit
         let root = liveAstroRoot
 
@@ -350,39 +1355,68 @@ final class AppModel {
                                neutralizeBackground: neutralizeBackground)
         case .nativeStack:
             let source = FolderFrameSource(folder: folder, mode: .live,
-                                            fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix)
+                                            fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
+                                            excludingPreExisting: excluded)
             let engine = makeStackEngine()
-            let (calibrator, calWarnings) = CalibrationLoader.makeCalibrator(
-                dark: calibration.darkPath.map { URL(fileURLWithPath: $0) },
-                flat: calibration.flatPath.map { URL(fileURLWithPath: $0) })
-            calWarnings.forEach { log.append("⚠ \($0)") }
-            CalibrationStore.save(calibration, to: .standard)
+            let cal = resolveCalibration(
+                watchFolder: folder, prefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
+                excludingPreExisting: excluded)
+            // Use the same peek as calibration, never a second scan whose result can race
+            // it. The first ingested sub is independently delivered through wireCallbacks.
+            if let metadata = cal.metadata { adoptSourceMetadata(metadata) }
+            cal.messages.forEach { log.append($0) }
+            CalibrationStore.save(calibration, to: userDefaults)
+            // Empty folder at Start → resolve calibration from the first sub that lands.
+            let provider = cal.foundMetadata ? nil : makeCalibratorProvider()
             p = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
                 rootDirectory: root, neutralizeBackground: neutralizeBackground,
-                               calibrator: calibrator)
+                calibrator: cal.calibrator, calibratorProvider: provider)
+            // Pin the session's own subs folder so a later re-stack resolves the recorded
+            // subs under IT, not whatever the operator has since changed the live controls to (Fix 4).
+            restackSourceDir = folder
+            // Capture the background/exposure the live master was built with, so a re-stack
+            // writes a master.fit at parity (neutralize) and with a truthful TOTALEXP even if
+            // the operator edits these controls after End.
+            sessionNeutralizeBackground = neutralizeBackground
+            sessionSubExposureSeconds = profile.subExposureSeconds
         }
-        p.displayAdjustments = displayAdjustments
+        p.displayAdjustments = staged.committed
 
         acceptedCount = 0
         rejectedCount = 0
+        subFrames = []
+        sessionCalibrator = nil   // captured at end() from the pipeline's effectiveCalibrator (Fix 1)
+        sessionSourceMetadata = nil   // captured at end() from the pipeline's capturedSourceMetadata (Fix P1b)
+
+        // Reset per-session completion state and ask for notification permission
+        // once (no-op if already granted/denied). The tick starts only on success.
+        completionDriver = SessionCompletionDriver()
+        lastAcceptedFrame = nil
+        notifier.requestAuthorizationIfNeeded()
 
         // Every accepted frame feeds scene automation (resets the stall clock,
-        // switches back to the stack scene if we were showing scope-due-to-stall).
-        // Watcher mode has no per-frame accept count (see acceptedCount doc), so
-        // only nativeStack bumps acceptedCount.
+        // switches back to the stack scene if we were showing scope-due-to-stall)
+        // and re-arms the idle safeguard via `lastAcceptedFrame`. The `onAccepted`
+        // hook fires for every accepted update in both modes; only nativeStack
+        // bumps the displayed acceptedCount (see acceptedCount doc).
         let onAccepted: @MainActor () -> Void
         if sourceMode == .nativeStack {
             onAccepted = { [weak self] in
                 self?.acceptedCount += 1
+                self?.lastAcceptedFrame = Date()
                 self?.broadcast.frameAccepted()
             }
         } else {
-            onAccepted = { [weak self] in self?.broadcast.frameAccepted() }
+            onAccepted = { [weak self] in
+                self?.lastAcceptedFrame = Date()
+                self?.broadcast.frameAccepted()
+            }
         }
         wireCallbacks(to: p, onAccepted: onAccepted)
         do {
             try p.start()
-            pipeline = p
+            setPipeline(p)
+            refreshPreview(force: true)   // fill the panel as soon as there is data
             isRunning = true
             selectedTab = .live
             sessionStart = Date()
@@ -390,8 +1424,19 @@ final class AppModel {
             replayURL = nil
             log.append("Session started — watching \(folder.path)")
             broadcast.sessionDidStart(subExposureSeconds: profile.subExposureSeconds)
+            // I3: resolve + push the live-rejection config now that the pipeline exists (stays
+            // off, with the reason shown, for stacker-output/network sources — updateLiveRejectionConfig
+            // folds sourceIsLocalLiveRelay into `enabled`). The advisory budget check uses only
+            // the PRIOR session's resolved frame size (this session's own metadata isn't known
+            // yet); a fresh install logs nothing (deferred to the first-refine hard check).
+            updateLiveRejectionConfig()
+            advisoryCheckLiveRejectionBudget()
+            startCompletionTick()
+            return true
         } catch {
             errorMessage = "Start failed: \(error.localizedDescription)"
+            sessionInputStatus = .failed(error.localizedDescription)
+            return false
         }
     }
 
@@ -415,6 +1460,16 @@ final class AppModel {
         }
 
         demoTask?.cancel()
+        // Snapshot the user's real settings so ending the demo restores them — the
+        // demo must leave no "Demo Nebula"/30 s branding, and no DemoInput folder /
+        // stacker-output mode / demo prefix, on a later real session or in saved
+        // settings (see metadataBeforeDemo, saveSettings, endSession). Captured
+        // BEFORE the overrides below.
+        metadataBeforeDemo = DemoMetadataSnapshot(
+            targetName: targetName, telescope: telescope, camera: camera, mount: mount,
+            filter: filter, locationLabel: locationLabel, bortleText: bortleText,
+            subExposureText: subExposureText, notes: notes,
+            sourceMode: sourceMode, watchFolder: watchFolder, fileNamePrefix: fileNamePrefix)
         sourceMode = .stackerOutput
         watchFolder = folder
         fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
@@ -430,7 +1485,12 @@ final class AppModel {
         log.append("Try Demo — writing sample stack updates to \(folder.path)")
 
         startSession()
-        guard isRunning else { return }
+        guard isRunning else {
+            // Session didn't start (e.g. an import is running) — undo the demo override
+            // so it doesn't leave "Demo Nebula"/DemoInput branding armed on the real fields.
+            restoreMetadataAfterDemoIfNeeded()
+            return
+        }
 
         let args = ["demo-stack", folder.path, "--interval", "3", "--count", "30"]
         demoTask = Task.detached { [weak self] in
@@ -457,17 +1517,98 @@ final class AppModel {
     /// `onAnyFrame` runs synchronously on the pipeline's callback thread for
     /// every produced frame (accepted or rejected); `onAccepted` runs on the
     /// main actor alongside the model updates for each accepted frame.
-    private func wireCallbacks(to pipeline: SessionPipeline,
+    func wireCallbacks(to pipeline: SessionPipeline,
                                onAccepted: (@MainActor () -> Void)? = nil,
                                onAnyFrame: (() -> Void)? = nil) {
-        pipeline.onUpdate = { [weak self] image, record in
+        let sessionID = UUID()
+        displayPresentation.begin(sessionID: sessionID)
+        // Binding a new presentation retires any pending Apply. This and the session scoping on
+        // `livePaneIsUpdating` are REDUNDANT for the transition the regression test covers:
+        // removing either one alone leaves that test passing, and removing both reintroduces the
+        // leak. Neither is therefore "the" fix, and the test is not contorted into depending on
+        // one — its job is the observable behaviour, and overlapping safeguards legitimately
+        // survive individual removal. Imports bind here WITHOUT going through
+        // setPipeline/clearPreview, which is how the stale value survived at all.
+        currentDisplaySessionID = sessionID
+        pendingLiveRevision = nil
+        pendingLiveSessionID = nil
+        latestImage = nil
+        broadcastImage = nil
+        displayedCleanMasterSubCount = nil
+        displayedIntegrationSeconds = nil
+        displayedPreviewIntegrationSeconds = nil
+        displayedSubExposureSeconds = nil
+        latestRecord = nil
+        pipeline.onSourceMetadata = { [weak self, weak pipeline] metadata in
+            Task { @MainActor in
+                guard let self, let pipeline,
+                      self.pipeline === pipeline, self.isRunning,
+                      !self.importer.isGeneratingReplay,
+                      self.currentDisplaySessionID == sessionID else { return }
+                self.sessionSubExposureSeconds = SourceMetadata.resolvedExposureSeconds(
+                    metadata: metadata, fallback: self.sessionSubExposureSeconds)
+                if self.adoptSourceMetadata(metadata) {
+                    self.log.append("The session folder keeps its original name; session metadata now follows the subs' headers.")
+                }
+            }
+        }
+        pipeline.onDisplayUpdate = { [weak self, weak pipeline] update in
+            guard let pipeline else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                // Outcome probe: a delivery can be correctly rendered and still be DROPPED here,
+                // because this re-check runs after a main-actor hop during which the revision may
+                // have moved on. Instrumentation only; nil in production.
+                if !pipeline.isCurrentDisplay(update) {
+                    self.displayDeliveryOutcomeForTest?(update.revision, "rejected-stale")
+                    return
+                }
+                guard self.displayPresentation.accept(update, sessionID: sessionID) else {
+                    self.displayDeliveryOutcomeForTest?(update.revision, "rejected-presentation")
+                    return
+                }
+                self.displayDeliveryOutcomeForTest?(update.revision, "accepted")
+                self.latestImage = update.previewImage
+                self.broadcastImage = update.broadcastImage
+                // The reference pane and its histogram follow the delivered broadcast directly.
+                self.previewCompareImage = update.broadcastImage
+                self.compareHistogram = update.broadcastImage.map { DisplayHistogram.of($0) } ?? []
+                // Clear only on a delivery that actually CARRIES AN IMAGE. A delivery at the right
+                // revision but with no broadcast image (nothing to render yet) means the live pane
+                // still has not shown the committed look, so reporting it caught up would be the
+                // same lie in a smaller window. Caught by a test: the image-less delivery that
+                // Apply's own refreshDisplay produces on a stackless pipeline cleared the badge
+                // immediately.
+                if let pending = self.pendingLiveRevision,
+                   self.pendingLiveSessionID == sessionID,
+                   update.revision >= pending,
+                   update.broadcastImage != nil {
+                    self.pendingLiveRevision = nil
+                    self.pendingLiveSessionID = nil
+                }
+                self.displayedCleanMasterSubCount = update.cleanMasterSubCount
+                self.displayedIntegrationSeconds = update.integrationSeconds
+                self.displayedPreviewIntegrationSeconds = update.previewIntegrationSeconds
+                self.displayedSubExposureSeconds = update.subExposureSeconds
+            }
+        }
+        solveAvailable = false   // new session/pipeline: no solve yet — don't carry a stale gate over
+        pipeline.onUpdate = { [weak self] _, record in
             onAnyFrame?()
             Task { @MainActor in
-                self?.latestImage = image
+                guard self?.displayPresentation.belongs(to: sessionID) == true else { return }
                 self?.latestRecord = record
+                self?.noteFrameIngested()
+                self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false   // gate the North-up toggle
+                self?.refreshPreview(force: true)   // a new sub changed the stack
                 onAccepted?()
                 self?.log.append("✓ update \(record.index) — \(record.snapshotFile)")
             }
+        }
+        // Fires from the refiner's BACKGROUND pass when a clean master publishes — hop to the
+        // main actor like every other callback here before touching AppModel state.
+        pipeline.onCleanMasterPublished = { [weak self] in
+            Task { @MainActor in self?.refreshPreview(force: true) }
         }
         pipeline.onRejected = { [weak self] reason, name in
             onAnyFrame?()
@@ -479,6 +1620,383 @@ final class AppModel {
         pipeline.onLog = { [weak self] message in
             Task { @MainActor in self?.log.append("⚠ \(message)") }
         }
+        // Watcher detection stalled (a hung folder read froze the poll queue) — make it loud:
+        // a system notification for an away/asleep operator, plus a visible error so it can't
+        // be missed. The loud "Watcher STALLED" line is already in the log via onLog above.
+        pipeline.onStall = { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.notifier.notifyStall()
+                self.errorMessage = "Capture detection stalled — new subs aren't being detected. "
+                    + "End and restart the session (a folder read appears to be hung)."
+            }
+        }
+        // Solve state changes off the hot path and emits no display update — refresh the toggle gate on
+        // BOTH edges: a solve landing (enable) and a reseed/auto-reseed invalidating it (disable). Also
+        // refresh the preview on both edges: a MANUAL reseed changes the stack immediately and may not
+        // produce another accepted frame for a while, so onUpdate alone can leave the panel showing the
+        // old stack; and North-up rotation is applied inside displayCGImage, so the preview's orientation
+        // changes the moment a solve lands.
+        pipeline.onSolveStateChanged = { [weak self] in
+            Task { @MainActor in
+                self?.solveAvailable = self?.pipeline?.hasSolvedWCS ?? false   // existing behaviour
+                self?.refreshPreview(force: true)                              // added
+            }
+        }
+        // Task 8a data plane: mirror each persisted sub onto the main actor for the Stats
+        // UI. The pipeline already wrote the record to session.subFrames on its own
+        // callback thread (SessionPipeline.handleNative) — this hop is UI-mirror only.
+        pipeline.onSubFrame = { [weak self] record in
+            Task { @MainActor in self?.subFrames.append(record) }
+        }
+    }
+
+    /// Number of subs the operator has flagged for exclusion from a re-stack.
+    var flaggedCount: Int { subFrames.filter(\.rejectedByUser).count }
+
+    /// True right after `endSession()` begins finalization, until it completes (mirrors
+    /// `importer.isGeneratingReplay`, which lives on the `importer` controller, not here — a
+    /// bare `isGeneratingReplay` on `AppModel` would not compile). Used to freeze the reject
+    /// state (P2-1): a reject landing after Task 10's `end()` has already frozen the survivor
+    /// set for the clean master would desync the written master from the UI's flags.
+    var isFinalizing: Bool { importer.isGeneratingReplay }
+
+    /// I3: whether the CURRENT source is a native `.live` relay writing to a LOCAL folder — the
+    /// only source shape the background global-rejection pass can run against. The pipeline
+    /// can't introspect its own `FrameSource` for locality, so this lives on `AppModel`, which
+    /// knows `sourceMode` and `watchFolder` directly. The path-locality predicate itself (D9) is
+    /// extracted to `LiveRejectionGate.isLocalPath` — pure given a URL, unit-tested in
+    /// `LiveAstroCoreTests` — since `SourceMode` is an app-only type `LiveAstroCore` can't depend on.
+    var sourceIsLocalLiveRelay: Bool {
+        guard sourceMode == .nativeStack, let folder = watchFolder else { return false }
+        return LiveRejectionGate.isLocalPath(folder)
+    }
+
+    /// The background refiner's survivor count, for the STATUS CAPTION only (the refiner's own
+    /// quorum check inside `GlobalRefiner.refine` is the actual gate — this exists purely so the
+    /// operator sees an accurate "need ≥ N subs" / "active: N subs" line). Sourced from
+    /// `SessionPipeline.currentSurvivorCount()`: the CURRENT stack generation's registered subs
+    /// minus the ones the operator has flagged — exactly the set the refiner combines, so the
+    /// caption can never count pre-reseed subs the clean master no longer contains. No pipeline
+    /// (no session yet) → 0.
+    private var liveRejectionSubCount: Int {
+        pipeline?.currentSurvivorCount() ?? 0
+    }
+
+    /// The resolved live trail-rejection status for the CaptureSettingsView caption (Task 11).
+    var liveRejectionStatus: LiveRejectionStatus {
+        if let count = displayedCleanMasterSubCount { return .active(subs: count) }
+        return LiveRejectionGate.reason(sourceIsLocalLiveRelay: sourceIsLocalLiveRelay,
+                                  subCount: liveRejectionSubCount,
+                                  minSubs: GlobalRefiner.defaultMinSubs,
+                                  reseeding: false,   // no live "reseed in progress" signal exists yet — reseed()
+                                                       // is synchronous (bumps the generation and returns), so there
+                                                       // is no AppModel-observable in-between window to report here.
+                                  enabled: liveTrailRejection,
+                                  // The clean master ACTUALLY being served, not the survivor count:
+                                  // nil until a pass publishes, which is what makes the caption say
+                                  // "building" instead of claiming a master the outputs don't have.
+                                  publishedSubs: displayedCleanMasterSubCount)
+    }
+
+    /// Human caption for `CaptureSettingsView`'s status line.
+    var liveRejectionStatusText: String {
+        switch liveRejectionStatus {
+        case .active(let subs):   return "Clean master: \(subs) sub\(subs == 1 ? "" : "s")"
+        case .building(let subs): return "Clean master: building over \(subs) subs…"
+        case .off(let reason):    return "Clean master off — \(reason)"
+        }
+    }
+
+    /// Pushes the resolved live-rejection config down to the pipeline (I3/P2/P2-1). Called at
+    /// session start and whenever `liveTrailRejection` is toggled while a session is running;
+    /// a no-op when no pipeline exists (e.g. the toggle flipped before Start). `enabled` folds
+    /// in source locality here (not just the operator's toggle) — the pipeline's
+    /// `liveRejectionActive` gate must stay false for a network/watcher/import source
+    /// regardless of the toggle, since `sourceIsLocalLiveRelay` is not something the pipeline
+    /// can determine on its own.
+    private func updateLiveRejectionConfig() {
+        guard let pipeline else { return }
+        let enabled = liveTrailRejection && sourceIsLocalLiveRelay
+        pipeline.configureLiveRejection(enabled: enabled, kappa: rejectionStrength.kappa)
+        // Turning rejection off, or changing kappa, invalidates whatever clean master was being
+        // served exactly like a reject does — refresh so the panel doesn't keep showing it.
+        refreshPreview(force: true)
+    }
+
+    /// Advisory-only budget check (Task 11 point 6): only runs when an expected frame size is
+    /// actually known — from the LAST session this launch resolved (`sessionSourceMetadata`,
+    /// captured in `endSession` from `SourceMetadata.width/height`). There is no "selected
+    /// camera profile" elsewhere in AppModel to read dimensions from ahead of a first session,
+    /// so a fresh install / first-ever session logs nothing here and defers entirely to
+    /// `GlobalRefiner`'s own first-refine hard check (Task 6), which knows the real frame size.
+    /// Assumes the refiner's post-debayer working format (RGB warped image + a 1-channel mask,
+    /// 4 bytes/component — see the design spec's sample-policy math), independent of the raw
+    /// FITS `channels` (mono cameras still warp/mask in this same shape). The threshold arithmetic
+    /// + message text (D9) are extracted to `LiveRejectionGate.sampleBudgetWarning`, pure and
+    /// unit-tested in `LiveAstroCoreTests`; this method keeps only the logging side-effect.
+    private func advisoryCheckLiveRejectionBudget() {
+        guard let meta = sessionSourceMetadata, let w = meta.width, let h = meta.height, w > 0, h > 0 else { return }
+        guard let warning = LiveRejectionGate.sampleBudgetWarning(
+            maxSampleBytes: GlobalRefiner.defaultMaxSampleBytes, width: w, height: h,
+            minFrames: GlobalRefiner.minViableSampleFrames) else { return }
+        log.append(warning)
+    }
+
+    /// Flips the operator reject flag on the in-memory mirror for the sub with `index`.
+    /// During a LIVE session this is mirror-only for `sub-frames.csv` — writing mid-session
+    /// would race the pipeline's consume task. Once the session has FINISHED (`!isRunning`),
+    /// there is no consume task, so the flip is persisted to `sub-frames.csv` IMMEDIATELY —
+    /// this keeps the Siril review workflow (flag → export CSV → reject in Siril, never
+    /// re-stack) and a subsequent quit truthful. Flags persist to sub-frames.csv, NEVER to the
+    /// manifest (whose per-sub `rejectedByUser` is always the record-time value, false).
+    /// Refused while a re-stack is in flight (Fix 5) or while `end()` is finalizing (P2-1) —
+    /// the latter because Task 10's `end()` freezes the survivor set for the clean master the
+    /// instant finalization begins, so a reject landing after that point can no longer affect
+    /// the written master and would desync the UI's flags from it.
+    ///
+    /// C4: this is also the FUNCTIONAL half of live trail-rejection — flipping the in-memory
+    /// flag alone does nothing to the background clean master. Pushing the resolved reject set
+    /// to the pipeline (`setUserRejected` then `noteUserRejectChanged`, bumping the generation
+    /// AFTER the set is in place) is what actually excludes the sub. `pipeline` is nil once a
+    /// session has ended, so this is a no-op post-session (the manifest's clean master is fixed
+    /// at that point; only sub-frames.csv / a re-stack still reflect a post-session flag).
+    func toggleReject(index: Int) {
+        guard !isRestacking && !isFinalizing else { return }
+        guard let i = subFrames.firstIndex(where: { $0.index == index }) else { return }
+        subFrames[i].rejectedByUser.toggle()
+        if !isRunning, let dir = lastSessionDirectory {
+            try? SubFrameCSV.write(subFrames: subFrames, to: dir)   // keep sub-frames.csv truthful during review
+        }
+        let rejected = Set(subFrames.filter(\.rejectedByUser).map(\.index))
+        pipeline?.setUserRejected(rejected)
+        pipeline?.noteUserRejectChanged()
+        // A reject makes the currently-published clean master unservable immediately, so
+        // previewSource falls back to .online — refresh so the panel reflects that at once.
+        refreshPreview(force: true)
+    }
+
+    /// Clears the native-session-only stats/re-stack state at the START of an offline import
+    /// (called via the `AppSurface.resetSessionStatsForImport` seam). `onSubFrame` fires
+    /// native-only, so without this an import would leave a prior live session's `subFrames`
+    /// (stale Stats rows) and `restackSourceDir`/calibrator/metadata (a re-stack pointed at the
+    /// prior folder) in place. After this, re-stack is cleanly unavailable for imports:
+    /// `flaggedCount` is 0 (empty subFrames) AND `restackSourceDir` is nil, so both
+    /// `restackOfferPending` and `restackWithoutFlagged`'s guards refuse it. Full import
+    /// stats-wiring (populating `subFrames` for imports) is a future feature (Fix P2-import).
+    func resetSessionStatsForImport() {
+        subFrames = []
+        restackSourceDir = nil
+        sessionCalibrator = nil
+        sessionSourceMetadata = nil
+        sessionNeutralizeBackground = false
+        sessionSubExposureSeconds = 60
+        restackOfferPending = false
+    }
+
+    /// Claim exclusive ownership of the presentation before launching restack work.
+    /// Both entry points re-check ownership: a pending Start dialog can outlive its preflight.
+    func claimRestackPresentation() -> Bool {
+        guard !isRunning, !isRestacking else { return false }
+        isRestacking = true
+        return true
+    }
+
+    /// The survivor set for a re-stack: the session's RECORDED subs (the exact frames the live
+    /// pipeline processed), in recorded `index` order, minus user-flagged, each resolved as a
+    /// basename under the session's pinned subs folder `dir` (Fix P1a).
+    ///
+    /// Rebuilds the master from the session's raw subs, excluding every sub the
+    /// operator has flagged, and applies the result (Task 8b). Post-capture only
+    /// (`!isRunning`, per Task 8 Refinement) — a live pipeline's display would just
+    /// overwrite a mid-session restack on the next frame, and this avoids concurrent
+    /// writers on the master/manifest.
+    ///
+    /// The re-stack uses the CURRENT stacking settings (rejection / weighting /
+    /// normalization / demosaic) via `makeStackEngine()`, so changing those after capture
+    /// changes the integration relative to the live master — intended for now.
+    func restackWithoutFlagged() {
+        guard !isRunning else { return }
+        guard !isRestacking else { return }
+        guard flaggedCount > 0 else {
+            log.append("Re-stack skipped — no subs are flagged.")
+            return
+        }
+        // Use the folder/prefix captured at session START, not the live-mutable controls —
+        // the operator may have changed watchFolder/fileNamePrefix (or source mode) after End
+        // but before Re-stack (Fix 4).
+        guard let dir = restackSourceDir else {
+            log.append("Re-stack unavailable — the raw subs folder is unknown.")
+            return
+        }
+        // Build the survivor set from the session's RECORDED subs (the exact frames the live
+        // pipeline processed and the Stats UI offered), in recorded order, minus user-flagged —
+        // NOT a folder listing, which would wrongly sweep in post-session or foreign same-prefix
+        // FITS the session never touched (Fix P1a). RestackCoordinator.skippedMissing still
+        // absorbs any recorded sub since deleted from disk. `excludingSourceFiles` is empty
+        // because `urls` is already the survivor set.
+        let survivorSubs = RestackPlanning.survivorSubs(subFrames: subFrames, in: dir)
+        guard !survivorSubs.isEmpty else {
+            log.append("Re-stack unavailable — no surviving subs (all recorded subs are flagged or none were recorded).")
+            return
+        }
+
+        let excludedCount = flaggedCount
+
+        // Reuse the EXACT calibrator the live pipeline applied before stacking (captured in
+        // endSession as effectiveCalibrator — explicit or first-frame auto-resolved), NOT a
+        // rebuild from legacy config paths (usually nil → an uncalibrated master would silently
+        // overwrite the good one). A nil sessionCalibrator (uncalibrated session) yields an
+        // identity prepare. Calibrator.apply is NSLock-guarded, safe off the main actor (Fix 1).
+        // restackOfferPending stays set until the re-stack SUCCEEDS (cleared in
+        // finishRestack only after the durable master.fit write succeeds), so a failed re-stack
+        // OR a failed master write leaves the offer up for retry (Fix 5 / Fix P2).
+        guard claimRestackPresentation() else { return }
+        let engine = makeStackEngine()
+        // Capture on the main actor everything the off-actor write needs: the session's metadata
+        // (Fix P1b — write master.fit with the SAME header the live master had), the pinned
+        // session directory, and the sub exposure (for TOTALEXP).
+        Task.detached { [weak self, sessionCalibrator, sessionSourceMetadata,
+                         sessionDir = lastSessionDirectory, sessionNeutralizeBackground,
+                         sessionSubExposureSeconds, survivorSubs] in
+            guard let self else { return }
+            let report: RestackReport
+            do {
+                report = try RestackCoordinator.restack(
+                    subs: survivorSubs, makeEngine: { engine },
+                    prepare: { sessionCalibrator?.apply($0) ?? $0 })
+            } catch let e as RestackError {
+                await MainActor.run {
+                    switch e {
+                    case let .noSurvivingSubs(missing, mismatch):
+                        self.log.append("Re-stack: no usable subs — \(mismatch) changed on disk, \(missing) missing. Master unchanged.")
+                    case let .belowSeedMinimum(surviving, needed, missing, mismatch):
+                        self.log.append("Re-stack: \(surviving) sub(s) loaded but too few stars to seed (need \(needed)); \(mismatch) changed on disk, \(missing) missing. Master unchanged.")
+                    }
+                    self.isRestacking = false
+                }
+                return
+            } catch {
+                await MainActor.run {
+                    self.log.append("Re-stack failed: \(error). Master unchanged.")
+                    self.isRestacking = false
+                }
+                return
+            }
+            // The master.fit write is the REQUIRED durable deliverable — do the (26MP) FITS
+            // encode + atomic write off the main actor so it never janks the UI, and gate
+            // success strictly on it (Fix P1b full metadata, Fix P2 gate-on-write).
+            let writeResult = Self.writeRestackedMaster(
+                report, to: sessionDir, metadata: sessionSourceMetadata,
+                neutralize: sessionNeutralizeBackground,
+                subExposureSeconds: sessionSubExposureSeconds)
+            await MainActor.run { self.finishRestack(report, excludedCount: excludedCount,
+                                                     writeResult: writeResult, sessionDir: sessionDir,
+                                                     neutralize: sessionNeutralizeBackground,
+                                                     subExposureSeconds: SourceMetadata.resolvedExposureSeconds(
+                                                        metadata: sessionSourceMetadata, fallback: sessionSubExposureSeconds)) }
+        }
+    }
+
+    /// Result of the off-actor durable master.fit write. `ok == false` means the durable
+    /// deliverable did not land, so the caller must keep `restackOfferPending` up for retry.
+    struct RestackMasterWrite { let ok: Bool; let logMessage: String? }
+
+    /// Encodes the re-stacked master to a full-metadata FITS and writes it atomically over
+    /// `master.fit`, matching the pipeline's own write (`SessionPipeline.writeMasterSnapshot` /
+    /// `end()`): `FITSWriter.float32(..., metadata:, stackCount:, totalExposureSeconds:)` +
+    /// tmp-then-`FileReplace.replaceItem`, so a failed write never truncates the existing good
+    /// master (Fix P1b + P2). Pure/static so it runs safely off the main actor.
+    ///
+    /// Parity with the live pipeline's master write: the re-stacked master is cropped to its
+    /// covered region (`CoverageCrop.cropToCoverage`) and, when the session ran with the flag
+    /// set, background-neutralized (`AutoStretch.neutralizeBackgroundAdditive`) — matching
+    /// `SessionPipeline.end()`/`writeMasterSnapshot`, so a re-stack no longer replaces a good
+    /// cropped/neutralized master with an uncropped/un-neutralized one.
+    nonisolated private static func writeRestackedMaster(_ report: RestackReport, to sessionDir: URL?,
+                                     metadata: SourceMetadata?,
+                                     neutralize: Bool, subExposureSeconds: Double) -> RestackMasterWrite {
+        guard let sessionDir else {
+            return RestackMasterWrite(ok: false,
+                logMessage: "Re-stack: no session directory on record — master.fit not written; re-stack offer left up to retry.")
+        }
+        // Pure crop + neutralize + FITS encode lives in core (RestackPlanning.encodeMaster,
+        // unit-tested); only the atomic tmp-write + FileReplace stays here (needs FileManager).
+        let data = RestackPlanning.encodeMaster(report, neutralize: neutralize,
+                                                metadata: metadata, subExposureSeconds: subExposureSeconds)
+        let target = sessionDir.appendingPathComponent("master.fit")
+        let tmp = sessionDir.appendingPathComponent(".restacked-master-\(UUID().uuidString).fit")
+        do {
+            try data.write(to: tmp)
+            try FileReplace.replaceItem(at: target, withItemAt: tmp)
+            return RestackMasterWrite(ok: true, logMessage: nil)
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            return RestackMasterWrite(ok: false,
+                logMessage: "Re-stack: could not write master.fit (\(error)). Master unchanged; re-stack offer left up to retry.")
+        }
+    }
+
+    /// Applies a completed re-stack on the main actor. Success is GATED strictly on the durable
+    /// master.fit write (Fix P2): if the write failed, log it, leave `restackOfferPending` up for
+    /// retry, and do NOT update the preview or log "Re-stacked…". Only on a successful write do we
+    /// write sub-frames.csv (best-effort), refresh the preview, log success, and clear the offer.
+    ///
+    /// v1 preview limitation: `AutoStretch.makeCGImage` is a basic stretch only — it does
+    /// NOT run the live DisplayAdjustments/DBE/denoise/north-up pipeline (that lives on
+    /// `SessionPipeline`, which has already ended by the time a restack is offered). The
+    /// durable deliverable is the corrected `master.fit`; the on-screen preview is a
+    /// basic-stretch confirmation that the restack happened, not a faithful re-render of
+    /// the operator's display settings.
+    func finishRestack(_ report: RestackReport, excludedCount: Int,
+                               writeResult: RestackMasterWrite, sessionDir: URL?, neutralize: Bool,
+                               subExposureSeconds: Double) {
+        guard writeResult.ok else {
+            if let m = writeResult.logMessage { log.append(m) }
+            // Durable write failed — do NOT report success: leave the offer up, don't touch the
+            // preview, don't log "Re-stacked…". (Fix P2)
+            isRestacking = false
+            return
+        }
+        // Master written durably. sub-frames.csv is best-effort — the master is the deliverable,
+        // so a CSV failure is logged but does not fail the op. Re-written from the in-memory mirror
+        // so it reflects the operator's flags at re-stack time (the manifest's persisted records
+        // were written before flagging, rejectedByUser = false at persist time).
+        // Write to the session dir captured ONCE at re-stack start (the same dir the master
+        // was written to), NOT a re-read of `lastSessionDirectory` — an import started mid
+        // re-stack could otherwise redirect this CSV to the wrong (or a cleared) dir (Fix D).
+        if let sessionDirectory = sessionDir {
+            do {
+                try SubFrameCSV.write(subFrames: subFrames, to: sessionDirectory)
+            } catch {
+                log.append("Re-stack: could not write sub-frames.csv (\(error)).")
+            }
+        }
+        if let cg = AutoStretch.makeCGImage(RestackPlanning.presentationMaster(report, neutralize: neutralize)) {
+            displayPresentation.begin(sessionID: UUID())
+            latestImage = cg
+            broadcastImage = cg
+            previewCompareImage = cg
+            compareHistogram = DisplayHistogram.of(cg)
+            displayedCleanMasterSubCount = nil
+            displayedIntegrationSeconds = Double(report.stackedCount) * subExposureSeconds
+            displayedPreviewIntegrationSeconds = displayedIntegrationSeconds
+            displayedSubExposureSeconds = subExposureSeconds
+        }
+        if report.skippedMissing > 0 {
+            log.append("Re-stack: \(report.skippedMissing) raw sub(s) missing — used the rest.")
+        }
+        if report.skippedMismatch > 0 {
+            log.append("Re-stack: \(report.skippedMismatch) sub(s) changed on disk since capture — skipped.")
+        }
+        if report.unverifiedLegacy {
+            log.append("Re-stack: some subs predate content verification — loaded unverified.")
+        }
+        log.append("Re-stacked without \(excludedCount) flagged sub(s): \(report.stackedCount) frames.")
+        // Clear the offer only now, on the SUCCESS path — a failed re-stack or failed master
+        // write leaves restackOfferPending up so the operator can retry (Fix 5 / Fix P2).
+        restackOfferPending = false
+        isRestacking = false
     }
 
     /// Reseeds the stacking engine reference frame (native mode only).
@@ -497,8 +2015,57 @@ final class AppModel {
         }
     }
 
+    /// Polls the completion driver every 30 s while the session runs. The tick is
+    /// generation/teardown-guarded: after each sleep it re-checks `isRunning` and
+    /// cancellation, so a fired action can never land after the session already
+    /// ended. On `.safeguard` it writes a master snapshot (idle safeguard KEEPS the
+    /// session live — it never ends it); on `.endSession` it routes to the existing
+    /// `endSession()` finalize (no parallel path) and stops ticking. Neither branch
+    /// quits the app or stops the broadcast directly.
+    private func startCompletionTick() {
+        completionTick?.cancel()
+        completionTick = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)   // 30 s
+                guard let self, self.isRunning, !Task.isCancelled else { return }
+                let action = self.completionDriver.step(
+                    now: Date(), plannedStopAnchor: self.plannedStopAnchor,
+                    lastAcceptedFrame: self.lastAcceptedFrame,
+                    settings: self.currentSettings().completionSettings)
+                switch action {
+                case .safeguard:
+                    // Idle safeguard is native-only (writeMasterSnapshot() can only
+                    // snapshot a native stack). In watcher/mirror mode the external
+                    // stacker owns its master, so skip and leave the fired flag set —
+                    // don't retry a pointless snapshot every 30 s. The UI gate is the
+                    // primary fix; this is belt-and-suspenders.
+                    if self.sourceMode != .nativeStack { break }
+                    // Idle capture: persist a master snapshot but keep running. If
+                    // the snapshot could not be written (a failed write), clear the
+                    // flag so it retries on the next tick rather than being silently
+                    // consumed.
+                    if self.pipeline?.writeMasterSnapshot() == true {
+                        self.notifier.notifySafeguard()
+                    } else {
+                        self.completionDriver.clearSafeguardForRetry()
+                    }
+                case .endSession:
+                    self.notifier.notifyPlannedStopEnd()
+                    self.endSession()   // existing full finalize; also cancels this tick
+                    return
+                case .none:
+                    break
+                }
+            }
+        }
+    }
+
     func endSession() {
+        sessionInputStatus = nil
+        restoreMetadataAfterDemoIfNeeded()   // undo demo branding before it can be persisted
         saveSettings()
+        completionTick?.cancel()
+        completionTick = nil
         guard let p = pipeline else { return }
         guard !importer.isGeneratingReplay else { return }
         importer.isGeneratingReplay = true
@@ -526,6 +2093,13 @@ final class AppModel {
                     self.replayURL = url
                     self.lastSessionDirectory = url.deletingLastPathComponent()
                     self.log.append("Replay ready: \(url.lastPathComponent)")
+                    // Overwrite the Core-written sub-frames.csv (rejectedByUser=false at
+                    // persist time — Core has no durable flag-setter, see Fix D) with one
+                    // reflecting the AppModel mirror's operator flags. Post-drain, main
+                    // actor: race-free against the pipeline's consume task.
+                    if !self.subFrames.isEmpty, let dir = self.lastSessionDirectory {
+                        try? SubFrameCSV.write(subFrames: self.subFrames, to: dir)
+                    }
                 }
                 shouldCompleteSession = true
             } catch {
@@ -543,6 +2117,17 @@ final class AppModel {
                         return false
                     }
                     self.errorMessage = "Replay failed: \(error)"
+                    // The session DID commit (manifest + master.fit persisted); only the replay
+                    // render failed. The success path's lastSessionDirectory update + flag-CSV
+                    // write live in the `do` block we skipped, so do them here too — otherwise a
+                    // committed session ends with a stale/nil lastSessionDirectory and an all-false
+                    // sub-frames.csv (Fix 3). Use the committed session's own directory.
+                    if let dir = p.sessionDir {
+                        self.lastSessionDirectory = dir
+                        if !self.subFrames.isEmpty {
+                            try? SubFrameCSV.write(subFrames: self.subFrames, to: dir)
+                        }
+                    }
                     return true
                 }
             }
@@ -550,13 +2135,149 @@ final class AppModel {
             await MainActor.run {
                 self.isRunning = false
                 self.importer.isGeneratingReplay = false
-                self.pipeline = nil
+                // Stash the calibrator the pipeline ACTUALLY applied (explicit or first-frame
+                // auto-resolved) BEFORE releasing the pipeline, so a post-session re-stack reuses
+                // the exact same calibration the live master used (Fix 1).
+                self.sessionCalibrator = p.effectiveCalibrator
+                self.sessionSourceMetadata = p.capturedSourceMetadata   // stamp re-stacked master.fit like the live one (Fix P1b)
+                self.sessionSubExposureSeconds = SourceMetadata.resolvedExposureSeconds(
+                    metadata: self.sessionSourceMetadata, fallback: self.sessionSubExposureSeconds)
+                // Pending edits die with the session, and nothing from a finished session
+                // lingers on screen.
+                self.setPipeline(nil)
+                self.staged.revert()
                 self.sessionEnd = Date()
+                self.restackOfferPending = self.flaggedCount > 0
                 // Common completion (success OR replay failure): only now stop
                 // the OBS stream/recording — a failed replay must still stop
                 // the stream, so this lives here, not on the success path.
                 self.broadcast.stopBroadcastAfterSessionEnd()
             }
+        }
+    }
+
+    // MARK: - Session Health summary text
+    //
+    // Single home for these formatters — previously duplicated between ControlView's
+    // "Copy Support Bundle" footer action and DiagnosticsView's Session Health grid.
+    // Both views reference these directly off the model.
+
+    var sessionStateText: String {
+        if liveSource.isDetecting { return "Detecting source" }
+        if importer.isImporting { return "Importing" }
+        if importer.isGeneratingReplay { return "Rendering replay" }
+        if isRunning { return "Running" }
+        return "Idle"
+    }
+
+    var sourceSummaryText: String {
+        switch sourceMode {
+        case .nativeStack:
+            return "Native stacking"
+        case .stackerOutput:
+            return "Siril / external stacker"
+        }
+    }
+
+    var watchFolderSummaryText: String {
+        watchFolder?.path ?? "(none selected)"
+    }
+
+    var lastUpdateSummaryText: String {
+        guard let record = latestRecord else { return integrationCaption }
+        return "#\(record.index) · \(record.snapshotFile)"
+    }
+
+    var framesSummaryText: String {
+        "accepted \(acceptedCount) · rejected \(rejectedCount)"
+    }
+
+    var lastRejectionSummaryText: String {
+        guard let line = log.last(where: { $0.hasPrefix("✗ rejected ") }) else {
+            return "(none)"
+        }
+        let prefix = "✗ rejected "
+        if line.hasPrefix(prefix) {
+            return String(line.dropFirst(prefix.count))
+        }
+        return line
+    }
+
+    var obsSummaryText: String {
+        switch broadcast.broadcastState {
+        case .idle:
+            return "idle"
+        case .unknown:
+            return "not checked"
+        case .connecting:
+            return "connecting"
+        case .live:
+            if let h = broadcast.streamHealth {
+                return "live · \(formatDuration(h.durationSeconds)) · \(h.skippedFrames) dropped · \(Int((h.congestion * 100).rounded()))% congestion"
+            }
+            return "live"
+        case .endingSession:
+            return "ending session"
+        case .stopping:
+            return "stopping"
+        case .stopUnconfirmed:
+            return "may still be live"
+        }
+    }
+
+    var outputsSummaryText: String {
+        if replayURL != nil { return "replay ready" }
+        if lastSessionDirectory != nil { return "session folder ready" }
+        return "no finished session yet"
+    }
+
+    func formatDuration(_ s: Double) -> String {
+        let total = Int(s)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let sec = total % 60
+        return String(format: "%02d:%02d:%02d", h, m, sec)
+    }
+
+    // MARK: - Folder pickers
+    //
+    // Single home for these — previously duplicated between ControlView's pinned
+    // footer and CaptureSettingsView's Start Workflow / Watch Folder sections.
+
+    func makeDirectoryPanel(title: String? = nil, message: String? = nil) -> NSOpenPanel {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if let title { panel.title = title }
+        if let message { panel.message = message }
+        return panel
+    }
+
+    func pickNativeWatchFolderLive() {
+        pickWatchFolderLive(
+            sourceMode: .nativeStack,
+            title: "Choose Live FITS Folder",
+            message: "Select the folder where NINA, ASIAIR, or another capture app writes new FITS light frames."
+        )
+    }
+
+    func pickWatchFolderLive(sourceMode: AppModel.SourceMode,
+                              title: String,
+                              message: String) {
+        let panel = makeDirectoryPanel(title: title, message: message)
+        panel.prompt = "Watch"
+        if panel.runModal() == .OK, let url = panel.url {
+            self.sourceMode = sourceMode
+            self.liveSource.startWatchFolderLive(source: url, sourceMode: sourceMode)
+        }
+    }
+
+    func pickImportFolder() {
+        let panel = makeDirectoryPanel(title: "Choose Subs Folder",
+                                       message: "Select a folder containing raw FITS subs to import")
+        if panel.runModal() == .OK, let url = panel.url {
+            importer.importSubs(from: url)
         }
     }
 }

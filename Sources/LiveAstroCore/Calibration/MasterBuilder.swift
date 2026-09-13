@@ -1,6 +1,6 @@
 import Foundation
 
-public enum MasterKind { case dark, flat, bias }
+public enum MasterKind: String, Codable { case dark, flat, bias }
 
 /// Builds master calibration frames by mean-combining raw FITS frames.
 /// Masters are canonical TOP-DOWN AstroImages (read with normalizeRowOrder: true),
@@ -12,36 +12,102 @@ public enum MasterBuilder {
     /// prototype's clip(flat, 1.0) in ADU space.
     public static let flatFloor: Float = 1.0 / 65535
 
-    public enum BuildError: Error, Equatable { case noFrames, noValidFrames }
+    public enum BuildError: Error, Equatable { case noFrames, noValidFrames, frameTooLarge }
 
-    /// Mean-combine `fitsURLs` into a top-down master.
-    /// - .flat: subtracts `bias` per-frame when provided, then clamps ≥ flatFloor
-    ///   and normalizes to median 1. The `bias` input may be a bias master or a
-    ///   matched dark-flat master; both occupy the same flat-offset role.
-    /// - The first successfully-read frame sets the reference dimensions; later
-    ///   frames of a different size are skipped. Throws if no frames are readable.
+    /// Upper bound on total elements (width·height·channels) of a master's accumulation buffer.
+    /// 500 M Doubles ≈ 4 GB — comfortably above any real sensor (a 150 MP RGB frame is ~450 M
+    /// elements) but a hard stop against a hostile/corrupt FITS header (e.g. NAXIS 1e6×1e6) that
+    /// would otherwise demand tens of terabytes.
+    public static let maxPixelElements = 500_000_000
+
+    /// width·height·channels, or nil if the product OVERFLOWS Int or exceeds `maxPixelElements`.
+    /// Overflow-safe so a public caller passing hostile `expected` dimensions gets a clean throw,
+    /// not an arithmetic trap, before any allocation.
+    public static func checkedElementCount(_ width: Int, _ height: Int, _ channels: Int) -> Int? {
+        guard width > 0, height > 0, channels > 0 else { return nil }
+        let (wh, o1) = width.multipliedReportingOverflow(by: height)
+        guard !o1 else { return nil }
+        let (whc, o2) = wh.multipliedReportingOverflow(by: channels)
+        guard !o2, whc <= maxPixelElements else { return nil }
+        return whc
+    }
+
+    /// A built master plus honest accounting of what actually went into it: how many frames
+    /// contributed (readable + matching dimensions — NOT the input count, which may include skipped
+    /// files) and, for flats, whether the offset was truly subtracted (it is silently skipped when
+    /// the offset's dimensions don't match, so callers must not claim "offset subtracted" blindly).
+    public struct BuildResult {
+        public let image: AstroImage
+        public let contributingCount: Int
+        public let offsetApplied: Bool
+    }
+
+    /// Mean-combine `fitsURLs` into a top-down master. Facade returning just the image; use
+    /// `combineDetailed` when the contributing count or offset-applied flag is needed.
     public static func combine(fitsURLs: [URL], kind: MasterKind,
                                bias: AstroImage?) throws -> AstroImage {
+        try combineDetailed(fitsURLs: fitsURLs, kind: kind, bias: bias).image
+    }
+
+    /// Mean-combine with full accounting (see `BuildResult`).
+    /// - .flat: subtracts `bias` per-frame when its dimensions match, then clamps ≥ flatFloor
+    ///   and normalizes to median 1. The `bias` input may be a bias master or a matched dark-flat
+    ///   master; both occupy the same flat-offset role. A dimension-mismatched offset is skipped
+    ///   and reported via `offsetApplied == false`.
+    /// - `expected`: when given, ONLY frames of exactly these dimensions contribute (the reference is
+    ///   fixed up front). Session calibration passes the light's target size so a stray wrong-size
+    ///   frame that happens to sort first can't hijack the reference and discard the valid frames.
+    ///   When nil, the first successfully-read frame sets the reference (later mismatches skipped).
+    /// - Unreadable/mismatched frames are excluded from `contributingCount`. Throws if none contribute.
+    public static func combineDetailed(fitsURLs: [URL], kind: MasterKind, bias: AstroImage?,
+                                       expected: (width: Int, height: Int, channels: Int)? = nil) throws -> BuildResult {
         guard !fitsURLs.isEmpty else { throw BuildError.noFrames }
 
         var sum: [Double] = []
         var refW = 0, refH = 0, refC = 0
         var count = 0
+        var offsetApplied = false
+        var haveRef = false
+        if let e = expected {
+            guard e.width > 0, e.height > 0, e.channels > 0 else { throw BuildError.noValidFrames }
+            refW = e.width; refH = e.height; refC = e.channels; haveRef = true
+            // NOTE: do NOT allocate here — a hostile `expected` size that no frame matches must not
+            // force a giant buffer. Allocation happens (bounded) only when a real frame matches.
+        }
 
         for url in fitsURLs {
-            guard let data = try? Data(contentsOf: url),
-                  let img = try? FITSReader.read(data, normalizeRowOrder: true) else { continue }
-            if count == 0 {
-                refW = img.width; refH = img.height; refC = img.channels
-                sum = [Double](repeating: 0, count: refW * refH * refC)
+            guard let data = try? Data(contentsOf: url) else { continue }
+            // Reject an oversized frame from its HEADER, BEFORE decoding its pixels. A syntactically
+            // valid but hostile header (large-but-allowed axes, e.g. 25001×20000) would otherwise
+            // force a multi-GB decode allocation in FITSReader.read just to be rejected by the ceiling
+            // afterward. checkedElementCount returns nil when the pixel count overflows or exceeds it.
+            guard let header = try? FITSReader.readHeader(data),
+                  checkedElementCount(header.width, header.height, header.channels) != nil else { continue }
+            // Once a reference exists (from `expected` or the first frame), skip a dimension-mismatched
+            // frame from its HEADER too — before decoding — so a huge-but-under-ceiling wrong-size frame
+            // (e.g. a stray 150 MP RGB calibration frame among 26 MP lights) can't force a big decode
+            // allocation just to be discarded for size.
+            if haveRef, header.width != refW || header.height != refH || header.channels != refC { continue }
+            guard let img = try? FITSReader.read(data, normalizeRowOrder: true) else { continue }
+            if !haveRef {
+                refW = img.width; refH = img.height; refC = img.channels; haveRef = true
             } else if img.width != refW || img.height != refH || img.channels != refC {
-                continue    // dimension mismatch → skip
+                continue    // defensive; the header already matched the reference above
+            }
+            // Allocate the accumulator on the FIRST contributing frame, bounded by a pixel ceiling so
+            // a corrupt/hostile dimension can't demand a multi-terabyte buffer.
+            if sum.isEmpty {
+                guard let elements = Self.checkedElementCount(refW, refH, refC) else {
+                    throw BuildError.frameTooLarge
+                }
+                sum = [Double](repeating: 0, count: elements)
             }
             // For flats, subtract the selected bias/dark-flat per-frame when its
-            // dimensions match.
+            // dimensions match; otherwise fall through WITHOUT subtracting (recorded below).
             if kind == .flat, let bias,
                bias.width == refW && bias.height == refH && bias.channels == refC {
                 for i in 0..<sum.count { sum[i] += Double(img.pixels[i]) - Double(bias.pixels[i]) }
+                offsetApplied = true
             } else {
                 for i in 0..<sum.count { sum[i] += Double(img.pixels[i]) }
             }
@@ -53,12 +119,8 @@ public enum MasterBuilder {
         let mean = sum.map { Float($0 / Double(count)) }
         let raw = AstroImage(width: refW, height: refH, channels: refC,
                              pixels: mean, sourceIsLinear: true)
-
-        if kind == .flat {
-            return normalizedFlat(raw)
-        }
-
-        return raw
+        let image = (kind == .flat) ? normalizedFlat(raw) : raw
+        return BuildResult(image: image, contributingCount: count, offsetApplied: offsetApplied)
     }
 
     /// Clamp a flat to ≥ flatFloor and normalize it to median 1 (a dimensionless

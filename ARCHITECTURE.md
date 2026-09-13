@@ -122,7 +122,7 @@ quality-weighted accumulate.
 ```mermaid
 flowchart TB
     RF["RawFrame (CFA or RGB, stored row order)"] --> CAL["Calibrator? — dark subtract / flat divide on raw CFA"]
-    CAL --> DB["Debayer (RCD default in app; bilinear legacy) → flip to top-down display RGB"]
+    CAL --> DB["Debayer (Malvar default in app; bilinear legacy) → flip to top-down display RGB"]
     CAL --> LUM["half-res superpixel luminance"]
     LUM --> SD["StarDetector: grid-background MADN, connected components, sub-pixel centroids"]
     SD --> REF{"reference seeded?"}
@@ -285,7 +285,7 @@ flowchart TB
     TABS --> LIVE["Live: BroadcastView (embedded) or detached placeholder"]
     TABS --> SETUP["Setup: ControlView form + fixed footer"]
     TABS --> HELP["Help: HelpView — bundled Help.md via MarkdownBlocks (own block parser)"]
-    SETUP --> FORM["source mode · watch folder · prefix · stacker toggles\n(neutralize, σ-clip + strength, weighting, sky-match, transparency)\nrelay retention · debayer (Bilinear/RCD) · post-process (None/GraXpert)\ncalibration masters · session profile · OBS section · display adjustments · log"]
+    SETUP --> FORM["source mode · watch folder · prefix · stacker toggles\n(neutralize, σ-clip + strength, weighting, sky-match, transparency)\nrelay retention · debayer (Bilinear/Malvar) · post-process (None/GraXpert)\ncalibration masters · session profile · OBS section · display adjustments · log"]
     SETUP --> FOOT["footer: Start Seestar · Start ASIAIR · Choose Folder… · Import Subs…\nStart/End Session · Go Live/End Broadcast · Reseed Reference · import progress"]
     LIVE --> ZOOM["zoom/pan: pinch, drag, scroll-wheel, Fit/100% — ZoomPanState clamp math in core"]
     LIVE --> OVER["overlay: target title, integration caption, equipment line, elapsed clock"]

@@ -54,6 +54,149 @@ final class StackFileWatcherTests: XCTestCase {
         XCTAssertTrue(got, "expected one update for a complete FITS write")
     }
 
+    final class OnceFlag: @unchecked Sendable {
+        private let lock = NSLock(); private var fired = false
+        func fireOnce() -> Bool { lock.lock(); defer { lock.unlock() }; if fired { return false }; fired = true; return true }
+    }
+
+    /// M8 stall FIXED AT THE SOURCE: content reads now run on a concurrent reader queue, not the
+    /// serial poll queue, so a hung read (dead share / iCloud fileprovider) no longer freezes
+    /// detection. Block ONE file's read and prove (a) the serial queue stays alive — polls keep
+    /// advancing and the stall watchdog does NOT fire — and (b) BOTH subs still emit once the read
+    /// is released, in revision order: the in-flight file holds its ordering slot, so no frame is
+    /// lost to the slow read.
+    func testBlockedContentReadDoesNotFreezeDetection() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.05, pollInterval: 0.05,
+                                   fileNamePrefix: "Light_", digestPolicy: .immutableAfterPublish)
+        let collector = collect(watcher)
+
+        let blocking = DispatchSemaphore(value: 0)
+        let reachedRead = DispatchSemaphore(value: 0)
+        let once = OnceFlag()
+        watcher.beforeContentReadForTesting = {
+            // Runs on the READER queue now — hanging here must NOT freeze the serial poll queue.
+            if once.fireOnce() { reachedRead.signal(); blocking.wait() }
+        }
+        // If detection froze, the watchdog would fire. Assert it does NOT.
+        watcher.stallThresholdNanos = 400_000_000    // 0.4 s
+        watcher.watchdogIntervalNanos = 100_000_000  // 0.1 s
+        let noStall = expectation(description: "watchdog must NOT fire — the serial queue stays alive")
+        noStall.isInverted = true
+        watcher.onStall = { noStall.fulfill() }
+
+        try watcher.start()
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("Light_0001.fit"))
+        try makeFITS(0.6).write(to: tmp.appendingPathComponent("Light_0002.fit"))
+        XCTAssertEqual(reachedRead.wait(timeout: .now() + 5), .success, "a content read should start")
+
+        // While one read hangs, scans must keep running and the watchdog must stay quiet.
+        let pollsBefore = watcher.pollCount
+        await fulfillment(of: [noStall], timeout: 1.0)   // ~10 watchdog ticks with no stall reported
+        XCTAssertGreaterThan(watcher.pollCount, pollsBefore,
+                             "the serial queue keeps polling while a read is blocked")
+        // The hung file must not be re-dispatched on every poll (inFlightReads dedupes).
+        XCTAssertLessThanOrEqual(watcher.digestComputations, 4,
+                                 "a pending read is not re-dispatched each poll")
+
+        blocking.signal()   // release the hung read
+        let both = await collector.waitForCount(2, timeout: 8)
+        XCTAssertTrue(both, "both subs emit once the read unblocks — no frame lost to the slow read")
+    }
+
+    /// The other half of the M8 fix: a SINGLE slow read no longer freezes the queue (above), but if
+    /// EVERY read slot is occupied by a stuck read (a truly dead share / offline iCloud), new files
+    /// are omitted at the cap and detection halts — silently, since the poll queue keeps ticking. The
+    /// watchdog must alarm on that "all read slots stuck" condition too, so it stays as visible as the
+    /// old whole-queue freeze. Block every read, flood past the cap, and require onStall to fire.
+    func testAllReadSlotsStuckFiresStall() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.05, pollInterval: 0.05,
+                                   fileNamePrefix: "Light_", digestPolicy: .immutableAfterPublish)
+        let collector = collect(watcher)
+        let blocking = DispatchSemaphore(value: 0)
+        watcher.beforeContentReadForTesting = { blocking.wait() }   // EVERY read hangs on the reader queue
+        defer { for _ in 0..<128 { blocking.signal() } }            // release all reads so teardown completes
+        watcher.stallThresholdNanos = 400_000_000    // 0.4 s
+        watcher.watchdogIntervalNanos = 100_000_000  // 0.1 s
+        let stalled = expectation(description: "watchdog reports the all-slots-stuck stall")
+        watcher.onStall = { stalled.fulfill() }
+
+        try watcher.start()
+        // More files than the in-flight cap, so every read slot fills with a hung read.
+        for i in 1...16 {
+            try makeFITS(Float(i) * 0.05)
+                .write(to: tmp.appendingPathComponent(String(format: "Light_%04d.fit", i)))
+        }
+        await fulfillment(of: [stalled], timeout: 5)
+        _ = collector
+    }
+
+    /// The classic single-file (Siril `live_stack.fit`) producer: there is only ONE file, rewritten
+    /// in place. If its content read hangs, no new stack updates ever appear — but outstanding reads
+    /// never reach the cap (it's stuck at 1) and the poll queue keeps ticking, so the count-based and
+    /// scan-liveness stall checks both miss it. A single stuck read must alarm in single-file mode.
+    func testSingleClassicReadStuckFiresStall() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.05, pollInterval: 0.05,
+                                   digestPolicy: .mutableStackerOutput)   // classic Siril single-file
+        let collector = collect(watcher)
+        let blocking = DispatchSemaphore(value: 0)
+        let once = OnceFlag()
+        watcher.beforeContentReadForTesting = { if once.fireOnce() { blocking.wait() } }
+        defer { for _ in 0..<8 { blocking.signal() } }
+        watcher.stallThresholdNanos = 400_000_000    // 0.4 s
+        watcher.watchdogIntervalNanos = 100_000_000  // 0.1 s
+        let stalled = expectation(description: "a single stuck classic read must alarm")
+        watcher.onStall = { stalled.fulfill() }
+
+        try watcher.start()
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        await fulfillment(of: [stalled], timeout: 5)
+        _ = collector
+    }
+
+    /// Guards against a COUNT-related stall of the live watcher (investigated after the M8 all-nighter
+    /// stalled ~762 frames in): native-relay style (.immutableAfterPublish, Light_ prefix), a large
+    /// batch of subs arriving incrementally, every one must be emitted. (Confirms the stall was NOT a
+    /// reducer/scan-at-scale bug on local storage — 1500 files emit in ~1.5s.)
+    func testStressManyFilesDoesNotStall() async throws {
+        let N = 1500
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.05, pollInterval: 0.05,
+                                   fileNamePrefix: "Light_", digestPolicy: .immutableAfterPublish)
+        let collector = collect(watcher)
+        try watcher.start()
+        // Incremental arrival, like a relay dropping subs over time (staggered writes).
+        for i in 0..<N {
+            try makeFITS(Float(i % 97) / 100 + 0.01)
+                .write(to: tmp.appendingPathComponent(String(format: "Light_%04d.fit", i)))
+            if i % 50 == 0 { try? await Task.sleep(nanoseconds: 30_000_000) }
+        }
+        let got = await collector.waitForCount(N, timeout: 180)
+        let count = await collector.items.count
+        XCTAssertTrue(got, "only \(count)/\(N) emitted — possible count-related stall")
+    }
+
+    final class LogSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _lines: [String] = []
+        func add(_ s: String) { lock.withLock { _lines.append(s) } }
+        var lines: [String] { lock.withLock { _lines } }
+    }
+
+    /// The liveness heartbeat (M8 stall diagnosis) logs through onLog and its poll/emit counters
+    /// advance — so a long session's log shows whether the watcher is still scanning + emitting.
+    func testHeartbeatLogsAndCountersAdvance() async throws {
+        watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.1, pollInterval: 0.1)
+        watcher.heartbeatIntervalNanos = 0   // force a heartbeat on every poll
+        let logs = LogSink()
+        watcher.onLog = { logs.add($0) }
+        let collector = collect(watcher)
+        try watcher.start()
+        try makeFITS(0.5).write(to: tmp.appendingPathComponent("live_stack.fit"))
+        _ = await collector.waitForCount(1, timeout: 5)
+        XCTAssertGreaterThanOrEqual(watcher.emittedCount, 1, "emit counter tracks yields")
+        XCTAssertGreaterThan(watcher.pollCount, 0, "poll counter advances")
+        XCTAssertTrue(logs.lines.contains { $0.hasPrefix("watcher alive:") }, "heartbeat logs through onLog")
+    }
+
     func testIgnoresPartialFITSUntilComplete() async throws {
         watcher = StackFileWatcher(folder: tmp, quietPeriod: 0.2, pollInterval: 0.3)
         let collector = collect(watcher)
@@ -429,6 +572,10 @@ final class StackFileWatcherTests: XCTestCase {
         let w = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
                                  fileNamePrefix: prefix, digestPolicy: policy)
         w.monotonicNowNanos = { clock.now() }
+        // These tests choreograph exact reducer state through synchronous scanNow() calls, so the
+        // content read must complete within the scan (the async reader queue would not have finished
+        // by the time scanNow() returns). The real-I/O tests cover the async transport.
+        w.synchronousContentReadsForTesting = true
         return w
     }
 
@@ -997,6 +1144,7 @@ final class StackFileWatcherTests: XCTestCase {
         async throws {
         watcher = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
                                    digestPolicy: .immutableAfterPublish)
+        watcher.synchronousContentReadsForTesting = true   // scanNow() choreography needs inline reads
         let collector = collect(watcher)
         try watcher.start()
 
@@ -1159,6 +1307,7 @@ final class StackFileWatcherTests: XCTestCase {
             let w = StackFileWatcher(folder: folder, quietPeriod: bad, pollInterval: bad,
                                      digestPolicy: .mutableStackerOutput)
             w.monotonicNowNanos = { clock.now() }
+            w.synchronousContentReadsForTesting = true   // scanNow() choreography needs inline reads
             defer { w.stop() }
             let collector = collect(w)
             try w.start()                  // pre-fix: NaN/∞ pollInterval crashed timer math
@@ -1801,9 +1950,23 @@ final class StackFileWatcherTests: XCTestCase {
 
         // The producer resumes and completes the file — well inside the 30 s budget.
         try full.write(to: url1)
-        try await Task.sleep(nanoseconds: 300_000_000)   // stability re-earned on real scans
-        clock.advance(seconds: 1)                        // ≥ quietPeriod, << budget → gates confirm
-        let got = await collector.waitForCount(2, timeout: 5)
+        // Outcome-based recovery, robust under load: DON'T assume a fixed wall-clock sleep lets the
+        // poll task observe url1's completed content before a single clock advance. Content reads are
+        // ASYNC (M8 reader queue), so a poll only SCHEDULES a read — the new digest lands later. Under
+        // full-suite CPU contention the read+stabilize lagged the fixed sleep, url1's stable-since was
+        // stamped only AFTER the advance, and — the ManualClock then frozen — it never cleared the
+        // quiet gate, so only _00002 emitted. Instead: nudge the budget clock in small steps (each ≥
+        // quietPeriod) while giving the async read+poll time, until BOTH files emit. Total advance is
+        // capped well under the 30 s blocking budget, so this can never trigger a write-off.
+        var got = false
+        let realDeadline = Date().addingTimeInterval(15)
+        var advancedSeconds = 0.0
+        while !got && Date() < realDeadline && advancedSeconds < 10 {
+            try await Task.sleep(nanoseconds: 20_000_000)   // let the async read + poll make progress
+            clock.advance(seconds: 0.2)                     // ≥ quietPeriod, << 30 s budget
+            advancedSeconds += 0.2
+            got = await collector.waitForCount(2, timeout: 0.05)
+        }
         XCTAssertTrue(got, "the recovered write emits — nothing was written off")
         let items = await collector.items
         XCTAssertEqual(items.map(\.url.lastPathComponent),

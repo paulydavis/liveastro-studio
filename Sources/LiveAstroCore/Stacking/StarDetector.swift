@@ -96,7 +96,71 @@ public enum StarDetector {
         var sig = sigGrid            // sigGrid is already computed above (per-cell 1.4826·MAD)
         sig.sort()
         let backgroundSigma = sig.isEmpty ? Float(1e-6) : sig[sig.count / 2]
-        return (Array(stars.prefix(maxStars)), backgroundSigma)
+        return (spatiallyDistributed(stars, width: width, height: height, maxStars: maxStars),
+                backgroundSigma)
+    }
+
+    /// Pick up to `maxStars` from the flux-sorted `stars` so they span the whole frame
+    /// instead of clustering where the brightest sources happen to be. Bins into an 8×8
+    /// grid and takes the brightest-per-cell in rounds (round 0 = brightest in each cell,
+    /// round 1 = next, …) until the budget fills. Same count as the old `prefix(maxStars)`
+    /// (so the O(n³) triangle matcher is unchanged), but the registration fit is now
+    /// constrained by stars in the CORNERS too — the old brightest-N-globally selection
+    /// left the rotation under-determined at the edges on star-poor fields, so a tiny
+    /// rotation error smeared corner stars tangentially while the center stayed round
+    /// (2026-08-16 M 63, 26MP). Fewer than `maxStars` detected → returned as-is.
+    static func spatiallyDistributed(_ stars: [Star], width: Int, height: Int,
+                                     maxStars: Int) -> [Star] {
+        guard stars.count > maxStars, width > 0, height > 0 else {
+            return Array(stars.prefix(maxStars))
+        }
+        let g = 8
+        var buckets = [[Star]](repeating: [], count: g * g)
+        for s in stars {   // stars is already flux-desc, so each bucket stays flux-desc
+            let cx = min(g - 1, max(0, Int(s.x) * g / width))
+            let cy = min(g - 1, max(0, Int(s.y) * g / height))
+            buckets[cy * g + cx].append(s)
+        }
+        // Visit buckets in a prefix-balanced (ordered-dither / Bayer) sequence rather than
+        // row-major. The triangle matcher uses only the FIRST maxTriangleStars (20) of the
+        // returned list, so a row-major fill would put the first 20 in the top grid rows —
+        // spatially biased, undoing the corner-coverage fix (2026-08-17 review). A Bayer
+        // order makes every prefix span all quadrants.
+        let order = Self.dispersedBucketOrder(g)
+        var out: [Star] = []
+        out.reserveCapacity(maxStars)
+        var round = 0
+        while out.count < maxStars {
+            var addedThisRound = false
+            for b in order where round < buckets[b].count {
+                out.append(buckets[b][round]); addedThisRound = true
+                if out.count == maxStars { break }
+            }
+            if !addedThisRound { break }   // every bucket exhausted
+            round += 1
+        }
+        return out
+    }
+
+    /// Bucket visitation order for a `g×g` grid (g a power of two) whose every prefix is
+    /// spatially spread — the recursive Bayer / ordered-dither threshold matrix, returned as
+    /// bucket indices (`cy*g+cx`) sorted by ascending Bayer rank. Used by
+    /// `spatiallyDistributed` so the first stars picked already cover all quadrants.
+    static func dispersedBucketOrder(_ g: Int) -> [Int] {
+        var m = [[0]]
+        var n = 1
+        while n < g {
+            var nm = [[Int]](repeating: [Int](repeating: 0, count: n * 2), count: n * 2)
+            for y in 0..<n { for x in 0..<n {
+                let base = 4 * m[y][x]
+                nm[y][x] = base;      nm[y][x + n]     = base + 2
+                nm[y + n][x] = base + 3; nm[y + n][x + n] = base + 1
+            } }
+            m = nm; n *= 2
+        }
+        var rank = [Int](repeating: 0, count: g * g)
+        for y in 0..<g { for x in 0..<g { rank[y * g + x] = m[y][x] } }
+        return (0..<g * g).sorted { rank[$0] < rank[$1] }
     }
 
     public static func detect(luminance: [Float], width: Int, height: Int,

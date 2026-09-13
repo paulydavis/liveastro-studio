@@ -35,6 +35,25 @@ final class ImportController {
 
     /// The active one-shot import pipeline (nil unless an import is draining).
     private var importPipeline: SessionPipeline?
+
+    /// True while an import still holds a pipeline — including through finalization, when its
+    /// display is already closed.
+    var hasActivePipeline: Bool { importPipeline != nil }
+
+    /// True only while a running import can still take display changes. Goes false at `end()`,
+    /// which freezes the display well before the pipeline is released.
+    var acceptsDisplayUpdates: Bool { importPipeline?.acceptsDisplayUpdates ?? false }
+
+    /// Routes committed display adjustments to a running import. The import captures the
+    /// adjustments once, when it starts, so without this an Apply during an import changed
+    /// nothing the operator could see. Returns the display revision the change will render under,
+    /// or nil when there is no import or it has stopped accepting.
+    @discardableResult
+    func applyDisplayAdjustments(_ adjustments: DisplayAdjustments) -> UInt64? {
+        // Atomic on the pipeline's side: checking acceptance and then assigning separately can be
+        // frozen in between, which reports success for a change the final render overwrites.
+        importPipeline?.applyCommittedAdjustments(adjustments)
+    }
     private var importPrepareGeneration = 0
     private var importPrepareInFlight = false
 
@@ -49,7 +68,17 @@ final class ImportController {
     func importSubs(from folder: URL) {
         surface.saveSettings?()
         guard !surface.isSessionRunning() else { surface.presentError("End the session before importing."); return }
+        // Refuse while a post-session re-stack is in flight: an import would clear the stats /
+        // session-dir state the re-stack's finalize still needs (Fix D belt-and-suspenders).
+        guard !(surface.isRestacking?() ?? false) else {
+            surface.presentError("Finish the re-stack before importing."); return
+        }
         guard !isImporting else { return }
+        // Offline import: `onSubFrame` fires native-only, so clear the native-session-only
+        // stats/re-stack state now — otherwise Stats would show a prior live session's rows and
+        // a re-stack could target the prior session's folder (Fix P2-import). Full import
+        // stats-wiring (populating subFrames for imports) is a future feature.
+        surface.resetSessionStatsForImport?()
         let prefix = surface.currentFileNamePrefix?() ?? ""
         importProcessed = 0
         importTotal = 0

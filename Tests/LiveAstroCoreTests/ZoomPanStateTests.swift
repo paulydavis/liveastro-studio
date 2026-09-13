@@ -119,4 +119,22 @@ final class ZoomPanStateTests: XCTestCase {
         XCTAssertEqual(z, start)
     }
 
+    func testZoomOutAtCornerConvergesToFit() {
+        let size = CGSize(width: 400, height: 300)
+        let corner = CGPoint(x: 400, y: 300)
+        var state = ZoomPanState(scale: 4, offset: CGSize(width: 180, height: 100))
+        for scale: CGFloat in [2, 1.1, 1] {
+            state = ZoomPanState.zoomed(toScale: scale, about: corner, viewSize: size,
+                                       from: state, fittedContentSize: size)
+        }
+        XCTAssertEqual(state, .fit, "zooming out must not leave an off-centre image at fit")
+    }
+
+    func testZeroStartingScaleReturnsCurrentWithoutDivision() {
+        let invalid = ZoomPanState(scale: 0, offset: CGSize(width: 7, height: -3))
+        let result = ZoomPanState.zoomed(toScale: 2, about: CGPoint(x: 300, y: 80),
+            viewSize: view, from: invalid, fittedContentSize: fitted)
+        XCTAssertEqual(result, invalid)
+    }
+
 }

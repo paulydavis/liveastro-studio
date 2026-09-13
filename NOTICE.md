@@ -19,3 +19,11 @@ implementation source was copied or adapted.
   with RANSAC + Umeyama least-squares transform estimation, from the standard
   literature.
 - **Pixel rejection** — Huber winsorized sigma clipping.
+
+## Star catalog (downloaded at runtime)
+
+Native plate-solving / north-up uses the **Tycho-2 Catalogue** (Høg, E. et al.,
+2000, A&A 355, L27), a product of the ESA Hipparcos space astrometry mission.
+Tycho-2 is freely available and redistributable. LiveAstro Studio does not bundle
+it — the app downloads a pre-built subset on demand (see `docs/CATALOG.md`) and
+caches it locally, so the catalog is never part of this MIT-licensed source tree.

@@ -156,6 +156,121 @@ deep-registration path. Live stacking should stay optimized for timely,
 consistent-frame broadcast work rather than trying to solve arbitrary
 multi-rig archival registration in real time.
 
+#### 7a. Import-only robust-combine (global rejection) mode
+
+**Problem.** Live and import currently share the *same* rejection: a single
+`WinsorizedSigmaClip` instance (`StackEngine.rejection`, built once in
+`AppModel`) applied by both `processDetailed` (live) and `commit`/
+`applyAccumulating` (import). It is an *online* winsorized κ-σ estimator —
+O(1) memory in frame count, with an 8-frame per-pixel warm-up, and it *clamps*
+outliers to ±κσ rather than dropping them. That design is correct for live
+26 MP broadcast (bounded memory, no buffering), but it is structurally weak at
+removing single-frame outliers in shallow stacks:
+
+- nothing is rejected until a pixel has ≥ 8 samples (warm-up), so an outlier in
+  the first 8 subs enters the accumulated mean un-clipped;
+- a bright outlier that lands during warm-up inflates both the running mean and
+  σ at those pixels, widening the ±κσ window so later crossings also escape;
+- winsorizing clamps, it cannot retroactively remove a warm-up contribution.
+
+Observed live on real data (2026-08-29): an 11-sub M 51 stack kept a visible
+satellite trail; the same trail would be statistically clipped in a deep (30–50
+sub) stack, but not in a shallow one. Import inherits this exactly — it is **not**
+a stronger combine, just the same online engine fed in parallel. Verified: there
+is no global/median/all-frames rejection anywhere in `Stacking/`.
+
+**Opportunity.** The import / "Stack Previous Shoot" path is *not* latency- or
+memory-constrained the way live is, so it can afford a true full-stack combine
+that the online engine cannot:
+
+- **Global κ-σ clipped mean** — per pixel, gather all N samples, iteratively
+  reject values beyond κσ of the (robust) center, average the survivors. Best
+  SNR; removes trails/cosmic rays cleanly regardless of stack depth.
+- **Median combine** — the non-rejection, non-averaging option: the middle
+  sample per pixel is inherently immune to single-frame outliers (the trail is
+  never *selected*, not clamped, no threshold). ~25 % noisier than a good
+  clipped mean, so best offered as an explicit "maximum trail/artifact removal"
+  choice rather than the default.
+
+**Design sketch.**
+
+- Add a `RejectionMethod` variant (or a distinct combine stage) that operates on
+  the full per-pixel sample set. Keep the live online `WinsorizedSigmaClip`
+  untouched — this is import-only, selected by the pipeline, not a global swap.
+- Memory: prefer a **two-pass** re-read over buffering all frames — the
+  `RestackCoordinator` already streams recorded subs by identity, and every sub
+  carries a content-digest (`SubFrameRecord.identity`), so pass 1 accumulates
+  per-pixel running stats (or a t-digest / sorted reservoir for median) and pass
+  2 combines. This preserves the "no [RawFrame] buffer" property the streaming
+  re-stack already guarantees. Must run **after** registration + warp (same
+  point the online rejection runs), on the warped, gradient-leveled frames.
+- UI: a Capture/Import setting — e.g. Rejection: *Online (live)* /
+  *Global κ-σ (import)* / *Median (import)* — defaulting to online; the global
+  options only enabled for finite (import/re-stack) sessions.
+- Tests: a synthetic trail across one sub of a small stack must survive the
+  online engine and be removed by the global/median combine; golden byte tests
+  pin the combine math; the live path is asserted unchanged.
+
+**Live variant — cadence-driven global refresh (import-first, then live).** The
+blocker for a global combine is memory + the single-pass online nature, NOT
+compute time. Live subs arrive every ~3–5 min (180 s exposures), which is huge
+idle headroom. So the same two-pass global combine can run *live* by
+**recomputing the full global median / κ-σ-clip from the on-disk subs each time
+a new sub lands** (or every K subs), streaming from disk — memory stays O(one
+image), and a full re-read + combine of a few dozen 300 MB subs off SSD is tens
+of seconds, trivial inside a 3-minute window. The broadcast master just
+*refreshes* every few minutes with a fully trail-free combine instead of the
+online winsorized mean. Two properties make this attractive:
+
+- **Cheapest exactly when it helps most.** Global rejection's advantage is in
+  *shallow* stacks (few subs, hard outliers). Early in a session there are only
+  5–15 subs to re-read (fast); by the time re-reading gets expensive (40+ subs)
+  the plain online mean is already statistically good. Natural design:
+  **global-combine for the first N subs, hand off to the online mean once
+  deep** (or throttle the refresh interval up as depth grows).
+- **Requires subs on fast LOCAL disk, not slow SMB** — re-reading 10+ GB over a
+  network share every 3 min would be brutal. The relay already localizes subs
+  (`~/LiveAstro/relay`), so the plumbing exists. Gate the live variant on a
+  local source; keep online-only for network/SMB live.
+
+This does not run the online engine differently — it's a *separate periodic
+refresh path* that produces the master alongside (or in place of) the online
+accumulator's output, driven by sub-arrival cadence. Cost: two moving parts (an
+online path for instant per-sub feedback + a periodic global-refresh path) and
+disk I/O that grows with depth — hence the cap / hand-off above.
+
+**Non-goal.** Do not make the *online accumulator* itself do global rejection —
+it stays online/O(1) for timely, network-tolerant broadcast. The global combine
+is always a distinct full-set pass (at end-of-session for import, or on a
+cadence timer for the live variant), never a change to the per-frame online
+kernel. It sits alongside the per-sub reject → re-stack flow (the manual
+counterpart).
+
+**Sensor-size dimension — the live variant splits by frame size, not just
+cadence.** Faster cadence and smaller frames tend to move together, and they
+roughly cancel, so the live global combine stays feasible across rigs — but the
+*implementation* differs:
+
+- **Large sensor, slow cadence** (ASI2600: 26 MP, ~180 s subs; ~300 MB/frame).
+  Holding a night in RAM is infeasible (180 × 300 MB ≈ 54 GB), but the generous
+  cadence leaves time for a **two-pass streaming re-read from local disk** each
+  refresh. Global-combine's advantage persists longer because depth accrues
+  slowly. This is the primary variant above.
+- **Small sensor, fast cadence** (Seestar S50: ~2 MP, 20–30 s subs;
+  ~15–25 MB/frame). Frames are ~12× smaller, so a global pass is cheap even in a
+  20–30 s window — and a night's worth fits in RAM (180 × 20 MB ≈ 3.6 GB), so an
+  **in-RAM rolling-buffer** median/κ-σ needs no disk re-read at all. Decouple the
+  refresh from arrival: the display still updates per-sub via the online mean,
+  the global master refreshes on a **timer** (~1–2 min) or every K subs, not
+  every sub. Depth accrues fast (past the 8-frame warm-up in ~4 min), so the
+  global combine's useful window is short — the online hand-off comes quickly.
+
+Shared caveat: fast-cadence rigs rack up **hundreds** of subs per night, so the
+working set must be capped regardless of variant — a rolling window of the last
+N (or a subsample) — so late-session RAM / re-read cost doesn't balloon. Pick
+the variant from the source's frame size and locality at session start (in-RAM
+for small/local, disk-two-pass for large/local, online-only for network/SMB).
+
 ### 8. Visual Identity
 
 After the workflow is clearer:

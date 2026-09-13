@@ -1,19 +1,31 @@
 import XCTest
 
 final class AppSourceRegressionTests: XCTestCase {
+    // Live-start/restack exclusion is covered behaviorally in SessionInputReportTests,
+    // including a restack claimed while the input confirmation is pending.
+
     private var root: URL {
         URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     }
 
     func testStackerOutputWorkflowPassesRequestedModeThroughLiveSourceController() throws {
         let controllerURL = root.appendingPathComponent("Sources/LiveAstroStudio/LiveSourceController.swift")
-        let controlViewURL = root.appendingPathComponent("Sources/LiveAstroStudio/ControlView.swift")
+        // The Start Workflow rows moved from ControlView to CaptureSettingsView, and the shared
+        // watch-folder picker to AppModel, in the Setup TabView split. The behavioral guard is
+        // unchanged: the row must pass its OWN sourceMode explicitly, never rely on ambient state.
+        let captureViewURL = root.appendingPathComponent("Sources/LiveAstroStudio/CaptureSettingsView.swift")
+        let appModelURL = root.appendingPathComponent("Sources/LiveAstroStudio/AppModel.swift")
         let controller = try String(contentsOf: controllerURL, encoding: .utf8)
-        let controlView = try String(contentsOf: controlViewURL, encoding: .utf8)
+        let captureView = try String(contentsOf: captureViewURL, encoding: .utf8)
+        let appModel = try String(contentsOf: appModelURL, encoding: .utf8)
 
         XCTAssertTrue(
-            controlView.contains("model.liveSource.startWatchFolderLive(source: url, sourceMode: sourceMode)"),
-            "ControlView must pass the row's selected sourceMode into LiveSourceController instead of relying on mutable AppModel state."
+            appModel.contains("startWatchFolderLive(source: url, sourceMode: sourceMode)"),
+            "pickWatchFolderLive must forward the REQUESTED sourceMode into LiveSourceController, not read back mutable AppModel state."
+        )
+        XCTAssertTrue(
+            captureView.contains("sourceMode: .stackerOutput"),
+            "The Watch Siril / External Stacker row must pass .stackerOutput explicitly instead of relying on mutable AppModel.sourceMode."
         )
         XCTAssertTrue(
             controller.contains("func startWatchFolderLive(source: URL, sourceMode: AppModel.SourceMode = .nativeStack)"),
@@ -33,22 +45,23 @@ final class AppSourceRegressionTests: XCTestCase {
         )
     }
 
-    func testAppModelPushesDisplayAdjustmentsToPipelineIndependentOfRenderThrottle() throws {
+    /// AppModel cannot be unit-tested (LiveAstroStudio is an executableTarget with no test
+    /// target, Package.swift:12,18), so this remains a source-text check — but it now guards
+    /// the staging invariant instead of a line that no longer exists. The BEHAVIOUR is tested
+    /// properly in StagedAdjustmentsTests; this only pins that AppModel pushes the value
+    /// apply() returned, rather than pushing pending straight through.
+    func testAppModelOnlyPushesCommittedAdjustmentsToThePipeline() throws {
         let appModelURL = root.appendingPathComponent("Sources/LiveAstroStudio/AppModel.swift")
         let appModel = try String(contentsOf: appModelURL, encoding: .utf8)
 
-        XCTAssertTrue(
-            appModel.contains("p.displayAdjustments = displayAdjustments"),
-            "A new SessionPipeline must receive persisted display adjustments before it starts rendering frames."
-        )
-        XCTAssertTrue(
-            appModel.contains("pipeline.displayAdjustments = adj"),
-            "applyDisplayAdjustments must always push state into the pipeline; the throttle may skip only the expensive re-render."
-        )
-        XCTAssertFalse(
-            appModel.contains("guard now.timeIntervalSince(lastAdjustmentRender) > 0.08 else { return }"),
-            "The 80 ms throttle must not return before updating SessionPipeline.displayAdjustments."
-        )
+        XCTAssertTrue(appModel.contains("staged.apply()"),
+                      "committing must go through StagedAdjustments.apply()")
+        XCTAssertFalse(appModel.contains("pipeline.displayAdjustments = staged.pending"),
+                       "pending adjustments must NEVER be pushed to the pipeline — that is the broadcast")
+        XCTAssertFalse(appModel.contains("p.displayAdjustments = displayAdjustments"),
+                       "the pre-staging direct push must be gone")
+        XCTAssertTrue(appModel.contains("p.displayAdjustments = staged.committed"),
+                      "a new SessionPipeline must receive the COMMITTED adjustments before it renders")
     }
 
     func testURLSessionOBSSocketOpenDelegateAndStateAreReusableAcrossReconnects() throws {
@@ -122,8 +135,8 @@ final class AppSourceRegressionTests: XCTestCase {
             "ImportController needs display-adjustment access through AppSurface so Stack Previous Shoot snapshots/replays honor persisted stretch/saturation/DBE."
         )
         XCTAssertTrue(
-            appModel.contains("currentDisplayAdjustments: { [weak self] in MainActor.assumeIsolated { self?.displayAdjustments ?? .neutral } }"),
-            "AppModel must wire persisted display adjustments into the import surface."
+            appModel.contains("currentDisplayAdjustments: { [weak self] in MainActor.assumeIsolated { self?.staged.committed ?? .neutral } }"),
+            "AppModel must wire persisted (committed) display adjustments into the import surface — never the uncommitted staged.pending."
         )
         XCTAssertTrue(
             source.contains("importPipeline.displayAdjustments = surface.currentDisplayAdjustments?() ?? .neutral"),
@@ -177,4 +190,35 @@ final class AppSourceRegressionTests: XCTestCase {
             "Configure helpers must also guard direct/internal calls before creating a relay."
         )
     }
+
+    /// Pins the P2#1 fix (session-completion post-merge review): the planned-stop
+    /// deadline must anchor on the shared armed-at anchor, NOT sessionStart — and
+    /// BOTH the driver tick and the Live-tab countdown must use the SAME anchor, or
+    /// they diverge and the stop can fire immediately on a mid-session enable.
+    func testPlannedStopUsesSharedArmedAtAnchorInDriverAndDisplay() throws {
+        let appModel = try String(contentsOf: root.appendingPathComponent("Sources/LiveAstroStudio/AppModel.swift"), encoding: .utf8)
+        let broadcast = try String(contentsOf: root.appendingPathComponent("Sources/LiveAstroStudio/BroadcastView.swift"), encoding: .utf8)
+
+        XCTAssertTrue(appModel.contains("var plannedStopArmedAt"),
+            "AppModel must track when planned-stop was armed, so a mid-session enable anchors on the enable time, not sessionStart.")
+        XCTAssertTrue(appModel.contains("var plannedStopAnchor"),
+            "AppModel must expose one shared plannedStopAnchor so the driver and the display agree.")
+        XCTAssertTrue(appModel.contains("plannedStopAnchor: self.plannedStopAnchor")
+                      || appModel.contains("plannedStopAnchor: plannedStopAnchor"),
+            "The driver tick must feed the shared plannedStopAnchor into step(), not sessionStart.")
+        XCTAssertFalse(appModel.contains("plannedStopAnchor: self.sessionStart")
+                       || appModel.contains("plannedStopAnchor: sessionStart"),
+            "Regression: the tick must NOT anchor the planned stop on sessionStart (fires immediately on a mid-session enable).")
+        XCTAssertTrue(broadcast.contains("model.plannedStopAnchor"),
+            "The Live-tab countdown must use the SAME shared anchor as the driver, or display and firing disagree.")
+    }
+
+    // NOTE: the former testApplyAdjustmentsGuardsItsDetachedRenderWithAMonotonicStamp lived here.
+    // It pinned AppModel's bespoke `applyRenderSeq` and its detached Apply render. Both were
+    // deleted when main's DisplayDelivery landed: ordering and session freshness for the
+    // COMMITTED surfaces are owned by that shared contract (revision + isCurrentDisplay), and
+    // keeping a second ordering system in the same display path is what produced this feature's
+    // stale-image bugs. Apply now commits synchronously and calls pipeline.refreshDisplay().
+    // The replacement is BEHAVIOURAL, in the new LiveAstroStudioTests target, not a source grep.
+
 }
