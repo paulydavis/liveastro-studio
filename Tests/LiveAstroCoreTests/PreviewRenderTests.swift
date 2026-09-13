@@ -3,6 +3,18 @@ import XCTest
 
 final class PreviewRenderTests: XCTestCase {
 
+    func testPipelineSetupRefusesAnUnsettledFixture() throws {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        XCTAssertThrowsError(try Self.runningPipeline(sandbox: sandbox, settleTimeout: 0)) { error in
+            guard let failure = error as? FixtureFailure else {
+                return XCTFail("expected fixture timeout, got \(error)")
+            }
+            if case .framesDidNotFinish(let expected, _) = failure { XCTAssertEqual(expected, 3) }
+        }
+    }
+
     /// The whole point of the staged model: rendering a preview must not move the state the
     /// broadcast reads. Pre-change, `renderCurrentDisplay(adjustments:)` assigned to
     /// `displayAdjustments` as a side effect (SessionPipeline.swift:1116).
@@ -140,10 +152,21 @@ final class PreviewRenderTests: XCTestCase {
 
         var a = DisplayAdjustments.neutral; a.blackPoint = 0.02
         var b = DisplayAdjustments.neutral; b.blackPoint = 0.06
-        _ = pipeline.renderPreview(source: .online, adjustments: a)
+        let engine = try XCTUnwrap(pipeline.engineForTest)
+        let generation = engine.currentStackGeneration
+        let revision = pipeline.previewStackRevisionForTesting
+        func assertSourceUnchanged() {
+            XCTAssertEqual(engine.currentStackGeneration, generation, "fixture source moved: generation changed")
+            XCTAssertEqual(pipeline.previewStackRevisionForTesting, revision, "fixture source moved: frame revision changed")
+        }
+        // All renders explicitly use the same quality: the third component of the online key.
+        XCTAssertNotNil(pipeline.renderPreview(source: .online, adjustments: a, quality: .settled))
+        assertSourceUnchanged()
         let buildsAfterFirst = pipeline.previewProxyBuildCountForTest
-        _ = pipeline.renderPreview(source: .online, adjustments: b)
-        _ = pipeline.renderPreview(source: .online, adjustments: a)
+        XCTAssertNotNil(pipeline.renderPreview(source: .online, adjustments: b, quality: .settled))
+        assertSourceUnchanged()
+        XCTAssertNotNil(pipeline.renderPreview(source: .online, adjustments: a, quality: .settled))
+        assertSourceUnchanged()
 
         XCTAssertEqual(pipeline.previewProxyBuildCountForTest, buildsAfterFirst,
                        "changing only the adjustments must reuse the cached proxy — adjustments are "
@@ -438,7 +461,11 @@ final class PreviewRenderTests: XCTestCase {
 
     /// Reuses the established live-pipeline harness and the top-level `StubLiveSource`
     /// extracted in Task 1 Step 0.
-    static func runningPipeline(sandbox: URL) throws -> (SessionPipeline, StubLiveSource) {
+    private enum FixtureFailure: Error {
+        case framesDidNotFinish(expected: Int, registered: Int)
+    }
+
+    static func runningPipeline(sandbox: URL, settleTimeout: TimeInterval = 120) throws -> (SessionPipeline, StubLiveSource) {
         let sessions = sandbox.appendingPathComponent("sessions")
         try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
         let profile = SessionProfile(targetName: "Preview", telescope: "T", camera: "C",
@@ -458,16 +485,21 @@ final class PreviewRenderTests: XCTestCase {
         let pipeline = SessionPipeline(nativeSource: source, engine: engine,
                                        profile: profile, rootDirectory: sessions)
         pipeline.rendersReplay = false
+        let finished = XCTestExpectation(description: "all preview fixture frame renders and writes finished")
+        finished.expectedFulfillmentCount = frames.count
+        finished.assertForOverFulfill = false // some callers explicitly send more frames later
+        pipeline.displayRenderPhaseProbeForTest = { _, phase in
+            if case .frameLockReleased = phase { finished.fulfill() }
+        }
         try pipeline.start()
-        let deadline = Date().addingTimeInterval(20)
-        // Wait for ALL queued frames to settle, not just the first. `StubLiveSource` buffers
-        // every frame up front, so waiting on only 1 hands callers a pipeline whose background
-        // consumer is still mid-flight on frames 2 and 3 — those land moments later and bump
-        // the preview cache's stack revision out from under a test that has already read
-        // `previewProxyBuildCountForTest` as its baseline, producing a spurious rebuild that
-        // looks like a caching bug. Settling fully here is what "running" means for this harness.
-        while pipeline.subRegistrations().count < frames.count && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.02)
+        // Registration is earlier than rendering/persistence. Only the completed-frame
+        // barrier establishes a stable fixture; the deadline is a failure watchdog, not
+        // permission to return an unsettled live source. No refiner is enabled here.
+        guard XCTWaiter.wait(for: [finished], timeout: settleTimeout) == .completed else {
+            let registered = pipeline.subRegistrations().count
+            source.stop()
+            _ = try? pipeline.end() // drain before the caller removes its sandbox
+            throw FixtureFailure.framesDidNotFinish(expected: frames.count, registered: registered)
         }
         return (pipeline, source)
     }

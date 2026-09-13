@@ -1629,6 +1629,9 @@ public final class SessionPipeline {
         previewRevLock.lock(); defer { previewRevLock.unlock() }; return previewStackRevision
     }
 
+    /// Read-only diagnostic for tests asserting that an online proxy's source stayed fixed.
+    var previewStackRevisionForTesting: Int { currentPreviewStackRevision }
+
     /// The most recent rendered linear image, at FULL resolution, with the monotonic token it
     /// was retained under. Watcher / external-stacker mode has NO engine — it loads and renders
     /// each incoming file — so without this neither the preview nor Apply would have anything

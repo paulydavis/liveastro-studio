@@ -1925,15 +1925,35 @@ final class StackFileWatcherTests: XCTestCase {
     /// irrelevant — and once the producer resumes and completes the file inside the budget,
     /// both revisions emit in order.
     func testMutablePolicy_tinyPollInterval_pausedWriteNotWrittenOffByScanCount() async throws {
+        try await assertPausedWriteRecovers(firstReadDelay: 0)
+    }
+
+    /// Deliberately outlast the former ~6s polling-attempt allowance without using up
+    /// the 15s watchdog. This is fault injection, not a sleep used to assume readiness.
+    func testMutablePolicy_pausedWriteRecoversAfterSlowAsyncRead() async throws {
+        try await assertPausedWriteRecovers(firstReadDelay: 8)
+    }
+
+    private func assertPausedWriteRecovers(firstReadDelay: TimeInterval) async throws {
         let clock = ManualClock()
         let w = StackFileWatcher(folder: tmp, quietPeriod: 0.05, pollInterval: 0.01,
                                  fileNamePrefix: "live_stack",
                                  digestPolicy: .mutableStackerOutput)
         w.monotonicNowNanos = { clock.now() }
+        let delayedRead = OnceFlag()
+        w.beforeContentReadForTesting = {
+            if delayedRead.fireOnce() && firstReadDelay > 0 {
+                Thread.sleep(forTimeInterval: firstReadDelay)
+            }
+        }
         watcher = w
         let logs = LogBox()
         w.onLog = { logs.append($0) }
         let collector = collect(w)
+        let scans = XCTestExpectation(description: "50 completed observation batches while clock is frozen")
+        scans.expectedFulfillmentCount = 50
+        scans.assertForOverFulfill = false
+        w.afterObservationBatchForTesting = { scans.fulfill() }
         let full = makeFITS(0.5, size: 64)
         let url1 = tmp.appendingPathComponent("live_stack_00001.fit")
         try full.prefix(full.count / 2).write(to: url1)   // the paused mid-write
@@ -1942,7 +1962,7 @@ final class StackFileWatcherTests: XCTestCase {
 
         // Let the 10 ms poll run MANY scans (far beyond the old 5-scan threshold) while the
         // monotonic clock stands still: no write-off may occur — the budget has not elapsed.
-        try await Task.sleep(nanoseconds: 500_000_000)
+        await fulfillment(of: [scans], timeout: 15)
         XCTAssertTrue(logs.all.filter { $0.contains("abandoning") }.isEmpty,
                       "scan count is irrelevant — no write-off before the monotonic budget elapses; got \(logs.all)")
         let heldItems = await collector.items
@@ -1950,24 +1970,35 @@ final class StackFileWatcherTests: XCTestCase {
 
         // The producer resumes and completes the file — well inside the 30 s budget.
         try full.write(to: url1)
-        // Outcome-based recovery, robust under load: DON'T assume a fixed wall-clock sleep lets the
-        // poll task observe url1's completed content before a single clock advance. Content reads are
-        // ASYNC (M8 reader queue), so a poll only SCHEDULES a read — the new digest lands later. Under
-        // full-suite CPU contention the read+stabilize lagged the fixed sleep, url1's stable-since was
-        // stamped only AFTER the advance, and — the ManualClock then frozen — it never cleared the
-        // quiet gate, so only _00002 emitted. Instead: nudge the budget clock in small steps (each ≥
-        // quietPeriod) while giving the async read+poll time, until BOTH files emit. Total advance is
-        // capped well under the 30 s blocking budget, so this can never trigger a write-off.
+        // Advance only after a completed async read has installed digest-stability evidence.
+        // Poll/read scheduling delays consume wall time, never the simulated blocking budget.
+        // The former 0.2s-per-attempt loop exhausted its 10s cap after ~50 attempts, long
+        // before its 15s watchdog. Smaller blind steps would merely move that race.
         var got = false
         let realDeadline = Date().addingTimeInterval(15)
-        var advancedSeconds = 0.0
-        while !got && Date() < realDeadline && advancedSeconds < 10 {
-            try await Task.sleep(nanoseconds: 20_000_000)   // let the async read + poll make progress
-            clock.advance(seconds: 0.2)                     // ≥ quietPeriod, << 30 s budget
-            advancedSeconds += 0.2
+        let recoveryStart = clock.now()
+        while !got && Date() < realDeadline {
+            let files = w.reducerStateSnapshot.generation.files
+            let now = clock.now()
+            // The earlier file must have recovered before allowing the later pending
+            // digest to age. Otherwise a transient invalid observation during the write
+            // can release _00002 first and turn _00001 into a late revision.
+            let earlierRecovered: Bool
+            switch files[url1.lastPathComponent] {
+            case .digestPending(let pending): earlierRecovered = pending.identity.size == full.count
+            case .ready, .settled: earlierRecovered = true
+            default: earlierRecovered = false
+            }
+            let needsQuietPeriod = files.values.contains { state in
+                guard case .digestPending(let pending) = state else { return false }
+                return now >= pending.firstObservedNanos && now - pending.firstObservedNanos < 50_000_000
+            }
+            if earlierRecovered && needsQuietPeriod { clock.advance(seconds: 0.06) }
             got = await collector.waitForCount(2, timeout: 0.05)
         }
-        XCTAssertTrue(got, "the recovered write emits — nothing was written off")
+        XCTAssertTrue(got, "watcher recovery did not complete before the wall-clock watchdog; state: \(w.reducerStateSnapshot.generation.files)")
+        XCTAssertLessThan(clock.now() - recoveryStart, w.blockingBudgetNanos,
+                          "recovery must not spend the write-off budget")
         let items = await collector.items
         XCTAssertEqual(items.map(\.url.lastPathComponent),
                        ["live_stack_00001.fit", "live_stack_00002.fit"],
