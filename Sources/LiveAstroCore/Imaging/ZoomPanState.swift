@@ -34,4 +34,27 @@ public struct ZoomPanState: Equatable {
         return CGSize(width: min(max(proposed.width, -maxX), maxX),
                       height: min(max(proposed.height, -maxY), maxY))
     }
+
+    /// Change the scale while keeping the content point currently under
+    /// `pointInView` fixed under that point — "zoom toward the cursor".
+    /// `pointInView` is in view coordinates with a TOP-LEFT origin (the caller
+    /// converts AppKit/window points first). Reduces to center-anchored zoom
+    /// when `pointInView` is the view center. Result offset is clamp-applied.
+    public static func zoomed(toScale newScale: CGFloat, about pointInView: CGPoint,
+                              viewSize: CGSize, from current: ZoomPanState,
+                              fittedContentSize: CGSize) -> ZoomPanState {
+        guard viewSize.width > 0, viewSize.height > 0, current.scale > 0 else { return current }
+        let s1 = clampScale(newScale)
+        // P = cursor relative to the view center, matching .scaleEffect(anchor: .center).
+        let p = CGSize(width: pointInView.x - viewSize.width / 2,
+                       height: pointInView.y - viewSize.height / 2)
+        // Keep the content point under P fixed: offset1 = P - (P - offset0)·(s1/s0).
+        let k = s1 / current.scale
+        let offset1 = CGSize(width: p.width - (p.width - current.offset.width) * k,
+                             height: p.height - (p.height - current.offset.height) * k)
+        return ZoomPanState(scale: s1,
+                            offset: clampedOffset(offset1, scale: s1,
+                                                  viewSize: viewSize,
+                                                  fittedContentSize: fittedContentSize))
+    }
 }
