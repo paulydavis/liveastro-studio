@@ -10,7 +10,7 @@
 # false-confidence pattern this gate exists to catch, reproduced inside the gate. It never touches
 # `.build/release`, which is a symlink into shared build output.
 #
-# SWIFT COMPILER warnings in the RELEASE build are FATAL, enforced by the compiler
+# SWIFT COMPILER warnings in the RELEASE build and TEST compilation are FATAL, enforced by the compiler
 # (-warnings-as-errors), not by matching the log. That flag reaches only swiftc's own diagnostics:
 # SwiftPM, the linker and other tools can still emit warnings, which are reported, not fatal.
 #
@@ -55,11 +55,21 @@ else
 fi
 
 status=0
-echo "== 3/3  full test suite (debug, INCREMENTAL) =="
+echo "== 3/3  full test suite (debug, INCREMENTAL; Swift warnings are errors) =="
 # Not piped into grep: under `pipefail` a non-matching grep would mark the step failed, conflating
 # "the suite failed" with "my pattern missed". Capture swift test's own status, then read the log.
-swift test > "$log.test" 2>&1
+swift test -Xswiftc -warnings-as-errors > "$log.test" 2>&1
 test_status=$?
+echo "   test log: $log.test"
+# Compiler enforcement includes test targets and their Swift dependencies. Warnings
+# from other tools remain informational: report the diagnostics, not an inferred cause.
+testwarn=$(grep -E 'warning:' "$log.test" | sort -u)
+if [ -n "$testwarn" ]; then
+    echo "   warnings emitted during the test step (SwiftPM/linker/other-tool warnings are not fatal):"
+    echo "$testwarn" | sed 's/^/     /'
+else
+    echo "   warnings emitted during the test step: 0"
+fi
 summary=$(grep -E "Executed [0-9]+ tests" "$log.test" | tail -1)
 if [ -n "$summary" ]; then
     echo "  $summary"
@@ -67,8 +77,8 @@ else
     echo "   (no test-summary line found in the log — reporting the exit status instead)"
 fi
 if [ $test_status -ne 0 ]; then
-    echo "   TEST SUITE FAILED (exit $test_status)"
-    grep -E "error:" "$log.test" | sed 's/.*Tests\./     /' | cut -c1-140 | sort -u | head
+    echo "   TEST BUILD OR SUITE FAILED (exit $test_status)"
+    grep -E "error:" "$log.test" | sort -u | head
     status=1
 fi
 
@@ -94,7 +104,7 @@ fi
 
 echo
 if [ $status -eq 0 ]; then
-    echo "PREFLIGHT PASSED — review the release-build warnings above."
+    echo "PREFLIGHT PASSED — review the release-build and test-step warnings above."
 else
     echo "PREFLIGHT FAILED"
 fi

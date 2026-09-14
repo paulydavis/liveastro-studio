@@ -157,12 +157,19 @@ review.
 
 The release step compiles into a throwaway scratch directory (so it cannot report "clean" by
 reusing existing output) and builds with `-Xswiftc -warnings-as-errors`. **A new Swift compiler
-warning in the release build fails the gate.** That is enforced by the compiler rather than by matching the build log,
+warning in the release build fails the gate.** The test step also uses
+`swift test -Xswiftc -warnings-as-errors`, so Swift compiler warnings in test targets
+and their dependencies fail the gate before tests run. The standalone debug build
+still counts warnings rather than enforcing them. Enforcement is by the compiler rather than by matching the build log,
 which would depend on message formatting and could not tell a real warning from the word "warning"
 in a path. Warnings from SwiftPM, the linker or other tools are outside that flag's reach; the gate
-reports those without failing. If a
+reports those from both the release and test logs without failing. The test step
+prints its detailed log path, including when compilation fails. If a
 warning is genuinely acceptable, fix it or silence it deliberately at the source — do not weaken
 the gate.
+
+The small gate-contract tests exercise real Swift compilation and test execution
+without running the app suite: `python3 Scripts/tests/test_preflight.py`.
 
 The individual steps, if you want them separately:
 

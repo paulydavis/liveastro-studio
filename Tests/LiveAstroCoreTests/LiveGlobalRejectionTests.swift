@@ -288,7 +288,7 @@ final class LiveGlobalRejectionTests: XCTestCase {
         throw XCTSkip("real 26 MP subs need an optimized build (debug star detection/registration trips the "
                       + "120 s drain window) — run: LAS_TRAIL_FRAMES=<dir> swift test -c release "
                       + "--filter LiveGlobalRejectionTests/testRealM51TrailRemovalPreservesSNR")
-        #endif
+        #else
         let dir = URL(fileURLWithPath: dirPath, isDirectory: true)
         let subURLs = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension.lowercased() == "fit" }
@@ -445,6 +445,7 @@ final class LiveGlobalRejectionTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(onSNR, 0.9 * offSNR,
                                     "removing a trail must not regress background SNR by more than the " +
                                     "survivor-count-difference tolerance (global >= 0.9 * online)")
+        #endif
     }
 
     // MARK: - D. Feature-OFF byte parity (I4)
