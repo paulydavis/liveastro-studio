@@ -105,11 +105,13 @@ final class AppModel {
     var calibration: CalibrationSelection
 
     /// Reusable master darks/bias, matched to a session by camera + settings.
-    let calibrationLibrary = CalibrationLibrary()
+    let calibrationLibrary: CalibrationLibrary
     /// Per-session flat frames (shot fresh each night) — a folder of raw flats built now.
     var sessionFlatsFolder: URL?
     /// Optional per-session dark-flats folder (offset subtracted when building the flat).
     var sessionDarkFlatsFolder: URL?
+    /// Session-only opt-in; never inferred from the presence of a dark-flat folder.
+    var useDarkFlatAsLightOffset = false
     /// Scale a library dark across exposures using bias when no exact-exposure dark exists.
     var scaleDarksAcrossExposures = true
     /// Latest auto-match status line, shown in the Calibration section.
@@ -371,8 +373,9 @@ final class AppModel {
     /// `userDefaults` defaults to `.standard` for every production call site (`AppModel()`
     /// unchanged). Tests pass a temporary suite so no test run reads or writes the real user's
     /// persisted settings.
-    init(userDefaults: UserDefaults = .standard) {
+    init(userDefaults: UserDefaults = .standard, calibrationLibrary: CalibrationLibrary = CalibrationLibrary()) {
         self.userDefaults = userDefaults
+        self.calibrationLibrary = calibrationLibrary
         self.calibration = CalibrationStore.load(userDefaults)
         // Build the seam bundle and the Broadcast controller first. The closures
         // capture `self` (safe: they only fire after init completes), and
@@ -1032,28 +1035,31 @@ final class AppModel {
         let r = CalibrationResolver.resolve(
             metadata: meta, library: calibrationLibrary, scaleEnabled: scaleDarksAcrossExposures,
             flatsFolder: sessionFlatsFolder, darkFlatsFolder: sessionDarkFlatsFolder,
-            legacyDarkPath: calibration.darkPath, legacyFlatPath: calibration.flatPath)
-        calibrationStatus = statusLine(dark: r.hasDark, flat: r.hasFlat)
+            legacyDarkPath: calibration.darkPath, legacyFlatPath: calibration.flatPath,
+            useDarkFlatAsLightOffset: useDarkFlatAsLightOffset)
+        calibrationStatus = statusLine(dark: r.hasDark, flat: r.hasFlat, lightOffset: r.hasLightOffset)
         return (r.calibrator, r.messages, true, meta)
     }
 
     /// First-sub calibrator provider for empty-folder starts: the pipeline calls this
     /// with the first frame's header on the consume task; it resolves calibration and
     /// hops to the main actor to log + update the status line.
-    private func makeCalibratorProvider() -> ((SourceMetadata) -> Calibrator?) {
+    func makeCalibratorProvider() -> ((SourceMetadata) -> Calibrator?) {
         let library = calibrationLibrary
         let scale = scaleDarksAcrossExposures
         let flats = sessionFlatsFolder, darkFlats = sessionDarkFlatsFolder
+        let lightOffset = useDarkFlatAsLightOffset
         let legacyDark = calibration.darkPath, legacyFlat = calibration.flatPath
         return { [weak self] meta in
             let r = CalibrationResolver.resolve(
                 metadata: meta, library: library, scaleEnabled: scale,
                 flatsFolder: flats, darkFlatsFolder: darkFlats,
-                legacyDarkPath: legacyDark, legacyFlatPath: legacyFlat)
+                legacyDarkPath: legacyDark, legacyFlatPath: legacyFlat,
+                useDarkFlatAsLightOffset: lightOffset)
             DispatchQueue.main.async {
                 guard let self else { return }
                 r.messages.forEach { self.log.append($0) }
-                self.calibrationStatus = self.statusLine(dark: r.hasDark, flat: r.hasFlat)
+                self.calibrationStatus = self.statusLine(dark: r.hasDark, flat: r.hasFlat, lightOffset: r.hasLightOffset)
             }
             return r.calibrator
         }
@@ -1074,7 +1080,8 @@ final class AppModel {
     }
 
 
-    private func statusLine(dark: Bool, flat: Bool) -> String {
+    private func statusLine(dark: Bool, flat: Bool, lightOffset: Bool = false) -> String {
+        if lightOffset { return "Calibrating with flat + dark-flat light offset (not a matched dark) ✓" }
         switch (dark, flat) {
         case (true, true):  return "Calibrating with dark + flat ✓"
         case (true, false): return "Calibrating with dark ✓"

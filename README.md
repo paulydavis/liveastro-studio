@@ -126,6 +126,18 @@ CMOS astro cameras, matched dark-flats are often preferred over very short bias
 frames. If you are stacking lights only and skipping flats, bias/dark-flat
 frames usually do little on their own.
 
+The live-session Calibration panel also offers **Also use dark-flat as the light
+offset**, off by default and not saved between app launches. This explicitly
+subtracts the selected dark-flat master from the lights before flat division,
+as an offset approximation—not a matched-exposure light dark. Use it only when
+appropriate for your calibration workflow; a shorter dark-flat does not model
+all dark signal in a longer light exposure. It requires usable session flats
+and dark-flats. Any usable library or explicitly selected light dark takes
+precedence, so the offset is never subtracted twice. The log and calibration
+status distinguish this fallback from dark calibration and report when it cannot
+be applied. This option is captured at live Start (including an empty-folder
+start); it does not change an active session or the separate offline Import path.
+
 ## Try It Without a Telescope
 
 Click **Try Demo** in the Start Workflow section. LiveAstro creates a local demo input folder, writes a changing sample stack, starts watching it, and lets you test the live view, broadcast window, snapshots, and replay without clear skies.

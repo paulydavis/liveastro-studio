@@ -11,12 +11,14 @@ public enum CalibrationResolver {
         public var messages: [String]
         public var hasDark: Bool
         public var hasFlat: Bool
+        /// A dark-flat was explicitly reused as a light offset, NOT as a matched light dark.
+        public var hasLightOffset: Bool = false
     }
 
     public static func resolve(
         metadata: SourceMetadata, library: CalibrationLibrary, scaleEnabled: Bool,
         flatsFolder: URL?, darkFlatsFolder: URL?,
-        legacyDarkPath: String?, legacyFlatPath: String?) -> Resolution {
+        legacyDarkPath: String?, legacyFlatPath: String?, useDarkFlatAsLightOffset: Bool = false) -> Resolution {
 
         var messages: [String] = []
         let entries = library.all()
@@ -112,14 +114,20 @@ public enum CalibrationResolver {
             return nil
         }()
         var flatImage: AstroImage?
+        var lightOffset: AstroImage?
         if let flatsFolder {
             var offset = biasImage
+            var darkFlatImage: AstroImage?
             if let dfFolder = darkFlatsFolder {
                 let dfURLs = CalibrationLibrary.fitsFiles(in: dfFolder)
                 if dfURLs.isEmpty {
                     messages.append("Calibration: no dark-flats in that folder — using bias as the flat offset.")
                 } else {
-                    do { offset = try MasterBuilder.combineDetailed(fitsURLs: dfURLs, kind: .bias, bias: nil, expected: targetDims).image }
+                    do {
+                        let built = try MasterBuilder.combineDetailed(fitsURLs: dfURLs, kind: .bias, bias: nil, expected: targetDims)
+                        offset = built.image
+                        darkFlatImage = built.image
+                    }
                     catch { messages.append("Calibration: dark-flats build failed — \(error.localizedDescription); using bias instead.") }
                 }
             }
@@ -131,6 +139,11 @@ public enum CalibrationResolver {
                     let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .flat, bias: offset, expected: targetDims)
                     if dimensionsOK(built.image, metadata) {
                         flatImage = built.image
+                        // Only the explicitly selected, successfully applied dark-flat qualifies.
+                        // A fallback library bias must never silently become the requested offset.
+                        if useDarkFlatAsLightOffset, darkImage == nil, built.offsetApplied {
+                            lightOffset = darkFlatImage
+                        }
                         // Report the offset HONESTLY: a dimension-mismatched offset is silently skipped
                         // by the builder, so don't claim "subtracted" unless it actually was.
                         let offsetNote = built.offsetApplied ? " (offset subtracted)"
@@ -160,9 +173,20 @@ public enum CalibrationResolver {
             }
         }
 
-        let cal = (darkImage != nil || flatImage != nil) ? Calibrator(dark: darkImage, flat: flatImage) : nil
+        if useDarkFlatAsLightOffset {
+            if darkImage != nil {
+                messages.append("Calibration: dark-flat light offset not applied — a light dark is active; avoiding double subtraction.")
+            } else if lightOffset != nil {
+                messages.append("Calibration: using dark-flat as light offset before flat division (opt-in; not a matched light dark).")
+            } else {
+                messages.append("Calibration: dark-flat light offset not applied — requires a usable session flat and matching dark-flats.")
+            }
+        }
+        // Calibrator owns orientation and subtraction-before-division for either input.
+        // Keep reporting separate: an offset fallback is not full dark calibration.
+        let cal = (darkImage != nil || flatImage != nil) ? Calibrator(dark: darkImage ?? lightOffset, flat: flatImage) : nil
         return Resolution(calibrator: cal, messages: messages,
-                          hasDark: darkImage != nil, hasFlat: flatImage != nil)
+                          hasDark: darkImage != nil, hasFlat: flatImage != nil, hasLightOffset: lightOffset != nil)
     }
 
     /// A loaded master must match the lights' sensor dimensions when they're known. When the light
