@@ -4,8 +4,16 @@ import SwiftUI
 @testable import LiveAstroStudio
 
 final class BroadcastDeliveryTests: XCTestCase {
+    @MainActor private func makeModel(_ name: String = #function) throws -> AppModel {
+        // These tests must neither load nor save the operator's real preferences.
+        let suite = "BroadcastDeliveryTests.\(name).\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return AppModel(userDefaults: defaults)
+    }
+
     @MainActor func testCapturedWindowUsesBroadcastPixelsInsteadOfOperatorPreview() async throws {
-        let model = AppModel()
+        let model = try makeModel()
         let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: sandbox) }
         try FileManager.default.createDirectory(at: sandbox.appendingPathComponent("snapshots"), withIntermediateDirectories: true)
@@ -61,7 +69,7 @@ final class BroadcastDeliveryTests: XCTestCase {
     }
 
     @MainActor func testNewSessionRejectsQueuedDeliveryFromPreviousPipeline() async throws {
-        let model = AppModel()
+        let model = try makeModel()
         let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let profile = SessionProfile(targetName: "Sessions", subExposureSeconds: 20)
         let old = SessionPipeline(watchFolder: sandbox, profile: profile, rootDirectory: sandbox)
@@ -96,7 +104,7 @@ final class BroadcastDeliveryTests: XCTestCase {
     }
 
     @MainActor func testSuccessfulRestackUpdatesDetachedDisplay() throws {
-        let model = AppModel()
+        let model = try makeModel()
         model.isDetached = true
         let old = try XCTUnwrap(AutoStretch.makeCGImage(AstroImage(width: 2, height: 2,
             channels: 1, pixels: [0.9, 0.9, 0.9, 0.9], sourceIsLinear: false)))
