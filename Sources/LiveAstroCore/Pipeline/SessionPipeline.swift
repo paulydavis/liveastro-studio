@@ -1273,10 +1273,9 @@ public final class SessionPipeline {
     /// `onlineMean`/`onlinePreviewCG` are the caller's already-cropped-to-coverage online mean and
     /// its already-rendered preview image; `onlineFrameCount` is the engine's frame-count fallback
     /// for `integrationFrames`. `downsampleLongEdge`, when non-nil, is applied to the
-    /// published-master branch exactly as the caller applied it to its own online branch — this is
-    /// the ONE asymmetry between the two call sites (renderSnapshot's import/live-preview render
-    /// downsamples to a long-edge preview; handleNative's live broadcast render stays full-res) and
-    /// is preserved by threading it through rather than being unified away. T9b: when the CLEAN
+    /// published-master branch exactly as the caller applied it to its own online branch.
+    /// Native live and import share the 2560 display limit; the full-resolution broadcast mean
+    /// remains available separately for statistics. T9b: when the CLEAN
     /// master is served, its depth is `survivorCount` (smaller than the online frame count after
     /// rejections) — used so the overlay's integration time matches the displayed image; the
     /// online-fallback branch is unchanged. The per-sub PREVIEW callers pass separately (onUpdate)
@@ -1920,7 +1919,8 @@ public final class SessionPipeline {
                 }
                 let mean = cropToCoverage(mean0, coverage: coverage)   // online — feeds the PREVIEW, unchanged (Task 9)
                 let online = OnlineDisplaySnapshot(image: mean, count: frameCount,
-                                                   cap: nil, generation: generation, exposure: exposure)
+                                                   cap: SnapshotRecorder.maxSnapshotLongEdge,
+                                                   generation: generation, exposure: exposure)
                 displayOnline = online
                 guard let recorder else {
                     onLog?("recorder missing — frame dropped (\(frame.sourceName))")
@@ -1935,11 +1935,11 @@ public final class SessionPipeline {
                                                             revision: revision, origin: "frame")
 
                     // BROADCAST/latest.png: prefer the clean published master over the online
-                    // mean, full-resolution (live, unlike renderSnapshot's downsampled preview) —
-                    // D10: see resolveBroadcastRender.
+                    // mean. Cap the chosen source BEFORE display processing, matching import;
+                    // keep broadcastMean full-resolution for recorded statistics and archival work.
                     let (broadcastMean, broadcastCG, integrationFrames, cleanCount, broadcastExposure) = try resolveBroadcastRender(
                         onlineMean: mean, onlinePreviewCG: previewCG, onlineFrameCount: frameCount,
-                        downsampleLongEdge: nil, context: context)
+                        downsampleLongEdge: online.cap, context: context)
 
                     // Pass the raw un-neutralized mean as linear: stats stay raw for v1.1 cloud gate.
                     displayRenderPhaseProbeForTest?(revision, .diskWriteBegan)
@@ -1986,10 +1986,12 @@ public final class SessionPipeline {
                 displayRenderLock.lock()
                 defer { displayRenderLock.unlock() }
                 let revision = nextDisplayRevision()
-                let cg = try displayCGImage(from: linear)
                 let index = session.acceptedCount + 1
-                displayOnline = OnlineDisplaySnapshot(image: linear, count: index,
-                                                      cap: nil, generation: nil)
+                let online = OnlineDisplaySnapshot(image: linear, count: index,
+                    cap: SnapshotRecorder.maxSnapshotLongEdge, generation: nil)
+                let cg = try renderOnlineDisplay(online, context: displayContext(),
+                    revision: revision, origin: "frame")
+                displayOnline = online
                 let record = try recorder.save(
                     cgImage: cg, linear: linear, sourceFile: update.url.lastPathComponent,
                     index: index, timestamp: Date(),
