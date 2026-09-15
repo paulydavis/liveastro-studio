@@ -23,24 +23,94 @@ public enum GlobalCombine {
         var center = [Float](repeating: 0, count: n)
         var scale = [Float](repeating: 0, count: n)
         var sampleCovered = [Bool](repeating: false, count: plane)
-        for p in 0..<plane {
-            sampleCovered[p] = sample.contains { $0.mask[p] > 0 }
-        }
-        var vbuf = [Float](); vbuf.reserveCapacity(sample.count)
-        var dbuf = [Float](); dbuf.reserveCapacity(sample.count)
-        for idx in 0..<n {
-            let p = idx % plane
-            vbuf.removeAll(keepingCapacity: true)
-            for s in sample where s.mask[p] > 0 { vbuf.append(s.image.pixels[idx]) }
-            if vbuf.isEmpty { continue }               // no coverage → center/scale stay 0
-            let med = median(&vbuf)
-            center[idx] = med
-            dbuf.removeAll(keepingCapacity: true)
-            for v in vbuf { dbuf.append(abs(v - med)) }
-            scale[idx] = madToSigma * median(&dbuf)
+        // Bound nested borrow stack usage, not the statistical sample. Large samples
+        // of tiny images retain the former serial algorithm and use EVERY input.
+        if sample.count > maximumScopedSampleBorrows {
+            for p in 0..<plane { sampleCovered[p] = sample.contains { $0.mask[p] > 0 } }
+            var vbuf = [Float](); vbuf.reserveCapacity(sample.count)
+            var dbuf = [Float](); dbuf.reserveCapacity(sample.count)
+            for idx in 0..<n {
+                let p = idx % plane
+                vbuf.removeAll(keepingCapacity: true)
+                for s in sample where s.mask[p] > 0 { vbuf.append(s.image.pixels[idx]) }
+                if vbuf.isEmpty { continue }
+                let med = median(&vbuf)
+                center[idx] = med
+                dbuf.removeAll(keepingCapacity: true)
+                for v in vbuf { dbuf.append(abs(v - med)) }
+                scale[idx] = madToSigma * median(&dbuf)
+            }
+        } else {
+            // Bands own disjoint spatial rows in every channel, including coverage.
+            // Mutable buffers are borrowed for the whole synchronous parallel operation;
+            // each band has its own median scratch. Sample order and per-pixel arithmetic
+            // stay unchanged, with no cross-band reduction or additional full-size image.
+            withSampleBuffers(sample) { inputs in
+                center.withUnsafeMutableBufferPointer { centerBuf in
+                    scale.withUnsafeMutableBufferPointer { scaleBuf in
+                        sampleCovered.withUnsafeMutableBufferPointer { coveredBuf in
+                            // Preserve the former flattened behavior even for paired negative
+                            // dimensions constructible through AstroImage's product-only check.
+                            let rowCount = max(h, 1), rowWidth = h > 0 ? w : plane
+                            Parallel.rows(rowCount) { rows in
+                                var vbuf = [Float](); vbuf.reserveCapacity(inputs.count)
+                                var dbuf = [Float](); dbuf.reserveCapacity(inputs.count)
+                                let pixels = (rows.lowerBound * rowWidth)..<(rows.upperBound * rowWidth)
+                                for p in pixels {
+                                    coveredBuf[p] = inputs.contains { $0.mask[p] > 0 }
+                                }
+                                for channel in 0..<c {
+                                    let base = channel * plane
+                                    for p in pixels {
+                                        let idx = base + p
+                                        vbuf.removeAll(keepingCapacity: true)
+                                        for s in inputs where s.mask[p] > 0 { vbuf.append(s.pixels[idx]) }
+                                        if vbuf.isEmpty { continue } // no coverage → center/scale stay 0
+                                        let med = median(&vbuf)
+                                        centerBuf[idx] = med
+                                        dbuf.removeAll(keepingCapacity: true)
+                                        for v in vbuf { dbuf.append(abs(v - med)) }
+                                        scaleBuf[idx] = madToSigma * median(&dbuf)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         return (AstroImage(width: w, height: h, channels: c, pixels: center, sourceIsLinear: true),
                 scale, sampleCovered)
+    }
+
+    private typealias SampleBuffer = (pixels: UnsafeBufferPointer<Float>, mask: UnsafeBufferPointer<Float>)
+
+    // A stack-depth safety limit only; larger samples are processed serially, never truncated.
+    private static let maximumScopedSampleBorrows = 64
+
+    /// Nest the input borrows so every pointer stays valid until the synchronous
+    /// computation finishes. Iterating these non-owning descriptors in pixel loops
+    /// avoids retaining/releasing the same image arrays from every worker.
+    private static func withSampleBuffers(
+        _ sample: [(image: AstroImage, mask: [Float])],
+        _ body: (UnsafeBufferPointer<SampleBuffer>) -> Void
+    ) {
+        var buffers = [SampleBuffer]()
+        buffers.reserveCapacity(sample.count)
+        func borrow(_ index: Int) {
+            guard index < sample.count else {
+                buffers.withUnsafeBufferPointer(body)
+                return
+            }
+            sample[index].image.pixels.withUnsafeBufferPointer { pixels in
+                sample[index].mask.withUnsafeBufferPointer { mask in
+                    buffers.append((pixels, mask))
+                    borrow(index + 1)
+                    buffers.removeLast()
+                }
+            }
+        }
+        borrow(0)
     }
 
     /// In-place median (sorts the buffer). Even count → mean of the two middle elements.
