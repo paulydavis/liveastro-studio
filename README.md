@@ -62,6 +62,14 @@ The broadcast window refreshes when a clean master publishes or becomes invalid,
 between subs. `latest.png` updates when a snapshot is saved; it is not the source of the
 Window Capture workflow above.
 
+Committed display images are processed at a maximum long edge of 2560 pixels in native
+live, offline import, and external-stacker modes, including Apply and final display
+refreshes. This reduces display-render cost but can change fine texture compared with
+processing at full resolution: DBE, stretch statistics, and denoise operate on the reduced
+image. Snapshots, `latest.png`, and replay inherit that appearance. The native accumulator,
+archival `master.fit`, and linear statistics retain their full-resolution data; clean-master
+selection is unchanged. Images smaller than the cap are not enlarged.
+
 ## OBS Automation
 
 LiveAstro can control OBS through the OBS WebSocket server.
