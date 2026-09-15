@@ -61,8 +61,7 @@ struct DisplaySettingsView: View {
             ScrollView {
                 Form {
                     Section("Night vision") {
-                        helpToggle("Red screen", isOn: $model.nightVisionOn,
-                                   help: "Tints the whole Mac display red to protect your dark adaptation at the scope — affects every app, not just LiveAstro. Clears when you quit.")
+                        helpToggle("Red screen", isOn: $model.nightVisionOn)
                             .onChange(of: model.nightVisionOn) { _, _ in model.applyNightVision() }
                         if model.nightVisionOn {
                             HStack {
@@ -81,7 +80,7 @@ struct DisplaySettingsView: View {
                     }
                     Section("Display Adjustments") {
                         VStack(alignment: .leading) {
-                            Text("Black point")
+                            HStack { Text("Black point"); SettingHelpButton(sectionTitle: "Black point") }
                             HStack {
                                 Slider(value: $model.staged.pending.blackPoint, in: 0...1)
                                     .onChange(of: model.staged.pending.blackPoint) { _, _ in
@@ -97,7 +96,7 @@ struct DisplaySettingsView: View {
                                 + "and use arrow keys for fine steps.")
                         }
                         VStack(alignment: .leading) {
-                            Text("Stretch strength")
+                            HStack { Text("Stretch strength"); SettingHelpButton(sectionTitle: "Stretch strength") }
                             HStack {
                                 Slider(value: $model.staged.pending.midtoneStrength, in: -1...1)
                                     .onChange(of: model.staged.pending.midtoneStrength) { _, _ in
@@ -111,7 +110,7 @@ struct DisplaySettingsView: View {
                                 + "arrow keys for fine steps.")
                         }
                         VStack(alignment: .leading) {
-                            Text("Saturation")
+                            HStack { Text("Saturation"); SettingHelpButton(sectionTitle: "Saturation") }
                             HStack {
                                 Slider(value: $model.staged.pending.saturation, in: 0...2)
                                     .onChange(of: model.staged.pending.saturation) { _, _ in
@@ -124,8 +123,7 @@ struct DisplaySettingsView: View {
                             .help("Color intensity. 1 = unchanged. Click the slider and use arrow "
                                 + "keys for fine steps.")
                         }
-                        helpToggle("Flatten background (DBE)", isOn: $model.staged.pending.backgroundExtraction,
-                                   help: "Remove the light-pollution gradient so the sky darkens evenly. Off by default.")
+                        helpToggle("Flatten background (DBE)", isOn: $model.staged.pending.backgroundExtraction)
                             .onChange(of: model.staged.pending.backgroundExtraction) { _, _ in
                                 model.refreshPreview(force: true)
                             }
@@ -152,7 +150,7 @@ struct DisplaySettingsView: View {
                             .help("Extra blur on the background model — raise to remove residual blotchiness, lower to track non-smooth gradients.")
                         }
                         VStack(alignment: .leading) {
-                            Text("Denoise")
+                            HStack { Text("Denoise"); SettingHelpButton(sectionTitle: "Denoise") }
                             Slider(value: $model.staged.pending.denoiseStrength, in: 0...1)
                                 .onChange(of: model.staged.pending.denoiseStrength) { _, _ in
                                     model.refreshPreview()
@@ -162,11 +160,10 @@ struct DisplaySettingsView: View {
                         switch model.catalogState {
                         case .installed:
                             helpToggle("North up", isOn: $model.staged.pending.northUp,
-                                       help: "Rotate the view so celestial north is up (display only — master.fit stays native). Needs a plate solve; enabled once the reference frame is solved.")
+                                       enabled: model.solveAvailable)
                                 .onChange(of: model.staged.pending.northUp) { _, _ in
                                     model.refreshPreview(force: true)
                                 }
-                                .disabled(!model.solveAvailable)
                         case .notInstalled:
                             Button("Download star catalog (~32 MB) — enables North up") {
                                 model.downloadCatalog()

@@ -94,23 +94,18 @@ struct CaptureSettingsView: View {
                         .disabled(model.isRunning || model.importer.isImporting)
                         .help("Only process files whose name starts with this prefix; leave empty to accept all FITS files in the watch folder.")
                     helpToggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground,
-                               help: "Apply a per-channel background neutralization pass after stacking to correct OSC white balance drift.")
-                        .disabled(model.isRunning || model.importer.isImporting)
+                               enabled: !model.isRunning && !model.importer.isImporting)
                     helpToggle("Reject outliers (σ-clip)", isOn: $model.rejectionEnabled,
-                               help: "Drop satellite / plane / cosmic-ray streaks by clamping pixels that deviate from the per-pixel stack statistics (winsorized κ-σ). On by default.")
-                        .disabled(model.isRunning || model.importer.isImporting)
+                               enabled: !model.isRunning && !model.importer.isImporting)
                     helpToggle("Weight frames by quality", isOn: $model.frameWeightingEnabled,
-                               help: "Give sharper, lower-noise subs more influence in the stack (star count + background noise). Turn off for an equal-weight stack.")
-                        .disabled(model.isRunning || model.importer.isImporting)
+                               enabled: !model.isRunning && !model.importer.isImporting)
                     helpToggle("Match sky background", isOn: $model.backgroundNormalizationEnabled,
-                               help: "Level each sub's sky gradient to the reference before stacking, so a drifting light-pollution ramp or moonrise gradient doesn't leave a residual gradient the master can't remove. Low-order per channel; off for an unadjusted stack.")
-                        .disabled(model.isRunning || model.importer.isImporting)
+                               enabled: !model.isRunning && !model.importer.isImporting)
                     helpToggle("Match transparency", isOn: $model.scaleNormalizationEnabled,
-                               help: "Scale each sub's signal to the reference brightness using matched star fluxes, so haze or thin cloud doesn't dim the master. Off for an unadjusted stack. Requires Match sky background (scaling pivots about the matched background).")
-                        .disabled(model.isRunning || model.importer.isImporting)
+                               enabled: !model.isRunning && !model.importer.isImporting)
                     HStack(spacing: 6) {
                         Text("Keep relay sessions")
-                        InfoButton(text: "Live sessions stage incoming subs in ~/LiveAstro/relay. Sessions older than this are deleted automatically when a new session starts — they are copies; originals stay on the Seestar/rig. Off disables pruning.")
+                        SettingHelpButton(sectionTitle: "Keep relay sessions")
                         Spacer()
                         Picker("", selection: $model.liveSource.relayRetentionDays) {
                             Text("Off").tag(0)
@@ -126,7 +121,7 @@ struct CaptureSettingsView: View {
                     }
                     HStack(spacing: 6) {
                         Text("Debayer")
-                        InfoButton(text: "Malvar (high quality) keeps star cores sharp and fringe-free (recommended). Bilinear is the legacy demosaic.")
+                        SettingHelpButton(sectionTitle: "Debayer")
                         Spacer()
                         Picker("", selection: $model.demosaic) {
                             Text("Bilinear").tag(DemosaicMethod.bilinear)
@@ -148,8 +143,7 @@ struct CaptureSettingsView: View {
                         .help("Higher = safer (rejects less); lower = more aggressive. Medium (κ=3) is the validated default.")
                     }
                     VStack(alignment: .leading, spacing: 2) {
-                        helpToggle("Live trail rejection (broadcast master)", isOn: $model.liveTrailRejection,
-                                   help: "Runs a background whole-frame outlier pass so satellite/plane trails drop out of the broadcast master and end-of-session master.fit, distinct from the per-pixel σ-clip above. Only engages for a local native live relay with enough subs; safe to toggle mid-session.")
+                        helpToggle("Live trail rejection (broadcast master)", isOn: $model.liveTrailRejection)
                         Text(model.liveRejectionStatusText)
                             .font(.caption).foregroundStyle(.secondary)
                     }
@@ -182,8 +176,7 @@ struct CaptureSettingsView: View {
                 Section("Session end") {
                     helpToggle("Idle safeguard — save master if capture stalls",
                                isOn: $model.idleSafeguardEnabled,
-                               help: "Writes master.fit and keeps stacking; a cloud gap resumes normally.")
-                        .disabled(model.sourceMode != .nativeStack)
+                               enabled: model.sourceMode == .nativeStack)
                     if model.sourceMode != .nativeStack {
                         Text("Native stacking only — external stackers own their own master.")
                             .font(.caption).foregroundStyle(.secondary)
@@ -194,8 +187,7 @@ struct CaptureSettingsView: View {
                             .help("How long capture may stall before a master snapshot is written. Stacking continues; a resumed feed re-arms the safeguard.")
                             .disabled(model.sourceMode != .nativeStack)
                     }
-                    helpToggle("Auto-stop at a set time", isOn: $model.plannedStopEnabled,
-                               help: "Runs a full End Session at this time (writes master + replay, ends an owned broadcast). Does not quit the app.")
+                    helpToggle("Auto-stop at a set time", isOn: $model.plannedStopEnabled)
                     if model.plannedStopEnabled {
                         DatePicker("Stop at", selection: Binding(
                             get: { Calendar.current.date(bySettingHour: model.plannedStopHour,

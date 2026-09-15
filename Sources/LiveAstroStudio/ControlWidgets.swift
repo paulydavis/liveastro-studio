@@ -12,33 +12,13 @@ let logDisplayCap = 200
 ///
 /// Shared across the Setup sub-tab views (Capture, Display) — kept here as the
 /// single copy so no destination file redeclares it.
-func helpToggle(_ title: String, isOn: Binding<Bool>, help: String) -> some View {
+func helpToggle(_ title: String, isOn: Binding<Bool>, enabled: Bool = true) -> some View {
     HStack(spacing: 6) {
         Text(title)
-        InfoButton(text: help)
+        SettingHelpButton(sectionTitle: title)
         Spacer()
         Toggle("", isOn: isOn).labelsHidden()
-    }
-}
-
-/// Small ⓘ affordance that reveals its help text in a popover on tap (and, as a
-/// bonus, a tooltip on hover — `.help()` works reliably on a Button control).
-struct InfoButton: View {
-    let text: String
-    @State private var showing = false
-    var body: some View {
-        Button { showing.toggle() } label: {
-            Image(systemName: "info.circle").foregroundStyle(.secondary)
-        }
-        .buttonStyle(.plain)
-        .help(text)
-        .popover(isPresented: $showing, arrowEdge: .bottom) {
-            Text(text)
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(12)
-                .frame(width: 300)
-        }
+            .disabled(!enabled)
     }
 }
 

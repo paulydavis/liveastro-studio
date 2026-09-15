@@ -1,7 +1,58 @@
 import SwiftUI
 import LiveAstroCore
 
+/// Contextual help reuses the bundled manual rather than maintaining a second explanation.
+struct SettingHelpButton: View {
+    let sectionTitle: String
+    @State private var isPresented = false
+    @State private var showsFullHelp = false
+
+    var body: some View {
+        Button {
+            showsFullHelp = false
+            isPresented = true
+        } label: {
+            Image(systemName: "info.circle")
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel("Help: \(sectionTitle)")
+        .help("Explain \(sectionTitle)")
+        .popover(isPresented: $isPresented) {
+            VStack(spacing: 0) {
+                HelpView(sectionTitle: showsFullHelp ? nil : sectionTitle)
+                    .id(showsFullHelp)
+                Divider()
+                HStack {
+                    Button(showsFullHelp ? "Back to setting" : "Read more in Help") {
+                        showsFullHelp.toggle()
+                    }
+                    Spacer()
+                    Button("Done") { isPresented = false }
+                        .keyboardShortcut(.cancelAction)
+                }.padding()
+            }
+            .frame(width: 500, height: 460)
+        }
+    }
+}
+
 struct HelpView: View {
+    var sectionTitle: String? = nil
+
+    /// Share a single bundled explanation between the manual and contextual help.
+    static func sectionBlocks(in blocks: [MarkdownBlock], title: String) -> [MarkdownBlock] {
+        guard let start = blocks.firstIndex(where: {
+            if case let .heading(_, text) = $0 { return text == title }
+            return false
+        }), case let .heading(level, _) = blocks[start] else {
+            return [.paragraph("This help topic is unavailable.")]
+        }
+        let end = blocks.indices.dropFirst(start + 1).first(where: {
+            if case let .heading(nextLevel, _) = blocks[$0] { return nextLevel <= level }
+            return false
+        }) ?? blocks.endIndex
+        return Array(blocks[start..<end])
+    }
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
@@ -20,11 +71,12 @@ struct HelpView: View {
         .scrollIndicators(.visible)
     }
 
-    private var blocks: [MarkdownBlock] {
+    var blocks: [MarkdownBlock] {
         guard let url = Bundle.module.url(forResource: "Help", withExtension: "md"),
               let md = try? String(contentsOf: url, encoding: .utf8)
         else { return [.paragraph("Help unavailable.")] }
-        return MarkdownBlocks.parse(md)
+        let parsed = MarkdownBlocks.parse(md)
+        return sectionTitle.map { Self.sectionBlocks(in: parsed, title: $0) } ?? parsed
     }
 
     @ViewBuilder

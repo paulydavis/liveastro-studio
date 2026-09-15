@@ -18,6 +18,7 @@ struct CalibrationSection: View {
             // --- Darks / Bias library ---
             HStack {
                 Text("Darks / Bias library").font(.caption.weight(.semibold))
+                SettingHelpButton(sectionTitle: "Calibration")
                 if model.calibrationBusy { ProgressView().controlSize(.small).padding(.leading, 2) }
                 Spacer()
                 Button("Add darks…") { addFolder(.dark) }.disabled(model.calibrationBusy)
@@ -56,10 +57,13 @@ struct CalibrationSection: View {
                       help: "A folder of raw flats shot for this session — ideally before the lights. Built into a master flat at Start.")
             folderRow("Dark-flats (optional)", folder: $model.sessionDarkFlatsFolder,
                       help: "Optional raw dark-flats — subtracted from the flats when the master flat is built.")
-            Toggle("Also use dark-flat as the light offset", isOn: $model.useDarkFlatAsLightOffset)
+            HStack {
+                Toggle("Also use dark-flat as the light offset", isOn: $model.useDarkFlatAsLightOffset)
                 .font(.caption)
                 .disabled(model.isRunning || model.hasPendingSessionStart || model.importer.isImporting)
                 .help("Live sessions only. Subtracts the selected dark-flat master from lights before flat division, only when no usable light dark is active. Off by default; not saved between app launches.")
+                SettingHelpButton(sectionTitle: "Using dark-flats as a light offset")
+            }
             if model.useDarkFlatAsLightOffset {
                 Text("This is not a matched light dark. Requires usable flats and dark-flats; a light dark takes precedence to prevent double subtraction. Applies at the next live Start, not offline Import.")
                     .font(.caption2).foregroundStyle(.orange)
