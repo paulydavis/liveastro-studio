@@ -36,6 +36,54 @@ Live sessions are session-scoped. Files already sitting in a folder before the s
 
 ---
 
+## Capture settings
+
+Click the ⓘ beside a setting for its explanation. **Read more in Help** opens the manual in the same popover; **Back to setting** returns to the topic. **Done** or Escape closes it without changing any setting.
+
+### Neutralize background (OSC white balance)
+
+Balances the red, green and blue background levels after stacking to reduce a broad color cast in the displayed image. OSC means a one-shot-color camera. This is not flat calibration and does not remove dust shadows. Choose it before starting; compare the color balance on your own data.
+
+### Reject outliers (σ-clip)
+
+Limits unusually different pixel values as subs are combined, reducing the influence of satellite trails, aircraft trails and isolated bright pixels. It is on by default. It does not guarantee that every trail disappears, particularly with few subs.
+
+**Strength** controls the tolerance: Low is more aggressive; High tolerates more variation and rejects less. Medium is the default. This online rejection is separate from the background clean-master pass described under **Live trail rejection**.
+
+### Weight frames by quality
+
+Gives sharper, lower-noise subs more influence using star-count and background-noise measurements. Turn it off for equal weighting. Weighting changes the contribution of a frame; it is not the same as rejecting the frame entirely.
+
+### Match sky background
+
+Matches each sub's broad background to the reference before stacking. This helps when sky brightness or its gradient changes during a session. It affects the stack, unlike display-only background extraction. Turn it off when you want to combine frames without this background adjustment.
+
+### Match transparency
+
+Uses matched stars to scale each sub's brightness toward the reference, compensating for changes such as thin haze. Requires **Match sky background**, because the scaling is applied about that matched background. It cannot recover detail obscured by cloud; turn it off for unscaled contributions.
+
+### Keep relay sessions
+
+Live relay sessions stage copies of incoming subs under `~/LiveAstro/relay`. When a new relay session starts, old relay sessions beyond the selected age are eligible for deletion. These are local copies, not the originals on the rig. **Off** disables this pruning; keep an eye on disk space if you retain everything.
+
+### Debayer
+
+Converts a color camera's raw mosaic into a color image. **Malvar (high quality)** is the recommended method; **Bilinear** is the older, simpler option. Choose this before stacking. It is not a saturation control or a substitute for correct camera mosaic information.
+
+### Live trail rejection (broadcast master)
+
+Runs a background whole-frame outlier pass to produce a cleaner broadcast master and final `master.fit`. It is separate from online per-pixel σ-clipping. It requires an eligible local native live source and enough subs; the status beneath the switch tells you whether a clean master is available.
+
+You can toggle it during a session. Do not assume the switch being on means a clean master has already been published—check the status.
+
+### Idle safeguard — save master if capture stalls
+
+For native stacking, writes a master snapshot after the selected period without incoming capture progress. It keeps the session running, so capture can resume after a cloud gap. This is a save safeguard, not End Session. External stackers manage their own masters.
+
+### Auto-stop at a set time
+
+Schedules a full End Session: finalizes the master and replay and ends a broadcast owned by LiveAstro. It does not quit the app. Check the displayed stop time before leaving the rig unattended; this is different from the idle safeguard, which keeps stacking.
+
 ## Try Without a Telescope
 
 Click **Try Demo** in the Start Workflow section. LiveAstro creates a local demo input folder, starts a sample stack stream, and watches it like an external stacker output.
@@ -126,6 +174,41 @@ Display controls are non-destructive. They change the live view and broadcast wi
 
 If your target fills most of the frame, use background extraction gently so it does not over-flatten the display.
 
+The lower **Your edit** pane previews pending changes. Click **Apply** to commit them or **Revert** to return to the committed settings. Proxy previews are approximate: the delivered broadcast can look different. **Currently live** shows the delivered broadcast; **Updating…** means a committed change has not reached that pane yet.
+
+### Black point
+
+Darkens the sky background. **0** leaves the automatic stretch's shadow cut unchanged. Higher values cut more shadow detail; much of the useful range is below **0.4**. Increase gently—an attractive black sky can also hide faint nebulosity. Click the slider and use arrow keys for fine steps, then Apply.
+
+### Stretch strength
+
+Adjusts how strongly faint detail is brought into view; **0** uses the automatic setting. Judge it alongside black point rather than trying to fix both with one slider. This changes the displayed image, not the linear `master.fit`. Preview the result, then Apply.
+
+### Saturation
+
+Controls color intensity. **1** leaves saturation unchanged; **0** removes color, and values above **1** strengthen it. Strong saturation can exaggerate color noise. This is a display adjustment—preview it, then Apply.
+
+### Flatten background (DBE)
+
+Reduces broad gradients such as light pollution or moonlight in the displayed image. The recommended live preset enables it; your saved settings may differ. It does not replace flats or repair dust calibration.
+
+- **Scale** is the smoothing scale as a percentage of image size. Lower values follow more local gradients; higher values target broader gradients.
+- **Smoothest** adds blur to the background model. Increase it to soften blotchiness, or reduce it to follow less-smooth gradients.
+
+Use gently when nebulosity fills the frame: real extended signal can be mistaken for background. Preview, then Apply. Processing can take time, and the proxy preview is not an exact broadcast match.
+
+### Denoise
+
+Smooths background grain and color mottle in the displayed stack. **0** is off. Increase cautiously because smoothing can also soften fine detail. Preview, then Apply; the linear `master.fit` is unchanged. This is separate from optional end-of-stack post-processing.
+
+### North up
+
+Rotates the display so celestial north is up. It requires a star catalog and a successful plate solve; the control is unavailable until a solve is available. The rotated display is cropped to valid image coverage, so its framing can change. The saved linear master stays in its native orientation. Preview, then Apply.
+
+### Red screen
+
+Tints the whole Mac display red to help preserve dark adaptation—not just the LiveAstro window. It takes effect immediately, without Apply, and clears when you quit. Lower brightness means a dimmer, deeper red. Screenshots remain normal because macOS captures them before the display tint.
+
 ---
 
 ## Calibration
@@ -141,6 +224,40 @@ You can use existing master calibration files or build masters from folders of c
 Darks are helpful for many cameras and conditions, but they are not required for every stack. For modern cooled cameras with dithered subs and Winsorized sigma clipping, compare your own data with and without darks if the result looks cleaner one way. LiveAstro does not perform dithering; Seestar, ASIAIR, NINA/PHD2, or another capture tool must do that upstream.
 
 Bias or dark-flat frames mostly matter when you use flats. With many CMOS astro cameras, matched dark-flats are often preferred over very short bias frames. If you are stacking lights only and skipping flats, bias/dark-flat usually does little by itself.
+
+### Using dark-flats as a light offset
+
+**Short answer:** leave **Also use dark-flat as the light offset** off unless you deliberately want this calibration workflow. It is an optional approximation, not a general dust-removal switch.
+
+**What are the different frames?**
+
+- **Lights** are your pictures of the sky.
+- **Flats** measure dust shadows and uneven illumination, so the app can correct those patterns in your lights.
+- **Dark-flats** are covered exposures taken with the same exposure and camera settings as the flats. Normally, LiveAstro subtracts them from the flats only.
+- **Light darks** are covered exposures matched to the lights. They account for the camera's offset and dark signal during those longer exposures.
+
+**What does the checkbox change?**
+
+The camera adds a background level, called an **offset**, even with no light entering it. If that level remains in the lights when the flat is applied, the correction can turn dark dust shadows into bright patches.
+
+With this option enabled, LiveAstro also subtracts the selected dark-flat master from the lights, **before** applying the flat. This treats the dark-flat as an approximation of the lights' offset. It does not make a short dark-flat equivalent to a longer light dark.
+
+**Example:** you have 300-second lights, 15-second flats and 15-second dark-flats. The dark-flats match your flats, not your 300-second lights. This option reuses them for light-offset subtraction only if you choose to do so. It may reduce bright overcorrection, but cannot promise complete dust removal or correction of all dark signal.
+
+**Which settings should I use?**
+
+1. Choose your session flats and dark-flats folders under **Setup → Capture → Calibration**.
+2. Leave the checkbox off to use dark-flats only on the flats—the existing behavior.
+3. Turn it on only when you intend to reuse the dark-flat for the lights too. Compare the result on copies of your data; bright circles alone do not prove this is the right correction.
+4. Check the calibration status and log after Start. They say whether the light offset was actually applied or why it was not.
+
+**Safeguards and limits**
+
+- A usable light dark always wins. LiveAstro does **not** subtract both the light dark and the extra dark-flat offset.
+- Usable session flats and dark-flats are required. A missing, unreadable or incompatible selection is reported rather than silently replaced by another offset.
+- This setting applies at **live Start**, including when the folder is initially empty. It cannot change calibration in an active session.
+- It resets to **off when you quit and reopen the app**.
+- It does **not** apply to **Stack Previous Shoot / offline Import**, which uses a separate calibration path.
 
 ---
 

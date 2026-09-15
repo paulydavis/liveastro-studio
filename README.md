@@ -62,6 +62,14 @@ The broadcast window refreshes when a clean master publishes or becomes invalid,
 between subs. `latest.png` updates when a snapshot is saved; it is not the source of the
 Window Capture workflow above.
 
+Committed display images are processed at a maximum long edge of 2560 pixels in native
+live, offline import, and external-stacker modes, including Apply and final display
+refreshes. This reduces display-render cost but can change fine texture compared with
+processing at full resolution: DBE, stretch statistics, and denoise operate on the reduced
+image. Snapshots, `latest.png`, and replay inherit that appearance. The native accumulator,
+archival `master.fit`, and linear statistics retain their full-resolution data; clean-master
+selection is unchanged. Images smaller than the cap are not enlarged.
+
 ## OBS Automation
 
 LiveAstro can control OBS through the OBS WebSocket server.
@@ -125,6 +133,18 @@ the camera readout offset from the flat before the flat is applied. With many
 CMOS astro cameras, matched dark-flats are often preferred over very short bias
 frames. If you are stacking lights only and skipping flats, bias/dark-flat
 frames usually do little on their own.
+
+The live-session Calibration panel also offers **Also use dark-flat as the light
+offset**, off by default and not saved between app launches. This explicitly
+subtracts the selected dark-flat master from the lights before flat division,
+as an offset approximation—not a matched-exposure light dark. Use it only when
+appropriate for your calibration workflow; a shorter dark-flat does not model
+all dark signal in a longer light exposure. It requires usable session flats
+and dark-flats. Any usable library or explicitly selected light dark takes
+precedence, so the offset is never subtracted twice. The log and calibration
+status distinguish this fallback from dark calibration and report when it cannot
+be applied. This option is captured at live Start (including an empty-folder
+start); it does not change an active session or the separate offline Import path.
 
 ## Try It Without a Telescope
 

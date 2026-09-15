@@ -8,8 +8,9 @@ public enum SnapshotError: Error { case encodeFailed }
 public final class SnapshotRecorder {
     private let sessionDirectory: URL
 
-    /// Snapshots (`%04d.png` + `latest.png`) only feed the 1920×1080 replay and the on-screen
-    /// preview, so they're capped at 2560 px on the long edge (2× the replay, crisp on 4K/5K).
+    /// Shared committed-display limit: native live, import and external-stacker display sources
+    /// are capped BEFORE DBE/stretch/denoise. The saver also enforces this limit defensively.
+    /// Snapshots (`%04d.png` + `latest.png`) feed the replay; no archival pixels are resized.
     /// This turns a ~7 s full-res 26 MP PNG encode per frame into ~0.5 s — the import bottleneck.
     /// master.fit and the manifest stats (from `linear`) stay full resolution.
     static let maxSnapshotLongEdge = 2560
