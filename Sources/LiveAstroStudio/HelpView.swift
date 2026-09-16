@@ -233,6 +233,9 @@ struct HelpView: View {
             Text(inline(text))
                 .font(headingFont(level))
                 .padding(.top, level <= 2 ? 8 : 4)
+            if let illustration = HelpIllustration.forTopic(text) {
+                HelpIllustrationView(illustration: illustration)
+            }
 
         case let .paragraph(text):
             Text(inline(text))
