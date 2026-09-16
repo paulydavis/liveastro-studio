@@ -38,6 +38,42 @@ struct SettingHelpButton: View {
 
 struct HelpView: View {
     var sectionTitle: String? = nil
+    @State private var query = ""
+    @State private var selectedTopic: String?
+    @State private var selectedGroup: HelpGroup?
+    @State private var lastTopicID: Int?
+    @State private var overviewRequest = 0
+
+    private static let markdown = Bundle.module.url(forResource: "Help", withExtension: "md")
+        .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+    private static let catalog = HelpCatalog(markdown: markdown ?? "")
+
+    private enum HelpGroup: String, CaseIterable, Identifiable {
+        case start = "Get started", settings = "Understand a setting", problems = "Fix a problem"
+        var id: String { rawValue }
+        var symbol: String {
+            switch self {
+            case .start: return "sparkles"
+            case .settings: return "slider.horizontal.3"
+            case .problems: return "stethoscope"
+            }
+        }
+        var summary: String {
+            switch self {
+            case .start: return "Connect your source, prepare calibration and start a session."
+            case .settings: return "What each control does, when to use it and what to check."
+            case .problems: return "No images, rejected subs, dust shadows or a delayed broadcast."
+            }
+        }
+        func includes(_ topic: HelpCatalog.Topic) -> Bool {
+            let section = topic.parent ?? topic.title
+            switch self {
+            case .start: return ["Quick Start", "Source Modes", "Try Without a Telescope", "OBS and Go Live", "Scene Automation", "Broadcast setups", "Session Outputs"].contains(section)
+            case .settings: return ["Capture settings", "Display Adjustments", "Calibration", "Reseed Reference"].contains(section)
+            case .problems: return section == "Troubleshooting"
+            }
+        }
+    }
 
     /// Share a single bundled explanation between the manual and contextual help.
     static func sectionBlocks(in blocks: [MarkdownBlock], title: String) -> [MarkdownBlock] {
@@ -54,15 +90,127 @@ struct HelpView: View {
         return Array(blocks[start..<end])
     }
     var body: some View {
+        Group {
+            if sectionTitle != nil {
+                article
+            } else {
+                browser
+            }
+        }
+    }
+
+    private var browser: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                if selectedTopic != nil {
+                    Button { selectedTopic = nil } label: { Label("Back", systemImage: "chevron.left") }
+                }
+                Text("Help").font(.title2.weight(.medium))
+                Spacer()
+                Button("All topics") {
+                    selectedTopic = nil; selectedGroup = nil; query = ""; lastTopicID = nil
+                    overviewRequest += 1
+                }
+            }.padding(20)
+            if let selectedTopic {
+                HelpView(sectionTitle: selectedTopic).id(selectedTopic)
+            } else {
+                HStack {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("Search settings, calibration or a problem", text: $query)
+                        .textFieldStyle(.plain)
+                        .accessibilityLabel("Search Help")
+                    if !query.isEmpty {
+                        Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                            .buttonStyle(.plain).accessibilityLabel("Clear search")
+                    }
+                }
+                .padding(12).background(SetupStyle.panel, in: RoundedRectangle(cornerRadius: 8))
+                .padding(.horizontal, 20).padding(.bottom, 12)
+                ScrollViewReader { scroll in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Color.clear.frame(height: 0).id("help-top")
+                        if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            ForEach(HelpGroup.allCases) { group in
+                                Button { selectedGroup = selectedGroup == group ? nil : group; lastTopicID = nil } label: {
+                                    HStack(alignment: .top, spacing: 12) {
+                                        Image(systemName: group.symbol).frame(width: 24).foregroundStyle(SetupStyle.accent)
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text(group.rawValue).font(.headline)
+                                            Text(group.summary).font(.callout).foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        Image(systemName: selectedGroup == group ? "chevron.down" : "chevron.right")
+                                    }.padding(14).background(SetupStyle.panel, in: RoundedRectangle(cornerRadius: 8))
+                                }.buttonStyle(.plain)
+                            }
+                        }
+                        Text(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                             ? selectedGroup?.rawValue ?? "All topics" : "Search results")
+                            .font(.headline).padding(.top, 8)
+                        let results = Self.catalog.search(query).filter {
+                            !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || selectedGroup?.includes($0) != false
+                        }
+                        if results.isEmpty {
+                            Text(Self.markdown == nil ? "Help unavailable. The bundled manual could not be loaded."
+                                 : "No matching topics. Try a shorter phrase such as ‘flats’, ‘rejected’ or ‘OBS’.")
+                                .foregroundStyle(.secondary)
+                        }
+                        ForEach(results) { topic in
+                            Button { lastTopicID = topic.id; selectedTopic = topic.title } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(topic.title).foregroundStyle(.primary)
+                                        if let parent = topic.parent { Text(parent).font(.caption).foregroundStyle(.secondary) }
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(SetupStyle.accent)
+                                }.contentShape(Rectangle()).padding(.vertical, 4)
+                            }.buttonStyle(.plain).id(topic.id)
+                            Divider()
+                        }
+                    }
+                    .padding(20)
+                    .frame(maxWidth: 820, alignment: .leading)
+                    .frame(maxWidth: .infinity)
+                    .background(AlwaysVisibleScroller())
+                }
+                .onAppear {
+                    if let lastTopicID { scroll.scrollTo(lastTopicID, anchor: .center) }
+                }
+                .onChange(of: query) { _, _ in
+                    lastTopicID = nil
+                    scroll.scrollTo("help-top", anchor: .top)
+                }
+                .onChange(of: overviewRequest) { _, _ in scroll.scrollTo("help-top", anchor: .top) }
+                }
+            }
+        }
+        .background(SetupStyle.background)
+        .environment(\.colorScheme, .dark)
+        .tint(SetupStyle.accent)
+    }
+
+    private var article: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
-                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                    view(for: block)
+                ForEach(HelpCatalog.articleParts(blocks)) { part in
+                    if let title = part.detailTitle {
+                        DisclosureGroup(title) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                ForEach(Array(part.blocks.enumerated()), id: \.offset) { _, block in view(for: block) }
+                            }.padding(.top, 8)
+                        }
+                    } else {
+                        ForEach(Array(part.blocks.enumerated()), id: \.offset) { _, block in view(for: block) }
+                    }
                 }
             }
             .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: 740, alignment: .leading)
             .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
             // Same permanent, space-reserving scroller as the Setup panels — walks up to the
             // enclosing NSScrollView and pins a legacy always-visible vertical scroller (and
             // sets hasVerticalScroller, so the page reliably scrolls all the way to the bottom).
@@ -72,8 +220,7 @@ struct HelpView: View {
     }
 
     var blocks: [MarkdownBlock] {
-        guard let url = Bundle.module.url(forResource: "Help", withExtension: "md"),
-              let md = try? String(contentsOf: url, encoding: .utf8)
+        guard let md = Self.markdown
         else { return [.paragraph("Help unavailable.")] }
         let parsed = MarkdownBlocks.parse(md)
         return sectionTitle.map { Self.sectionBlocks(in: parsed, title: $0) } ?? parsed
