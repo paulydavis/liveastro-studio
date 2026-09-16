@@ -148,38 +148,89 @@ extension GlobalCombine {
         // `let`, not `var`: AnyIterator.next() is non-mutating (it calls a boxed closure), so the
         // binding is never mutated and `var` drew a release-configuration warning.
         let it = frames()
-        while let f = it.next() {
-            guard f.image.width == w, f.image.height == h, f.image.channels == c,
-                  f.mask.count == plane, f.image.pixels.count == n else { return nil }
-            any = true
-            for p in 0..<plane where f.mask[p] > 0 { coverage[p] += 1 }   // spatial depth per pixel
-            for idx in 0..<n where f.mask[idx % plane] > 0 {
-                let v = f.image.pixels[idx]
-                // Sample-UNCOVERED pixel: no robust center/scale exists here (robustCenter left
-                // center=0/scale=0 for it) — clipping against that phantom center would reject
-                // every real value and fall back to black. Take the true weighted mean instead.
-                if !sampleCovered[idx % plane] {
-                    sumW[idx]  += f.weight
-                    sumWV[idx] += f.weight * v
-                    continue
+        // Preserve frame order and streaming ownership: next() runs only on the caller,
+        // after the previous frame's synchronous bands have joined and its borrows ended.
+        // Each band owns disjoint spatial pixels in ALL channels. No parallel reduction
+        // changes Float addition order and no extra full-frame intermediate is retained.
+        // Paired negative dimensions retain the former flattened traversal.
+        let rowCount = max(h, 1), rowWidth = h > 0 ? w : plane
+        let valid = center.pixels.withUnsafeBufferPointer { centers in
+            scale.withUnsafeBufferPointer { scales in
+                sampleCovered.withUnsafeBufferPointer { sampled in
+                    sumW.withUnsafeMutableBufferPointer { weights in
+                        sumWV.withUnsafeMutableBufferPointer { weighted in
+                            coverage.withUnsafeMutableBufferPointer { depth in
+                                while let f = it.next() {
+                                    // Pixel count is also enforced by AstroImage's initializer;
+                                    // retain the defensive check at this buffer boundary.
+                                    guard f.image.width == w, f.image.height == h, f.image.channels == c,
+                                          f.mask.count == plane, f.image.pixels.count == n else { return false }
+                                    any = true
+                                    // Zero-width images may have arbitrarily large heights. There
+                                    // is no work to schedule (and band arithmetic could overflow).
+                                    guard plane > 0 else { continue }
+                                    let weight = f.weight
+                                    f.image.pixels.withUnsafeBufferPointer { pixels in
+                                        f.mask.withUnsafeBufferPointer { mask in
+                                            Parallel.rows(rowCount) { rows in
+                                                let band = (rows.lowerBound * rowWidth)..<(rows.upperBound * rowWidth)
+                                                for p in band where mask[p] > 0 { depth[p] += 1 }
+                                                for channel in 0..<c {
+                                                    let base = channel * plane
+                                                    for p in band where mask[p] > 0 {
+                                                        let idx = base + p
+                                                        let v = pixels[idx]
+                                                        // No sample center exists here: use the true
+                                                        // weighted mean, not clipping against zero.
+                                                        if !sampled[p] {
+                                                            weights[idx] += weight
+                                                            weighted[idx] += weight * v
+                                                            continue
+                                                        }
+                                                        // A zero-MAD core must still reject outliers.
+                                                        let sigma = max(scales[idx], scaleFloor)
+                                                        if abs(v - centers[idx]) > kappa * sigma { continue }
+                                                        weights[idx] += weight
+                                                        weighted[idx] += weight * v
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                return true
+                            }
+                        }
+                    }
                 }
-                // REAL floor as the clip denominator: a zero-MAD core (e.g. [1,1,1,1,9]) must still
-                // reject the 9. `if scale>floor` (the earlier form) wrongly ACCEPTED everything at MAD=0.
-                let sigma = max(scale[idx], scaleFloor)
-                if abs(v - center.pixels[idx]) > kappa * sigma { continue }   // reject outlier
-                sumW[idx]  += f.weight
-                sumWV[idx] += f.weight * v
             }
         }
-        guard any else { return nil }
+        guard valid, any else { return nil }
         var out = [Float](repeating: 0, count: n)
-        for idx in 0..<n {
-            if sumW[idx] > 0 { out[idx] = sumWV[idx] / sumW[idx] }
-            // Sample-covered but every full-set frame was clipped → the robust center is real and
-            // meaningful for this pixel; fall back to it (no black speckle). A sample-UNCOVERED
-            // pixel never reaches this branch with sumW==0 unless it truly had zero coverage
-            // (`any` frame at all) — its real values are always accumulated above, never clipped.
-            else if coverage[idx % plane] > 0 { out[idx] = center.pixels[idx] }
+        if plane > 0 {
+            out.withUnsafeMutableBufferPointer { output in
+                sumW.withUnsafeBufferPointer { weights in
+                    sumWV.withUnsafeBufferPointer { weighted in
+                        coverage.withUnsafeBufferPointer { depth in
+                            center.pixels.withUnsafeBufferPointer { centers in
+                                Parallel.rows(rowCount) { rows in
+                                    let band = (rows.lowerBound * rowWidth)..<(rows.upperBound * rowWidth)
+                                    for channel in 0..<c {
+                                        let base = channel * plane
+                                        for p in band {
+                                            let idx = base + p
+                                            if weights[idx] > 0 { output[idx] = weighted[idx] / weights[idx] }
+                                            // Covered but all clipped: preserve the robust center
+                                            // fallback rather than introduce black speckles.
+                                            else if depth[p] > 0 { output[idx] = centers[idx] }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         return (AstroImage(width: w, height: h, channels: c, pixels: out, sourceIsLinear: center.sourceIsLinear), coverage)
     }
