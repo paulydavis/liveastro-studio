@@ -8,17 +8,16 @@ It does not control your camera or mount. Use Seestar, ASIAIR, NINA, Siril, or a
 
 ## Quick Start
 
-1. Start your capture or live-stacking workflow.
-2. Choose a source in LiveAstro:
-   - **Start Seestar** for a mounted Seestar share
-   - **Start ASIAIR** for a mounted ASIAIR share
-   - **Choose Folder…** for NINA or any incoming raw-sub folder
-   - **Stacker output folder** for Siril or another external stacker
-   - **Stack Previous Shoot…** for an existing folder of captured subs
-3. Fill in the session profile fields you want saved with the session.
-4. Start the session.
-5. Click **Detach** to open the broadcast window for OBS.
-6. End the session when finished. LiveAstro writes the replay and session record under `~/Documents/LiveAstro/`.
+LiveAstro reads files from your capture app; it does not take exposures or point the telescope.
+
+1. Mount the rig's network share in Finder, or locate the folder your capture app writes to.
+2. Open **Setup → Capture**. Under **Where images come from**, select **Raw subs (native stacking)** and choose the lights folder. Check the filename prefix: empty accepts any supported FITS name. For automatic Seestar/ASIAIR discovery or offline stacking, expand **Other ways to start**.
+3. If using calibration, open **Calibration → Configure calibration** before starting. Selected folders and library counts are not proof that calibration will match; check the status and log after Start.
+4. Open **Session details** to set your target and equipment. FITS headers can supply session metadata; the typed exposure is a fallback when a sub has no usable exposure header.
+5. Click **Start Session**. If matching subs already exist, choose **Stack existing + new**, **New arrivals only**, or **Cancel**. Preparing a content baseline can take time on a large folder.
+6. Start or resume capture on your rig. Watch accepted/rejected counts and the log. A rejected sub arrived but could not join the stack.
+7. To stream, open the Live view and **Detach** the broadcast window, then configure OBS. **Start Session** does not start a broadcast.
+8. Click **End Session** and let finalization finish before quitting. Find results through **Session outputs**; additional files and support actions are under **More outputs**.
 
 ---
 
@@ -26,13 +25,13 @@ It does not control your camera or mount. Use Seestar, ASIAIR, NINA, Siril, or a
 
 | Mode | Use it when |
 |------|-------------|
-| **Start Seestar** | A Seestar SMB share is mounted and writing raw FITS subs. |
-| **Start ASIAIR** | An ASIAIR network share is mounted and writing light frames. |
-| **Choose Folder…** | NINA or another capture app writes incoming raw subs to a folder you choose. |
-| **Stacker output folder** | Siril or another stacker writes `live_stack.fit` or image revisions. |
-| **Stack Previous Shoot…** | You already have a folder of subs and want a stack/replay afterward. |
+| **Live from Seestar** | A Seestar SMB share is mounted and writing raw FITS subs. |
+| **Live from ASIAIR** | An ASIAIR network share is mounted and writing light frames. |
+| **Live from Folder / NINA** | NINA or another capture app writes incoming raw subs to a folder you choose. |
+| **Watch Siril / External Stacker** | Siril or another stacker writes `live_stack.fit` or image revisions. |
+| **Stack Previous Shoot** | You already have a folder of subs and want a stack/replay afterward. |
 
-Live sessions are session-scoped. Files already sitting in a folder before the source is armed are not replayed as new live frames.
+These shortcuts live under **Setup → Capture → Other ways to start**. For a native start onto existing matching files, the confirmation determines whether they are included. **New arrivals only** excludes the captured baseline; files arriving during the question remain eligible. Do not assume every existing file is ignored automatically. External stacker output is a different mode and does not use this raw-sub choice.
 
 ---
 
@@ -86,7 +85,7 @@ Schedules a full End Session: finalizes the master and replay and ends a broadca
 
 ## Try Without a Telescope
 
-Click **Try Demo** in the Start Workflow section. LiveAstro creates a local demo input folder, starts a sample stack stream, and watches it like an external stacker output.
+Click **Try Demo** under **Setup → Capture → Other ways to start**. LiveAstro creates a local demo input folder, starts a sample stack stream, and watches it like an external stacker output.
 
 If you are running from the repository and want the Terminal fallback:
 
@@ -95,7 +94,7 @@ mkdir -p /tmp/liveastro-demo-stack
 swift run demo-stack /tmp/liveastro-demo-stack --interval 3 --count 30
 ```
 
-Then choose **Stacker output folder** in LiveAstro and select `/tmp/liveastro-demo-stack`.
+Then select **Stacker output (Siril)**, choose `/tmp/liveastro-demo-stack`, and start the session.
 
 This checks folder watching, display updates, the broadcast window, snapshots, and replay generation. It does not test camera acquisition, real calibration quality, real star registration from your optics, or network-share behavior.
 
@@ -215,19 +214,31 @@ Tints the whole Mac display red to help preserve dark adaptation—not just the 
 
 Calibration applies to native raw-sub stacking and import workflows.
 
-- **Dark** subtracts thermal signal.
-- **Flat** corrects dust and vignetting.
-- **Bias / dark-flat** removes camera readout offset, mainly so flats can be applied cleanly.
+The overview shows **selected folders** and **library inventory**, not a promise that calibration is active. Open **Configure calibration** to change them. After starting, read the calibration status and log to see what was actually used or why a selection was skipped.
 
-You can use existing master calibration files or build masters from folders of calibration frames. Leave a calibration row empty to skip it.
+### Flats
 
-Darks are helpful for many cameras and conditions, but they are not required for every stack. For modern cooled cameras with dithered subs and Winsorized sigma clipping, compare your own data with and without darks if the result looks cleaner one way. LiveAstro does not perform dithering; Seestar, ASIAIR, NINA/PHD2, or another capture tool must do that upstream.
+Correct dust shadows and uneven illumination. Choose the session's flats folder. Keep the optical setup matched to your lights: moving dust, rotating the camera or changing the optical train can make old flats unsuitable. Display background extraction is not a replacement for flats.
 
-Bias or dark-flat frames mostly matter when you use flats. With many CMOS astro cameras, matched dark-flats are often preferred over very short bias frames. If you are stacking lights only and skipping flats, bias/dark-flat usually does little by itself.
+### Dark-flats
+
+Covered exposures matched to your flats' exposure and camera settings. Choose their folder beside the flats. They normally calibrate the flats, not the lights. The optional **Also use dark-flat as the light offset** is a separate, limited workflow explained below—not a general dust-removal switch.
+
+### Darks
+
+Covered exposures used to correct the lights' camera offset and dark signal. Add them to the Darks / Bias library. Matching depends on the incoming frame metadata, not just the number of masters listed. Check the session log for the actual match. A shorter dark is not automatically equivalent to a longer light exposure.
+
+### Bias
+
+Very short covered exposures that measure the camera's readout offset. Add them with **Add bias…** in the library controls. A usable matching bias can calibrate flats when dark-flats are not supplied, and enables bias-aware dark scaling when an exact-exposure dark is unavailable and scaling is enabled. A library count does not mean a matching bias was applied.
+
+Bias and dark-flats are not interchangeable in every camera or exposure regime. Use calibration frames appropriate to your camera and inspect the result; do not subtract multiple offset corrections blindly.
 
 ### Using dark-flats as a light offset
 
 **Short answer:** leave **Also use dark-flat as the light offset** off unless you deliberately want this calibration workflow. It is an optional approximation, not a general dust-removal switch.
+
+**Key limits:** native live Start only, not offline Import; resets off when the app reopens. A usable light dark takes precedence, so this option does not add a second offset subtraction on top of it. Check the calibration log for what was actually applied.
 
 **What are the different frames?**
 
@@ -251,7 +262,7 @@ With this option enabled, LiveAstro also subtracts the selected dark-flat master
 3. Turn it on only when you intend to reuse the dark-flat for the lights too. Compare the result on copies of your data; bright circles alone do not prove this is the right correction.
 4. Check the calibration status and log after Start. They say whether the light offset was actually applied or why it was not.
 
-**Safeguards and limits**
+#### Technical detail: safeguards and limits
 
 - A usable light dark always wins. LiveAstro does **not** subtract both the light dark and the extra dark-flat offset.
 - Usable session flats and dark-flats are required. A missing, unreadable or incompatible selection is reported rather than silently replaced by another offset.
@@ -310,23 +321,50 @@ Useful buttons:
 
 ## Troubleshooting
 
-**No Seestar or ASIAIR share found**
-Mount the device's SMB share in Finder first, then try again.
+Start with the session status and log. Discovery, successful reading, acceptance into the stack and delivery to the broadcast are different stages.
 
-**Folder selected, but nothing stacks**
-Confirm new `.fit` or `.fits` files are appearing after the session starts.
+### No frames arriving
 
-**Refresh Sizes shows a large output footprint**
-That number is informational. LiveAstro will not delete anything when you click **Refresh Sizes**.
+1. Confirm the watch-folder path is the folder where new FITS files actually appear, not its parent or an older session folder.
+2. Check Source: raw exposures need **Raw subs (native stacking)**; a Siril stack output needs **Stacker output (Siril)**.
+3. Check **Filename prefix** against the real filenames. Empty removes the prefix restriction. A folder containing files can still have no matches.
+4. If you chose **New arrivals only**, baseline files are intentionally excluded. Take another exposure or restart and deliberately include existing subs.
+5. Allow a file to finish writing. Check the log for read or validation failures rather than assuming discovery means acceptance.
 
-**Seestar stacks do not start**
-Confirm the Seestar is writing raw FITS subs, not JPEG-only live-view images.
+### All subs rejected
 
-**Siril files are rejected**
-In Siril's command line, run `cd /path/to/watch/folder` before starting livestacking.
+Rejection means a sub was seen, not that the folder is empty. Read its rejection reason in the log. Check focus, cloud, trailing, framing and whether these are light frames with usable stars. Covered dark exposures are useful for checking file arrival, not sky-registration quality; the initial reference can behave differently from later subs.
 
-**OBS will not connect**
-Check that OBS is running, WebSocket Server is enabled, the port matches, and the password is current.
+Use **Reseed Reference** only when the reference is no longer appropriate. It resets the current stack; it is not a cure for cloud or unusable input.
 
-**Replay skips cloudy frames**
+### Dust remains or turns bright
+
+Check the calibration status and log first: were flats actually applied? Do the flats match this optical setup and dust pattern? Were they calibrated with appropriate dark-flats or bias? A selected folder alone proves none of these.
+
+Bright overcorrection can involve an offset mismatch, but bright circles alone do not establish the cause. Review **Using dark-flats as a light offset** before enabling that optional live-only approximation. Compare copies of the same data, and keep your originals.
+
+### Broadcast looks behind or different
+
+In Display, **Your edit** is an approximate pending preview; **Apply** commits it. **Currently live** is the delivered broadcast. **Updating…** means the committed change has not reached it yet. Processing may take time; check progress and logs rather than assuming the slider changed the stream immediately.
+
+The clean-master caption describes the delivered rejection result, not necessarily every sub accepted so far. Also confirm OBS captures the intended detached LiveAstro window. Display adjustments do not alter the linear master.
+
+### No Seestar or ASIAIR share found
+
+Mount the device's SMB share in Finder first, check you can see its FITS files, then retry the matching shortcut under **Other ways to start**. A relay's local watch folder can differ from the rig's original folder.
+
+### OBS will not connect
+
+Check that OBS is running, WebSocket Server is enabled, the port matches, and the password is current. If a start/stop cannot be confirmed, check OBS itself. Do not infer that the stream stopped from LiveAstro ending a session.
+
+### No master or replay found
+
+Let **End Session** finish, then use **Session outputs → Folder** and **More outputs → Open Summary**. Native stacking needs a current stack to write a master; external stackers own their own master. Read the log for finalization or replay errors. Your original captures are separate from these generated outputs.
+
+### Output folder is large
+
+**More outputs → Refresh Sizes** measures disk usage; it does not delete files. Relay retention applies to local relay copies, not originals on the rig. Review what a folder contains before removing it.
+
+### Replay skips cloudy frames
+
 The replay generator can drop frames whose background brightness is far outside the recent baseline, while still keeping the first and last frames.
