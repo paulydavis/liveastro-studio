@@ -1,0 +1,11 @@
+Sombrero Galaxy (M104), image opo0328a.
+Credit: NASA/ESA and The Hubble Heritage Team (STScI/AURA)
+Source: https://esahubble.org/images/opo0328a/
+Usage terms: https://esahubble.org/copyright/
+License: Creative Commons Attribution 4.0 International
+https://creativecommons.org/licenses/by/4.0/
+
+The bundled image is the user's downloaded opo0328a.jpg, unmodified.
+The Setup header crops and dims its presentation. It is fixed decorative artwork,
+not a live image and not selected according to the current session target.
+No endorsement by NASA, ESA, STScI or AURA is implied.
