@@ -63,6 +63,7 @@ struct ControlView: View {
         let inputRequestID = model.pendingSessionStart?.id
         @Bindable var model = model
         VStack(spacing: 0) {
+            SetupBrandHeader()
             TabView(selection: $model.setupSubTab) {
                 CaptureSettingsView(model: model)
                     .tabItem { Label("Capture", systemImage: "camera") }
@@ -87,6 +88,9 @@ struct ControlView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
         }
+        .background(SetupStyle.background)
+        .environment(\.colorScheme, .dark)
+        .tint(SetupStyle.accent)
         .alert("LiveAstro", isPresented: $model.isShowingError) {
             Button("OK") { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
@@ -171,22 +175,8 @@ struct ControlView: View {
                         .disabled(model.importer.isImporting || model.isRestacking)
                 }
                 Spacer()
-                Button {
-                    model.liveSource.startSeestarLive()
-                } label: { Label("Start Seestar", systemImage: "dot.radiowaves.left.and.right") }
-                .help("Auto-detect the mounted Seestar folder, start relaying its 10s subs, and begin native stacking — one tap.")
-                .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
-                Button {
-                    model.liveSource.startASIAIRLive()
-                } label: { Label("Start ASIAIR", systemImage: "camera.aperture") }
-                .help("Auto-detect the ASIAIR's Autorun/Light folder, relay its subs, and begin native stacking — one tap.")
-                .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
-                Button("Live from Folder / NINA…") { model.pickNativeWatchFolderLive() }
-                    .help("Live-stack subs from any folder your rig writes to, including NINA or another FITS capture app.")
-                    .disabled(model.isRunning || model.importer.isImporting || model.liveSource.isDetecting)
-                Button("Stack Previous Shoot…") { model.pickImportFolder() }
-                    .disabled(model.isRunning || model.importer.isImporting)
-                    .help("Select a folder of previously captured FITS light frames to stack offline, with progress tracking and Cancel support.")
+                Text(model.sessionStateText)
+                    .font(.caption).foregroundStyle(.secondary)
             }
             // Go Live / End Broadcast — decoupled from session start.
             HStack {
@@ -269,91 +259,9 @@ struct ControlView: View {
                 }.padding(.horizontal)
             }
             if !model.isRunning {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text("Session Outputs")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Text("Output footprint: \(outputFootprintText)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        Button("Refresh Sizes") { refreshOutputFootprint() }
-                            .help("Calculate the size of the LiveAstro output root and latest session folder.")
-                        Button("Open Sessions Folder") { openSessionsRoot() }
-                            .help("Open the root folder where LiveAstro writes session outputs.")
-                        Button("Regenerate Replay…") { pickSessionDirectory() }
-                            .disabled(model.importer.isGeneratingReplay)
-                    }
-
-                    if hasSessionOutputs {
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack(spacing: 8) {
-                                Button("Open Replay") { openReplay() }
-                                    .disabled(model.replayURL == nil)
-                                    .help("Open the latest replay video with the default macOS app.")
-
-                                Button("Reveal Replay") { revealReplay() }
-                                    .disabled(model.replayURL == nil)
-                                    .help("Show the latest replay video in Finder.")
-
-                                Button("Open Session Folder") { openSessionFolder() }
-                                    .disabled(model.lastSessionDirectory == nil)
-                                    .help("Open the folder containing this session's manifest, snapshots, replay, and native master when present.")
-
-                                if latestImageURL != nil {
-                                    Button("Open Latest Image") { openLatestImage() }
-                                        .help("Open the session's latest.png monitor image.")
-
-                                    Button("Reveal latest.png") { revealLatestImage() }
-                                        .help("Show the session's latest.png monitor image in Finder.")
-                                }
-
-                                if latestMasterURL != nil {
-                                    Button("Open master.fit") { openMaster() }
-                                        .help("Open master.fit in your default FITS app (e.g. Siril) for further processing.")
-                                    Button("Reveal master.fit") { revealMaster() }
-                                        .help("Show the native stacking master in Finder.")
-                                } else if model.lastSessionDirectory != nil {
-                                    Button("No master.fit") {}
-                                        .disabled(true)
-                                        .help("Native sessions write master.fit when a current stack exists. Siril/external stacker sessions may not create one.")
-                                }
-
-                                Spacer()
-                            }
-
-                            HStack(spacing: 8) {
-                                if sessionSummaryURL != nil {
-                                    Button("Open Summary") { openSessionSummary() }
-                                        .help("Open the session-summary.md human-readable session report.")
-                                }
-
-                                if frameSummaryURL != nil {
-                                    Button("Open Frame CSV") { openFrameSummary() }
-                                        .help("Open the frame-summary.csv per-snapshot table.")
-                                }
-
-                                if subFramesURL != nil {
-                                    Button("Open sub-frames.csv") { openSubFrames() }
-                                        .help("Open the per-sub quality + rejection table.")
-                                }
-
-                                Spacer()
-
-                                Button("Copy Support Bundle") { copySupportBundle() }
-                                    .help("Copy health, output paths, and recent log lines for sharing or debugging.")
-
-                                Button("Copy Summary") { copySessionSummary() }
-                                    .help("Copy target, output paths, and accepted/rejected frame counts.")
-                            }
-                        }
-                        .font(.caption)
-                    } else {
-                        Text("Finish a session or stack a previous shoot to see output shortcuts here.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                ViewThatFits(in: .horizontal) {
+                    HStack { outputShortcuts }
+                    VStack(alignment: .leading, spacing: 8) { outputShortcuts }
                 }
             }
             if model.processorBackend != .none, model.sourceMode == .nativeStack, let dir = model.lastSessionDirectory {
@@ -374,6 +282,48 @@ struct ControlView: View {
                 .foregroundStyle(.tertiary)
                 .frame(maxWidth: .infinity, alignment: .trailing)
         }
+    }
+
+    @ViewBuilder
+    private var outputShortcuts: some View {
+        Label("Session outputs", systemImage: "clock.arrow.circlepath")
+            .font(.caption).foregroundStyle(.secondary)
+        if hasSessionOutputs {
+            Button("Folder") { openSessionFolder() }
+                .disabled(model.lastSessionDirectory == nil)
+                .help("Open the latest session folder.")
+            Button("Master") { openMaster() }
+                .disabled(latestMasterURL == nil)
+                .help("Open master.fit in the default FITS app. External stacker sessions may not create one.")
+            Button("Replay") { openReplay() }
+                .disabled(model.replayURL == nil)
+                .help("Open the latest replay video.")
+        }
+        Menu("More outputs") {
+            Button("Open Sessions Folder") { openSessionsRoot() }
+            Button("Regenerate Replay…") { pickSessionDirectory() }
+                .disabled(model.importer.isGeneratingReplay)
+            Button("Refresh Sizes") { refreshOutputFootprint() }
+            Text("Output footprint: \(outputFootprintText)")
+            if hasSessionOutputs {
+                Divider()
+                Button("Reveal Replay") { revealReplay() }.disabled(model.replayURL == nil)
+                if latestImageURL != nil {
+                    Button("Open Latest Image") { openLatestImage() }
+                    Button("Reveal latest.png") { revealLatestImage() }
+                }
+                if latestMasterURL != nil {
+                    Button("Reveal master.fit") { revealMaster() }
+                }
+                Divider()
+                if sessionSummaryURL != nil { Button("Open Summary") { openSessionSummary() } }
+                if frameSummaryURL != nil { Button("Open Frame CSV") { openFrameSummary() } }
+                if subFramesURL != nil { Button("Open sub-frames.csv") { openSubFrames() } }
+                Button("Copy Support Bundle") { copySupportBundle() }
+                Button("Copy Summary") { copySessionSummary() }
+            }
+        }
+        .fixedSize()
     }
 
     private func pickSessionDirectory() {

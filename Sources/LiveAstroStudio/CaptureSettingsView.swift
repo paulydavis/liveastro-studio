@@ -4,6 +4,7 @@ import LiveAstroCore
 
 struct CaptureSettingsView: View {
     @Bindable var model: AppModel
+    @State private var calibrationExpanded = false
 
     private var liveWorkflowDisabled: Bool {
         model.isRunning || model.importer.isImporting || model.liveSource.isDetecting
@@ -14,197 +15,303 @@ struct CaptureSettingsView: View {
     }
 
     var body: some View {
-        ScrollView {
-            Form {
-                Section("Start Workflow") {
-                    WorkflowActionRow(
-                        title: "Live from Seestar",
-                        subtitle: "Auto-detect the mounted Seestar folder, relay new subs, and start native live stacking.",
-                        systemImage: "dot.radiowaves.left.and.right",
-                        disabled: liveWorkflowDisabled
-                    ) {
-                        model.liveSource.startSeestarLive()
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Session setup").font(.caption).foregroundStyle(.secondary)
+                        Text(SetupPresentation.targetTitle(model.targetName))
+                            .font(.largeTitle.weight(.regular))
+                            .textSelection(.enabled)
+                        Text(model.sessionStateText).font(.callout).foregroundStyle(.secondary)
                     }
+                    .padding(.vertical, 4)
 
-                    WorkflowActionRow(
-                        title: "Live from ASIAIR",
-                        subtitle: "Auto-detect the ASIAIR Autorun/Light folder and start native live stacking.",
-                        systemImage: "camera.aperture",
-                        disabled: liveWorkflowDisabled
-                    ) {
-                        model.liveSource.startASIAIRLive()
-                    }
-
-                    WorkflowActionRow(
-                        title: "Live from Folder / NINA",
-                        subtitle: "Watch any folder where NINA or another capture app writes new FITS light frames.",
-                        systemImage: "folder.badge.plus",
-                        disabled: liveWorkflowDisabled
-                    ) {
-                        model.pickNativeWatchFolderLive()
-                    }
-
-                    WorkflowActionRow(
-                        title: "Watch Siril / External Stacker",
-                        subtitle: "Watch a live_stack FITS output from Siril or another stacker instead of stacking raw subs.",
-                        systemImage: "rectangle.stack.badge.play",
-                        disabled: liveWorkflowDisabled
-                    ) {
-                        pickStackerOutputWatchFolder()
-                    }
-
-                    WorkflowActionRow(
-                        title: "Stack Previous Shoot",
-                        subtitle: "Choose a folder of existing FITS light frames and stack them offline.",
-                        systemImage: "tray.and.arrow.down",
-                        disabled: offlineWorkflowDisabled
-                    ) {
-                        model.pickImportFolder()
-                    }
-
-                    WorkflowActionRow(
-                        title: "Try Demo",
-                        subtitle: "Start a local sample stack stream so you can test the display, outputs, and replay without clear skies.",
-                        systemImage: "sparkles",
-                        disabled: liveWorkflowDisabled
-                    ) {
-                        model.startDemoSession()
-                    }
-                }
-                Section("Watch Folder") {
-                    Picker("Source", selection: $model.sourceMode) {
-                        ForEach(AppModel.SourceMode.allCases, id: \.self) { mode in
-                            Text(mode.rawValue).tag(mode)
+                    let layout = geometry.size.width >= 820 && !calibrationExpanded
+                        ? AnyLayout(HStackLayout(alignment: .top, spacing: 18))
+                        : AnyLayout(VStackLayout(alignment: .leading, spacing: 18))
+                    layout {
+                        SetupCard(title: "Where images come from", symbol: "folder") {
+                            sourceControls
+                        }
+                        if model.sourceMode == .nativeStack {
+                            SetupCard(title: "Calibration", symbol: "rectangle.on.rectangle") {
+                                calibrationOverview
+                            }
                         }
                     }
-                    .pickerStyle(.segmented)
-                    .disabled(model.isRunning || model.importer.isImporting)
-                    .help("Seestar Live displays Siril's live_stack.fit directly; Raw subs stacks individual exposures natively using LiveAstro's built-in stacker.")
 
-                    HStack {
-                        Text(model.watchFolder?.path ?? "none selected")
-                            .lineLimit(1).truncationMode(.middle)
-                        Spacer()
-                        Button("Choose…") { pickFolder() }
-                            .disabled(model.isRunning || model.importer.isImporting)
-                            .help("Choose the folder to watch for incoming FITS subs or the Seestar relay folder.")
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 12) { stackingControls }
+                            .padding(.top, 10)
+                    } label: {
+                        Label("Stacking options", systemImage: "square.3.layers.3d")
+                        Text("Alignment, weighting and trail rejection").font(.caption).foregroundStyle(.secondary)
                     }
-                    TextField("File prefix (empty = any; e.g. Light_ for native subs)",
-                              text: $model.fileNamePrefix)
-                        .disabled(model.isRunning || model.importer.isImporting)
-                        .help("Only process files whose name starts with this prefix; leave empty to accept all FITS files in the watch folder.")
-                    helpToggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground,
-                               enabled: !model.isRunning && !model.importer.isImporting)
-                    helpToggle("Reject outliers (σ-clip)", isOn: $model.rejectionEnabled,
-                               enabled: !model.isRunning && !model.importer.isImporting)
-                    helpToggle("Weight frames by quality", isOn: $model.frameWeightingEnabled,
-                               enabled: !model.isRunning && !model.importer.isImporting)
-                    helpToggle("Match sky background", isOn: $model.backgroundNormalizationEnabled,
-                               enabled: !model.isRunning && !model.importer.isImporting)
-                    helpToggle("Match transparency", isOn: $model.scaleNormalizationEnabled,
-                               enabled: !model.isRunning && !model.importer.isImporting)
-                    HStack(spacing: 6) {
-                        Text("Keep relay sessions")
-                        SettingHelpButton(sectionTitle: "Keep relay sessions")
-                        Spacer()
-                        Picker("", selection: $model.liveSource.relayRetentionDays) {
-                            Text("Off").tag(0)
-                            Text("3d").tag(3)
-                            Text("7d").tag(7)
-                            Text("14d").tag(14)
-                            Text("30d").tag(30)
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .frame(maxWidth: 300)
-                        .disabled(model.isRunning || model.importer.isImporting)
+                    Divider()
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 10) { sessionDetails }
+                            .padding(.top, 10)
+                    } label: {
+                        Label("Session details", systemImage: "note.text")
+                        Text("Target, equipment and exposure").font(.caption).foregroundStyle(.secondary)
                     }
-                    HStack(spacing: 6) {
-                        Text("Debayer")
-                        SettingHelpButton(sectionTitle: "Debayer")
-                        Spacer()
-                        Picker("", selection: $model.demosaic) {
-                            Text("Bilinear").tag(DemosaicMethod.bilinear)
-                            Text("Malvar (high quality)").tag(DemosaicMethod.malvar)
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .frame(maxWidth: 220)
-                        .disabled(model.isRunning || model.importer.isImporting)
-                    }
-                    if model.rejectionEnabled {
-                        Picker("Strength", selection: $model.rejectionStrength) {
-                            Text("Low").tag(RejectionStrength.low)
-                            Text("Medium").tag(RejectionStrength.medium)
-                            Text("High").tag(RejectionStrength.high)
-                        }
-                        .pickerStyle(.segmented)
-                        .disabled(model.isRunning || model.importer.isImporting)
-                        .help("Higher = safer (rejects less); lower = more aggressive. Medium (κ=3) is the validated default.")
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        helpToggle("Live trail rejection (broadcast master)", isOn: $model.liveTrailRejection)
-                        Text(model.liveRejectionStatusText)
+                    Divider()
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 10) { sessionEndControls }
+                            .padding(.top, 10)
+                    } label: {
+                        Label("Session end", systemImage: "clock")
+                        Text(model.plannedStopEnabled
+                             ? String(format: "Auto-stop %02d:%02d", model.plannedStopHour, model.plannedStopMinute)
+                             : "Idle safeguard and scheduled stop")
                             .font(.caption).foregroundStyle(.secondary)
                     }
-                    Picker("Post-process", selection: $model.processorBackend) {
-                        Text("None").tag(ProcessorBackend.none)
-                        Text("GraXpert").tag(ProcessorBackend.graxpert)
-                        Text("Native NR").tag(ProcessorBackend.nativeDenoise)
-                    }
-                    .pickerStyle(.segmented)
-                    .disabled(model.isRunning || model.importer.isImporting || model.importer.isProcessing)
-                    .help("After stacking, optionally post-process the master to a master_processed FITS: GraXpert (background extraction + denoise, requires install) or the built-in Native NR denoiser.")
                 }
-                if model.sourceMode == .nativeStack {
-                    Section("Calibration") {
-                        CalibrationSection(model: model)
-                    }
-                }
-                Section("Session Profile") {
-                    TextField("Target name", text: $model.targetName)
-                    TextField("Telescope", text: $model.telescope)
-                    TextField("Camera", text: $model.camera)
-                    TextField("Mount", text: $model.mount)
-                    TextField("Filter", text: $model.filter)
-                    TextField("Location", text: $model.locationLabel)
-                    TextField("Bortle (1–9)", text: $model.bortleText)
-                    TextField("Sub-exposure seconds", text: $model.subExposureText)
-                        .help("Individual sub-exposure length in seconds; recorded in the session manifest and used for dark-frame matching.")
-                    TextField("Notes", text: $model.notes)
-                }
-                Section("Session end") {
-                    helpToggle("Idle safeguard — save master if capture stalls",
-                               isOn: $model.idleSafeguardEnabled,
-                               enabled: model.sourceMode == .nativeStack)
-                    if model.sourceMode != .nativeStack {
-                        Text("Native stacking only — external stackers own their own master.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    if model.idleSafeguardEnabled {
-                        Stepper("After \(model.idleSafeguardMinutes) min idle",
-                                value: $model.idleSafeguardMinutes, in: 5...120, step: 5)
-                            .help("How long capture may stall before a master snapshot is written. Stacking continues; a resumed feed re-arms the safeguard.")
-                            .disabled(model.sourceMode != .nativeStack)
-                    }
-                    helpToggle("Auto-stop at a set time", isOn: $model.plannedStopEnabled)
-                    if model.plannedStopEnabled {
-                        DatePicker("Stop at", selection: Binding(
-                            get: { Calendar.current.date(bySettingHour: model.plannedStopHour,
-                                    minute: model.plannedStopMinute, second: 0, of: Date()) ?? Date() },
-                            set: { newDate in
-                                let c = Calendar.current.dateComponents([.hour, .minute], from: newDate)
-                                model.plannedStopHour = c.hour ?? 3
-                                model.plannedStopMinute = c.minute ?? 0
-                            }), displayedComponents: .hourAndMinute)
-                            .help("Runs a full End Session at this clock time (next occurrence, crosses midnight).")
-                    }
+                .padding(22)
+                .frame(maxWidth: 1100, alignment: .leading)
+                .frame(maxWidth: .infinity)
+                .background(AlwaysVisibleScroller())
+            }
+            .scrollIndicators(.visible)
+        }
+    }
+
+    private var sourceControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Choose where incoming images come from.").font(.caption).foregroundStyle(.secondary)
+            Picker("Source", selection: $model.sourceMode) {
+                ForEach(AppModel.SourceMode.allCases, id: \.self) { mode in
+                    Text(mode.rawValue).tag(mode)
                 }
             }
-            .formStyle(.grouped)
-            .background(AlwaysVisibleScroller())
+            .pickerStyle(.segmented)
+            .disabled(model.isRunning || model.importer.isImporting)
+            .help("Seestar Live displays Siril's live_stack.fit directly; Raw subs stacks individual exposures natively using LiveAstro's built-in stacker.")
+
+            HStack {
+                Text(model.watchFolder?.path ?? "none selected")
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer()
+                Button("Choose…") { pickFolder() }
+                    .disabled(model.isRunning || model.importer.isImporting)
+                    .help("Choose the folder to watch for incoming FITS subs or the Seestar relay folder.")
+            }
+            LabeledContent("Filename prefix") {
+                TextField("Empty = any FITS file",
+                      text: $model.fileNamePrefix)
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
+                .disabled(model.isRunning || model.importer.isImporting)
+                .help("Only process files whose name starts with this prefix; leave empty to accept all FITS files in the watch folder.")
+            }
+            DisclosureGroup("Other ways to start") {
+                VStack(alignment: .leading, spacing: 10) { workflowActions }
+                    .padding(.top, 10)
+            }
         }
-        .scrollIndicators(.visible)
+    }
+
+    private var calibrationOverview: some View {
+        let summary = SetupPresentation.calibration(flats: model.sessionFlatsFolder,
+            darkFlats: model.sessionDarkFlatsFolder, library: model.libraryEntries)
+        return VStack(alignment: .leading, spacing: 10) {
+            calibrationRow("Flats", value: summary.flats)
+            calibrationRow("Dark-flats", value: summary.darkFlats)
+            calibrationRow("Darks", value: summary.darks)
+            calibrationRow("Bias", value: summary.bias)
+            Text("Library masters are matched to incoming exposures at Start.")
+                .font(.caption).foregroundStyle(.secondary)
+            if !model.calibrationStatus.isEmpty {
+                Text(model.calibrationStatus).font(.caption).foregroundStyle(.secondary)
+            }
+            if model.calibrationBusy { ProgressView("Building calibration master…").controlSize(.small) }
+            DisclosureGroup("What do these do?") {
+                Text("Flats correct dust and uneven illumination. Dark-flats remove the offset from flats; a usable matching bias is the fallback. Darks correct camera signal in light exposures. Bias also enables dark scaling when an exact-exposure dark is unavailable.")
+                    .font(.caption).foregroundStyle(.secondary).padding(.top, 6)
+            }
+            DisclosureGroup("Configure calibration", isExpanded: $calibrationExpanded) {
+                CalibrationSection(model: model).padding(.top, 10)
+            }
+        }
+        .onAppear { model.refreshLibraryEntries() }
+    }
+
+    private func calibrationRow(_ title: String, value: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                .help(value)
+        }
+    }
+
+    @ViewBuilder private var workflowActions: some View {
+        WorkflowActionRow(
+            title: "Live from Seestar",
+            subtitle: "Auto-detect the mounted Seestar folder, relay new subs, and start native live stacking.",
+            systemImage: "dot.radiowaves.left.and.right",
+            disabled: liveWorkflowDisabled
+        ) {
+            model.liveSource.startSeestarLive()
+        }
+
+        WorkflowActionRow(
+            title: "Live from ASIAIR",
+            subtitle: "Auto-detect the ASIAIR Autorun/Light folder and start native live stacking.",
+            systemImage: "camera.aperture",
+            disabled: liveWorkflowDisabled
+        ) {
+            model.liveSource.startASIAIRLive()
+        }
+
+        WorkflowActionRow(
+            title: "Live from Folder / NINA",
+            subtitle: "Watch any folder where NINA or another capture app writes new FITS light frames.",
+            systemImage: "folder.badge.plus",
+            disabled: liveWorkflowDisabled
+        ) {
+            model.pickNativeWatchFolderLive()
+        }
+
+        WorkflowActionRow(
+            title: "Watch Siril / External Stacker",
+            subtitle: "Watch a live_stack FITS output from Siril or another stacker instead of stacking raw subs.",
+            systemImage: "rectangle.stack.badge.play",
+            disabled: liveWorkflowDisabled
+        ) {
+            pickStackerOutputWatchFolder()
+        }
+
+        WorkflowActionRow(
+            title: "Stack Previous Shoot",
+            subtitle: "Choose a folder of existing FITS light frames and stack them offline.",
+            systemImage: "tray.and.arrow.down",
+            disabled: offlineWorkflowDisabled
+        ) {
+            model.pickImportFolder()
+        }
+
+        WorkflowActionRow(
+            title: "Try Demo",
+            subtitle: "Start a local sample stack stream so you can test the display, outputs, and replay without clear skies.",
+            systemImage: "sparkles",
+            disabled: liveWorkflowDisabled
+        ) {
+            model.startDemoSession()
+        }
+    }
+
+    @ViewBuilder private var stackingControls: some View {
+        helpToggle("Neutralize background (OSC white balance)", isOn: $model.neutralizeBackground,
+                   enabled: !model.isRunning && !model.importer.isImporting)
+        helpToggle("Reject outliers (σ-clip)", isOn: $model.rejectionEnabled,
+                   enabled: !model.isRunning && !model.importer.isImporting)
+        helpToggle("Weight frames by quality", isOn: $model.frameWeightingEnabled,
+                   enabled: !model.isRunning && !model.importer.isImporting)
+        helpToggle("Match sky background", isOn: $model.backgroundNormalizationEnabled,
+                   enabled: !model.isRunning && !model.importer.isImporting)
+        helpToggle("Match transparency", isOn: $model.scaleNormalizationEnabled,
+                   enabled: !model.isRunning && !model.importer.isImporting)
+        HStack(spacing: 6) {
+            Text("Keep relay sessions")
+            SettingHelpButton(sectionTitle: "Keep relay sessions")
+            Spacer()
+            Picker("", selection: $model.liveSource.relayRetentionDays) {
+                Text("Off").tag(0)
+                Text("3d").tag(3)
+                Text("7d").tag(7)
+                Text("14d").tag(14)
+                Text("30d").tag(30)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 300)
+            .disabled(model.isRunning || model.importer.isImporting)
+        }
+        HStack(spacing: 6) {
+            Text("Debayer")
+            SettingHelpButton(sectionTitle: "Debayer")
+            Spacer()
+            Picker("", selection: $model.demosaic) {
+                Text("Bilinear").tag(DemosaicMethod.bilinear)
+                Text("Malvar (high quality)").tag(DemosaicMethod.malvar)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 220)
+            .disabled(model.isRunning || model.importer.isImporting)
+        }
+        if model.rejectionEnabled {
+            Picker("Strength", selection: $model.rejectionStrength) {
+                Text("Low").tag(RejectionStrength.low)
+                Text("Medium").tag(RejectionStrength.medium)
+                Text("High").tag(RejectionStrength.high)
+            }
+            .pickerStyle(.segmented)
+            .disabled(model.isRunning || model.importer.isImporting)
+            .help("Higher = safer (rejects less); lower = more aggressive. Medium (κ=3) is the validated default.")
+        }
+        VStack(alignment: .leading, spacing: 2) {
+            helpToggle("Live trail rejection (broadcast master)", isOn: $model.liveTrailRejection)
+            Text(model.liveRejectionStatusText)
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        Picker("Post-process", selection: $model.processorBackend) {
+            Text("None").tag(ProcessorBackend.none)
+            Text("GraXpert").tag(ProcessorBackend.graxpert)
+            Text("Native NR").tag(ProcessorBackend.nativeDenoise)
+        }
+        .pickerStyle(.segmented)
+        .disabled(model.isRunning || model.importer.isImporting || model.importer.isProcessing)
+        .help("After stacking, optionally post-process the master to a master_processed FITS: GraXpert (background extraction + denoise, requires install) or the built-in Native NR denoiser.")
+    }
+
+    @ViewBuilder private var sessionDetails: some View {
+        profileField("Target name", text: $model.targetName)
+        profileField("Telescope", text: $model.telescope)
+        profileField("Camera", text: $model.camera)
+        profileField("Mount", text: $model.mount)
+        profileField("Filter", text: $model.filter)
+        profileField("Location", text: $model.locationLabel)
+        profileField("Bortle (1–9)", text: $model.bortleText)
+        profileField("Sub-exposure seconds", text: $model.subExposureText)
+            .help("Individual sub-exposure length in seconds; recorded in the session manifest and used for dark-frame matching.")
+        profileField("Notes", text: $model.notes)
+    }
+
+    private func profileField(_ title: String, text: Binding<String>) -> some View {
+        LabeledContent(title) {
+            TextField(title, text: text).labelsHidden().textFieldStyle(.roundedBorder)
+        }
+    }
+
+    @ViewBuilder private var sessionEndControls: some View {
+        helpToggle("Idle safeguard — save master if capture stalls",
+                   isOn: $model.idleSafeguardEnabled,
+                   enabled: model.sourceMode == .nativeStack)
+        if model.sourceMode != .nativeStack {
+            Text("Native stacking only — external stackers own their own master.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        if model.idleSafeguardEnabled {
+            Stepper("After \(model.idleSafeguardMinutes) min idle",
+                    value: $model.idleSafeguardMinutes, in: 5...120, step: 5)
+                .help("How long capture may stall before a master snapshot is written. Stacking continues; a resumed feed re-arms the safeguard.")
+                .disabled(model.sourceMode != .nativeStack)
+        }
+        helpToggle("Auto-stop at a set time", isOn: $model.plannedStopEnabled)
+        if model.plannedStopEnabled {
+            DatePicker("Stop at", selection: Binding(
+                get: { Calendar.current.date(bySettingHour: model.plannedStopHour,
+                        minute: model.plannedStopMinute, second: 0, of: Date()) ?? Date() },
+                set: { newDate in
+                    let c = Calendar.current.dateComponents([.hour, .minute], from: newDate)
+                    model.plannedStopHour = c.hour ?? 3
+                    model.plannedStopMinute = c.minute ?? 0
+                }), displayedComponents: .hourAndMinute)
+                .help("Runs a full End Session at this clock time (next occurrence, crosses midnight).")
+        }
     }
 
     private func pickFolder() {
