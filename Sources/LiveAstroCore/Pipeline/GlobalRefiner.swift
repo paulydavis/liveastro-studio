@@ -52,7 +52,7 @@ struct ProductionFrameLoader: FrameLoader {
 public final class GlobalRefiner {
     /// Aborts the CURRENT `refine` pass (cancel or past-deadline) — always unwinds to `nil`
     /// (the online master is kept; never a partial publish).
-    private struct AbortPass: Error {}
+    private struct AbortPass: Error { let reason: CleanStackFailure }
 
     /// Cold-review fix (the M8 stall class, re-introduced): a heap-allocated, lock-guarded box
     /// carrying `boundedLoad`'s result from its concurrent worker back to the waiter. The
@@ -372,7 +372,10 @@ public final class GlobalRefiner {
     ///     dominates the observation bound.
     func refine(survivors: [SubRegistration], currentGeneration: Int, kappa: Float,
                        minSubs: Int, maxSampleBytes: Int, deadline: DispatchTime,
-                       isCancelled: @escaping () -> Bool) -> RefineResult? {
+                       isCancelled: @escaping () -> Bool,
+                       onFailure: (CleanStackFailure) -> Void = { _ in },
+                       progress: @escaping (String) -> Void = { _ in }) -> RefineResult? {
+        func fail(_ reason: CleanStackFailure) -> RefineResult? { onFailure(reason); return nil }
         let thisPassId: Int = passLock.withLock {
             currentPassId += 1
             return currentPassId
@@ -407,7 +410,7 @@ public final class GlobalRefiner {
             // timed-out wait has no way to know whether its worker is actually done; signalling
             // from here would free a slot a still-blocked worker occupies, defeating the cap.
             if loaderPool.wait(timeout: perLoadDeadline) != .success {
-                if DispatchTime.now() >= deadline { throw AbortPass() }   // pass-budget bound reached
+                if DispatchTime.now() >= deadline { throw AbortPass(reason: .timedOut) }
                 return nil   // no worker slot free (share wedged) — recoverable skip, budget remains
             }
 
@@ -436,14 +439,16 @@ public final class GlobalRefiner {
                 case nil: return nil   // unreachable (set() always precedes signal()); safe fallback
                 }
             }
-            if DispatchTime.now() >= deadline { throw AbortPass() }   // pass-budget bound reached
+            if DispatchTime.now() >= deadline { throw AbortPass(reason: .timedOut) }
             return nil   // perSubLoadCap bound only — recoverable skip, budget remains
         }
 
         // A load/digest failure RETURNS nil (recoverable — caller does skippedIds.insert).
         // Cancel/deadline THROWS AbortPass — unwinds the whole `refine` body below.
         func loadWarp(_ reg: SubRegistration) throws -> (image: AstroImage, mask: [Float])? {
-            if stopRequested() || DispatchTime.now() >= deadline { throw AbortPass() }
+            if stopRequested() { throw AbortPass(reason: .cancelled) }
+            if DispatchTime.now() >= deadline { throw AbortPass(reason: .timedOut) }
+            progress("Reading and aligning sub #\(reg.subIndex)…")
             let rgb: AstroImage
             do {
                 // Bounded wait: a wedged read can't block us past perSubLoadCap / the pass deadline.
@@ -452,8 +457,8 @@ public final class GlobalRefiner {
                     return nil   // perSubLoadCap-only timeout → recoverable skip (budget remains)
                 }
                 rgb = image
-            } catch is AbortPass {
-                throw AbortPass()   // pass deadline reached — propagate, do NOT swallow as a skip
+            } catch let abort as AbortPass {
+                throw abort
             } catch {
                 onLog("live rejection: skipping sub \(reg.subIndex): \(error)")
                 return nil          // loader/digest failure → recoverable skip
@@ -469,7 +474,7 @@ public final class GlobalRefiner {
         // double-count the same sub across the dim-probe / sample-build / output-stream phases).
         var skippedIds = Set<Int>()
         var loaded = [Int: (image: AstroImage, mask: [Float])]()
-        var aborted = false
+        var abortReason: CleanStackFailure?
 
         do {
             // 1. Filter to the current generation by EXPLICIT equality — never majority.
@@ -487,13 +492,13 @@ public final class GlobalRefiner {
             }
             guard let sampleFrameBytes, sampleFrameBytes > 0 else {
                 onLog("live rejection: no surviving subs could be loaded this pass")
-                return nil   // none loaded → quorum fails
+                return fail(.unreadableInputs)
             }
             let maxSampleFrames = max(1, maxSampleBytes / sampleFrameBytes)
             guard maxSampleFrames >= GlobalRefiner.minViableSampleFrames else {
                 onLog("live rejection off: insufficient sample budget "
                     + "(\(maxSampleFrames) < \(GlobalRefiner.minViableSampleFrames) frames)")
-                return nil
+                return fail(.insufficientMemoryBudget)
             }
 
             // 3. Build the RAM sample (dimension-probe frame enters only if its index ∈ idxs).
@@ -515,7 +520,9 @@ public final class GlobalRefiner {
             // sample EVEN even though `idxs.count` was already odd (sampleIndices' own
             // reduction) — drop the last for a true per-pixel middle median, deterministically.
             if !sample.isEmpty, sample.count % 2 == 0 { sample.removeLast() }
-            guard sample.count >= minSubs else { return nil }   // fail closed
+            guard sample.count >= minSubs else {
+                return fail(skippedIds.isEmpty ? .insufficientFrames : .unreadableInputs)
+            }
             passLock.withLock {
                 _lastMaterializedSampleCount = sample.count
                 // Review P1: `loaded` is complete here — only sizing/sample frames ever enter it.
@@ -523,11 +530,15 @@ public final class GlobalRefiner {
                 _lastPeakRetainedFrames = loaded.count
             }
 
-            guard let centerResult = GlobalCombine.robustCenter(sample: sample) else { return nil }
+            progress("Computing the trail-rejection reference…")
+            guard let centerResult = GlobalCombine.robustCenter(sample: sample) else { return fail(.combinationFailed) }
             let sampleCovered = centerResult.sampleCovered
 
             // 4. Output — reuse under budget, stream when capped.
             let combined: (image: AstroImage, coverage: [Float])?
+            if stopRequested() { return fail(.cancelled) }
+            if DispatchTime.now() >= deadline { return fail(.timedOut) }
+            progress("Combining \(inGen.count) eligible frames…")
             if inGen.count <= maxSampleFrames {
                 // Under budget: idxs == all indices, so `loaded` already holds every survivor
                 // that loaded successfully. Iterate in inGen ORDER (not loaded.values — dict
@@ -569,7 +580,7 @@ public final class GlobalRefiner {
                                     }
                                     skippedIds.insert(reg.subIndex)   // recoverable — advance
                                 } catch {
-                                    aborted = true
+                                    abortReason = (error as? AbortPass)?.reason ?? .combinationFailed
                                     return nil                        // ends iteration only
                                 }
                             }
@@ -579,15 +590,18 @@ public final class GlobalRefiner {
                     center: centerResult.center, scale: centerResult.scale,
                     sampleCovered: sampleCovered, kappa: kappa)
             }
-            if aborted { return nil }
-            guard let combined else { return nil }
+            if let abortReason { return fail(abortReason) }
+            if stopRequested() { return fail(.cancelled) }
+            if DispatchTime.now() >= deadline { return fail(.timedOut) }
+            guard let combined else { return fail(.combinationFailed) }
 
             // 5. Quorum over the WHOLE generation set (the frames that actually contributed —
             // what Task 10's STACKCNT/TOTALEXP use, not the pre-skip count).
             let contributing = inGen.count - skippedIds.count
             // defense-in-depth: unreachable given the sample-quorum check above (sample.count >=
             // minSubs) + loaded being monotonic across the pass, kept as a floor.
-            guard contributing >= minSubs else { return nil }
+            guard contributing >= minSubs else { return fail(.unreadableInputs) }
+            if !skippedIds.isEmpty { onFailure(.unreadableInputs) }
             var exposure = ExposureSummary()
             for reg in inGen where !skippedIds.contains(reg.subIndex) {
                 exposure.add(reg.exposure ?? FrameExposure(metadata: nil, fallback: 0))
@@ -597,7 +611,7 @@ public final class GlobalRefiner {
         } catch {
             // Any AbortPass (cancel/deadline) thrown from the sizing or sample-build phases
             // unwinds here — never a partial publish; the caller keeps the last online master.
-            return nil
+            return fail((error as? AbortPass)?.reason ?? .combinationFailed)
         }
     }
 }

@@ -780,12 +780,15 @@ public final class SessionPipeline {
     /// accepted sub's background pass hadn't finished/published yet). This is the ONLY bound on
     /// that final pass — step 4 already cancelled any in-flight background pass, so nothing else
     /// cancels it; `refine`'s own between-sub deadline check (C3) aborts at this bound and `end()`
-    /// falls back to the online master, so `end()` can never hang on a wedged/slow final pass.
+    /// falls back to the last servable clean master (or online if none exists).
     /// Distinct from `GlobalRefiner.passBudget` (the background trigger's own, longer, budget) —
     /// this one gates end() itself, so it defaults shorter: long enough for a modest stack the
     /// background pass hasn't yet caught up on, short enough that shutdown still feels bounded.
     /// Internal so tests can shrink it (hang-safety test, C3).
     var finalRefineBudget: DispatchTimeInterval = .seconds(30)
+    /// Read after end() has committed (also available if only replay generation failed).
+    /// No in-flight/live request is exposed; callers must not read this concurrently with end().
+    public private(set) var cleanStackCompletion: CleanStackCompletion?
     /// Test seam (cold-review wedged-read fix): overrides `GlobalRefiner.perSubLoadCap` on the
     /// lazily-created `_globalRefiner`, so a shutdown test can shrink the per-sub bounded-load
     /// wait far below `finalRefineBudget` and still run fast. nil = leave `GlobalRefiner`'s own
@@ -2249,10 +2252,12 @@ public final class SessionPipeline {
         frozenGen: Int,
         master0: AstroImage,
         final: StackEngine.FinalizationState
-    ) -> (report: RestackReport, cleanCount: Int?) {
+    ) -> (report: RestackReport, cleanCount: Int?, status: CleanStackStatus?) {
         var clean: (image: AstroImage, coverage: [Float], survivorCount: Int, exposure: ExposureSummary?)?
+        var failure: CleanStackFailure?
         if frozen.active {
-            if let pub = frozen.published, pub.key == frozen.key {
+            if let pub = frozen.published, pub.key == frozen.key,
+               pub.survivorCount == frozen.survivors.count {
                 // A background pass already published a master computed over EXACTLY the
                 // frozen survivor set — nothing deeper is available, so no final pass.
                 clean = (pub.image, pub.coverage, pub.survivorCount, pub.exposure)
@@ -2271,7 +2276,7 @@ public final class SessionPipeline {
                         kappa: frozen.kappa, minSubs: liveRejectionMinSubs,
                         maxSampleBytes: frozen.budget,
                         deadline: .now() + finalRefineBudget,
-                        isCancelled: { false })
+                        isCancelled: { false }, onFailure: { failure = $0 })
                     if let result {
                         clean = (result.image, result.coverage, result.survivorCount, result.exposure)
                     }
@@ -2293,17 +2298,31 @@ public final class SessionPipeline {
         // All output goes through the shared crop-to-coverage + additive-neutralize +
         // FITS-metadata path (RestackPlanning.encodeMaster) — same path a post-session
         // re-stack uses — so master.fit never diverges pixel-for-pixel between the two.
+        var status: CleanStackStatus?
+        if frozen.active && frozen.survivors.count >= liveRejectionMinSubs {
+            var expectedExposure = ExposureSummary()
+            for sub in frozen.survivors {
+                expectedExposure.add(sub.exposure ?? FrameExposure(metadata: nil, fallback: profile.subExposureSeconds))
+            }
+            let count = clean?.survivorCount ?? final.frameCount
+            status = CleanStackStatus(expectedCount: frozen.survivors.count, savedCount: count,
+                expectedExposure: expectedExposure,
+                savedExposure: clean.map { $0.exposure ?? .estimated(count: $0.survivorCount, seconds: profile.subExposureSeconds) }
+                    ?? final.exposure,
+                savedClean: clean != nil, reason: failure)
+            if let status, status.needsCompletion { onLog?(status.message) }
+        }
         if let clean {
             // CLEAN global result: STACKCNT/TOTALEXP reflect the count that actually
             // combined into the written pixels, not the online engine's frame count.
             return (RestackReport(exposure: clean.exposure, master: clean.image, stackedCount: clean.survivorCount,
                                  skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
-                                 coverage: clean.coverage), clean.survivorCount)
+                                 coverage: clean.coverage), clean.survivorCount, status)
         } else {
             // Online fallback / feature-off: EXACTLY today's counts, for byte parity.
             return (RestackReport(exposure: final.exposure, master: master0, stackedCount: final.frameCount,
                                  skippedMissing: 0, skippedMismatch: 0, unverifiedLegacy: false,
-                                 coverage: final.coverage), nil)
+                                 coverage: final.coverage), nil, status)
         }
     }
 
@@ -2408,6 +2427,8 @@ public final class SessionPipeline {
             // `currentFreshnessKey()`/`publishedMasterIfCurrent()`, which re-acquire regLock and
             // would deadlock here since we already hold it).
             var finalization: SessionFinalizationFacts?
+            var cleanStatus: CleanStackStatus?
+            var makeCleanCompletion: (() throws -> CleanStackCompletion)?
             let finalContext = freezeDisplayContextForFinalRender()
             var finalBroadcast: (image: AstroImage, count: Int, cleanCount: Int?, exposure: ExposureSummary?)?
             if let eng = engine {
@@ -2444,12 +2465,28 @@ public final class SessionPipeline {
                     guard let master0 = final.image else {
                         throw StackEngine.FinalizationError.invariantBreach
                     }
-                    let (report, cleanCount) = selectMasterReport(frozen: frozen, frozenGen: frozenGen,
+                    let (report, cleanCount, status) = selectMasterReport(frozen: frozen, frozenGen: frozenGen,
                                                     master0: master0, final: final)
+                    cleanStatus = status
                     let masterData = RestackPlanning.encodeMaster(
                         report, neutralize: neutralizeBackground,
                         metadata: sourceMetadata, subExposureSeconds: profile.subExposureSeconds)
                     try masterData.write(to: dir.appendingPathComponent("master.fit"))
+                    if let status, status.needsCompletion {
+                        // Freeze the ACTUAL calibration strongly. The live refiner's lazy weak
+                        // pipeline provider is inappropriate once AppModel releases the pipeline.
+                        let appliedCalibrator = effectiveCalibrator
+                        let loader: FrameLoader = refinerLoaderOverride
+                            ?? ProductionFrameLoader(calibratorProvider: { appliedCalibrator }, demosaic: eng.demosaicMethod)
+                        makeCleanCompletion = { [survivors = frozen.survivors, generation = frozenGen,
+                            kappa = frozen.kappa, budget = frozen.budget, minSubs = liveRejectionMinSubs,
+                            metadata = sourceMetadata, neutralize = neutralizeBackground,
+                            fallback = profile.subExposureSeconds] in
+                            try CleanStackCompletion(directory: dir, survivors: survivors, generation: generation,
+                                kappa: kappa, budget: budget, minSubs: minSubs, loader: loader,
+                                metadata: metadata, neutralize: neutralize, fallbackSeconds: fallback, status: status)
+                        }
+                    }
                     finalBroadcast = (cropToCoverage(report.master, coverage: report.coverage),
                                       report.stackedCount, cleanCount, report.exposure)
                     outcome = .written
@@ -2469,7 +2506,8 @@ public final class SessionPipeline {
                     masterOutcome: outcome,
                     stackFrameCount: final.frameCount,
                     sessionAcceptedCount: final.sessionAcceptedCount,
-                    sessionRejectedCount: final.sessionRejectedCount, exposure: finalBroadcast?.exposure)
+                    sessionRejectedCount: final.sessionRejectedCount, exposure: finalBroadcast?.exposure,
+                    cleanStackStatus: cleanStatus)
             } else {
                 // Review11 finding 2, watcher mode: the stack is the external stacker's artifact;
                 // this session never promises a master (masterExpected == false since start).
@@ -2501,6 +2539,8 @@ public final class SessionPipeline {
             }
             // Commit point: master.fit is durable (native mode), so stamping end_time is now honest.
             try session.endSession(finalization: finalization, intake: intake)
+            do { cleanStackCompletion = try makeCleanCompletion?() }
+            catch { onLog?("Finish clean stack unavailable: \(error.localizedDescription). The incomplete-master report remains in the session summary.") }
             // Drain the display renderer and publish one final, frozen pair. Late refiner or
             // adjustment requests cannot resurrect an ended session's display.
             displayRenderLock.lock()

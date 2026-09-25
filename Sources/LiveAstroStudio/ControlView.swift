@@ -165,6 +165,29 @@ struct ControlView: View {
     private var controlFooter: some View {
         VStack(spacing: 8) {
             sessionInputBanner
+            if let status = model.cleanStackStatus {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(status.message).font(.caption)
+                    if let progress = model.cleanStackProgress {
+                        HStack {
+                            ProgressView().controlSize(.small)
+                            Text(progress).font(.caption)
+                            Spacer()
+                            Button("Cancel") { model.cancelCleanStack() }
+                        }
+                    } else if status.needsCompletion {
+                        Button("Finish clean stack") { model.finishCleanStack() }
+                            .disabled(!model.canFinishCleanStack)
+                            .help("Finish the original session's trail rejection. Keeps the saved master if cancelled or incomplete. Cancellation waits for the current processing step.")
+                    } else {
+                        Text("master.fit is complete. The on-screen image and replay are unchanged.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
+            }
             HStack {
                 if model.isRunning {
                     Button("End Session", role: .destructive) { model.endSession() }

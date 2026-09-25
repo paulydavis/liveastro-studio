@@ -304,6 +304,28 @@ Common outputs:
 
 External-stacker sessions may not write `master.fit`; the external stacker owns that file.
 
+### When the clean master is still catching up
+
+Live trail rejection can lag behind newly accepted frames. **End Session** attempts a final
+clean pass with a 30-second budget, checked between processing steps. If that pass cannot
+finish, the app may save the last available clean master. The standing message, log, manifest
+and summary say how many eligible accepted frames it contains, any integration not included,
+and why the final pass stopped. “Eligible” excludes frames you rejected and older stacks
+cleared by a reseed; it is not always the lifetime accepted count.
+
+After End, choose **Finish clean stack** to retry using that session's original calibration,
+registrations and rejection settings. This deliberately allows longer processing. Progress
+and **Cancel** remain available; cancellation waits for the current file or calculation step.
+Missing or changed inputs, cancellation, or an incomplete retry do not replace the saved master.
+On success, the previous master and manifest are kept in a `clean-stack-backup-…` folder.
+
+Completion updates `master.fit`, `manifest.json` and the summary, not the on-screen image,
+`latest.png` or historical replay. The action is available only while the ended session remains
+open in this app instance; starting another session/import or changing rejection flags retires
+that frozen request. Your original captures are not deleted. This differs from the ordinary
+**Re-stack without flagged** action, which rebuilds using current settings rather than finishing
+the original global trail-rejection pass.
+
 Useful buttons:
 
 - **Open Sessions Folder** opens the output root in Finder.
