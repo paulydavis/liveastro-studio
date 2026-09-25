@@ -47,6 +47,12 @@ public enum SessionSummaryMarkdown {
         lines.append("| --- | --- |")
         lines.append(row("Master expected", manifest.masterExpected.map { $0 ? "yes" : "no" } ?? "unknown"))
         lines.append(row("Master outcome", manifest.masterOutcome?.rawValue ?? "unknown"))
+        if let clean = manifest.cleanStackStatus {
+            lines.append(row("Clean master", clean.message))
+            if clean.needsCompletion {
+                lines.append(row("Recovery", "Original inputs were not deleted. Use Finish clean stack while this session is still open in the app."))
+            }
+        }
         if let exposure = manifest.exposure {
             lines.append(row("Current-stack frames", "\(exposure.frameCount)"))
             lines.append(row("Current-stack integration", exposure.caption))

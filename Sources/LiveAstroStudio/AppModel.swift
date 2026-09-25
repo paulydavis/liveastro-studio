@@ -147,6 +147,63 @@ final class AppModel {
     /// Guards against concurrent restack runs; also usable to disable the re-stack
     /// button in the Stats UI (Task 10).
     private(set) var isRestacking = false
+    private(set) var cleanStackStatus: CleanStackStatus?
+    private(set) var cleanStackProgress: String?
+    private var pendingCleanStack: CleanStackCompletion?
+    private var cleanStackCancellation: CleanStackCancellation?
+    var isFinishingCleanStack: Bool { cleanStackCancellation != nil }
+    var canFinishCleanStack: Bool {
+        pendingCleanStack != nil && !isRunning && !isRestacking && !isFinalizing
+            && !importer.isImporting && !hasPendingSessionStart
+    }
+
+    func presentCleanStackCompletion(_ request: CleanStackCompletion?, status: CleanStackStatus?) {
+        pendingCleanStack = request
+        cleanStackStatus = status
+        cleanStackProgress = nil
+    }
+
+    func finishCleanStack() {
+        guard canFinishCleanStack, let request = pendingCleanStack, claimRestackPresentation() else { return }
+        let cancellation = CleanStackCancellation()
+        cleanStackCancellation = cancellation
+        cleanStackProgress = "Preparing full clean stack…"
+        Task.detached { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try request.finish(isCancelled: { cancellation.isCancelled }, progress: { [weak self] message in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.cleanStackCancellation === cancellation else { return }
+                        self.cleanStackProgress = cancellation.isCancelled
+                            ? "Cancelling after the current processing step…" : message
+                    }
+                })
+                await MainActor.run {
+                    self.cleanStackStatus = result.status
+                    self.pendingCleanStack = nil
+                    self.log.append("Full clean master saved: \(result.report.stackedCount) frames. Previous master preserved at \(result.backupDirectory.path).")
+                    self.log.append("Completion updated master.fit and its accounting; the on-screen image, latest.png and replay remain the session's original output.")
+                    if let warning = result.summaryWarning { self.log.append(warning) }
+                }
+            } catch {
+                await MainActor.run {
+                    self.log.append("Finish clean stack: \(error.localizedDescription)")
+                    // Retry remains available; a failure never gets presented as completion.
+                    if (error as? CleanStackFailure) != .cancelled { self.errorMessage = error.localizedDescription }
+                }
+            }
+            await MainActor.run {
+                self.cleanStackCancellation = nil
+                self.cleanStackProgress = nil
+                self.isRestacking = false
+            }
+        }
+    }
+
+    func cancelCleanStack() {
+        cleanStackCancellation?.cancel()
+        if isFinishingCleanStack { cleanStackProgress = "Cancelling after the current processing step…" }
+    }
     /// True right after a session ends with flagged subs on record — surfaces a non-blocking
     /// "re-stack for a clean final master?" confirm in StatsView (Task 11). Never triggers a
     /// re-stack automatically; the operator must tap "Re-stack now".
@@ -373,7 +430,8 @@ final class AppModel {
     /// `userDefaults` defaults to `.standard` for every production call site (`AppModel()`
     /// unchanged). Tests pass a temporary suite so no test run reads or writes the real user's
     /// persisted settings.
-    init(userDefaults: UserDefaults = .standard, calibrationLibrary: CalibrationLibrary = CalibrationLibrary()) {
+    init(userDefaults: UserDefaults = .standard, calibrationLibrary: CalibrationLibrary = CalibrationLibrary(),
+         relayRoot: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("LiveAstro/relay", isDirectory: true)) {
         self.userDefaults = userDefaults
         self.calibrationLibrary = calibrationLibrary
         self.calibration = CalibrationStore.load(userDefaults)
@@ -429,7 +487,8 @@ final class AppModel {
                 self.startSession(completion: completion)
             } },
             saveSettings: { [weak self] in MainActor.assumeIsolated { self?.saveSettings() } },
-            isSessionStartPending: { [weak self] in MainActor.assumeIsolated { self?.hasPendingSessionStart ?? false } }))
+            isSessionStartPending: { [weak self] in MainActor.assumeIsolated { self?.hasPendingSessionStart ?? false } },
+            isRestacking: { [weak self] in MainActor.assumeIsolated { self?.isRestacking ?? false } }), relayRoot: relayRoot)
 
         // Import + post-processing cluster: the shared log/error/session-running
         // seam plus the T3 reads the moved bodies need (stacker engine,
@@ -1457,6 +1516,7 @@ final class AppModel {
 
         acceptedCount = 0
         rejectedCount = 0
+        presentCleanStackCompletion(nil, status: nil)
         subFrames = []
         sessionCalibrator = nil   // captured at end() from the pipeline's effectiveCalibrator (Fix 1)
         sessionSourceMetadata = nil   // captured at end() from the pipeline's capturedSourceMetadata (Fix P1b)
@@ -1844,6 +1904,7 @@ final class AppModel {
         guard !isRestacking && !isFinalizing else { return }
         guard let i = subFrames.firstIndex(where: { $0.index == index }) else { return }
         subFrames[i].rejectedByUser.toggle()
+        if !isRunning { pendingCleanStack = nil } // frozen selection no longer matches the operator's flags
         if !isRunning, let dir = lastSessionDirectory {
             try? SubFrameCSV.write(subFrames: subFrames, to: dir)   // keep sub-frames.csv truthful during review
         }
@@ -1864,6 +1925,8 @@ final class AppModel {
     /// `restackOfferPending` and `restackWithoutFlagged`'s guards refuse it. Full import
     /// stats-wiring (populating `subFrames` for imports) is a future feature (Fix P2-import).
     func resetSessionStatsForImport() {
+        guard !isRestacking else { return }
+        presentCleanStackCompletion(nil, status: nil)
         subFrames = []
         restackSourceDir = nil
         sessionCalibrator = nil
@@ -1931,6 +1994,7 @@ final class AppModel {
         // finishRestack only after the durable master.fit write succeeds), so a failed re-stack
         // OR a failed master write leaves the offer up for retry (Fix 5 / Fix P2).
         guard claimRestackPresentation() else { return }
+        pendingCleanStack = nil // ordinary restack owns replacement now, not the old frozen request
         let engine = makeStackEngine()
         // Capture on the main actor everything the off-actor write needs: the session's metadata
         // (Fix P1b — write master.fit with the SAME header the live master had), the pinned
@@ -2093,6 +2157,7 @@ final class AppModel {
         // write leaves restackOfferPending up so the operator can retry (Fix 5 / Fix P2).
         restackOfferPending = false
         isRestacking = false
+        cleanStackStatus = nil
     }
 
     /// Reseeds the stacking engine reference frame (native mode only).
@@ -2235,6 +2300,7 @@ final class AppModel {
                 // auto-resolved) BEFORE releasing the pipeline, so a post-session re-stack reuses
                 // the exact same calibration the live master used (Fix 1).
                 self.sessionCalibrator = p.effectiveCalibrator
+                self.presentCleanStackCompletion(p.cleanStackCompletion, status: p.session.manifest?.cleanStackStatus)
                 self.sessionSourceMetadata = p.capturedSourceMetadata   // stamp re-stacked master.fit like the live one (Fix P1b)
                 self.sessionSubExposureSeconds = SourceMetadata.resolvedExposureSeconds(
                     metadata: self.sessionSourceMetadata, fallback: self.sessionSubExposureSeconds)

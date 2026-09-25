@@ -99,7 +99,7 @@ struct StatsView: View {
 
     private var footer: some View {
         HStack {
-            if model.isRestacking { ProgressView().controlSize(.small); Text("Re-stacking…").foregroundStyle(.secondary) }
+            if model.isRestacking { ProgressView().controlSize(.small); Text(model.isFinishingCleanStack ? "Finishing clean stack…" : "Re-stacking…").foregroundStyle(.secondary) }
             else { Text(model.flaggedCount == 0 ? "No subs flagged" : "\(model.flaggedCount) flagged").foregroundStyle(.secondary) }
             Spacer()
             Button("Re-stack without flagged") { model.restackWithoutFlagged() }

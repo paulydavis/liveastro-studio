@@ -27,6 +27,7 @@ public enum RestackPlanning {
     public static func updatingMaster(in manifest: SessionManifest, report: RestackReport,
                                       fallbackExposureSeconds: Double) -> SessionManifest {
         var result = manifest
+        result.cleanStackStatus = nil // ordinary re-stack does not run the global clean refinement
         let exposure = report.exposure ?? .estimated(count: report.stackedCount, seconds: fallbackExposureSeconds)
         result.exposure = exposure
         result.stackFrameCount = report.stackedCount

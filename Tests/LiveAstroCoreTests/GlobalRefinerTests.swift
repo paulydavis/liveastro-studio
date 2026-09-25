@@ -1592,6 +1592,14 @@ final class GlobalRefinerTests: XCTestCase {
     /// trails back into `master.fit`. So the servable-but-shallow master remains the fallback,
     /// reached only after full depth was actually attempted.
     func testEndFallsBackToTheShallowCleanMasterWhenTheFinalPassCannotRun() throws {
+        try checkIncompleteFinalMaster(timedOut: false)
+    }
+
+    func testEndReportsDeadlineSeparatelyFromUnreadableInputs() throws {
+        try checkIncompleteFinalMaster(timedOut: true)
+    }
+
+    private func checkIncompleteFinalMaster(timedOut: Bool) throws {
         let sandbox = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: sandbox) }
@@ -1601,6 +1609,7 @@ final class GlobalRefinerTests: XCTestCase {
         // Every load throws (no images registered), so the final pass drops below `minSubs` and
         // returns nil — the deadline path is the same branch, exercised without the wall-clock wait.
         pipeline.refinerLoaderOverride = FailOnceLoader(images: [:], failOnce: [])
+        if timedOut { pipeline.finalRefineBudget = .nanoseconds(0) }
         pipeline.configureLiveRejection(enabled: true)
 
         let keyOver5 = pipeline.currentFreshnessKey()
@@ -1618,7 +1627,17 @@ final class GlobalRefinerTests: XCTestCase {
                        + "(0.42) rather than dropping to the online star field, which rejects nothing")
         let header = try FITSReader.readHeader(Data(contentsOf: replayDir.appendingPathComponent("master.fit")))
         XCTAssertEqual(Int(header.keywords["STACKCNT"] ?? ""), 5,
-                       "and it must report the depth it actually has, not the 6 it tried for")
+                      "and it must report the depth it actually has, not the 6 it tried for")
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with:
+            Data(contentsOf: replayDir.appendingPathComponent("manifest.json"))) as? [String: Any])
+        let status = try XCTUnwrap(json["clean_stack_status"] as? [String: Any],
+                                  "A shallow master must be disclosed in the durable session record")
+        XCTAssertEqual(status["expected_count"] as? Int, 6)
+        XCTAssertEqual(status["saved_count"] as? Int, 5)
+        XCTAssertEqual(status["reason"] as? String, timedOut ? "timed_out" : "unreadable_inputs")
+        let summary = try String(contentsOf: replayDir.appendingPathComponent("session-summary.md"))
+        XCTAssertTrue(summary.contains("5 of 6"), "The saved summary must disclose incomplete integration")
+        XCTAssertNotNil(pipeline.cleanStackCompletion, "End must offer recovery for the exact frozen session")
     }
 
     /// The other half of the same bug: the publish seam itself dropped a finished pass whose set

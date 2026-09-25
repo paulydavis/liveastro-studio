@@ -57,6 +57,7 @@ public enum MasterOutcome: String, Codable, Equatable {
 }
 
 public struct SessionFinalizationFacts: Codable, Equatable {
+    public var cleanStackStatus: CleanStackStatus? = nil
     public var exposure: ExposureSummary? = nil
     public let masterOutcome: MasterOutcome
     public let stackFrameCount: Int
@@ -64,7 +65,9 @@ public struct SessionFinalizationFacts: Codable, Equatable {
     public let sessionRejectedCount: Int
 
     public init(masterOutcome: MasterOutcome, stackFrameCount: Int,
-                sessionAcceptedCount: Int, sessionRejectedCount: Int, exposure: ExposureSummary? = nil) {
+                sessionAcceptedCount: Int, sessionRejectedCount: Int, exposure: ExposureSummary? = nil,
+                cleanStackStatus: CleanStackStatus? = nil) {
+        self.cleanStackStatus = cleanStackStatus
         self.exposure = exposure
         self.masterOutcome = masterOutcome
         self.stackFrameCount = stackFrameCount
@@ -74,6 +77,7 @@ public struct SessionFinalizationFacts: Codable, Equatable {
 }
 
 public struct SessionManifest: Codable, Equatable {
+    public var cleanStackStatus: CleanStackStatus? = nil
     public var exposure: ExposureSummary? = nil
     public var importFrameExposures: [ImportedFrameExposure]? = nil
     public let sessionId: String
@@ -144,7 +148,7 @@ public struct SessionManifest: Codable, Equatable {
                 masterOutcome: masterOutcome,
                 stackFrameCount: stackFrameCount,
                 sessionAcceptedCount: sessionAcceptedCount,
-                sessionRejectedCount: sessionRejectedCount, exposure: exposure)
+                sessionRejectedCount: sessionRejectedCount, exposure: exposure, cleanStackStatus: cleanStackStatus)
         }
         set {
             masterOutcome = newValue?.masterOutcome
@@ -152,6 +156,7 @@ public struct SessionManifest: Codable, Equatable {
             sessionAcceptedCount = newValue?.sessionAcceptedCount
             sessionRejectedCount = newValue?.sessionRejectedCount
             exposure = newValue?.exposure
+            cleanStackStatus = newValue?.cleanStackStatus
         }
     }
 }
