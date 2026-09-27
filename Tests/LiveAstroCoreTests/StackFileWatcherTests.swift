@@ -1928,6 +1928,122 @@ final class StackFileWatcherTests: XCTestCase {
         try await assertPausedWriteRecovers(firstReadDelay: 0)
     }
 
+    /// A lower digest can finish before it has aged enough, leaving the file
+    /// pending but no longer in flight. A later confirming read must still see
+    /// that ordering blocker. Removing between-read context must fail this test.
+    func testAsyncHigherCompletionCannotPassLowerBetweenReads() async throws {
+        try await assertAsyncCompletionOrdering(removeLowerBeforeHigher: false)
+    }
+
+    func testAsyncHigherCompletionForgetsLowerAfterObservedRemoval() async throws {
+        try await assertAsyncCompletionOrdering(removeLowerBeforeHigher: true)
+    }
+
+    func testAsyncLowerCompletionDoesNotEmitReplacedReadyPeer() async throws {
+        try await assertAsyncCompletionOrdering(removeLowerBeforeHigher: false, replaceReadyHigher: true)
+    }
+
+    private func assertAsyncCompletionOrdering(removeLowerBeforeHigher: Bool,
+                                               replaceReadyHigher: Bool = false) async throws {
+        let clock = ManualClock()
+        let w = StackFileWatcher(folder: tmp, quietPeriod: 3600, pollInterval: 3600,
+                                 fileNamePrefix: "live_stack", digestPolicy: .mutableStackerOutput)
+        watcher = w
+        w.monotonicNowNanos = { clock.now() }
+        w.synchronousContentReadsForTesting = true
+        let one = "live_stack_00001.fit", two = "live_stack_00002.fit"
+        try makeFITS(0.4).write(to: tmp.appendingPathComponent(one))
+        try makeFITS(0.6).write(to: tmp.appendingPathComponent(two))
+        let collector = collect(w)
+        let lowerGate = DispatchSemaphore(value: 0), higherGate = DispatchSemaphore(value: 0)
+        defer { lowerGate.signal(); higherGate.signal() }
+        let lowerStarted = expectation(description: "lower async read started")
+        let higherStarted = expectation(description: "higher async read started")
+        let lowerIntegrated = expectation(description: "lower completed before quiet period")
+        let higherIntegrated = expectation(description: "higher completed after quiet period")
+        let lowerOnce = OnceFlag(), higherOnce = OnceFlag()
+        let lowerDone = OnceFlag(), higherDone = OnceFlag()
+        w.onAsyncReadPhaseForTesting = { name, phase in
+            switch phase {
+            case .began:
+                if name == one && lowerOnce.fireOnce() {
+                    lowerStarted.fulfill()
+                    if lowerGate.wait(timeout: .now() + 10) != .success { XCTFail("lower read gate timed out") }
+                } else if name == two && higherOnce.fireOnce() {
+                    higherStarted.fulfill()
+                    if higherGate.wait(timeout: .now() + 10) != .success { XCTFail("higher read gate timed out") }
+                }
+            case .integrated:
+                if name == one && lowerDone.fireOnce() { lowerIntegrated.fulfill() }
+                if name == two && higherDone.fireOnce() { higherIntegrated.fulfill() }
+            }
+        }
+        try w.start()
+        w.scanNow() // actual stat observations
+        w.scanNow() // actual digests, both waiting for quiet separation
+        for name in [one, two] {
+            guard case .digestPending = w.reducerStateSnapshot.generation.files[name] else {
+                return XCTFail("prerequisite: \(name) must have a pending digest")
+            }
+        }
+        w.synchronousContentReadsForTesting = false
+        w.scanNow()
+        await fulfillment(of: [lowerStarted, higherStarted], timeout: 5)
+        if replaceReadyHigher {
+            clock.advance(seconds: 3601)
+            higherGate.signal()
+            await fulfillment(of: [higherIntegrated], timeout: 5)
+            guard case .ready = w.reducerStateSnapshot.generation.files[two] else {
+                return XCTFail("prerequisite: higher must be ready but held behind lower")
+            }
+            XCTAssertEqual(w.emittedCount, 0)
+            let replacement = makeFITS(0.8)
+            try replacement.write(to: tmp.appendingPathComponent(two), options: .atomic)
+            lowerGate.signal()
+            await fulfillment(of: [lowerIntegrated], timeout: 5)
+            XCTAssertEqual(w.emittedCount, 1, "ordering context must not emit the replaced peer's cached identity")
+            // Both reads are integrated; use real inline reads to settle the replacement.
+            w.synchronousContentReadsForTesting = true
+            w.scanNow()
+            w.scanNow()
+            clock.advance(seconds: 3601)
+            w.scanNow()
+            let both = await collector.waitForCount(2, timeout: 5)
+            XCTAssertTrue(both)
+            let items = await collector.items
+            XCTAssertEqual(items.map(\.url.lastPathComponent), [one, two])
+            XCTAssertEqual(items.last?.identity?.digest, FileIdentity.contentDigest(data: replacement),
+                           "the emitted higher version must describe the replacement bytes")
+            return
+        }
+        lowerGate.signal()
+        await fulfillment(of: [lowerIntegrated], timeout: 5)
+        guard case .digestPending = w.reducerStateSnapshot.generation.files[one] else {
+            return XCTFail("prerequisite: completed lower read still needs quiet separation")
+        }
+        clock.advance(seconds: 3601)
+        if removeLowerBeforeHigher {
+            try FileManager.default.removeItem(at: tmp.appendingPathComponent(one))
+            w.scanNow() // a real enumeration, not omission from a completion batch
+        }
+        higherGate.signal()
+        await fulfillment(of: [higherIntegrated], timeout: 5)
+        if removeLowerBeforeHigher {
+            XCTAssertEqual(w.emittedCount, 1, "observed absence must retire the remembered blocker")
+            let arrived = await collector.waitForCount(1, timeout: 5)
+            XCTAssertTrue(arrived)
+            let items = await collector.items
+            XCTAssertEqual(items.map(\.url.lastPathComponent), [two])
+            return
+        }
+        XCTAssertEqual(w.emittedCount, 0, "a lower file between reads must still block the higher completion")
+        w.scanNow() // fresh confirming read for the lower file
+        let both = await collector.waitForCount(2, timeout: 5)
+        XCTAssertTrue(both, "both real files must eventually emit")
+        let items = await collector.items
+        XCTAssertEqual(items.map(\.url.lastPathComponent), [one, two])
+    }
+
     /// Deliberately outlast the former ~6s polling-attempt allowance without using up
     /// the 15s watchdog. This is fault injection, not a sleep used to assume readiness.
     func testMutablePolicy_pausedWriteRecoversAfterSlowAsyncRead() async throws {

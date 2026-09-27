@@ -258,6 +258,9 @@ struct FileObservation: Equatable {
 enum ObservationOutcome: Equatable {
     case absent
     case invalid
+    /// Present in the last successful directory enumeration. This is ordering
+    /// context only: it neither rereads content nor supplies stability evidence.
+    case orderingContext
     case unstable(identity: FileIdentity)
     case identityUnchanged(identity: FileIdentity)
     /// The file exists and its identity is known, but its blocking content read has been
@@ -536,6 +539,13 @@ struct WatcherReducer {
         let isConverging: Bool
     }
 
+    /// Remembered presence holds an ordering slot, but cannot authorize emission
+    /// of cached bytes. Non-context observations retain their existing readiness rules.
+    private func isEmissionReady(_ item: ClassifiedObservation) -> Bool {
+        item.observation.outcome != .orderingContext
+            && readyCandidate(in: state.generation.files[item.observation.name]) != nil
+    }
+
     private mutating func reduce(_ batch: ObservationBatch) -> [WatcherEffect] {
         var classifiedByName: [String: ClassifiedObservation] = [:]
         for observation in batch.entries {
@@ -605,6 +615,9 @@ struct WatcherReducer {
         var effects: [WatcherEffect] = []
         var intentNames: Set<String> = []
         var pendingOwners = state.generation.ordering.pendingEmissionOwners
+        let emissionEligibleNames = Set(classified.filter {
+            $0.observation.outcome != .orderingContext
+        }.map { $0.observation.name })
 
         func appendIntent(
             named name: String,
@@ -613,6 +626,7 @@ struct WatcherReducer {
             intentNames: inout Set<String>,
             pendingOwners: inout Set<RevisionKey>
         ) {
+            guard emissionEligibleNames.contains(name) else { return }
             guard intentNames.insert(name).inserted else { return }
             guard let candidate = readyCandidate(in: state.generation.files[name]) else { return }
             effects.append(.emit(EmissionIntent(
@@ -660,7 +674,7 @@ struct WatcherReducer {
                     state.generation.files[$0.observation.name])
             }
             guard let blockerIndex = potential.firstIndex(where: {
-                readyCandidate(in: state.generation.files[$0.observation.name]) == nil
+                !isEmissionReady($0)
             }) else {
                 state.generation.ordering.activeBlocker = nil
                 for item in potential {
@@ -931,7 +945,7 @@ struct WatcherReducer {
                       (name: item.observation.name, revision: revision),
                       (name: name, revision: victimRevision)),
                   participatesInNumberedOrdering(state.generation.files[item.observation.name]),
-                  readyCandidate(in: state.generation.files[item.observation.name]) == nil
+                  !isEmissionReady(item)
             else { continue }
             return false
         }
@@ -953,6 +967,8 @@ struct WatcherReducer {
     ) -> Bool {
         let existing = state.generation.files[observation.name]
         switch observation.outcome {
+        case .orderingContext:
+            return false // no state mutation or new convergence evidence
         case .absent:
             switch existing {
             case .observing, .digestPending, .ready:

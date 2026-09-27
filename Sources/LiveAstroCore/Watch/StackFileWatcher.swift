@@ -396,6 +396,11 @@ public final class StackFileWatcher {
     /// in production.
     internal var beforeContentReadForTesting: (() -> Void)?
 
+    /// Deterministic async-transport tests can park a named read and observe its
+    /// integration without substituting file contents or reducer state.
+    internal enum AsyncReadPhase { case began, integrated }
+    internal var onAsyncReadPhaseForTesting: ((String, AsyncReadPhase) -> Void)?
+
     /// Test seam: when true, content reads run INLINE on the serial queue during scan() instead of
     /// being dispatched to the reader queue, so deterministic `scanNow()` + manual-clock tests can
     /// choreograph exact reducer state within a single scan call. The async transport is covered
@@ -432,6 +437,9 @@ public final class StackFileWatcher {
     /// picked up on later polls). A genuinely hung read stays in this map, keeping its ordering slot
     /// until the reducer's existing write-off budget abandons it.
     private var inFlightReads: [String: FileIdentity] = [:]
+    /// Presence belongs to the current folder generation, not the set of reader
+    /// tasks. In particular, a lower digest may still be pending BETWEEN reads.
+    private var knownPresentNames: Set<String> = []
     /// Dispatch time (monotonic nanos) per in-flight read, parallel to `inFlightReads` — feeds the
     /// watchdog's oldest-outstanding-read age. Serial-queue confined.
     private var inFlightSince: [String: UInt64] = [:]
@@ -452,6 +460,11 @@ public final class StackFileWatcher {
             kind: reducer.entryKind(for: name),
             outcome: .pendingRead(identity: identity),
             observedAtNanos: monotonicNowNanos())
+    }
+
+    private func orderingContext(named name: String) -> FileObservation {
+        FileObservation(name: name, url: folder.appendingPathComponent(name),
+                        kind: reducer.entryKind(for: name), outcome: .orderingContext)
     }
 
     /// The synchronous (non-blocking) decision for one file: open + fstat + readPlan only. A file
@@ -701,6 +714,7 @@ public final class StackFileWatcher {
         // promptly, closing their own descriptors; their integration hop then no-ops on .stopped.
         // Clear the map so no phantom placeholder survives a restart.
         inFlightReads.removeAll()
+        knownPresentNames.removeAll()
         inFlightSince.removeAll()
         refreshReadLiveness()
         // The fd is closed by the source's cancel handler, never here (see armSource()).
@@ -774,6 +788,11 @@ public final class StackFileWatcher {
 
         guard folderFD >= 0, let names = Self.enumerateDirectory(fd: folderFD) else { return }
         let trackedNames = reducer.orderedNamesForScan(names.filter(isTrackedFileName))
+        // Native subs have no revision ordering: do not replay their accumulated
+        // names on every completion. Only mutable stacker outputs need context.
+        if reducer.configuration.digestPolicy == .mutableStackerOutput {
+            knownPresentNames = Set(trackedNames)
+        }
         let absentCandidateNames = Set(reducer.state.generation.files.keys)
             .union(reducer.state.generation.ordering.victimLedgers.keys)
         var observations: [FileObservation] = []
@@ -811,8 +830,11 @@ public final class StackFileWatcher {
                                         handle: handle, generation: reducer.state.generation.id)
                     observations.append(pendingReadObservation(name: n, identity: id))
                 } else {
-                    // At capacity — omit this brand-new file; a later poll dispatches it once a
-                    // read slot frees. It is unknown to the reducer, so omission is invisible.
+                    // Reader capacity must not erase an enumerated file's ordering
+                    // slot. It earns fresh content evidence on a later scan.
+                    if reducer.configuration.digestPolicy == .mutableStackerOutput {
+                        observations.append(orderingContext(named: n))
+                    }
                     try? handle.close()
                 }
             }
@@ -917,9 +939,11 @@ public final class StackFileWatcher {
         _digestComputations += 1
         let stopFlag = stopRequested
         let seam = beforeContentReadForTesting   // capture on the serial queue; run it on the reader queue
+        let phase = onAsyncReadPhaseForTesting
         let baseline = exclusionDigest(name: name, identity: identity)
         readerQueue.async { [weak self] in
             defer { try? handle.close() }
+            phase?(name, .began)
             let observation = Self.readContentObservation(
                 handle: handle, name: name, url: url, kind: kind,
                 identity: identity, isFITS: isFITS, stopFlag: stopFlag, seam: seam,
@@ -971,10 +995,6 @@ public final class StackFileWatcher {
         return obs(.digested(identity: identity, digest: digest, byteCount: identity.size))
     }
 
-    /// Integrate a completed content read back on the serial queue as a single-entry observation
-    /// batch. Guards: a stale generation (folder replaced mid-read) or a stop drops the result. This
-    /// one-entry batch is safe by the reducer contract — the reducer never infers absence from
-    /// omission, and a one-entry batch cannot charge the ordering ledgers.
     /// Refresh the watchdog's lock-visible view of outstanding reads: the count (for the alert text)
     /// and the OLDEST outstanding read's dispatch time (0 = none in flight). The watchdog compares
     /// that dispatch time to now, so a read stuck past the threshold trips the alarm even when it's
@@ -1005,21 +1025,23 @@ public final class StackFileWatcher {
         livenessLock.withLock { lastProgressNanos = now }   // a completion also proves the serial queue is alive
         var entry = observation
         entry.observedAtNanos = now
-        // Carry the full ordering context: the completed file PLUS a placeholder for every OTHER
-        // still-in-flight read. Without the placeholders a higher revision completing first would
-        // emit past an in-flight lower one (whose placeholder is absent from a bare single-entry
-        // batch), and the lower one would later be high-water-dropped — the exact frame loss the
-        // placeholder exists to prevent. With them, the reducer holds the higher file behind the
-        // in-flight lower blocker, and the normal emit/emissionFinished cycle stays intact.
+        // A completion is a partial observation, not a new folder listing. Keep
+        // every known present file in ordering, including those BETWEEN reads.
+        // Do not replay old digests: that would invent fresh stability/convergence
+        // evidence. Only this completed read and actual in-flight peers supply it.
         var entries = [entry]
         for (pendingName, pendingIdentity) in inFlightReads {
             entries.append(pendingReadObservation(name: pendingName, identity: pendingIdentity))
+        }
+        for knownName in knownPresentNames where knownName != name && inFlightReads[knownName] == nil {
+            entries.append(orderingContext(named: knownName))
         }
         let effects = reducer.reduce(.observe(ObservationBatch(
             generation: generation,
             entries: entries,
             nowNanos: now)))
         execute(effects)
+        onAsyncReadPhaseForTesting?(name, .integrated)
     }
 
     private func execute(_ effects: [WatcherEffect]) {
@@ -1074,6 +1096,7 @@ public final class StackFileWatcher {
         // integrateCompletedRead. Clearing here stops a re-scan from re-presenting a phantom
         // in-flight file that may not exist in the new folder. (The read task still closes its own fd.)
         inFlightReads.removeAll()
+        knownPresentNames.removeAll()
         inFlightSince.removeAll()
         refreshReadLiveness()
     }
