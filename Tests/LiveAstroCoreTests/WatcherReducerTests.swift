@@ -2,6 +2,56 @@ import XCTest
 @testable import LiveAstroCore
 
 final class WatcherReducerTests: XCTestCase {
+    func testContextOnlyReadyLowerCannotBePassedByFreshHigher() {
+        let one = "live_stack_00001.fit", two = "live_stack_00002.fit"
+        let first = makeCandidate(name: one, identity: makeIdentity(1), digest: "one",
+                                  kind: .numbered(revision: "00001"))
+        let second = makeCandidate(name: two, identity: makeIdentity(2), digest: "two",
+                                   kind: .numbered(revision: "00002"))
+        var reducer = makeReducer(files: [one: .ready(first), two: .ready(second)])
+        let effects = observeBatch([
+            observation(name: one, revision: "00001", outcome: .orderingContext),
+            observation(name: two, revision: "00002", outcome: .digested(
+                identity: second.identity, digest: second.digest, byteCount: second.byteCount)),
+        ], nowNanos: 0, reducer: &reducer)
+        XCTAssertTrue(effects.isEmpty, "suppressing context emission must also hold higher revisions")
+        XCTAssertEqual(reducer.state.generation.files[one], .ready(first),
+                       "presence alone must not discard valid digest progress")
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, one)
+    }
+
+    func testOrderingContextDoesNotConfirmDigestOrRenewConvergenceGrace() {
+        let one = "live_stack_00001.fit", two = "live_stack_00002.fit"
+        let pending = FileState.digestPending(PendingDigest(
+            digest: "one", identity: makeIdentity(1), firstObservedNanos: 0))
+        let ready = FileState.ready(makeCandidate(name: two, identity: makeIdentity(2),
+                                                  digest: "two", kind: .numbered(revision: "00002")))
+        var reducer = makeReducer(files: [one: pending, two: ready])
+        let effects = observeBatch([
+            observation(name: one, revision: "00001", outcome: .orderingContext),
+            observation(name: two, revision: "00002", outcome: .orderingContext),
+        ], nowNanos: 1_000, reducer: &reducer)
+        XCTAssertTrue(effects.isEmpty, "elapsed time alone cannot confirm an unread digest")
+        XCTAssertEqual(reducer.state.generation.files[one], pending)
+        XCTAssertEqual(reducer.state.generation.files[two], ready)
+        XCTAssertTrue(reducer.state.generation.ordering.ownerGraceUntil.isEmpty,
+                      "remembered presence is not fresh progress")
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, one)
+    }
+
+    func testOrderingContextOfUnreadableLowerFileStillHoldsItsPlace() {
+        let one = "live_stack_00001.fit", two = "live_stack_00002.fit"
+        var reducer = makeReducer(files: [two: .ready(makeCandidate(
+            name: two, identity: makeIdentity(2), digest: "two", kind: .numbered(revision: "00002")))])
+        let effects = observeBatch([
+            observation(name: one, revision: "00001", outcome: .orderingContext),
+            observation(name: two, revision: "00002", outcome: .orderingContext),
+        ], nowNanos: 0, reducer: &reducer)
+        XCTAssertTrue(effects.isEmpty)
+        XCTAssertNil(reducer.state.generation.files[one], "presence must not fabricate content state")
+        XCTAssertEqual(reducer.state.generation.ordering.activeBlocker?.blocker, one)
+    }
+
     func testRetainedDigestIsNeverGenerationOrderingEvidence() {
         let one = "live_stack_00001.fit"
         let two = "live_stack_00002.fit"
