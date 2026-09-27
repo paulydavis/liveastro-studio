@@ -22,7 +22,7 @@ Scripts/package_store_preview.sh \
 preview_app="$PWD/.build/store-preview-task3/LiveAstro Store Preview.app"
 codesign --verify --deep --strict "$preview_app"
 codesign -dv --verbose=4 "$preview_app" 2>&1
-codesign -d --entitlements :- "$preview_app" > /tmp/liveastro-store-preview-entitlements.plist
+codesign -d --entitlements - --xml "$preview_app" > /tmp/liveastro-store-preview-entitlements.plist
 plutil -p /tmp/liveastro-store-preview-entitlements.plist
 plutil -p "$preview_app/Contents/Info.plist"
 ```

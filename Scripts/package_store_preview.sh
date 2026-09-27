@@ -69,9 +69,8 @@ done
 
 # Validate the complete plan before invoking mktemp, Swift, or any signing tool.
 [ -n "$IDENTITY" ] || fail "an existing Developer ID Application identity is required via --identity or DEVID"
-case "$VERSION" in
-    ""|*[!0-9.]*|.*|*.) fail "--version must contain dot-separated decimal components" ;;
-esac
+[[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]] \
+    || fail "--version must contain non-empty dot-separated decimal components"
 case "$OUTPUT_APP" in
     /*.app) ;;
     *) fail "--output-app must be an absolute path ending in .app" ;;
@@ -117,7 +116,11 @@ case "$CANONICAL_OUTPUT_PARENT" in
 esac
 
 SCRATCH=""
+PUBLISH_APP=""
 cleanup() {
+    if [ -n "$PUBLISH_APP" ] && [ -d "$PUBLISH_APP" ]; then
+        rm -rf -- "$PUBLISH_APP"
+    fi
     if [ -n "$SCRATCH" ] && [ -d "$SCRATCH" ]; then
         rm -rf -- "$SCRATCH"
     fi
@@ -188,15 +191,18 @@ SIGN=(codesign --force --options runtime --timestamp=none --sign "$IDENTITY")
 "${SIGN[@]}" --entitlements "$ENTITLEMENTS" "$STAGED_APP"
 codesign --verify --deep --strict "$STAGED_APP"
 
-# Create the final path atomically as an empty directory so a concurrently
-# created or pre-existing app can never be merged into or overwritten.
+# Copy to an owned temporary sibling on the destination filesystem. Nothing is
+# visible at the final path until this copy has passed every verification.
 mkdir -p "$OUTPUT_PARENT"
-mkdir "$OUTPUT_APP" || fail "output appeared while packaging; preserving it: $OUTPUT_APP"
-ditto --norsrc --noextattr "$STAGED_APP/" "$OUTPUT_APP/"
+if [ -e "$OUTPUT_APP" ] || [ -L "$OUTPUT_APP" ]; then
+    fail "output appeared while packaging; preserving it: $OUTPUT_APP"
+fi
+PUBLISH_APP="$(mktemp -d "$OUTPUT_PARENT/.${DISPLAY_NAME}.app.publish.XXXXXX")"
+ditto --norsrc --noextattr "$STAGED_APP/" "$PUBLISH_APP/"
 
-echo "== verify final signed preview =="
-codesign --verify --deep --strict "$OUTPUT_APP"
-SIGNED_INFO="$(codesign -dv --verbose=4 "$OUTPUT_APP" 2>&1)"
+echo "== verify destination copy before publication =="
+codesign --verify --deep --strict "$PUBLISH_APP"
+SIGNED_INFO="$(codesign -dv --verbose=4 "$PUBLISH_APP" 2>&1)"
 SIGNED_IDENTIFIER="$(printf '%s\n' "$SIGNED_INFO" | sed -n 's/^Identifier=//p')"
 SIGNED_AUTHORITY="$(printf '%s\n' "$SIGNED_INFO" | sed -n 's/^Authority=//p' | sed -n '1p')"
 [ "$SIGNED_IDENTIFIER" = "$BUNDLE_ID" ] || fail "signed identifier mismatch: $SIGNED_IDENTIFIER"
@@ -206,7 +212,7 @@ case "$SIGNED_AUTHORITY" in
 esac
 
 ACTUAL_ENTITLEMENTS="$SCRATCH/signed-entitlements.plist"
-codesign -d --entitlements :- "$OUTPUT_APP" > "$ACTUAL_ENTITLEMENTS"
+codesign -d --entitlements - --xml "$PUBLISH_APP" > "$ACTUAL_ENTITLEMENTS"
 for key in \
     com.apple.security.app-sandbox \
     com.apple.security.files.user-selected.read-write \
@@ -217,10 +223,37 @@ do
     [ "$value" = "true" ] || fail "signed entitlement is not enabled: $key"
 done
 
-PLIST_IDENTIFIER="$(plutil -extract CFBundleIdentifier raw -o - "$OUTPUT_APP/Contents/Info.plist")"
-PLIST_NAME="$(plutil -extract CFBundleDisplayName raw -o - "$OUTPUT_APP/Contents/Info.plist")"
+PLIST_IDENTIFIER="$(plutil -extract CFBundleIdentifier raw -o - "$PUBLISH_APP/Contents/Info.plist")"
+PLIST_NAME="$(plutil -extract CFBundleDisplayName raw -o - "$PUBLISH_APP/Contents/Info.plist")"
 [ "$PLIST_IDENTIFIER" = "$BUNDLE_ID" ] || fail "bundle identifier mismatch: $PLIST_IDENTIFIER"
 [ "$PLIST_NAME" = "$DISPLAY_NAME" ] || fail "bundle display name mismatch: $PLIST_NAME"
+
+# Plain mv is unsafe here: if the destination appears concurrently as a
+# directory, mv nests the app inside it. renamex_np(RENAME_EXCL) is an atomic,
+# same-filesystem no-replace publication primitive on supported macOS releases.
+PUBLISH_HELPER="$SCRATCH/publish-exclusive"
+xcrun clang -x c -std=c11 -Wall -Wextra -Werror -o "$PUBLISH_HELPER" - <<'C'
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "exclusive publisher requires source and destination\n");
+        return 64;
+    }
+    if (renamex_np(argv[1], argv[2], RENAME_EXCL) == 0) {
+        return 0;
+    }
+    int error = errno;
+    fprintf(stderr, "exclusive publish failed: %s\n", strerror(error));
+    return error == EEXIST ? 3 : 1;
+}
+C
+
+echo "== atomically publish verified preview =="
+"$PUBLISH_HELPER" "$PUBLISH_APP" "$OUTPUT_APP"
+PUBLISH_APP=""
 
 echo "   bundle id: $SIGNED_IDENTIFIER"
 echo "   name:      $PLIST_NAME"

@@ -41,6 +41,7 @@ class StorePreviewPackagingTests(unittest.TestCase):
         self.environment["PATH"] = str(self.stub_bin) + os.pathsep + self.environment["PATH"]
         self.environment["STORE_PREVIEW_TOOL_LOG"] = str(self.tool_log)
         self.environment["STORE_PREVIEW_TEST_ENTITLEMENTS"] = str(self.scripts / ENTITLEMENTS.name)
+        self.environment["STORE_PREVIEW_REAL_DITTO"] = "/usr/bin/ditto"
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -93,13 +94,27 @@ printf '\n' >> "$STORE_PREVIEW_TOOL_LOG"
 display_entitlements=0
 display_details=0
 previous=""
+verify=0
 for argument in "$@"; do
   if [ "$previous" = "-d" ] && [ "$argument" = "--entitlements" ]; then
     display_entitlements=1
   fi
   [ "$argument" = "-dv" ] && display_details=1
+  [ "$argument" = "--verify" ] && verify=1
   previous="$argument"
 done
+target="${!#}"
+if [ "$verify" -eq 1 ]; then
+    case "$target" in
+      "${STORE_PREVIEW_TEST_OUTPUT:-}"|*.publish.*)
+        if [ "${STORE_PREVIEW_CREATE_CONCURRENT_OUTPUT:-0}" = 1 ]; then
+            mkdir -p "$STORE_PREVIEW_TEST_OUTPUT"
+            printf 'concurrent owner\n' > "$STORE_PREVIEW_TEST_OUTPUT/concurrent-marker.txt"
+        fi
+        [ "${STORE_PREVIEW_FAIL_FINAL_VERIFY:-0}" != 1 ] || exit 95
+        ;;
+    esac
+fi
 if [ "$display_entitlements" -eq 1 ]; then
     cat "$STORE_PREVIEW_TEST_ENTITLEMENTS"
 elif [ "$display_details" -eq 1 ]; then
@@ -108,6 +123,32 @@ elif [ "$display_details" -eq 1 ]; then
     echo 'Authority=Developer ID Application: Paul Davis (HCAXQRGYPR)' >&2
     echo 'TeamIdentifier=HCAXQRGYPR' >&2
 fi
+''',
+        )
+        self._write_executable(
+            "ditto",
+            r'''#!/bin/bash
+set -euo pipefail
+printf 'ditto' >> "$STORE_PREVIEW_TOOL_LOG"
+printf ' <%s>' "$@" >> "$STORE_PREVIEW_TOOL_LOG"
+printf '\n' >> "$STORE_PREVIEW_TOOL_LOG"
+target="${!#}"
+case "$target" in
+  "${STORE_PREVIEW_TEST_OUTPUT:-}"|*.publish.*)
+    [ "${STORE_PREVIEW_FAIL_PUBLISH_COPY:-0}" != 1 ] || exit 96
+    ;;
+esac
+exec "$STORE_PREVIEW_REAL_DITTO" "$@"
+''',
+        )
+        self._write_executable(
+            "xcrun",
+            r'''#!/bin/bash
+set -euo pipefail
+printf 'xcrun' >> "$STORE_PREVIEW_TOOL_LOG"
+printf ' <%s>' "$@" >> "$STORE_PREVIEW_TOOL_LOG"
+printf '\n' >> "$STORE_PREVIEW_TOOL_LOG"
+exec /usr/bin/xcrun "$@"
 ''',
         )
         self._write_executable(
@@ -138,6 +179,7 @@ printf '\n' >> "$STORE_PREVIEW_TOOL_LOG"
         cases = [
             ("--unknown",),
             ("--identity",),
+            ("--version", "1..2", "--identity", "fixture"),
             ("--output-app", "/Applications/LiveAstro Store Preview.app", "--identity", "fixture"),
         ]
         for arguments in cases:
@@ -173,6 +215,56 @@ printf '\n' >> "$STORE_PREVIEW_TOOL_LOG"
 
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertFalse(self.tool_log.exists(), "a resolved /Applications target must fail before building")
+
+    def test_publish_copy_failure_leaves_no_output_and_retry_succeeds(self):
+        output_parent = self.root / "copy-failure-output"
+        output_parent.mkdir()
+        output = output_parent / "LiveAstro Store Preview.app"
+        self.environment["STORE_PREVIEW_TEST_OUTPUT"] = str(output)
+        self.environment["STORE_PREVIEW_FAIL_PUBLISH_COPY"] = "1"
+
+        failed = self.invoke("--identity", "fixture", "--output-app", output)
+
+        self.assertNotEqual(failed.returncode, 0, failed.stdout)
+        self.assertFalse(output.exists(), "a failed publication copy must not expose the final app")
+        self.assertEqual(list(output_parent.glob(".LiveAstro Store Preview.app.publish.*")), [])
+
+        self.environment.pop("STORE_PREVIEW_FAIL_PUBLISH_COPY")
+        retried = self.invoke("--identity", "fixture", "--output-app", output)
+        self.assertEqual(retried.returncode, 0, retried.stdout)
+        self.assertTrue((output / "Contents/Info.plist").is_file())
+
+    def test_final_verification_failure_leaves_no_output_and_retry_succeeds(self):
+        output_parent = self.root / "verification-failure-output"
+        output_parent.mkdir()
+        output = output_parent / "LiveAstro Store Preview.app"
+        self.environment["STORE_PREVIEW_TEST_OUTPUT"] = str(output)
+        self.environment["STORE_PREVIEW_FAIL_FINAL_VERIFY"] = "1"
+
+        failed = self.invoke("--identity", "fixture", "--output-app", output)
+
+        self.assertNotEqual(failed.returncode, 0, failed.stdout)
+        self.assertFalse(output.exists(), "a rejected publication copy must not expose the final app")
+        self.assertEqual(list(output_parent.glob(".LiveAstro Store Preview.app.publish.*")), [])
+
+        self.environment.pop("STORE_PREVIEW_FAIL_FINAL_VERIFY")
+        retried = self.invoke("--identity", "fixture", "--output-app", output)
+        self.assertEqual(retried.returncode, 0, retried.stdout)
+        self.assertTrue((output / "Contents/Info.plist").is_file())
+
+    def test_concurrent_destination_is_preserved_by_exclusive_publish(self):
+        output_parent = self.root / "concurrent-output"
+        output_parent.mkdir()
+        output = output_parent / "LiveAstro Store Preview.app"
+        self.environment["STORE_PREVIEW_TEST_OUTPUT"] = str(output)
+        self.environment["STORE_PREVIEW_CREATE_CONCURRENT_OUTPUT"] = "1"
+
+        result = self.invoke("--identity", "fixture", "--output-app", output)
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual((output / "concurrent-marker.txt").read_text(), "concurrent owner\n")
+        self.assertFalse((output / "Contents").exists(), "publisher must not merge into a concurrent destination")
+        self.assertEqual(list(output_parent.glob(".LiveAstro Store Preview.app.publish.*")), [])
 
     def test_build_is_anchored_to_package_root_from_unrelated_working_directory(self):
         unrelated = self.root / "unrelated-working-directory"
@@ -232,8 +324,11 @@ printf '\n' >> "$STORE_PREVIEW_TOOL_LOG"
         self.assertEqual(scratch.parent, build_root)
         self.assertTrue(scratch.name.startswith("liveastro-store-preview."))
         self.assertFalse(scratch.exists(), "the script must clean only its owned mktemp scratch")
-        self.assertIn(f"codesign <--verify> <--deep> <--strict> <{output}>", log)
-        self.assertIn("codesign <-d> <--entitlements> <:-", log)
+        verify_lines = [line for line in log.splitlines()
+                        if line.startswith("codesign <--verify> <--deep> <--strict>")]
+        self.assertTrue(any(".publish." in line for line in verify_lines), log)
+        self.assertNotIn(f"codesign <--verify> <--deep> <--strict> <{output}>", log)
+        self.assertIn("codesign <-d> <--entitlements> <-> <--xml>", log)
         self.assertIn("codesign <-dv> <--verbose=4>", log)
         self.assertEqual(shared_marker.read_text(), "preserve shared scratch\n")
         self.assertEqual(output_marker.read_text(), "preserve sibling\n")
