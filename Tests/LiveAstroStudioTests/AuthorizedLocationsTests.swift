@@ -4,6 +4,27 @@ import XCTest
 
 @MainActor
 final class AuthorizedLocationsTests: XCTestCase {
+    func testFailedStaleRenewalPreservesBytesAndLastOwnerStopsMovedScope() throws {
+        let defaults = try isolatedDefaults(), backend = FakeBookmarkBackend()
+        let original = temporaryURL("original"), moved = temporaryURL("moved")
+        let store = makeStore(defaults, backend)
+        _ = try store.select(original, key: "capture")
+        let before = try XCTUnwrap(defaults.data(forKey: AuthorizedLocations.defaultsKey))
+        let bookmark = try XCTUnwrap(backend.createdBookmarks.first)
+        backend.resolutions[bookmark] = BookmarkResolution(url: moved, isStale: true)
+        backend.deniedCreates.insert(moved.standardizedFileURL)
+        var lease: FileAccessLease? = try store.acquire(key: "capture")
+        var workerOwner = lease
+        XCTAssertEqual(lease?.url.path, moved.path)
+        XCTAssertEqual(defaults.data(forKey: AuthorizedLocations.defaultsKey), before)
+        XCTAssertEqual(store.displayURL(key: "capture")?.path, original.path)
+        lease = nil
+        XCTAssertEqual(workerOwner?.url.path, moved.path)
+        XCTAssertEqual(backend.stoppedURLs.filter { $0.path == moved.path }.count, 0)
+        workerOwner = nil
+        XCTAssertEqual(backend.stoppedURLs.filter { $0.path == moved.path }.count, 1)
+        XCTAssertEqual(defaults.data(forKey: AuthorizedLocations.defaultsKey), before)
+    }
     func testGroupUsesOriginalMovedParentOnlyWithinItsAcquisition() throws {
         let defaults = try isolatedDefaults(), backend = FakeBookmarkBackend()
         let original = temporaryURL("original"), moved = temporaryURL("moved")

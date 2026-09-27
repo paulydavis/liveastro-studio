@@ -138,8 +138,10 @@ public final class CalibrationLibrary: Sendable {
     @discardableResult
     public func add(kind: MasterKind, camera: String, gain: Double?, exposureSeconds: Double?,
                     setTempC: Double?, binning: Int?, fitsURLs: [URL],
-                    bias: AstroImage? = nil, sourceDirectory: URL? = nil) throws -> MasterFrame {
-        let built = try MasterBuilder.combineDetailed(fitsURLs: fitsURLs, kind: kind, bias: bias)
+                    bias: AstroImage? = nil, sourceDirectory: URL? = nil,
+                    failOnReadError: Bool = false) throws -> MasterFrame {
+        let built = try MasterBuilder.combineDetailed(fitsURLs: fitsURLs, kind: kind, bias: bias,
+                                                       failOnReadError: failOnReadError)
         let master = built.image
         let id = UUID()
         let fileName = "master-\(id.uuidString).fit"
@@ -159,13 +161,16 @@ public final class CalibrationLibrary: Sendable {
     /// Re-combine an entry from its remembered source folder, replacing the master
     /// in place (same id/fileName) and refreshing dimensions/count/date.
     /// The caller may supply a bookmark-resolved moved source; remember it after successful rebuild.
-    public func rebuild(id: UUID, bias: AstroImage? = nil, sourceDirectory: URL? = nil) throws {
+    public func rebuild(id: UUID, bias: AstroImage? = nil, sourceDirectory: URL? = nil,
+                        failOnReadError: Bool = false) throws {
         var frames = all()
         guard let idx = frames.firstIndex(where: { $0.id == id }) else { return }
         guard let src = frames[idx].sourcePath else { throw LibraryError.noSourceFolder }
-        let urls = Self.fitsFiles(in: sourceDirectory ?? URL(fileURLWithPath: src, isDirectory: true))
+        let folder = sourceDirectory ?? URL(fileURLWithPath: src, isDirectory: true)
+        let urls = failOnReadError ? try Self.fitsFilesRequiringAccess(in: folder) : Self.fitsFiles(in: folder)
         guard !urls.isEmpty else { throw LibraryError.noFramesInSource }
-        let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: frames[idx].kind, bias: bias)
+        let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: frames[idx].kind, bias: bias,
+                                                       failOnReadError: failOnReadError)
         let master = built.image
         guard let masterURL = masterURL(for: frames[idx].fileName) else { throw LibraryError.unsafeFileName }
         try MasterBuilder.save(master, to: masterURL)
@@ -174,6 +179,20 @@ public final class CalibrationLibrary: Sendable {
         frames[idx].createdAt = Date()
         if let sourceDirectory { frames[idx].sourcePath = sourceDirectory.path }
         try writeIndex(frames)
+    }
+
+    /// Persist bookmark-resolved provenance independently of a later pixel build.
+    /// Callers authorize these directories; this does not grant access or claim a
+    /// successful rebuild. Preserve every other field and avoid rewriting unchanged indexes.
+    public func updateSourceDirectories(_ directories: [UUID: URL]) throws {
+        var frames = all()
+        var changed = false
+        for idx in frames.indices {
+            guard let directory = directories[frames[idx].id], frames[idx].sourcePath != directory.path else { continue }
+            frames[idx].sourcePath = directory.path
+            changed = true
+        }
+        if changed { try writeIndex(frames) }
     }
 
     /// Remove an entry and its master file.

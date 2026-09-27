@@ -31,6 +31,71 @@ final class CalibrationLibraryTests: XCTestCase {
         CalibrationLibrary(baseDirectory: tmp.appendingPathComponent("lib", isDirectory: true))
     }
 
+    func testDefaultReadPolicyStillSkipsMissingChildAndReportsNoFramesForMissingFolder() throws {
+        let library = lib()
+        let good = writeRaws(1, value: 0.2)
+        let missing = rawDir.appendingPathComponent("disappeared.fit")
+        let frame = try library.add(kind: .dark, camera: "cam", gain: nil, exposureSeconds: nil,
+            setTempC: nil, binning: nil, fitsURLs: good + [missing])
+        XCTAssertEqual(frame.frameCount, 1)
+        // A dangling child is returned by enumeration but its data read fails.
+        try FileManager.default.createSymbolicLink(at: rawDir.appendingPathComponent("gone.fit"), withDestinationURL: missing)
+        try library.rebuild(id: frame.id)
+        XCTAssertEqual(library.all().first?.frameCount, 1)
+        try FileManager.default.removeItem(at: rawDir)
+        XCTAssertThrowsError(try library.rebuild(id: frame.id)) {
+            XCTAssertEqual($0 as? CalibrationLibrary.LibraryError, .noFramesInSource)
+        }
+    }
+
+    func testStrictAddFailsOnDisappearedChildWithoutCreatingPartialLibrary() throws {
+        let library = lib(), good = writeRaws(1, value: 0.2)
+        let missing = rawDir.appendingPathComponent("disappeared.fit")
+        XCTAssertThrowsError(try library.add(kind: .dark, camera: "cam", gain: nil, exposureSeconds: nil,
+            setTempC: nil, binning: nil, fitsURLs: good + [missing], failOnReadError: true)) {
+            XCTAssertEqual(($0 as? CalibrationReadError)?.url.path, missing.path)
+        }
+        XCTAssertTrue(library.all().isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.appendingPathComponent("lib").path))
+    }
+
+    func testStrictRebuildMissingChildAndEnumerationFailurePreserveBytes() throws {
+        let library = lib()
+        let frame = try library.add(kind: .dark, camera: "cam", gain: nil, exposureSeconds: nil,
+            setTempC: nil, binning: nil, fitsURLs: writeRaws(1, value: 0.2))
+        let indexURL = tmp.appendingPathComponent("lib/index.json")
+        let masterURL = tmp.appendingPathComponent("lib/" + frame.fileName)
+        let index = try Data(contentsOf: indexURL), master = try Data(contentsOf: masterURL)
+        let missing = rawDir.appendingPathComponent("gone.fit")
+        try FileManager.default.createSymbolicLink(at: missing, withDestinationURL: tmp.appendingPathComponent("absent.fit"))
+        XCTAssertThrowsError(try library.rebuild(id: frame.id, failOnReadError: true)) {
+            let failed = ($0 as? CalibrationReadError)?.url
+            XCTAssertEqual(failed?.lastPathComponent, missing.lastPathComponent)
+            XCTAssertEqual(failed?.deletingLastPathComponent().resolvingSymlinksInPath().path,
+                           self.rawDir.resolvingSymlinksInPath().path)
+        }
+        XCTAssertEqual(try Data(contentsOf: indexURL), index)
+        XCTAssertEqual(try Data(contentsOf: masterURL), master)
+        try FileManager.default.removeItem(at: rawDir)
+        XCTAssertThrowsError(try library.rebuild(id: frame.id, failOnReadError: true)) {
+            XCTAssertEqual(($0 as? CalibrationReadError)?.url.path, self.rawDir.path)
+        }
+        XCTAssertEqual(try Data(contentsOf: indexURL), index)
+        XCTAssertEqual(try Data(contentsOf: masterURL), master)
+    }
+
+    func testStrictReadPolicyStillRejectsFormatAndSizeWithoutChangingPixelSelection() throws {
+        let library = lib(), good = writeRaws(1, value: 0.2)
+        let invalid = rawDir.appendingPathComponent("invalid.fit")
+        try Data("not FITS".utf8).write(to: invalid)
+        let wrongSize = rawDir.appendingPathComponent("other-size.fit")
+        try FITSWriter.float32(width: 8, height: 8, channels: 1, pixels: [Float](repeating: 0.9, count: 64)).write(to: wrongSize)
+        let frame = try library.add(kind: .dark, camera: "cam", gain: nil, exposureSeconds: nil,
+            setTempC: nil, binning: nil, fitsURLs: good + [invalid, wrongSize], failOnReadError: true)
+        XCTAssertEqual(frame.frameCount, 1)
+        XCTAssertEqual(try XCTUnwrap(library.master(for: frame)).pixels[0], 0.2, accuracy: 1e-5)
+    }
+
     /// One malformed/legacy entry in the index must not hide every good master — all() skips it.
     func testTolerantDecodeSkipsMalformedEntry() throws {
         let l = lib()

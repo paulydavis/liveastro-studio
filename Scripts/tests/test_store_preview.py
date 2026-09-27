@@ -161,7 +161,7 @@ printf '\n' >> "$STORE_PREVIEW_TOOL_LOG"
 ''',
         )
 
-    def invoke(self, *arguments, cwd=None):
+    def invoke(self, *arguments, cwd=None, umask=0o022):
         return subprocess.run(
             ["bash", str(self.scripts / SCRIPT.name), *map(str, arguments)],
             cwd=cwd or self.project,
@@ -170,6 +170,7 @@ printf '\n' >> "$STORE_PREVIEW_TOOL_LOG"
             stderr=subprocess.STDOUT,
             text=True,
             timeout=30,
+            umask=umask,
         )
 
     def test_bad_arguments_fail_before_building(self):
@@ -309,6 +310,8 @@ printf '\n' >> "$STORE_PREVIEW_TOOL_LOG"
 
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertTrue(output.is_dir())
+        self.assertEqual(output.stat().st_mode & 0o777, 0o755,
+                         "publication must preserve the staged app root mode, not mktemp's 0700")
         info = plistlib.loads((output / "Contents/Info.plist").read_bytes())
         self.assertEqual(info["CFBundleIdentifier"], "com.pauldavis.liveastrostudio.store-preview")
         self.assertEqual(info["CFBundleName"], "LiveAstro Store Preview")
@@ -345,6 +348,13 @@ printf '\n' >> "$STORE_PREVIEW_TOOL_LOG"
                 "com.apple.security.network.client": True,
             },
         )
+
+    def test_publish_root_preserves_nondefault_staged_mode(self):
+        output = self.root / "restricted-development" / "LiveAstro Store Preview.app"
+        result = self.invoke("--identity", "fixture", "--output-app", output, umask=0o027)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(output.stat().st_mode & 0o777, 0o750,
+                         "the owned publish sibling must retain the staged root's actual mode")
 
 
 if __name__ == "__main__":

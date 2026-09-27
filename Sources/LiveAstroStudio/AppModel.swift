@@ -404,6 +404,20 @@ final class AppModel {
     var selectedOutputFolder: URL?
     private var pendingFileAccess: OperationFileAccess?
     private var sessionFileAccess: OperationFileAccess?
+    private var completedSessionAccess: SessionDirectoryAccess?
+
+    private func publishFinishedSession(_ url: URL, access: OperationFileAccess?) {
+        lastSessionDirectory = url
+        completedSessionAccess = isStorePreview ? access.map { SessionDirectoryAccess(url: url, operation: $0) } : nil
+    }
+
+    private func acquireSessionDirectoryAccess(_ url: URL) throws -> SessionDirectoryAccess {
+        if let retained = completedSessionAccess,
+           retained.url.path == url.standardizedFileURL.resolvingSymlinksInPath().path {
+            return retained
+        }
+        return SessionDirectoryAccess(lease: try acquireReadableLocation(url))
+    }
     private var demoTask: Task<Void, Never>?
 
     /// Where session/calibration settings persist. Defaults to `.standard` (production); tests
@@ -449,7 +463,8 @@ final class AppModel {
          relayRoot: URL? = nil,
          configuration: StorePreviewConfiguration = StorePreviewConfiguration(),
          bookmarkBackend: any BookmarkAccessing = FoundationBookmarkAccessor(),
-         locationAvailability: any LocationAvailabilityChecking = FileLocationAvailability()) {
+         locationAvailability: any LocationAvailabilityChecking = FileLocationAvailability(),
+         makeNativeProcessor: @escaping @Sendable () -> any Processor = { NativeDenoiseProcessor() }) {
         self.userDefaults = userDefaults
         self.locationAvailability = locationAvailability
         self.distribution = configuration
@@ -549,18 +564,19 @@ final class AppModel {
             resetSessionStatsForImport: { [weak self] in MainActor.assumeIsolated { self?.resetSessionStatsForImport() } },
             isRestacking: { [weak self] in MainActor.assumeIsolated { self?.isRestacking ?? false } },
             setReplayURL: { [weak self] url in MainActor.assumeIsolated { self?.replayURL = url } },
-            setLastSessionDirectory: { [weak self] url in MainActor.assumeIsolated { self?.lastSessionDirectory = url } },
+            setLastSessionDirectory: { [weak self] url, access in
+                MainActor.assumeIsolated { self?.publishFinishedSession(url, access: access) } },
             acquireOperationAccess: { [weak self] url in
                 guard let self else { throw CocoaError(.userCancelled) }
                 return try self.acquireOperationAccess(input: url)
             }, acquireLocationAccess: { [weak self] url in
                 guard let self else { throw CocoaError(.userCancelled) }
-                return try self.acquireReadableLocation(url)
+                return try self.acquireSessionDirectoryAccess(url)
             }, isStorePreview: configuration.isStorePreview, catalogURL: configuration.catalogURL,
             persistCalibration: { [weak self] selection in
                 guard let self else { return }
                 CalibrationStore.save(selection, to: self.userDefaults)
-            }))
+            }), makeNativeProcessor: makeNativeProcessor)
         loadSettings()
 
         // Save settings and stop the relay when the app is about to terminate.
@@ -1221,6 +1237,7 @@ final class AppModel {
         log.append("Calibration: preparing \(kind.rawValue) master…")
         let lib = calibrationLibrary
         let sourceDirectory = isStorePreview ? access.url : nil
+        let strict = isStorePreview
         Task.detached { [weak self, access] in
             defer { withExtendedLifetime(access) {} }
             // Swift 6: rebind weak self to a strong immutable up front — nested
@@ -1256,7 +1273,7 @@ final class AppModel {
                     // uncontrolled) must not masquerade as a setpoint — that made uncooled darks carry
                     // a spurious temperature that then false-rejected uncooled lights.
                     setTempC: meta.setTempC, binning: meta.binning, fitsURLs: urls,
-                    sourceDirectory: sourceDirectory)
+                    sourceDirectory: sourceDirectory, failOnReadError: strict)
                 await MainActor.run {
                     self.calibrationBusy = false
                     self.refreshLibraryEntries()
@@ -1265,6 +1282,7 @@ final class AppModel {
             } catch {
                 await MainActor.run {
                     self.calibrationBusy = false
+                    if error is CalibrationReadError { self.reportFileAccess(error) }
                     self.log.append("Calibration: build failed — \(error.localizedDescription)")
                 }
             }
@@ -1277,22 +1295,45 @@ final class AppModel {
     }
 
     func rebuildMaster(_ id: UUID) {
-        guard let path = calibrationLibrary.all().first(where: { $0.id == id })?.sourcePath else { return }
+        let entries = calibrationLibrary.all()
+        guard let selected = entries.first(where: { $0.id == id }), let path = selected.sourcePath else { return }
         let access: FileAccessLease
-        do { access = try acquireReadableLocation(URL(fileURLWithPath: path)) }
+        do {
+            if isStorePreview {
+                // Resolve all remembered siblings against ONE original grant snapshot.
+                // Renewal must not strand another child of the same moved grant.
+                let sources = [selected] + entries.filter { $0.id != id && $0.sourcePath != nil }
+                let results = authorizedLocations.acquireGroup(sources.map { .url(URL(fileURLWithPath: $0.sourcePath!)) })
+                var resolved: [UUID: URL] = [:]
+                for (entry, result) in zip(sources, results) {
+                    if case .success(let lease) = result { resolved[entry.id] = lease.url }
+                }
+                // Save successful identities even if the selected acquisition/build
+                // fails; unrelated failed grants do not block this entry's rebuild.
+                try calibrationLibrary.updateSourceDirectories(resolved)
+                refreshLibraryEntries()
+                access = try results[0].get()
+            } else { access = try acquireReadableLocation(URL(fileURLWithPath: path)) }
+        }
         catch { reportFileAccess(error); return }
         calibrationBusy = true
         let lib = calibrationLibrary
+        let strict = isStorePreview
         Task.detached { [weak self, access] in
             defer { withExtendedLifetime(access) {} }
             guard let self else { return }   // Swift 6: strong immutable for nested closures
-            let message: String
-            do { try lib.rebuild(id: id, sourceDirectory: access.url); message = "Calibration: rebuilt master." }
-            catch { message = "Calibration: rebuild failed — \(error.localizedDescription)" }
+            do {
+                try lib.rebuild(id: id, sourceDirectory: access.url, failOnReadError: strict)
+                await MainActor.run { self.log.append("Calibration: rebuilt master.") }
+            } catch {
+                await MainActor.run {
+                    if error is CalibrationReadError { self.reportFileAccess(error) }
+                    self.log.append("Calibration: rebuild failed — \(error.localizedDescription)")
+                }
+            }
             await MainActor.run {
                 self.calibrationBusy = false
                 self.refreshLibraryEntries()
-                self.log.append(message)
             }
         }
     }
@@ -1720,6 +1761,7 @@ final class AppModel {
         do {
             try p.start()
             sessionFileAccess = access
+            completedSessionAccess = nil
             setPipeline(p)
             refreshPreview(force: true)   // fill the panel as soon as there is data
             isRunning = true
@@ -2112,6 +2154,7 @@ final class AppModel {
     func resetSessionStatsForImport() {
         guard !isRestacking else { return }
         sessionFileAccess = nil
+        completedSessionAccess = nil
         presentCleanStackCompletion(nil, status: nil)
         subFrames = []
         restackSourceDir = nil
@@ -2440,7 +2483,7 @@ final class AppModel {
                 let url = try p.end()
                 await MainActor.run {
                     self.replayURL = url
-                    self.lastSessionDirectory = url.deletingLastPathComponent()
+                    self.publishFinishedSession(url.deletingLastPathComponent(), access: access)
                     self.log.append("Replay ready: \(url.lastPathComponent)")
                     // Overwrite the Core-written sub-frames.csv (rejectedByUser=false at
                     // persist time — Core has no durable flag-setter, see Fix D) with one
@@ -2488,7 +2531,7 @@ final class AppModel {
                     // committed session ends with a stale/nil lastSessionDirectory and an all-false
                     // sub-frames.csv (Fix 3). Use the committed session's own directory.
                     if let dir = p.sessionDir {
-                        self.lastSessionDirectory = dir
+                        self.publishFinishedSession(dir, access: access)
                         if !self.subFrames.isEmpty {
                             try? SubFrameCSV.write(subFrames: self.subFrames, to: dir)
                         }

@@ -89,13 +89,13 @@ struct AppSurface {
 
     /// Publishes the generated replay URL.
     var setReplayURL: ((URL) -> Void)?
-    /// Publishes the finished session directory.
-    var setLastSessionDirectory: ((URL) -> Void)?
+    /// Publishes the finished session directory together with its captured owner.
+    var setLastSessionDirectory: ((URL, OperationFileAccess?) -> Void)?
 
     // Authorization stays at the app boundary; controllers capture these owners
     // before metadata reads and carry them through their existing start paths.
     var acquireOperationAccess: (@MainActor (URL) throws -> OperationFileAccess)?
-    var acquireLocationAccess: (@MainActor (URL) throws -> FileAccessLease)?
+    var acquireLocationAccess: (@MainActor (URL) throws -> SessionDirectoryAccess)?
     var startAuthorizedSession: (@MainActor (OperationFileAccess, @escaping (Bool) -> Void) -> Void)?
     var isStorePreview: Bool
     var catalogURL: URL?
@@ -125,9 +125,9 @@ struct AppSurface {
          resetSessionStatsForImport: (() -> Void)? = nil,
          isRestacking: (() -> Bool)? = nil,
          setReplayURL: ((URL) -> Void)? = nil,
-         setLastSessionDirectory: ((URL) -> Void)? = nil,
+         setLastSessionDirectory: ((URL, OperationFileAccess?) -> Void)? = nil,
          acquireOperationAccess: (@MainActor (URL) throws -> OperationFileAccess)? = nil,
-         acquireLocationAccess: (@MainActor (URL) throws -> FileAccessLease)? = nil,
+         acquireLocationAccess: (@MainActor (URL) throws -> SessionDirectoryAccess)? = nil,
          startAuthorizedSession: (@MainActor (OperationFileAccess, @escaping (Bool) -> Void) -> Void)? = nil,
          isStorePreview: Bool = false, catalogURL: URL? = nil,
          persistCalibration: (@MainActor (CalibrationSelection) -> Void)? = nil) {

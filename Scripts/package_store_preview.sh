@@ -199,6 +199,9 @@ if [ -e "$OUTPUT_APP" ] || [ -L "$OUTPUT_APP" ]; then
 fi
 PUBLISH_APP="$(mktemp -d "$OUTPUT_PARENT/.${DISPLAY_NAME}.app.publish.XXXXXX")"
 ditto --norsrc --noextattr "$STAGED_APP/" "$PUBLISH_APP/"
+# ditto copies the contents into the existing mktemp directory, whose 0700
+# mode would otherwise survive publication. Keep the staged bundle root mode.
+chmod "$(stat -f '%Lp' "$STAGED_APP")" "$PUBLISH_APP"
 
 echo "== verify destination copy before publication =="
 codesign --verify --deep --strict "$PUBLISH_APP"

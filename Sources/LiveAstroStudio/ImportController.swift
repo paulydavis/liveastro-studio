@@ -17,6 +17,7 @@ import LiveAstroCore
 final class ImportController {
 
     private let surface: AppSurface
+    private let makeNativeProcessor: @Sendable () -> any Processor
 
     /// True while a one-shot batch import is draining. Gates the start*Live paths
     /// (read back through `AppSurface.isImporting`) and `startSession`; drives the
@@ -58,8 +59,10 @@ final class ImportController {
     private var importPrepareInFlight = false
     private var importPreparationTask: Task<Void, Never>?
 
-    init(surface: AppSurface) {
+    init(surface: AppSurface,
+         makeNativeProcessor: @escaping @Sendable () -> any Processor = { NativeDenoiseProcessor() }) {
         self.surface = surface
+        self.makeNativeProcessor = makeNativeProcessor
     }
 
     /// Imports raw FITS subs from `folder` as a one-shot batch.
@@ -186,7 +189,7 @@ final class ImportController {
                         self.surface.presentError(ImportController.noMatchMessage(prefix: prefix))
                     } else {
                         self.surface.setReplayURL?(url)
-                        self.surface.setLastSessionDirectory?(url.deletingLastPathComponent())
+                        self.surface.setLastSessionDirectory?(url.deletingLastPathComponent(), access)
                         self.surface.log("Import complete. Replay: \(url.path)")
                     }
                     self.isImporting = false
@@ -234,7 +237,7 @@ final class ImportController {
 
     func regenerateReplay(sessionDirectory: URL) {
         guard !surface.isSessionRunning() && !isGeneratingReplay else { return }
-        let access: FileAccessLease?
+        let access: SessionDirectoryAccess?
         do { access = try surface.acquireLocationAccess?(sessionDirectory) }
         catch { surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again."); return }
         let sessionDirectory = access?.url ?? sessionDirectory
@@ -263,7 +266,7 @@ final class ImportController {
             surface.presentError("External processors are unavailable in this preview. Choose Native NR.")
             return
         }
-        let access: FileAccessLease?
+        let access: SessionDirectoryAccess?
         do { access = try surface.acquireLocationAccess?(sessionDirectory) }
         catch { surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again."); return }
         let sessionDirectory = access?.url ?? sessionDirectory
@@ -284,6 +287,7 @@ final class ImportController {
             return
         }
         isProcessing = true
+        let makeNativeProcessor = makeNativeProcessor
         surface.log(backend == .graxpert ? "Processing master with GraXpert…"
                                          : "Processing master with Native NR…")
         Task.detached { [weak self, access] in
@@ -295,7 +299,7 @@ final class ImportController {
                 // unwrap is unreachable otherwise.
                 let proc: any Processor = backend == .graxpert
                     ? GraXpertProcessor(executable: graxpertExe!)
-                    : NativeDenoiseProcessor()
+                    : makeNativeProcessor()
                 // process() runs synchronously within this task, so the strong `self`
                 // let is safely captured by the progress callback for its duration.
                 let produced = try proc.process(masterURL: master, outputURL: out) { m in

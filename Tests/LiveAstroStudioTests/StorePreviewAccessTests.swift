@@ -6,6 +6,264 @@ import Darwin
 
 @MainActor
 final class StorePreviewAccessTests: XCTestCase {
+    func testPreviewLibraryAddFailsOnUnreadableChildDespiteReadableSibling() async throws {
+        let (model, backend, _, root) = try fixture()
+        let source = try directory(root, "darks")
+        try writeFITS(source.appendingPathComponent("a-readable.fit"))
+        let denied = source.appendingPathComponent("b-denied.fit")
+        try FITSWriter.float32(width: 8, height: 8, channels: 1, pixels: [Float](repeating: 0.9, count: 64)).write(to: denied)
+        XCTAssertNotNil(model.selectSourceFolder(source))
+        XCTAssertEqual(chmod(denied.path, 0), 0)
+        defer { chmod(denied.path, 0o600) }
+        model.addMasterFromFolder(source, kind: .dark)
+        for _ in 0..<500 where model.calibrationBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertFalse(model.calibrationBusy)
+        XCTAssertTrue(model.libraryEntries.isEmpty, "an access failure must not produce a partial master")
+        XCTAssertTrue(model.errorMessage?.contains("b-denied.fit") == true)
+        XCTAssertFalse(model.log.contains { $0.contains("Calibration: added") })
+        XCTAssertEqual(backend.balance(source), 0)
+    }
+
+    func testPreviewLibraryRebuildReadAndListingFailuresPreservePriorMasterAndIndex() async throws {
+        let (model, backend, _, root) = try fixture()
+        let source = try directory(root, "darks")
+        try writeFITS(source.appendingPathComponent("a-readable.fit"))
+        let denied = source.appendingPathComponent("b-denied.fit")
+        try FITSWriter.float32(width: 8, height: 8, channels: 1, pixels: [Float](repeating: 0.9, count: 64)).write(to: denied)
+        XCTAssertNotNil(model.selectSourceFolder(source))
+        model.addMasterFromFolder(source, kind: .dark)
+        for _ in 0..<500 where model.calibrationBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        let frame = try XCTUnwrap(model.libraryEntries.first)
+        let master = root.appendingPathComponent("container/library/" + frame.fileName)
+        let index = root.appendingPathComponent("container/library/index.json")
+        let masterBefore = try Data(contentsOf: master), indexBefore = try Data(contentsOf: index)
+        XCTAssertEqual(chmod(denied.path, 0), 0)
+        defer { chmod(denied.path, 0o600); chmod(source.path, 0o700) }
+        model.rebuildMaster(frame.id)
+        for _ in 0..<500 where model.calibrationBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(model.errorMessage?.contains("b-denied.fit") == true)
+        XCTAssertEqual(try Data(contentsOf: master), masterBefore)
+        XCTAssertEqual(try Data(contentsOf: index), indexBefore)
+        model.errorMessage = nil
+        XCTAssertEqual(chmod(source.path, 0), 0)
+        model.rebuildMaster(frame.id)
+        for _ in 0..<500 where model.calibrationBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNotNil(model.errorMessage, "denied enumeration must surface a folder-access error, not no frames")
+        XCTAssertEqual(try Data(contentsOf: master), masterBefore)
+        XCTAssertEqual(try Data(contentsOf: index), indexBefore)
+        XCTAssertEqual(backend.balance(source), 0)
+    }
+
+    func testFailedMovedLibraryRebuildPersistsSiblingSourcesForRetryAndRelaunch() async throws {
+        let (model, backend, defaults, root) = try fixture()
+        let parent = try directory(root, "raws"), moved = root.appendingPathComponent("moved-raws")
+        let darks = try directory(parent, "darks"), bias = try directory(parent, "bias")
+        try writeFITS(darks.appendingPathComponent("dark.fit"))
+        try writeFITS(bias.appendingPathComponent("bias.fit"))
+        XCTAssertNotNil(model.selectSourceFolder(parent))
+        model.addMasterFromFolder(darks, kind: .dark)
+        for _ in 0..<500 where model.calibrationBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        model.addMasterFromFolder(bias, kind: .bias)
+        for _ in 0..<500 where model.calibrationBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        let dark = try XCTUnwrap(model.libraryEntries.first { $0.kind == .dark })
+        let oldEntries = model.libraryEntries
+        let master = root.appendingPathComponent("container/library/" + dark.fileName)
+        let originalBytes = try Data(contentsOf: master)
+        try FileManager.default.moveItem(at: parent, to: moved)
+        backend.moves[parent.path] = moved
+        let movedDarks = moved.appendingPathComponent("darks")
+        try FileManager.default.removeItem(at: movedDarks.appendingPathComponent("dark.fit"))
+        model.rebuildMaster(dark.id)
+        for _ in 0..<500 where model.calibrationBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(model.log.contains { $0.contains("rebuild failed") })
+        XCTAssertEqual(try Data(contentsOf: master), originalBytes)
+        for old in oldEntries {
+            var expected = old
+            expected.sourcePath = moved.appendingPathComponent(old.kind == .dark ? "darks" : "bias").path
+            XCTAssertEqual(model.libraryEntries.first { $0.id == old.id }, expected,
+                           "only source identity may change when building fails")
+        }
+        XCTAssertThrowsError(try model.acquireReadableLocation(darks), "do not authorize obsolete aliases")
+        try writeFITS(movedDarks.appendingPathComponent("restored.fit"))
+        model.rebuildMaster(dark.id)
+        XCTAssertTrue(model.calibrationBusy)
+        for _ in 0..<500 where model.calibrationBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.log.filter { $0 == "Calibration: rebuilt master." }.count, 1)
+        let reopened = AppModel(userDefaults: defaults,
+            calibrationLibrary: CalibrationLibrary(baseDirectory: root.appendingPathComponent("container/library")),
+            configuration: config(root), bookmarkBackend: backend)
+        reopened.refreshLibraryEntries()
+        XCTAssertEqual(reopened.libraryEntries.count, 2)
+        for entry in reopened.libraryEntries {
+            reopened.rebuildMaster(entry.id)
+            XCTAssertTrue(reopened.calibrationBusy)
+            for _ in 0..<500 where reopened.calibrationBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+            XCTAssertNil(reopened.errorMessage)
+        }
+        XCTAssertEqual(reopened.log.filter { $0 == "Calibration: rebuilt master." }.count, 2)
+        XCTAssertEqual(backend.balance(moved), 0)
+    }
+
+    func testUnrelatedDeniedLibraryGrantDoesNotBlockSelectedRebuild() async throws {
+        let (model, backend, _, root) = try fixture()
+        let selected = try directory(root, "darks"), unrelated = try directory(root, "bias")
+        for folder in [selected, unrelated] {
+            try writeFITS(folder.appendingPathComponent("raw.fit"))
+            XCTAssertNotNil(model.selectSourceFolder(folder))
+            model.addMasterFromFolder(folder, kind: folder == selected ? .dark : .bias)
+            for _ in 0..<500 where model.calibrationBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        }
+        let dark = try XCTUnwrap(model.libraryEntries.first { $0.kind == .dark })
+        let bias = try XCTUnwrap(model.libraryEntries.first { $0.kind == .bias })
+        backend.denied = unrelated
+        try writeFITS(selected.appendingPathComponent("second.fit"))
+        model.rebuildMaster(dark.id)
+        for _ in 0..<500 where model.calibrationBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.libraryEntries.first { $0.id == dark.id }?.frameCount, 2)
+        XCTAssertEqual(model.libraryEntries.first { $0.id == bias.id }, bias)
+        XCTAssertEqual(backend.balance(selected), 0)
+        XCTAssertEqual(backend.balance(unrelated), 0)
+    }
+
+    func testNativeNRUsesRetainedLiveSessionAfterOutputChangeAndWorkerOutlivesContext() async throws {
+        let gate = GatedNativeProcessor()
+        let (model, backend, _, root) = try fixture(makeNativeProcessor: { gate })
+        let input = try directory(root, "input"), output = try directory(root, "output"), future = try directory(root, "future")
+        XCTAssertTrue(model.selectLocation(input, key: "capture"))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.sourceMode = .nativeStack
+        model.startSession()
+        for _ in 0..<500 where model.isPreparingSessionInput { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(model.isRunning)
+        model.endSession()
+        for _ in 0..<1000 where model.isRunning { try await Task.sleep(nanoseconds: 10_000_000) }
+        let session = try XCTUnwrap(model.lastSessionDirectory)
+        // Empty live End supplies the real ownership context; a small master fixture
+        // avoids unrelated watcher/stack quality behavior in this post-processing test.
+        let master = session.appendingPathComponent("master.fit")
+        try writeFITS(master)
+        XCTAssertTrue(model.selectLocation(future, key: "output"))
+        model.processorBackend = .nativeDenoise
+        model.errorMessage = nil
+        model.importer.processMaster(sessionDirectory: session)
+        for _ in 0..<500 where model.importer.isProcessing { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNil(model.errorMessage)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: session.appendingPathComponent("master_processed.fit").path))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: future.path).isEmpty)
+        let unrelated = try directory(output, "unrelated-session")
+        try writeFITS(unrelated.appendingPathComponent("master.fit"))
+        model.importer.processMaster(sessionDirectory: unrelated)
+        XCTAssertNotNil(model.errorMessage, "retained owner only authorizes the exact completed session")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: unrelated.appendingPathComponent("master_processed.fit").path))
+        model.errorMessage = nil
+        XCTAssertNotNil(model.selectSourceFolder(unrelated))
+        model.importer.processMaster(sessionDirectory: unrelated)
+        for _ in 0..<500 where model.importer.isProcessing { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNil(model.errorMessage)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.appendingPathComponent("master_processed.fit").path))
+        XCTAssertEqual(backend.balance(unrelated), 0, "an unrelated directory uses an independent short-lived grant")
+        let processed = session.appendingPathComponent("master_processed.fit")
+        try FileManager.default.removeItem(at: processed)
+        gate.parkNextCall()
+        defer { gate.release.signal() }
+        model.importer.processMaster(sessionDirectory: session)
+        guard model.importer.isProcessing else { return XCTFail("NR must acquire the retained context") }
+        for _ in 0..<500 where !gate.hasEntered { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertTrue(gate.hasEntered)
+        // New admitted work retires the app context while its native processor
+        // is parked. The gate owns no leases and delegates real NR when released.
+        model.importer.importSubs(from: input)
+        for _ in 0..<500 where model.importer.isImporting { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(backend.balance(output), 1, "the NR reader owns its own captured operation")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: processed.path))
+        model.errorMessage = nil // clear the deliberately empty replacement import's no-match message
+        gate.release.signal()
+        for _ in 0..<500 where model.importer.isProcessing || backend.balance(output) != 0 { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertFalse(model.importer.isProcessing)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: processed.path))
+        XCTAssertEqual(backend.balance(output), 0)
+    }
+
+    func testNativeNRUsesFinishedImportContextAfterFutureOutputChange() async throws {
+        let gate = GatedNativeProcessor()
+        let (model, backend, _, root) = try fixture(makeNativeProcessor: { gate })
+        let input = try directory(root, "input"), output = try directory(root, "output"), future = try directory(root, "future")
+        try writeStarField(input.appendingPathComponent("Light_001.fit"))
+        model.fileNamePrefix = "Light_"
+        XCTAssertNotNil(model.selectSourceFolder(input))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.importer.importSubs(from: input)
+        for _ in 0..<1500 where model.importer.isImporting { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertFalse(model.importer.isImporting)
+        XCTAssertNil(model.errorMessage)
+        let session = try XCTUnwrap(model.lastSessionDirectory)
+        XCTAssertTrue(session.path.hasPrefix(output.path + "/"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: session.appendingPathComponent("master.fit").path))
+        XCTAssertTrue(model.selectLocation(future, key: "output"))
+        // A denied preparation must not retire the successful import context.
+        model.importer.importSubs(from: root.appendingPathComponent("not-authorized"))
+        XCTAssertNotNil(model.errorMessage)
+        model.errorMessage = nil
+        // Cancellation of a real metadata read likewise keeps the old context.
+        let cancelledInput = try directory(root, "cancelled-input")
+        let fifo = cancelledInput.appendingPathComponent("Light_blocked.fit")
+        XCTAssertEqual(mkfifo(fifo.path, 0o600), 0)
+        XCTAssertNotNil(model.selectSourceFolder(cancelledInput))
+        model.importer.importSubs(from: cancelledInput)
+        var writer: Int32 = -1
+        defer { if writer >= 0 { Darwin.close(writer) } }
+        for _ in 0..<500 where writer < 0 {
+            writer = Darwin.open(fifo.path, O_WRONLY | O_NONBLOCK)
+            if writer < 0 { try await Task.sleep(nanoseconds: 1_000_000) }
+        }
+        XCTAssertGreaterThanOrEqual(writer, 0)
+        model.importer.cancelImport()
+        XCTAssertEqual(backend.balance(output), 1)
+        Darwin.close(writer); writer = -1
+        for _ in 0..<500 where backend.balance(cancelledInput) != 0 { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertEqual(backend.balance(cancelledInput), 0)
+        XCTAssertNil(model.errorMessage)
+        model.processorBackend = .nativeDenoise
+        gate.parkNextCall()
+        defer { gate.release.signal() }
+        model.importer.processMaster(sessionDirectory: session)
+        for _ in 0..<500 where !gate.hasEntered { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertTrue(gate.hasEntered)
+        let empty = try directory(root, "next-empty-import")
+        XCTAssertNotNil(model.selectSourceFolder(empty))
+        model.importer.importSubs(from: empty)
+        for _ in 0..<500 where model.importer.isImporting { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertFalse(model.importer.isImporting)
+        XCTAssertEqual(backend.balance(output), 1, "NR keeps the finished import owner after context retirement")
+        model.errorMessage = nil
+        gate.release.signal()
+        for _ in 0..<1000 where model.importer.isProcessing || backend.balance(output) != 0 { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNil(model.errorMessage)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: session.appendingPathComponent("master_processed.fit").path))
+        for child in try FileManager.default.contentsOfDirectory(at: future, includingPropertiesForKeys: nil) {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: child.appendingPathComponent("master_processed.fit").path))
+        }
+        XCTAssertEqual(backend.balance(output), 0)
+    }
+
+    private func writeStarField(_ url: URL) throws {
+        let size = 512
+        var pixels = [Float](repeating: 0.05, count: size * size)
+        for i in 0..<24 {
+            let cx = (i * 47 + 13) % 480 + 16, cy = (i * 83 + 29) % 480 + 16
+            for y in (cy - 8)...(cy + 8) {
+                for x in (cx - 8)...(cx + 8) {
+                    let dx = Double(x - cx), dy = Double(y - cy)
+                    pixels[y * size + x] += 0.8 * Float(exp(-(dx * dx + dy * dy) / 18))
+                }
+            }
+        }
+        try FITSWriter.float32(width: size, height: size, channels: 1, pixels: pixels).write(to: url)
+    }
+
     func testRelayStopDoesNotRetireUnownedDirectDiscoveryState() throws {
         let (_, _, _, root) = try fixture()
         let controller = LiveSourceController(surface: AppSurface(log: { _ in }, presentError: { _ in },
@@ -795,19 +1053,36 @@ final class StorePreviewAccessTests: XCTestCase {
                                   containerRoot: root.appendingPathComponent("container"))
     }
 
-    private func fixture() throws -> (AppModel, PreviewBookmarkBackend, UserDefaults, URL) {
+    private func fixture(makeNativeProcessor: @escaping @Sendable () -> any Processor = { NativeDenoiseProcessor() }) throws -> (AppModel, PreviewBookmarkBackend, UserDefaults, URL) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("StorePreviewTests-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let suite = "StorePreviewTests.\(UUID())", defaults = UserDefaults(suiteName: suite)!
         let backend = PreviewBookmarkBackend()
         addTeardownBlock { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: root) }
-        return (AppModel(userDefaults: defaults, calibrationLibrary: CalibrationLibrary(baseDirectory: root.appendingPathComponent("container/library")), configuration: config(root), bookmarkBackend: backend), backend, defaults, root)
+        return (AppModel(userDefaults: defaults, calibrationLibrary: CalibrationLibrary(baseDirectory: root.appendingPathComponent("container/library")), configuration: config(root), bookmarkBackend: backend, makeNativeProcessor: makeNativeProcessor), backend, defaults, root)
     }
 
     private func directory(_ root: URL, _ name: String) throws -> URL {
         let url = root.appendingPathComponent(name)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+}
+
+/// Parks only the processor boundary; neither captures nor releases access owners.
+private final class GatedNativeProcessor: Processor, @unchecked Sendable {
+    let name = "Gated Native NR"
+    let isAvailable = true
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var shouldPark = false
+    private var entered = false
+    var hasEntered: Bool { lock.lock(); defer { lock.unlock() }; return entered }
+    func parkNextCall() { lock.lock(); shouldPark = true; lock.unlock() }
+    func process(masterURL: URL, outputURL: URL, log: ((String) -> Void)?) throws -> URL {
+        lock.lock(); let park = shouldPark; shouldPark = false; entered = park; lock.unlock()
+        if park && release.wait(timeout: .now() + 5) != .success { throw CocoaError(.fileReadUnknown) }
+        return try NativeDenoiseProcessor().process(masterURL: masterURL, outputURL: outputURL, log: log)
     }
 }
 

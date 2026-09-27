@@ -52,6 +52,28 @@ struct OperationFileAccess: Sendable {
     }
 }
 
+/// Authorization for one exact finished session directory, not every child of
+/// its old output root. Workers copy this value so replacing the app's retained
+/// context cannot revoke access underneath an already-running reader.
+struct SessionDirectoryAccess: Sendable {
+    let url: URL
+    private let owner: Owner
+    private enum Owner: Sendable {
+        case operation(OperationFileAccess)
+        case independent(FileAccessLease)
+    }
+
+    init(url: URL, operation: OperationFileAccess) {
+        self.url = url.standardizedFileURL.resolvingSymlinksInPath()
+        self.owner = .operation(operation)
+    }
+
+    init(lease: FileAccessLease) {
+        self.url = lease.url
+        self.owner = .independent(lease)
+    }
+}
+
 extension AppModel {
     var isStorePreview: Bool { distribution.isStorePreview }
 
