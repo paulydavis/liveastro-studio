@@ -10,7 +10,7 @@ struct BookmarkResolution: Sendable {
     let isStale: Bool
 }
 
-protocol BookmarkAccessing: AnyObject {
+protocol BookmarkAccessing: AnyObject, Sendable {
     func createBookmark(for url: URL) throws -> Data
     func resolveBookmark(_ data: Data) throws -> BookmarkResolution
     func startAccessing(_ url: URL) -> Bool
@@ -42,11 +42,11 @@ final class FoundationBookmarkAccessor: BookmarkAccessing {
     }
 }
 
-final class FileAccessLease: @unchecked Sendable {
+final class FileAccessLease: Sendable {
     let url: URL
-    private let cleanup: (() -> Void)?
+    private let cleanup: (@Sendable () -> Void)?
 
-    init(url: URL, cleanup: (() -> Void)? = nil) {
+    init(url: URL, cleanup: (@Sendable () -> Void)? = nil) {
         self.url = url
         self.cleanup = cleanup
     }
@@ -199,7 +199,7 @@ final class AuthorizedLocations {
             Self.fileURL(path: $0.value.displayPath).pathComponents.count
                 > Self.fileURL(path: $1.value.displayPath).pathComponents.count
         }
-        var matchedDeniedGrant = false
+        var matchingError: (any Error)?
 
         for (key, record) in candidates {
             guard let bookmark = record.bookmark else { continue }
@@ -209,7 +209,9 @@ final class AuthorizedLocations {
             do {
                 resolution = try backend.resolveBookmark(bookmark)
             } catch {
-                if displayedSuffix != nil { throw error }
+                if displayedSuffix != nil, matchingError == nil {
+                    matchingError = error
+                }
                 continue
             }
 
@@ -226,7 +228,9 @@ final class AuthorizedLocations {
             }
 
             guard backend.startAccessing(resolvedRoot) else {
-                matchedDeniedGrant = true
+                if matchingError == nil {
+                    matchingError = AuthorizedLocationError.accessDenied(resolvedRoot)
+                }
                 continue
             }
 
@@ -237,8 +241,8 @@ final class AuthorizedLocations {
             return scopedLease(url: operationURL, scopeURL: resolvedRoot)
         }
 
-        if matchedDeniedGrant {
-            throw AuthorizedLocationError.accessDenied(requestedURL)
+        if let matchingError {
+            throw matchingError
         }
         throw AuthorizedLocationError.notAuthorized(requestedURL)
     }

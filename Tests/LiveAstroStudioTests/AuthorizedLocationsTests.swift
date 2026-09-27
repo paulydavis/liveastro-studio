@@ -184,6 +184,63 @@ final class AuthorizedLocationsTests: XCTestCase {
         }
     }
 
+    func testBrokenSpecificGrantFallsBackToValidParentGrant() throws {
+        let defaults = try isolatedDefaults()
+        let backend = FakeBookmarkBackend()
+        let parent = temporaryURL("parent")
+        let child = parent.appendingPathComponent("child", isDirectory: true)
+        let target = child.appendingPathComponent("file.fit")
+        let store = makeStore(defaults, backend)
+        var parentSelection: FileAccessLease? = try store.select(parent, key: "source:\(parent.absoluteString)")
+        var childSelection: FileAccessLease? = try store.select(child, key: "source:\(child.absoluteString)")
+        XCTAssertEqual(parentSelection?.url, parent)
+        XCTAssertEqual(childSelection?.url, child)
+        parentSelection = nil
+        childSelection = nil
+        let parentBookmark = try XCTUnwrap(backend.createdBookmarks.first)
+        let childBookmark = try XCTUnwrap(backend.createdBookmarks.last)
+        backend.deniedResolutions.insert(childBookmark)
+
+        var operation: FileAccessLease? = try store.acquire(url: target)
+
+        XCTAssertEqual(operation?.url, target)
+        XCTAssertEqual(backend.resolvedBookmarks.suffix(2), [childBookmark, parentBookmark])
+        XCTAssertEqual(backend.startedURLs.last, parent)
+        operation = nil
+        XCTAssertEqual(backend.stoppedURLs.last, parent)
+        XCTAssertEqual(backend.startedURLs.count, backend.stoppedURLs.count)
+    }
+
+    func testLeasesCrossExecutorsAndConcurrentCleanupBalancesEveryStart() async throws {
+        let defaults = try isolatedDefaults()
+        let backend = FakeBookmarkBackend()
+        assertSendable(backend as any BookmarkAccessing)
+        let root = temporaryURL("concurrent")
+        let store = makeStore(defaults, backend)
+
+        let tasks = (0..<32).map { index in
+            Task.detached { @Sendable in
+                let lease = await MainActor.run {
+                    try? store.select(root, key: "source:\(index)")
+                }
+                await Task.yield()
+                return lease?.url
+            }
+        }
+        var returnedURLs: [URL] = []
+        for task in tasks {
+            if let url = await task.value {
+                returnedURLs.append(url)
+            }
+        }
+
+        XCTAssertEqual(returnedURLs, Array(repeating: root, count: 32))
+        XCTAssertEqual(backend.startedURLs.count, 32)
+        XCTAssertEqual(backend.stoppedURLs.count, 32)
+        XCTAssertEqual(backend.startedURLs.sorted(by: { $0.absoluteString < $1.absoluteString }),
+                       backend.stoppedURLs.sorted(by: { $0.absoluteString < $1.absoluteString }))
+    }
+
     func testDirectPolicyPersistsSelectionsAndNeverUsesSecurityScope() throws {
         let defaults = try isolatedDefaults()
         let backend = FakeBookmarkBackend()
@@ -250,7 +307,7 @@ final class AuthorizedLocationsTests: XCTestCase {
     }
 }
 
-private final class FakeBookmarkBackend: BookmarkAccessing {
+private final class FakeBookmarkBackend: BookmarkAccessing, @unchecked Sendable {
     enum FakeError: Error {
         case createDenied
         case resolutionDenied
@@ -263,51 +320,105 @@ private final class FakeBookmarkBackend: BookmarkAccessing {
         case stop(URL)
     }
 
-    var resolutions: [Data: BookmarkResolution] = [:]
-    var deniedCreates: Set<URL> = []
-    var deniedResolutions: Set<Data> = []
-    var deniedStarts: Set<URL> = []
-    var denyEveryStart = false
-    private(set) var events: [Event] = []
-    private(set) var createdBookmarks: [Data] = []
+    private let lock = NSLock()
+    private var storedResolutions: [Data: BookmarkResolution] = [:]
+    private var storedDeniedCreates: Set<URL> = []
+    private var storedDeniedResolutions: Set<Data> = []
+    private var storedDeniedStarts: Set<URL> = []
+    private var storedDenyEveryStart = false
+    private var storedEvents: [Event] = []
+    private var storedCreatedBookmarks: [Data] = []
+
+    var resolutions: [Data: BookmarkResolution] {
+        get { locked { storedResolutions } }
+        set { locked { storedResolutions = newValue } }
+    }
+
+    var deniedCreates: Set<URL> {
+        get { locked { storedDeniedCreates } }
+        set { locked { storedDeniedCreates = newValue } }
+    }
+
+    var deniedResolutions: Set<Data> {
+        get { locked { storedDeniedResolutions } }
+        set { locked { storedDeniedResolutions = newValue } }
+    }
+
+    var deniedStarts: Set<URL> {
+        get { locked { storedDeniedStarts } }
+        set { locked { storedDeniedStarts = newValue } }
+    }
+
+    var denyEveryStart: Bool {
+        get { locked { storedDenyEveryStart } }
+        set { locked { storedDenyEveryStart = newValue } }
+    }
+
+    var events: [Event] {
+        locked { storedEvents }
+    }
+
+    var createdBookmarks: [Data] {
+        locked { storedCreatedBookmarks }
+    }
 
     var createdURLs: [URL] {
-        events.compactMap { if case let .create(url) = $0 { return url }; return nil }
+        locked { storedEvents.compactMap { if case let .create(url) = $0 { return url }; return nil } }
     }
 
     var startedURLs: [URL] {
-        events.compactMap { if case let .start(url) = $0 { return url }; return nil }
+        locked { storedEvents.compactMap { if case let .start(url) = $0 { return url }; return nil } }
     }
 
     var stoppedURLs: [URL] {
-        events.compactMap { if case let .stop(url) = $0 { return url }; return nil }
+        locked { storedEvents.compactMap { if case let .stop(url) = $0 { return url }; return nil } }
+    }
+
+    var resolvedBookmarks: [Data] {
+        locked { storedEvents.compactMap { if case let .resolve(data) = $0 { return data }; return nil } }
     }
 
     func createBookmark(for url: URL) throws -> Data {
-        let normalized = url.standardizedFileURL
-        events.append(.create(normalized))
-        guard !deniedCreates.contains(normalized) else { throw FakeError.createDenied }
-        let data = Data("bookmark-\(createdBookmarks.count)-\(normalized.absoluteString)".utf8)
-        createdBookmarks.append(data)
-        resolutions[data] = BookmarkResolution(url: normalized, isStale: false)
-        return data
+        try locked {
+            let normalized = url.standardizedFileURL
+            storedEvents.append(.create(normalized))
+            guard !storedDeniedCreates.contains(normalized) else { throw FakeError.createDenied }
+            let data = Data("bookmark-\(storedCreatedBookmarks.count)-\(normalized.absoluteString)".utf8)
+            storedCreatedBookmarks.append(data)
+            storedResolutions[data] = BookmarkResolution(url: normalized, isStale: false)
+            return data
+        }
     }
 
     func resolveBookmark(_ data: Data) throws -> BookmarkResolution {
-        events.append(.resolve(data))
-        guard !deniedResolutions.contains(data), let resolution = resolutions[data] else {
-            throw FakeError.resolutionDenied
+        try locked {
+            storedEvents.append(.resolve(data))
+            guard !storedDeniedResolutions.contains(data), let resolution = storedResolutions[data] else {
+                throw FakeError.resolutionDenied
+            }
+            return resolution
         }
-        return resolution
     }
 
     func startAccessing(_ url: URL) -> Bool {
-        let normalized = url.standardizedFileURL
-        events.append(.start(normalized))
-        return !denyEveryStart && !deniedStarts.contains(normalized)
+        locked {
+            let normalized = url.standardizedFileURL
+            storedEvents.append(.start(normalized))
+            return !storedDenyEveryStart && !storedDeniedStarts.contains(normalized)
+        }
     }
 
     func stopAccessing(_ url: URL) {
-        events.append(.stop(url.standardizedFileURL))
+        locked {
+            storedEvents.append(.stop(url.standardizedFileURL))
+        }
+    }
+
+    private func locked<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
     }
 }
+
+private func assertSendable<T: Sendable>(_ value: T) {}
