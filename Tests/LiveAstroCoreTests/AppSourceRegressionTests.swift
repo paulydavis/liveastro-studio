@@ -20,8 +20,8 @@ final class AppSourceRegressionTests: XCTestCase {
         let appModel = try String(contentsOf: appModelURL, encoding: .utf8)
 
         XCTAssertTrue(
-            appModel.contains("startWatchFolderLive(source: url, sourceMode: sourceMode)"),
-            "pickWatchFolderLive must forward the REQUESTED sourceMode into LiveSourceController, not read back mutable AppModel state."
+            appModel.contains("startWatchFolderLive(source: watchFolder ?? url, sourceMode: sourceMode)"),
+            "pickWatchFolderLive must forward the permission-resolved folder and REQUESTED sourceMode into LiveSourceController, not read back mutable AppModel.sourceMode."
         )
         XCTAssertTrue(
             captureView.contains("sourceMode: .stackerOutput"),
@@ -119,8 +119,8 @@ final class AppSourceRegressionTests: XCTestCase {
         let appModel = try String(contentsOf: appModelURL, encoding: .utf8)
 
         XCTAssertTrue(
-            source.contains("Task.detached { [weak self, folder, prefix] in"),
-            "importSubs must move the initial newest-FITS metadata scan off MainActor; SMB enumeration/header reads can be slow."
+            source.contains("importPreparationTask = Task.detached { [weak self, folder, prefix, access] in"),
+            "importSubs must move the initial newest-FITS metadata scan off MainActor with its captured folder access; SMB enumeration/header reads can be slow."
         )
         XCTAssertTrue(
             source.contains("let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder)"),
@@ -151,8 +151,8 @@ final class AppSourceRegressionTests: XCTestCase {
             "ImportController must distinguish prepare-with-no-pipeline from cancel-drain-with-no-pipeline; double cancel must not unlock UI mid-finalization."
         )
         XCTAssertTrue(
-            source.contains("beginImport(from: folder, meta: meta, prefix: prefix, generation: generation)"),
-            "The detached prepare completion must carry the generation it started under."
+            source.contains("self.beginImport(from: folder, meta: meta, prefix: prefix, generation: generation,\n                                     output: output, calibration: calibration, access: access, loaded: loaded)"),
+            "The detached prepare completion must carry its original generation, captured destination/calibration/access, and prepared calibration result."
         )
         XCTAssertTrue(
             source.contains("guard generation == importPrepareGeneration"),
