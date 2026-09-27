@@ -74,6 +74,12 @@ final class ImportController {
             surface.presentError("Finish the re-stack before importing."); return
         }
         guard !isImporting else { return }
+        let access: OperationFileAccess?
+        do { access = try surface.acquireOperationAccess?(folder) }
+        catch { surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again."); return }
+        let folder = access?.input ?? folder
+        let output = access?.output ?? surface.currentLiveAstroRoot!()
+        let calibration = access?.calibration ?? surface.currentCalibration!()
         // Offline import: `onSubFrame` fires native-only, so clear the native-session-only
         // stats/re-stack state now — otherwise Stats would show a prior live session's rows and
         // a re-stack could target the prior session's folder (Fix P2-import). Full import
@@ -88,11 +94,13 @@ final class ImportController {
         let generation = importPrepareGeneration
         surface.log("Preparing import from \(folder.path)…")
 
-        Task.detached { [weak self, folder, prefix] in
+        Task.detached { [weak self, folder, prefix, access] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }
             let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder)
             await MainActor.run {
-                self.beginImport(from: folder, meta: meta, prefix: prefix, generation: generation)
+                self.beginImport(from: folder, meta: meta, prefix: prefix, generation: generation,
+                                 output: output, calibration: calibration, access: access)
             }
         }
     }
@@ -100,7 +108,8 @@ final class ImportController {
     private func beginImport(from folder: URL,
                              meta: (object: String?, exposureSeconds: Double?, fileExtension: String)?,
                              prefix: String,
-                             generation: Int) {
+                             generation: Int, output: URL, calibration: CalibrationSelection,
+                             access: OperationFileAccess?) {
         guard generation == importPrepareGeneration, isImporting else { return }
         importPrepareInFlight = false
         guard !surface.isSessionRunning() else {
@@ -119,18 +128,18 @@ final class ImportController {
             surface.saveSettings?()
         }
         let source = FolderFrameSource(folder: folder, mode: .importOnce,
-                                        fileNamePrefix: prefix.isEmpty ? nil : prefix)
+                                        fileNamePrefix: prefix.isEmpty ? nil : prefix, accessLifetime: access)
         let engine = surface.makeStackEngine!()
-        let calibration = surface.currentCalibration!()
         let (importCalibrator, importCalWarnings) = CalibrationLoader.makeCalibrator(
             dark: calibration.darkPath.map { URL(fileURLWithPath: $0) },
             flat: calibration.flatPath.map { URL(fileURLWithPath: $0) })
         importCalWarnings.forEach { surface.log("⚠ \($0)") }
-        CalibrationStore.save(calibration, to: .standard)
+        surface.persistCalibration?(calibration)
+        surface.saveSettings?()
         let importPipeline = SessionPipeline(nativeSource: source, engine: engine, profile: surface.currentProfile!(),
-                                              rootDirectory: surface.currentLiveAstroRoot!(),
+                                              rootDirectory: output,
                                               neutralizeBackground: surface.currentNeutralizeBackground!(),
-                                              calibrator: importCalibrator)
+                                              calibrator: importCalibrator, catalogURL: surface.catalogURL, accessLifetime: access)
         importPipeline.displayAdjustments = surface.currentDisplayAdjustments?() ?? .neutral
         importPipeline.onImportProgress = { [weak self] processed, total, accepted, rejected in
             DispatchQueue.main.async {
@@ -147,7 +156,8 @@ final class ImportController {
         let matchedFrames = AtomicCounter()
         surface.wireImportCallbacks?(importPipeline, { matchedFrames.increment() })
         surface.log("Importing subs from \(folder.path)…")
-        Task.detached { [weak self] in
+        Task.detached { [weak self, access] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             do {
                 try importPipeline.start()
@@ -203,9 +213,14 @@ final class ImportController {
 
     func regenerateReplay(sessionDirectory: URL) {
         guard !surface.isSessionRunning() && !isGeneratingReplay else { return }
+        let access: FileAccessLease?
+        do { access = try surface.acquireLocationAccess?(sessionDirectory) }
+        catch { surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again."); return }
+        let sessionDirectory = access?.url ?? sessionDirectory
         isGeneratingReplay = true
         surface.log("Regenerating replay for \(sessionDirectory.lastPathComponent)…")
-        Task.detached { [weak self] in
+        Task.detached { [weak self, access] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             do {
                 let url = try ReplayService.regenerate(sessionDirectory: sessionDirectory)
@@ -223,6 +238,14 @@ final class ImportController {
     func processMaster(sessionDirectory: URL) {
         guard !isProcessing, !isImporting, !surface.isSessionRunning() else { return }
         let backend = surface.currentProcessorBackend?() ?? ProcessorBackend.none
+        guard !(surface.isStorePreview && backend == .graxpert) else {
+            surface.presentError("External processors are unavailable in this preview. Choose Native NR.")
+            return
+        }
+        let access: FileAccessLease?
+        do { access = try surface.acquireLocationAccess?(sessionDirectory) }
+        catch { surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again."); return }
+        let sessionDirectory = access?.url ?? sessionDirectory
         let graxpertExe = GraXpertProcessor.defaultExecutable()
         switch backend {
         case .none:
@@ -242,7 +265,8 @@ final class ImportController {
         isProcessing = true
         surface.log(backend == .graxpert ? "Processing master with GraXpert…"
                                          : "Processing master with Native NR…")
-        Task.detached { [weak self] in
+        Task.detached { [weak self, access] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             do {
                 let out = sessionDirectory.appendingPathComponent("master_processed.fit")

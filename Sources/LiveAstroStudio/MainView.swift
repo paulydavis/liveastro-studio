@@ -7,6 +7,10 @@ struct MainView: View {
     var body: some View {
         @Bindable var model = model
         VStack(spacing: 0) {
+            if model.isStorePreview {
+                Text("LiveAstro Store Preview").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(.top, 8)
+            }
             HStack {
                 Picker("", selection: $model.selectedTab) {
                     ForEach(AppModel.MainTab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
@@ -20,6 +24,7 @@ struct MainView: View {
                         .foregroundStyle(model.nightVisionOn ? Color.red : Color.primary)
                 }
                 .help("Red night-vision screen tint (whole display) — for dark-adapted viewing at the scope. Fine-tune brightness under Setup ▸ Night vision.")
+                .disabled(model.isStorePreview)
                 if model.selectedTab == .live {
                     Button { openWindow(id: "broadcast"); model.isDetached = true } label: {
                         Image(systemName: "rectangle.portrait.and.arrow.right")

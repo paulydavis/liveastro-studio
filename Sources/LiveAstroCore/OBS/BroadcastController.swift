@@ -28,19 +28,23 @@ public struct BroadcastDeps {
     /// exists. Re-derived at EVERY Go Live — the T1 probe showed ids are
     /// per-window-instance and go stale across window recreation.
     public var broadcastWindowID: () -> UInt32?
+    /// Distribution policy at the app boundary. nil preserves the direct edition's behavior.
+    public var unavailableReason: (() -> String?)?
 
     public init(log: @escaping (String) -> Void = { _ in },
                 presentError: @escaping (String) -> Void = { _ in },
                 isSessionRunning: @escaping () -> Bool = { false },
                 launchOBS: @escaping () -> Void = {},
                 openBroadcastWindow: @escaping () -> Void = {},
-                broadcastWindowID: @escaping () -> UInt32? = { nil }) {
+                broadcastWindowID: @escaping () -> UInt32? = { nil },
+                unavailableReason: (() -> String?)? = nil) {
         self.log = log
         self.presentError = presentError
         self.isSessionRunning = isSessionRunning
         self.launchOBS = launchOBS
         self.openBroadcastWindow = openBroadcastWindow
         self.broadcastWindowID = broadcastWindowID
+        self.unavailableReason = unavailableReason
     }
 }
 
@@ -281,6 +285,7 @@ public final class BroadcastController {
     /// session profile (owned by the app) — passed in so the controller stays
     /// reference-free.
     public func sessionDidStart(subExposureSeconds: Double) {
+        guard deps.unavailableReason?() == nil else { return }
         startSceneAutomation(subExposureSeconds: subExposureSeconds)
     }
 
@@ -548,6 +553,7 @@ public final class BroadcastController {
     /// .stopUnconfirmed} — from a rich state this no-ops with an honest log
     /// instead of killing the working session's machinery.
     public func beginConnectAndReconcile() {
+        if let reason = deps.unavailableReason?() { deps.presentError(reason); return }
         guard broadcastState != .connecting else { return }   // one attempt at a time
         guard connectAllowed else {
             deps.log("OBS: already connected/stopping — not reconnecting")
@@ -574,6 +580,7 @@ public final class BroadcastController {
     /// this function's first await.
     @discardableResult
     public func connectAndReconcile() async -> Bool {
+        if let reason = deps.unavailableReason?() { deps.presentError(reason); return false }
         guard broadcastState != .connecting else {
             return obs.state == .connected || obs.state == .streaming
         }
@@ -849,6 +856,7 @@ public final class BroadcastController {
     // MARK: - Broadcast orchestration
 
     public func goLive() {
+        if let reason = deps.unavailableReason?() { deps.presentError(reason); return }
         // Review7 P1: .unknown keeps one-click Go Live from a cold start — the
         // task below connects AND reconciles first, and only starts a broadcast
         // when the reconcile confirmed both outputs inactive.
@@ -1215,6 +1223,7 @@ public final class BroadcastController {
     /// Reconnects the control link first if it dropped (a stranded-live
     /// disconnect lands here) — but never launches OBS.
     public func retryStop() {
+        if let reason = deps.unavailableReason?() { deps.presentError(reason); return }
         guard broadcastState == .stopUnconfirmed else { return }
         broadcastGeneration += 1
         let gen = broadcastGeneration

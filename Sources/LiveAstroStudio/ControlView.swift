@@ -74,7 +74,12 @@ struct ControlView: View {
                 StatsView(model: model)
                     .tabItem { Label("Stats", systemImage: "chart.bar") }
                     .tag(AppModel.SetupSubTab.stats)
-                BroadcastSettingsView(model: model)
+                Group {
+                    if model.isStorePreview {
+                        Text("OBS integration is unavailable in this preview. You can still detach the Live display into its own window.")
+                            .foregroundStyle(.secondary).padding()
+                    } else { BroadcastSettingsView(model: model) }
+                }
                     .tabItem { Label("Broadcast", systemImage: "dot.radiowaves.left.and.right") }
                     .tag(AppModel.SetupSubTab.broadcast)
                 DiagnosticsView(model: model)
@@ -353,11 +358,12 @@ struct ControlView: View {
         let panel = model.makeDirectoryPanel(title: "Choose Session Directory",
                                              message: "Select a past session folder containing manifest.json")
         let liveAstro = model.liveAstroRoot
-        if FileManager.default.fileExists(atPath: liveAstro.path) {
+        if model.isStorePreview || FileManager.default.fileExists(atPath: liveAstro.path) {
             panel.directoryURL = liveAstro
         }
         if panel.runModal() == .OK, let url = panel.url {
-            model.importer.regenerateReplay(sessionDirectory: url)
+            guard let selected = model.selectSourceFolder(url) else { return }
+            model.importer.regenerateReplay(sessionDirectory: selected)
         }
     }
 
@@ -398,7 +404,9 @@ struct ControlView: View {
 
     private func refreshOutputFootprint() {
         do {
-            let rootBytes = try DirectoryFootprint.byteCount(at: model.liveAstroRoot)
+            let access = try model.acquireOutputLocation()
+            defer { withExtendedLifetime(access) {} }
+            let rootBytes = try DirectoryFootprint.byteCount(at: access.url)
             let rootSize = ByteCountFormatter.string(fromByteCount: rootBytes, countStyle: .file)
             if let session = model.lastSessionDirectory {
                 let sessionBytes = try DirectoryFootprint.byteCount(at: session)
@@ -420,8 +428,10 @@ struct ControlView: View {
     }
 
     private func openSessionsRoot() {
-        let url = model.liveAstroRoot
         do {
+            let access = try model.acquireOutputLocation()
+            defer { withExtendedLifetime(access) {} }
+            let url = access.url
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
             NSWorkspace.shared.open(url)
             model.log.append("Opened sessions folder")

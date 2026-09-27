@@ -34,8 +34,8 @@ public enum CatalogInstaller {
     /// Cheap "is a catalog installed?" for the UI gate — reads only the 12-byte header (magic + count),
     /// NOT the whole 32 MB file. (StarCatalog.installed() does the one full parse when the catalog is
     /// actually needed.)
-    public static func isInstalled() -> Bool {
-        guard let fh = try? FileHandle(forReadingFrom: cacheURL()) else { return false }
+    public static func isInstalled(at url: URL? = nil) -> Bool {
+        guard let fh = try? FileHandle(forReadingFrom: url ?? cacheURL()) else { return false }
         defer { try? fh.close() }
         guard let head = try? fh.read(upToCount: 12), head.count == 12 else { return false }
         let b = [UInt8](head)
@@ -47,7 +47,7 @@ public enum CatalogInstaller {
     /// Download from `url ?? remoteURL`, verify SHA-256 + that it parses as a non-empty catalog, then
     /// write it atomically into the cache. Throws (cache untouched) on missing checksum config, HTTP
     /// error, checksum mismatch, or invalid catalog. `progress` reports 0…1.
-    public static func download(from url: URL? = nil, session: URLSession = .shared,
+    public static func download(from url: URL? = nil, session: URLSession = .shared, to destination: URL? = nil,
                                 progress: @escaping (Double) -> Void) async throws {
         guard !expectedSHA256.isEmpty else { throw InstallError.checksumNotConfigured }
         let src = url ?? remoteURL
@@ -66,7 +66,7 @@ public enum CatalogInstaller {
         guard let cat = try? StarCatalog(data: data), cat.count > 0 else { throw InstallError.invalidCatalog }
         _ = cat
 
-        let dest = cacheURL()
+        let dest = destination ?? cacheURL()
         try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(),
                                                 withIntermediateDirectories: true)
         // .atomic writes to a temp file in the same directory then renames — the cache never sees a

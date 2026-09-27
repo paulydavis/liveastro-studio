@@ -183,8 +183,13 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting,
     private let stateLock = NSLock()
     private var state: LifecycleState = .initial
 
+    /// The unfolding stream also owns this context: stop() cannot revoke a live file read.
+    private let accessLifetime: (any Sendable)?
+
     public init(folder: URL, mode: Mode, fileNamePrefix: String? = nil,
-                excludingPreExisting: WatchFolderInput.Snapshot? = nil) {
+                excludingPreExisting: WatchFolderInput.Snapshot? = nil,
+                accessLifetime: (any Sendable)? = nil) {
+        self.accessLifetime = accessLifetime
         self.folder = folder
         self.mode = mode
         self.fileNamePrefix = fileNamePrefix
@@ -215,6 +220,7 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting,
             // the reason (review11 finding 5 — pre-fix `try?` dropped frames silently), and
             // the pull advances to the next file: one frame lost, never the session.
             self.frames = AsyncStream(unfolding: {
+                defer { withExtendedLifetime(accessLifetime) {} }
                 while !Task.isCancelled {
                     do {
                         guard let url = try cursor.next() else { return nil }
@@ -250,7 +256,10 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting,
             let pull = LivePull(updates: updates, seams: seams, intake: intake)
             self.livePull = pull
             // Cold1 I2: the public frame stream decodes lazily — one pull, one decode.
-            self.frames = AsyncStream(unfolding: { await pull.nextFrame() })
+            self.frames = AsyncStream(unfolding: {
+                defer { withExtendedLifetime(accessLifetime) {} }
+                return await pull.nextFrame()
+            })
         }
     }
 
@@ -304,7 +313,7 @@ public final class FolderFrameSource: FrameSource, FrameSourceActivityReporting,
             }
             let w = StackFileWatcher(folder: folder, fileNamePrefix: fileNamePrefix,
                                      digestPolicy: .immutableAfterPublish,
-                                     excludingPreExisting: excludedPreExisting)
+                                     excludingPreExisting: excludedPreExisting, accessLifetime: accessLifetime)
             // Cold2 M2: log through the RELAY, never a snapshot of `onLog` — a sink
             // assigned after start() (SessionPipeline wires it in startSources) must
             // still reach the watcher. The relay is seeded with the current sink and

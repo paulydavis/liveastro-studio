@@ -495,10 +495,15 @@ public final class StackFileWatcher {
         return true
     }
 
+    /// Detached content reads retain their own copy beyond the watcher's bounded stop.
+    private let accessLifetime: (any Sendable)?
+
     public init(folder: URL, quietPeriod: TimeInterval = 0.5, pollInterval: TimeInterval = 2.0,
                 fileNamePrefix: String? = nil,
                 digestPolicy: DigestPolicy = .mutableStackerOutput,
-                excludingPreExisting: WatchFolderInput.Snapshot? = nil) {
+                excludingPreExisting: WatchFolderInput.Snapshot? = nil,
+                accessLifetime: (any Sendable)? = nil) {
+        self.accessLifetime = accessLifetime
         self.folder = folder
         self.excludedInput = excludingPreExisting
         // Review10 item 7: hostile timing values are clamped/defaulted, never trusted into
@@ -918,7 +923,8 @@ public final class StackFileWatcher {
         let stopFlag = stopRequested
         let seam = beforeContentReadForTesting   // capture on the serial queue; run it on the reader queue
         let baseline = exclusionDigest(name: name, identity: identity)
-        readerQueue.async { [weak self] in
+        readerQueue.async { [weak self, accessLifetime] in
+            defer { withExtendedLifetime(accessLifetime) {} }
             defer { try? handle.close() }
             let observation = Self.readContentObservation(
                 handle: handle, name: name, url: url, kind: kind,

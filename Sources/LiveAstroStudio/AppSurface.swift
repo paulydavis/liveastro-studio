@@ -92,6 +92,15 @@ struct AppSurface {
     /// Publishes the finished session directory.
     var setLastSessionDirectory: ((URL) -> Void)?
 
+    // Authorization stays at the app boundary; controllers capture these owners
+    // before metadata reads and carry them through their existing start paths.
+    var acquireOperationAccess: (@MainActor (URL) throws -> OperationFileAccess)?
+    var acquireLocationAccess: (@MainActor (URL) throws -> FileAccessLease)?
+    var startAuthorizedSession: (@MainActor (OperationFileAccess, @escaping (Bool) -> Void) -> Void)?
+    var isStorePreview: Bool
+    var catalogURL: URL?
+    var persistCalibration: (@MainActor (CalibrationSelection) -> Void)?
+
     init(log: @escaping (String) -> Void,
          presentError: @escaping (String) -> Void,
          isSessionRunning: @escaping () -> Bool,
@@ -116,7 +125,12 @@ struct AppSurface {
          resetSessionStatsForImport: (() -> Void)? = nil,
          isRestacking: (() -> Bool)? = nil,
          setReplayURL: ((URL) -> Void)? = nil,
-         setLastSessionDirectory: ((URL) -> Void)? = nil) {
+         setLastSessionDirectory: ((URL) -> Void)? = nil,
+         acquireOperationAccess: (@MainActor (URL) throws -> OperationFileAccess)? = nil,
+         acquireLocationAccess: (@MainActor (URL) throws -> FileAccessLease)? = nil,
+         startAuthorizedSession: (@MainActor (OperationFileAccess, @escaping (Bool) -> Void) -> Void)? = nil,
+         isStorePreview: Bool = false, catalogURL: URL? = nil,
+         persistCalibration: (@MainActor (CalibrationSelection) -> Void)? = nil) {
         self.log = log
         self.presentError = presentError
         self.isSessionRunning = isSessionRunning
@@ -142,6 +156,12 @@ struct AppSurface {
         self.isRestacking = isRestacking
         self.setReplayURL = setReplayURL
         self.setLastSessionDirectory = setLastSessionDirectory
+        self.acquireOperationAccess = acquireOperationAccess
+        self.acquireLocationAccess = acquireLocationAccess
+        self.startAuthorizedSession = startAuthorizedSession
+        self.isStorePreview = isStorePreview
+        self.catalogURL = catalogURL
+        self.persistCalibration = persistCalibration
     }
 }
 

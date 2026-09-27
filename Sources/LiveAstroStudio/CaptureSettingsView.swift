@@ -41,6 +41,16 @@ struct CaptureSettingsView: View {
                         }
                     }
 
+                    if model.isStorePreview {
+                        SetupCard(title: "Save sessions to", symbol: "folder.badge.plus") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(model.selectedOutputFolder?.path ?? "Choose a folder before Start or Import")
+                                    .font(.callout).textSelection(.enabled)
+                                Button(model.selectedOutputFolder == nil ? "Choose…" : "Change…") { model.chooseSessionOutputFolder() }
+                            }
+                        }
+                    }
+
                     DisclosureGroup {
                         VStack(alignment: .leading, spacing: 12) { stackingControls }
                             .padding(.top, 10)
@@ -147,11 +157,15 @@ struct CaptureSettingsView: View {
     }
 
     @ViewBuilder private var workflowActions: some View {
+        if model.isStorePreview {
+            Text("Automatic share discovery is unavailable in this preview. Use Live from Folder / NINA to select a mounted share.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
         WorkflowActionRow(
             title: "Live from Seestar",
             subtitle: "Auto-detect the mounted Seestar folder, relay new subs, and start native live stacking.",
             systemImage: "dot.radiowaves.left.and.right",
-            disabled: liveWorkflowDisabled
+            disabled: liveWorkflowDisabled || model.isStorePreview
         ) {
             model.liveSource.startSeestarLive()
         }
@@ -160,7 +174,7 @@ struct CaptureSettingsView: View {
             title: "Live from ASIAIR",
             subtitle: "Auto-detect the ASIAIR Autorun/Light folder and start native live stacking.",
             systemImage: "camera.aperture",
-            disabled: liveWorkflowDisabled
+            disabled: liveWorkflowDisabled || model.isStorePreview
         ) {
             model.liveSource.startASIAIRLive()
         }
@@ -259,12 +273,15 @@ struct CaptureSettingsView: View {
         }
         Picker("Post-process", selection: $model.processorBackend) {
             Text("None").tag(ProcessorBackend.none)
-            Text("GraXpert").tag(ProcessorBackend.graxpert)
+            if !model.isStorePreview { Text("GraXpert").tag(ProcessorBackend.graxpert) }
             Text("Native NR").tag(ProcessorBackend.nativeDenoise)
         }
         .pickerStyle(.segmented)
         .disabled(model.isRunning || model.importer.isImporting || model.importer.isProcessing)
         .help("After stacking, optionally post-process the master to a master_processed FITS: GraXpert (background extraction + denoise, requires install) or the built-in Native NR denoiser.")
+        if model.isStorePreview {
+            Text("External processors are unavailable in this preview. Native NR is available.").font(.caption).foregroundStyle(.secondary)
+        }
     }
 
     @ViewBuilder private var sessionDetails: some View {
@@ -316,7 +333,7 @@ struct CaptureSettingsView: View {
 
     private func pickFolder() {
         let panel = model.makeDirectoryPanel()
-        if panel.runModal() == .OK { model.watchFolder = panel.url }
+        if panel.runModal() == .OK, let url = panel.url { model.selectLocation(url, key: "capture") }
     }
 
     private func pickStackerOutputWatchFolder() {

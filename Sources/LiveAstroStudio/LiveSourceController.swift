@@ -16,6 +16,7 @@ final class LiveSourceController {
 
     private let surface: AppSurface
     private let relayRoot: URL
+    private var relayAccess: OperationFileAccess?
 
     /// True while an auto-detect path is scanning for a share off the main
     /// thread. Gates the start*Live entry points and disables their buttons.
@@ -44,6 +45,7 @@ final class LiveSourceController {
     func stopRelay() {
         frameRelay?.stop()
         frameRelay = nil
+        relayAccess = nil
     }
 
     /// Age-prune old relay sessions just before a new one is created (spec:
@@ -62,28 +64,36 @@ final class LiveSourceController {
             && !(surface.isRestacking?() ?? false)
     }
 
-    private func startConfiguredSession() {
+    private func startConfiguredSession(relayDirectory: URL? = nil) {
         guard let start = surface.startSession else { stopRelay(); return }
         isStarting = true
         let relay = frameRelay
-        start { [weak self] started in
+        let completion: (Bool) -> Void = { [weak self] started in
             guard let self else { relay?.stop(); return }
             self.isStarting = false
             if !started {
                 relay?.stop()
-                if self.frameRelay === relay { self.frameRelay = nil }
+                if self.frameRelay === relay { self.stopRelay() }
             } else {
                 self.surface.selectLiveTab?()
             }
         }
+        if let access = relayAccess, let relayDirectory, let authorizedStart = surface.startAuthorizedSession {
+            authorizedStart(access.relayed(to: relayDirectory), completion)
+        } else { start(completion) }
     }
 
     func startWatchFolderLive(source: URL, sourceMode: AppModel.SourceMode = .nativeStack) {
         guard canApplyDetectedLiveSource(), !isDetecting else { return }
+        let access: OperationFileAccess?
+        do { access = try surface.acquireOperationAccess?(source) }
+        catch { surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again."); return }
+        let source = access?.input ?? source
         surface.resetZoomPan?()
         isDetecting = true
         surface.log("Reading subs in \(source.lastPathComponent)…")
-        Task.detached { [weak self] in
+        Task.detached { [weak self, access] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: source)   // SMB header read, off main
             await MainActor.run {
@@ -92,6 +102,7 @@ final class LiveSourceController {
                     self.surface.log("Live source detection ignored — a session or import started while detection was running.")
                     return
                 }
+                self.relayAccess = access
                 self.configureAndStartWatchFolder(source: source, sourceMode: sourceMode, meta: meta)
             }
         }
@@ -111,16 +122,20 @@ final class LiveSourceController {
         let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
         let relayDir = relayRoot.appendingPathComponent("\(target)-\(df.string(from: Date()))", isDirectory: true)
         pruneRelay(excluding: relayDir)
-        let relay = FrameRelay(source: source, destination: relayDir, glob: glob)
+        let relay = FrameRelay(source: source, destination: relayDir, glob: glob, accessLifetime: relayAccess)
         relay.onLog = { [weak self] msg in Task { @MainActor in self?.surface.log(msg) } }
-        do { try relay.start() } catch { surface.presentError("Relay failed to start: \(error)"); return }
+        do { try relay.start() } catch { relayAccess = nil; surface.presentError("Relay failed to start: \(error)"); return }
         frameRelay = relay
         surface.applyDetectedProfile?(DetectedProfile(watchFolder: relayDir))
         surface.saveSettings?()
-        startConfiguredSession()
+        startConfiguredSession(relayDirectory: relayDir)
     }
 
     func startSeestarLive() {
+        guard !surface.isStorePreview else {
+            surface.presentError("Automatic discovery is unavailable in this preview. Choose Live from Folder / NINA.")
+            return
+        }
         guard canApplyDetectedLiveSource(), !isDetecting else { return }
         surface.resetZoomPan?()
         isDetecting = true
@@ -172,6 +187,10 @@ final class LiveSourceController {
     }
 
     func startASIAIRLive() {
+        guard !surface.isStorePreview else {
+            surface.presentError("Automatic discovery is unavailable in this preview. Choose Live from Folder / NINA.")
+            return
+        }
         guard canApplyDetectedLiveSource(), !isDetecting else { return }
         surface.resetZoomPan?()
         isDetecting = true

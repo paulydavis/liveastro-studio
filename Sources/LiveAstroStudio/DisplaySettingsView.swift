@@ -62,7 +62,11 @@ struct DisplaySettingsView: View {
                 Form {
                     Section("Night vision") {
                         helpToggle("Red screen", isOn: $model.nightVisionOn)
+                            .disabled(model.isStorePreview)
                             .onChange(of: model.nightVisionOn) { _, _ in model.applyNightVision() }
+                        if model.isStorePreview {
+                            Text("Whole-screen tint is unavailable in this preview.").font(.caption).foregroundStyle(.secondary)
+                        }
                         if model.nightVisionOn {
                             HStack {
                                 Text("Brightness").frame(width: 90, alignment: .leading)

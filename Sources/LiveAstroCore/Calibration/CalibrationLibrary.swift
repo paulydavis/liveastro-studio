@@ -134,10 +134,11 @@ public final class CalibrationLibrary: Sendable {
 
     /// Build a master from `fitsURLs` and add it to the library. `bias` is only
     /// used when building a flat/dark-flat offset — irrelevant for dark/bias masters.
+    /// An explicit source keeps the authorized folder identity even if enumeration canonicalizes it.
     @discardableResult
     public func add(kind: MasterKind, camera: String, gain: Double?, exposureSeconds: Double?,
                     setTempC: Double?, binning: Int?, fitsURLs: [URL],
-                    bias: AstroImage? = nil) throws -> MasterFrame {
+                    bias: AstroImage? = nil, sourceDirectory: URL? = nil) throws -> MasterFrame {
         let built = try MasterBuilder.combineDetailed(fitsURLs: fitsURLs, kind: kind, bias: bias)
         let master = built.image
         let id = UUID()
@@ -150,18 +151,19 @@ public final class CalibrationLibrary: Sendable {
             // frameCount reflects frames that ACTUALLY contributed (readable + matching dims), not
             // the input count — a corrupt/odd-sized file is skipped and must not inflate the ×N.
             channels: master.channels, frameCount: built.contributingCount, createdAt: Date(),
-            fileName: fileName, sourcePath: fitsURLs.first?.deletingLastPathComponent().path)
+            fileName: fileName, sourcePath: sourceDirectory?.path ?? fitsURLs.first?.deletingLastPathComponent().path)
         var frames = all(); frames.append(frame); try writeIndex(frames)
         return frame
     }
 
     /// Re-combine an entry from its remembered source folder, replacing the master
     /// in place (same id/fileName) and refreshing dimensions/count/date.
-    public func rebuild(id: UUID, bias: AstroImage? = nil) throws {
+    /// The caller may supply a bookmark-resolved moved source; remember it after successful rebuild.
+    public func rebuild(id: UUID, bias: AstroImage? = nil, sourceDirectory: URL? = nil) throws {
         var frames = all()
         guard let idx = frames.firstIndex(where: { $0.id == id }) else { return }
         guard let src = frames[idx].sourcePath else { throw LibraryError.noSourceFolder }
-        let urls = Self.fitsFiles(in: URL(fileURLWithPath: src, isDirectory: true))
+        let urls = Self.fitsFiles(in: sourceDirectory ?? URL(fileURLWithPath: src, isDirectory: true))
         guard !urls.isEmpty else { throw LibraryError.noFramesInSource }
         let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: frames[idx].kind, bias: bias)
         let master = built.image
@@ -170,6 +172,7 @@ public final class CalibrationLibrary: Sendable {
         frames[idx].width = master.width; frames[idx].height = master.height
         frames[idx].channels = master.channels; frames[idx].frameCount = built.contributingCount
         frames[idx].createdAt = Date()
+        if let sourceDirectory { frames[idx].sourcePath = sourceDirectory.path }
         try writeIndex(frames)
     }
 

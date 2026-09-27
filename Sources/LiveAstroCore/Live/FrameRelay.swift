@@ -6,6 +6,8 @@ import Foundation
 /// cp stage→dest, skip files already in dest.
 public final class FrameRelay {
     private let source: URL
+    /// In-flight copy methods retain the relay, and therefore its caller-owned file access.
+    private let accessLifetime: (any Sendable)?
     private let destination: URL
     private let glob: String
     private let pollSeconds: Double
@@ -35,7 +37,9 @@ public final class FrameRelay {
 
     public init(source: URL, destination: URL,
                 glob: String = "Light_*_10.0s_*.fit", pollSeconds: Double = 5,
-                sessionScoped: Bool = true, stabilityInterval: Double = 0.05) {
+                sessionScoped: Bool = true, stabilityInterval: Double = 0.05,
+                accessLifetime: (any Sendable)? = nil) {
+        self.accessLifetime = accessLifetime
         self.source = source; self.destination = destination
         self.glob = glob; self.pollSeconds = pollSeconds
         self.sessionScoped = sessionScoped

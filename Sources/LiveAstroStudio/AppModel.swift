@@ -168,7 +168,8 @@ final class AppModel {
         let cancellation = CleanStackCancellation()
         cleanStackCancellation = cancellation
         cleanStackProgress = "Preparing full clean stack…"
-        Task.detached { [weak self] in
+        Task.detached { [weak self, access = sessionFileAccess] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }
             do {
                 let result = try request.finish(isCancelled: { cancellation.isCancelled }, progress: { [weak self] message in
@@ -326,6 +327,11 @@ final class AppModel {
     /// Apply the current night-vision on/off + level to the display. Called from the
     /// control-panel toggle and slider.
     func applyNightVision() {
+        guard !isStorePreview else {
+            nightVisionOn = false
+            errorMessage = "Whole-screen tint is unavailable in this preview."
+            return
+        }
         if nightVisionOn { nightMode.enable(level: Int(nightVisionLevel)) }
         else { nightMode.disable() }
     }
@@ -336,7 +342,7 @@ final class AppModel {
 
     /// Whether the (download-on-demand) star catalog needed for plate-solving / north-up is present.
     enum CatalogState: Equatable { case notInstalled, downloading(Double), installed, failed(String) }
-    private(set) var catalogState: CatalogState = CatalogInstaller.isInstalled() ? .installed : .notInstalled
+    private(set) var catalogState: CatalogState = .notInstalled
 
     private(set) var lastSessionDirectory: URL?
     var errorMessage: String?
@@ -389,6 +395,11 @@ final class AppModel {
     var importer: ImportController!
 
     private var pipeline: SessionPipeline?
+    let distribution: StorePreviewConfiguration
+    let authorizedLocations: AuthorizedLocations
+    var selectedOutputFolder: URL?
+    private var pendingFileAccess: OperationFileAccess?
+    private var sessionFileAccess: OperationFileAccess?
     private var demoTask: Task<Void, Never>?
 
     /// Where session/calibration settings persist. Defaults to `.standard` (production); tests
@@ -397,7 +408,7 @@ final class AppModel {
     /// `CalibrationStore.load`/`SessionSettingsStore.load` (below) read through this SAME
     /// property, not `.standard` directly, precisely so an injected suite is honestly isolated
     /// on both the read and the write path, not just the write path.
-    private let userDefaults: UserDefaults
+    let userDefaults: UserDefaults
 
     /// Snapshot of the user's real session settings, captured when a Try-Demo
     /// session overrides them with demo values (branding: "Demo Nebula", 30 s,
@@ -430,10 +441,17 @@ final class AppModel {
     /// `userDefaults` defaults to `.standard` for every production call site (`AppModel()`
     /// unchanged). Tests pass a temporary suite so no test run reads or writes the real user's
     /// persisted settings.
-    init(userDefaults: UserDefaults = .standard, calibrationLibrary: CalibrationLibrary = CalibrationLibrary(),
-         relayRoot: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("LiveAstro/relay", isDirectory: true)) {
+    init(userDefaults: UserDefaults = .standard, calibrationLibrary: CalibrationLibrary? = nil,
+         relayRoot: URL? = nil,
+         configuration: StorePreviewConfiguration = StorePreviewConfiguration(),
+         bookmarkBackend: any BookmarkAccessing = FoundationBookmarkAccessor()) {
         self.userDefaults = userDefaults
-        self.calibrationLibrary = calibrationLibrary
+        self.distribution = configuration
+        self.authorizedLocations = AuthorizedLocations(defaults: userDefaults,
+            policy: configuration.isStorePreview ? .sandboxed : .direct,
+            containerRoots: configuration.isStorePreview ? [configuration.containerRoot] : [], backend: bookmarkBackend)
+        self.calibrationLibrary = calibrationLibrary ?? CalibrationLibrary(baseDirectory: configuration.libraryRoot)
+        self.catalogState = CatalogInstaller.isInstalled(at: configuration.catalogURL) ? .installed : .notInstalled
         self.calibration = CalibrationStore.load(userDefaults)
         // Build the seam bundle and the Broadcast controller first. The closures
         // capture `self` (safe: they only fire after init completes), and
@@ -468,6 +486,8 @@ final class AppModel {
                         }
                         .first
                 }
+            }, unavailableReason: {
+                configuration.isStorePreview ? "OBS integration is unavailable in this preview. The separate broadcast window remains available." : nil
             }))
 
         // Live-source cluster: same seam, plus the T2 closures for the detect
@@ -488,7 +508,14 @@ final class AppModel {
             } },
             saveSettings: { [weak self] in MainActor.assumeIsolated { self?.saveSettings() } },
             isSessionStartPending: { [weak self] in MainActor.assumeIsolated { self?.hasPendingSessionStart ?? false } },
-            isRestacking: { [weak self] in MainActor.assumeIsolated { self?.isRestacking ?? false } }), relayRoot: relayRoot)
+            isRestacking: { [weak self] in MainActor.assumeIsolated { self?.isRestacking ?? false } },
+            acquireOperationAccess: { [weak self] url in
+                guard let self else { throw CocoaError(.userCancelled) }
+                return try self.acquireOperationAccess(input: url)
+            }, startAuthorizedSession: { [weak self] access, completion in
+                guard let self else { completion(false); return }
+                self.startSession(access: access, completion: completion)
+            }, isStorePreview: configuration.isStorePreview), relayRoot: relayRoot ?? configuration.relayRoot)
 
         // Import + post-processing cluster: the shared log/error/session-running
         // seam plus the T3 reads the moved bodies need (stacker engine,
@@ -516,7 +543,18 @@ final class AppModel {
             resetSessionStatsForImport: { [weak self] in MainActor.assumeIsolated { self?.resetSessionStatsForImport() } },
             isRestacking: { [weak self] in MainActor.assumeIsolated { self?.isRestacking ?? false } },
             setReplayURL: { [weak self] url in MainActor.assumeIsolated { self?.replayURL = url } },
-            setLastSessionDirectory: { [weak self] url in MainActor.assumeIsolated { self?.lastSessionDirectory = url } }))
+            setLastSessionDirectory: { [weak self] url in MainActor.assumeIsolated { self?.lastSessionDirectory = url } },
+            acquireOperationAccess: { [weak self] url in
+                guard let self else { throw CocoaError(.userCancelled) }
+                return try self.acquireOperationAccess(input: url)
+            }, acquireLocationAccess: { [weak self] url in
+                guard let self else { throw CocoaError(.userCancelled) }
+                return try self.acquireReadableLocation(url)
+            }, isStorePreview: configuration.isStorePreview, catalogURL: configuration.catalogURL,
+            persistCalibration: { [weak self] selection in
+                guard let self else { return }
+                CalibrationStore.save(selection, to: self.userDefaults)
+            }))
         loadSettings()
 
         // Save settings and stop the relay when the app is about to terminate.
@@ -682,6 +720,7 @@ final class AppModel {
         plannedStopEnabled = s.plannedStopEnabled
         plannedStopHour = s.plannedStopHour
         plannedStopMinute = s.plannedStopMinute
+        restoreAuthorizedSelections()
     }
 
     /// Download the star catalog on demand (3c). The download itself runs off-main (CatalogInstaller
@@ -691,9 +730,10 @@ final class AppModel {
     func downloadCatalog() {
         if case .downloading = catalogState { return }
         catalogState = .downloading(0)
+        let catalogURL = distribution.catalogURL
         Task { [weak self] in
             do {
-                try await CatalogInstaller.download(progress: { p in
+                try await CatalogInstaller.download(to: catalogURL, progress: { p in
                     Task { @MainActor [weak self] in
                         if case .downloading = self?.catalogState { self?.catalogState = .downloading(p) }
                     }
@@ -1036,7 +1076,8 @@ final class AppModel {
     /// Root for all session output; every session/import directory lives under here.
     static let sessionRootName = "LiveAstro"
     var liveAstroRoot: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        if isStorePreview { return selectedOutputFolder ?? distribution.containerRoot }
+        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(Self.sessionRootName, isDirectory: true)
     }
 
@@ -1076,7 +1117,8 @@ final class AppModel {
     /// A session begun on an EMPTY folder can't be matched yet — that's logged and left
     /// uncalibrated (resolve-on-first-sub is a documented follow-up). Not CI-testable
     /// (FileManager + pipeline); the pure matcher/scaler/library are unit-tested.
-    func resolveCalibration(watchFolder: URL, prefix: String?, excludingPreExisting: WatchFolderInput.Snapshot? = nil)
+    func resolveCalibration(watchFolder: URL, prefix: String?, excludingPreExisting: WatchFolderInput.Snapshot? = nil,
+                            access: OperationFileAccess? = nil)
         -> (calibrator: Calibrator?, messages: [String], foundMetadata: Bool, metadata: SourceMetadata?) {
         // Old files were explicitly excluded. Even a newly arrived file may still be writing;
         // resolve on the first frame the source actually ingests, using its captured metadata.
@@ -1093,8 +1135,9 @@ final class AppModel {
         }
         let r = CalibrationResolver.resolve(
             metadata: meta, library: calibrationLibrary, scaleEnabled: scaleDarksAcrossExposures,
-            flatsFolder: sessionFlatsFolder, darkFlatsFolder: sessionDarkFlatsFolder,
-            legacyDarkPath: calibration.darkPath, legacyFlatPath: calibration.flatPath,
+            flatsFolder: access == nil ? sessionFlatsFolder : access?.flats,
+            darkFlatsFolder: access == nil ? sessionDarkFlatsFolder : access?.darkFlats,
+            legacyDarkPath: (access?.calibration ?? calibration).darkPath, legacyFlatPath: (access?.calibration ?? calibration).flatPath,
             useDarkFlatAsLightOffset: useDarkFlatAsLightOffset)
         calibrationStatus = statusLine(dark: r.hasDark, flat: r.hasFlat, lightOffset: r.hasLightOffset)
         return (r.calibrator, r.messages, true, meta)
@@ -1103,13 +1146,15 @@ final class AppModel {
     /// First-sub calibrator provider for empty-folder starts: the pipeline calls this
     /// with the first frame's header on the consume task; it resolves calibration and
     /// hops to the main actor to log + update the status line.
-    func makeCalibratorProvider() -> ((SourceMetadata) -> Calibrator?) {
+    func makeCalibratorProvider(access: OperationFileAccess? = nil) -> ((SourceMetadata) -> Calibrator?) {
         let library = calibrationLibrary
         let scale = scaleDarksAcrossExposures
-        let flats = sessionFlatsFolder, darkFlats = sessionDarkFlatsFolder
+        let flats = access == nil ? sessionFlatsFolder : access?.flats
+        let darkFlats = access == nil ? sessionDarkFlatsFolder : access?.darkFlats
         let lightOffset = useDarkFlatAsLightOffset
-        let legacyDark = calibration.darkPath, legacyFlat = calibration.flatPath
-        return { [weak self] meta in
+        let legacyDark = (access?.calibration ?? calibration).darkPath, legacyFlat = (access?.calibration ?? calibration).flatPath
+        return { [weak self, access] meta in
+            defer { withExtendedLifetime(access) {} }
             let r = CalibrationResolver.resolve(
                 metadata: meta, library: library, scaleEnabled: scale,
                 flatsFolder: flats, darkFlatsFolder: darkFlats,
@@ -1161,12 +1206,17 @@ final class AppModel {
     /// Build a master (dark or bias) from a folder of raw frames, keyed automatically
     /// from the first frame's FITS header, and add it to the library. Off the main thread.
     func addMasterFromFolder(_ folder: URL, kind: MasterKind) {
-        let urls = CalibrationLibrary.fitsFiles(in: folder)
+        let access: FileAccessLease
+        do { access = try acquireReadableLocation(folder) }
+        catch { reportFileAccess(error); return }
+        let urls = CalibrationLibrary.fitsFiles(in: access.url)
         guard !urls.isEmpty else { log.append("Calibration: no FITS frames in that folder."); return }
         calibrationBusy = true
         log.append("Calibration: building \(kind.rawValue) master from \(urls.count) frames…")
         let lib = calibrationLibrary
-        Task.detached { [weak self] in
+        let sourceDirectory = isStorePreview ? access.url : nil
+        Task.detached { [weak self, access] in
+            defer { withExtendedLifetime(access) {} }
             // Swift 6: rebind weak self to a strong immutable up front — nested
             // @Sendable closures may not reference a captured weak *var*.
             guard let self else { return }
@@ -1189,7 +1239,8 @@ final class AppModel {
                     // Store only the controlled SET-TEMP as the master's setpoint. CCD-TEMP (actual,
                     // uncontrolled) must not masquerade as a setpoint — that made uncooled darks carry
                     // a spurious temperature that then false-rejected uncooled lights.
-                    setTempC: meta.setTempC, binning: meta.binning, fitsURLs: urls)
+                    setTempC: meta.setTempC, binning: meta.binning, fitsURLs: urls,
+                    sourceDirectory: sourceDirectory)
                 await MainActor.run {
                     self.calibrationBusy = false
                     self.refreshLibraryEntries()
@@ -1210,12 +1261,17 @@ final class AppModel {
     }
 
     func rebuildMaster(_ id: UUID) {
+        guard let path = calibrationLibrary.all().first(where: { $0.id == id })?.sourcePath else { return }
+        let access: FileAccessLease
+        do { access = try acquireReadableLocation(URL(fileURLWithPath: path)) }
+        catch { reportFileAccess(error); return }
         calibrationBusy = true
         let lib = calibrationLibrary
-        Task.detached { [weak self] in
+        Task.detached { [weak self, access] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }   // Swift 6: strong immutable for nested closures
             let message: String
-            do { try lib.rebuild(id: id); message = "Calibration: rebuilt master." }
+            do { try lib.rebuild(id: id, sourceDirectory: access.url); message = "Calibration: rebuilt master." }
             catch { message = "Calibration: rebuild failed — \(error.localizedDescription)" }
             await MainActor.run {
                 self.calibrationBusy = false
@@ -1272,6 +1328,7 @@ final class AppModel {
         inputPreparationID = nil // retire ownership before the worker can complete
         inputPreparationTask?.cancel()
         inputPreparationTask = nil
+        pendingFileAccess = nil
         sessionInputStatus = nil
         let completion = pendingStartCompletion
         pendingStartCompletion = nil
@@ -1342,11 +1399,12 @@ final class AppModel {
         let completion = pendingStartCompletion ?? { _ in }
         pendingStartCompletion = nil
         guard choice != .cancel else {
+            pendingFileAccess = nil
             log.append("Start cancelled — \(pending.snapshot.count) subs were already in the folder.")
             completion(false)
             return
         }
-        guard let folder = watchFolder else { completion(false); return }
+        guard let folder = watchFolder else { pendingFileAccess = nil; completion(false); return }
         let filter = fileNamePrefix.isEmpty ? nil : fileNamePrefix
         let excluding = Self.exclusion(for: choice, snapshot: pending.snapshot,
                                        folder: folder, fileNamePrefix: filter)
@@ -1384,7 +1442,7 @@ final class AppModel {
     /// Preflight first: read the folder, and either ask about subs already in it, stand up a
     /// "waiting" status for a filter matching nothing, or report a read failure as a failure.
     /// `beginSession` is the part that actually starts anything.
-    func startSession(completion: @escaping (Bool) -> Void = { _ in }) {
+    func startSession(access: OperationFileAccess? = nil, completion: @escaping (Bool) -> Void = { _ in }) {
         guard !hasPendingSessionStart else {
             log.append("Start is already awaiting input confirmation or baseline preparation.")
             completion(false)
@@ -1397,6 +1455,16 @@ final class AppModel {
             return
         }
         sessionInputStatus = nil
+        do {
+            guard let folder = watchFolder else { throw AuthorizedLocationError.missingSelection("capture") }
+            pendingFileAccess = try access ?? acquireOperationAccess(input: folder)
+            watchFolder = pendingFileAccess?.input
+        } catch {
+            pendingFileAccess = nil
+            reportFileAccess(error)
+            completion(false)
+            return
+        }
         guard sourceMode == .nativeStack else { completion(beginSession(excludingPreExisting: nil)); return }
         guard let folder = watchFolder else {
             errorMessage = "Pick a watch folder first."
@@ -1408,7 +1476,8 @@ final class AppModel {
         inputPreparationID = id
         pendingStartCompletion = completion
         sessionInputStatus = .preparingBaseline(completed: 0, total: 0)
-        inputPreparationTask = Task.detached(priority: .userInitiated) { [weak self] in
+        inputPreparationTask = Task.detached(priority: .userInitiated) { [weak self, access = pendingFileAccess] in
+            defer { withExtendedLifetime(access) {} }
             let owner = self
             let result: Result<WatchFolderInput.Snapshot, Error>
             do {
@@ -1445,6 +1514,7 @@ final class AppModel {
         }
         switch result {
         case .failure(let error):
+            pendingFileAccess = nil
             let reason = error.localizedDescription
             // A folder that cannot be read is a failure, never "no matching subs found".
             sessionInputStatus = .failed(reason)
@@ -1471,38 +1541,44 @@ final class AppModel {
     /// Not unit-testable: needs FileManager, a live pipeline, and a real watch
     /// folder — the end-to-end test covers this path.
     private func beginSession(excludingPreExisting excluded: WatchFolderInput.Snapshot?) -> Bool {
+        let access = pendingFileAccess
+        pendingFileAccess = nil
+        defer { withExtendedLifetime(access) {} }
         guard !isRestacking else { errorMessage = "Finish the re-stack before starting a session."; return false }
         saveSettings()
         guard !isRunning else { return false }
         guard !importer.isImporting else { errorMessage = "Finish the import before starting a session."; return false }
         guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return false }
         zoomPan = .fit
-        let root = liveAstroRoot
+        guard let access else { errorMessage = "Choose authorized input and output folders before starting."; return false }
+        let root = access.output
 
         let p: SessionPipeline
         switch sourceMode {
         case .stackerOutput:
             p = SessionPipeline(watchFolder: folder, profile: profile, rootDirectory: root,
                                fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
-                               neutralizeBackground: neutralizeBackground)
+                               neutralizeBackground: neutralizeBackground,
+                               catalogURL: distribution.catalogURL, accessLifetime: access)
         case .nativeStack:
             let source = FolderFrameSource(folder: folder, mode: .live,
                                             fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
-                                            excludingPreExisting: excluded)
+                                            excludingPreExisting: excluded, accessLifetime: access)
             let engine = makeStackEngine()
             let cal = resolveCalibration(
                 watchFolder: folder, prefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
-                excludingPreExisting: excluded)
+                excludingPreExisting: excluded, access: access)
             // Use the same peek as calibration, never a second scan whose result can race
             // it. The first ingested sub is independently delivered through wireCallbacks.
             if let metadata = cal.metadata { adoptSourceMetadata(metadata) }
             cal.messages.forEach { log.append($0) }
             CalibrationStore.save(calibration, to: userDefaults)
             // Empty folder at Start → resolve calibration from the first sub that lands.
-            let provider = cal.foundMetadata ? nil : makeCalibratorProvider()
+            let provider = cal.foundMetadata ? nil : makeCalibratorProvider(access: access)
             p = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
                 rootDirectory: root, neutralizeBackground: neutralizeBackground,
-                calibrator: cal.calibrator, calibratorProvider: provider)
+                calibrator: cal.calibrator, calibratorProvider: provider,
+                catalogURL: distribution.catalogURL, accessLifetime: access)
             // Pin the session's own subs folder so a later re-stack resolves the recorded
             // subs under IT, not whatever the operator has since changed the live controls to (Fix 4).
             restackSourceDir = folder
@@ -1548,6 +1624,7 @@ final class AppModel {
         wireCallbacks(to: p, onAccepted: onAccepted)
         do {
             try p.start()
+            sessionFileAccess = access
             setPipeline(p)
             refreshPreview(force: true)   // fill the panel as soon as there is data
             isRunning = true
@@ -1584,7 +1661,11 @@ final class AppModel {
             return
         }
 
-        let folder = liveAstroRoot.appendingPathComponent("DemoInput", isDirectory: true)
+        let output: FileAccessLease
+        do { output = try acquireOutputLocation() }
+        catch { reportFileAccess(error); return }
+        defer { withExtendedLifetime(output) {} }
+        let folder = output.url.appendingPathComponent("DemoInput", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {
@@ -1626,7 +1707,8 @@ final class AppModel {
         }
 
         let args = ["demo-stack", folder.path, "--interval", "3", "--count", "30"]
-        demoTask = Task.detached { [weak self] in
+        demoTask = Task.detached { [weak self, output] in
+            defer { withExtendedLifetime(output) {} }
             guard let model = self else { return }
             do {
                 try DemoStackGenerator.run(
@@ -1926,6 +2008,7 @@ final class AppModel {
     /// stats-wiring (populating `subFrames` for imports) is a future feature (Fix P2-import).
     func resetSessionStatsForImport() {
         guard !isRestacking else { return }
+        sessionFileAccess = nil
         presentCleanStackCompletion(nil, status: nil)
         subFrames = []
         restackSourceDir = nil
@@ -1999,9 +2082,10 @@ final class AppModel {
         // Capture on the main actor everything the off-actor write needs: the session's metadata
         // (Fix P1b — write master.fit with the SAME header the live master had), the pinned
         // session directory, and the sub exposure (for TOTALEXP).
-        Task.detached { [weak self, sessionCalibrator, sessionSourceMetadata,
+        Task.detached { [weak self, sessionCalibrator, sessionSourceMetadata, access = sessionFileAccess,
                          sessionDir = lastSessionDirectory, sessionNeutralizeBackground,
                          sessionSubExposureSeconds, survivorSubs] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }
             let report: RestackReport
             do {
@@ -2245,7 +2329,8 @@ final class AppModel {
         // the detached replay task).
         broadcast.sessionDidEnd()
 
-        Task.detached { [weak self] in
+        Task.detached { [weak self, access = sessionFileAccess] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             let shouldCompleteSession: Bool
             do {
@@ -2430,8 +2515,9 @@ final class AppModel {
         let panel = makeDirectoryPanel(title: title, message: message)
         panel.prompt = "Watch"
         if panel.runModal() == .OK, let url = panel.url {
+            guard selectLocation(url, key: "capture") else { return }
             self.sourceMode = sourceMode
-            self.liveSource.startWatchFolderLive(source: url, sourceMode: sourceMode)
+            self.liveSource.startWatchFolderLive(source: watchFolder ?? url, sourceMode: sourceMode)
         }
     }
 
@@ -2439,7 +2525,8 @@ final class AppModel {
         let panel = makeDirectoryPanel(title: "Choose Subs Folder",
                                        message: "Select a folder containing raw FITS subs to import")
         if panel.runModal() == .OK, let url = panel.url {
-            importer.importSubs(from: url)
+            guard let selected = selectSourceFolder(url) else { return }
+            importer.importSubs(from: selected)
         }
     }
 }

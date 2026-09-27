@@ -445,7 +445,10 @@ public final class SessionPipeline {
     private var solveAttempted = false          // guarded by plateSolveLock
     private var solveGeneration = 0             // guarded by plateSolveLock; bumped on reseed to void stale solves
     private let plateSolveQueue = DispatchQueue(label: "com.liveastro.platesolve")
-    private var _plateSolveCatalog: StarCatalog? = StarCatalog.installed()   // guarded by plateSolveLock
+    private let catalogURL: URL?
+    /// Opaque caller-owned file access; propagated to readers that can outlive End's wait.
+    private let accessLifetime: (any Sendable)?
+    private var _plateSolveCatalog: StarCatalog?   // guarded by plateSolveLock
     /// The catalog plate-solving uses (the injection seam for tests; `installed()` in production).
     /// Lock-guarded because `reloadCatalog()` may swap it from the UI thread while the frame path reads it.
     var plateSolveCatalog: StarCatalog? {
@@ -491,7 +494,7 @@ public final class SessionPipeline {
     /// restart. A no-op-safe: if nothing is installed, plateSolveCatalog becomes nil and plate-solve
     /// stays the usual no-op.
     public func reloadCatalog() {
-        plateSolveCatalog = StarCatalog.installed()
+        plateSolveCatalog = StarCatalog.installed(at: catalogURL)
         invalidatePlateSolve()
     }
 
@@ -890,7 +893,7 @@ public final class SessionPipeline {
         let loader: FrameLoader = refinerLoaderOverride
             ?? ProductionFrameLoader(calibratorProvider: { [weak self] in self?.effectiveCalibrator },
                                      demosaic: demosaic)
-        let refiner = GlobalRefiner(loader: loader, onLog: { [weak self] msg in self?.onLog?(msg) })
+        let refiner = GlobalRefiner(loader: loader, onLog: { [weak self] msg in self?.onLog?(msg) }, accessLifetime: accessLifetime)
         if let cap = refinerPerSubLoadCapOverride { refiner.perSubLoadCap = cap }
         refiner.makeSnapshot = { [weak self] in self?.makeRefinerSnapshot() }
         refiner.publish = { [weak self] result, key in self?.publishRefineResult(result, key: key) }
@@ -1121,7 +1124,11 @@ public final class SessionPipeline {
     public init(watchFolder: URL, profile: SessionProfile, rootDirectory: URL,
                 replaySettings: ReplaySettings = .init(),
                 maxKeyframes: Int = FrameSelector.defaultMaxKeyframes,
-                fileNamePrefix: String? = nil, neutralizeBackground: Bool = false) {
+                fileNamePrefix: String? = nil, neutralizeBackground: Bool = false,
+                catalogURL: URL? = nil, accessLifetime: (any Sendable)? = nil) {
+        self.catalogURL = catalogURL
+        self.accessLifetime = accessLifetime
+        self._plateSolveCatalog = StarCatalog.installed(at: catalogURL)
         // Review7 P2 / review9 item 1: Siril watcher mode matches BOTH the classic
         // in-place live_stack.fit AND the immutable numbered revisions
         // (live_stack_00001.fit …) Siril 1.4+ writes under the same prefix.
@@ -1133,7 +1140,7 @@ public final class SessionPipeline {
         // (same stat-stability + digest-stability gates) they cost one fstat per
         // poll instead of re-hashing an ever-growing revision history.
         self.watcher = StackFileWatcher(folder: watchFolder, fileNamePrefix: fileNamePrefix,
-                                        digestPolicy: .mutableStackerOutput)
+                                        digestPolicy: .mutableStackerOutput, accessLifetime: accessLifetime)
         self.source = nil
         self.engine = nil
         self.profile = profile
@@ -1151,7 +1158,11 @@ public final class SessionPipeline {
                 rootDirectory: URL, replaySettings: ReplaySettings = .init(),
                 maxKeyframes: Int = FrameSelector.defaultMaxKeyframes,
                 neutralizeBackground: Bool = false, calibrator: Calibrator? = nil,
-                calibratorProvider: ((SourceMetadata) -> Calibrator?)? = nil) {
+                calibratorProvider: ((SourceMetadata) -> Calibrator?)? = nil,
+                catalogURL: URL? = nil, accessLifetime: (any Sendable)? = nil) {
+        self.catalogURL = catalogURL
+        self.accessLifetime = accessLifetime
+        self._plateSolveCatalog = StarCatalog.installed(at: catalogURL)
         self.watcher = nil
         self.source = nativeSource
         self.engine = engine
@@ -2481,10 +2492,11 @@ public final class SessionPipeline {
                         makeCleanCompletion = { [survivors = frozen.survivors, generation = frozenGen,
                             kappa = frozen.kappa, budget = frozen.budget, minSubs = liveRejectionMinSubs,
                             metadata = sourceMetadata, neutralize = neutralizeBackground,
-                            fallback = profile.subExposureSeconds] in
+                            fallback = profile.subExposureSeconds, accessLifetime] in
                             try CleanStackCompletion(directory: dir, survivors: survivors, generation: generation,
                                 kappa: kappa, budget: budget, minSubs: minSubs, loader: loader,
-                                metadata: metadata, neutralize: neutralize, fallbackSeconds: fallback, status: status)
+                                metadata: metadata, neutralize: neutralize, fallbackSeconds: fallback, status: status,
+                                accessLifetime: accessLifetime)
                         }
                     }
                     finalBroadcast = (cropToCoverage(report.master, coverage: report.coverage),

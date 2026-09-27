@@ -53,9 +53,9 @@ struct CalibrationSection: View {
 
             // --- Flats (this session) ---
             Text("Flats (this session)").font(.caption.weight(.semibold))
-            folderRow("Flats", folder: $model.sessionFlatsFolder,
+            folderRow("Flats", folder: Binding(get: { model.sessionFlatsFolder }, set: { model.setCalibrationFolder($0, darkFlats: false) }),
                       help: "A folder of raw flats shot for this session — ideally before the lights. Built into a master flat at Start.")
-            folderRow("Dark-flats (optional)", folder: $model.sessionDarkFlatsFolder,
+            folderRow("Dark-flats (optional)", folder: Binding(get: { model.sessionDarkFlatsFolder }, set: { model.setCalibrationFolder($0, darkFlats: true) }),
                       help: "Optional raw dark-flats — subtracted from the flats when the master flat is built.")
             HStack {
                 Toggle("Also use dark-flat as the light offset", isOn: $model.useDarkFlatAsLightOffset)
@@ -95,7 +95,7 @@ struct CalibrationSection: View {
     }
 
     private func addFolder(_ kind: MasterKind) {
-        if let u = pickFolder() { model.addMasterFromFolder(u, kind: kind) }
+        if let u = pickFolder(), let selected = model.selectSourceFolder(u) { model.addMasterFromFolder(selected, kind: kind) }
     }
 
     private func pickFolder() -> URL? {
