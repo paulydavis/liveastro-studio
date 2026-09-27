@@ -5,6 +5,38 @@ import XCTest
 /// must be called exactly once, on the FIRST frame carrying metadata, and its returned
 /// Calibrator must be applied to that same frame.
 final class CalibrationProviderSeamTests: XCTestCase {
+    func testThrowingProviderLatchesBeforeEngineAndEndCannotCommitSuccess() throws {
+        let sessions = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: sessions) }
+        let source = ControlledLiveSource(), engine = StackEngine()
+        let calls = Locked(0), failures = Locked(0)
+        let denied = sessions.appendingPathComponent("selected-flat.fit")
+        let pipeline = SessionPipeline(nativeSource: source, engine: engine,
+            profile: SessionProfile(targetName: "Seam", telescope: "T", camera: "C", mount: "M", filter: "F",
+                locationLabel: "L", bortle: 5, subExposureSeconds: 180, notes: ""), rootDirectory: sessions,
+            calibratorProvider: { _ in
+                calls.mutate { $0 += 1 }
+                throw CalibrationReadError(url: denied, underlying: CocoaError(.fileReadNoPermission))
+            })
+        let failed = expectation(description: "typed calibration failure")
+        pipeline.onCalibrationFailure = { error in
+            XCTAssertTrue(error is CalibrationReadError)
+            failures.mutate { $0 += 1 }; failed.fulfill()
+        }
+        try pipeline.start()
+        source.send(makeFrame(name: "Light_001.fit", seed: 1, meta: meta(exp: 180)).0)
+        source.send(makeFrame(name: "Light_002.fit", seed: 7, meta: meta(exp: 180)).0)
+        wait(for: [failed], timeout: 5)
+        XCTAssertThrowsError(try pipeline.end()) { XCTAssertTrue($0 is CalibrationReadError) }
+        XCTAssertEqual(calls.value, 1)
+        XCTAssertEqual(failures.value, 1)
+        XCTAssertEqual(engine.acceptedCount, 0)
+        XCTAssertEqual(engine.rejectedCount, 0)
+        XCTAssertNil(pipeline.session.manifest?.endTime)
+        let directory = try XCTUnwrap(pipeline.sessionDir)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("master.fit").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("replay.mp4").path))
+    }
 
     private final class ControlledLiveSource: FrameSource {
         let frames: AsyncStream<RawFrame>

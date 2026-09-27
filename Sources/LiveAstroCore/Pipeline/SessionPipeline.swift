@@ -1002,7 +1002,10 @@ public final class SessionPipeline {
     /// started on an empty folder, where the lights' camera/gain/exposure aren't
     /// known until the first sub lands. Called at most once, on the serial consume
     /// task inside handleNative, so its state needs no extra locking.
-    private let calibratorProvider: ((SourceMetadata) -> Calibrator?)?
+    private let calibratorProvider: ((SourceMetadata) throws -> Calibrator?)?
+    private var calibrationFailure: Error? // serial consume; read by End only after drain
+    /// Delivered outside locks before any frame reaches the engine. End drains normally, then throws this failure.
+    public var onCalibrationFailure: ((Error) -> Void)?
     private var providerCalibrator: Calibrator?
     private var providerAttempted = false
     /// The calibrator the pipeline ACTUALLY applied to frames before stacking: the
@@ -1158,7 +1161,7 @@ public final class SessionPipeline {
                 rootDirectory: URL, replaySettings: ReplaySettings = .init(),
                 maxKeyframes: Int = FrameSelector.defaultMaxKeyframes,
                 neutralizeBackground: Bool = false, calibrator: Calibrator? = nil,
-                calibratorProvider: ((SourceMetadata) -> Calibrator?)? = nil,
+                calibratorProvider: ((SourceMetadata) throws -> Calibrator?)? = nil,
                 catalogURL: URL? = nil, accessLifetime: (any Sendable)? = nil) {
         self.catalogURL = catalogURL
         self.accessLifetime = accessLifetime
@@ -1799,13 +1802,19 @@ public final class SessionPipeline {
     private func handleNative(_ rawFrame: RawFrame, engine: StackEngine) {
         withCallbackDelivery {
             if cancelled.isSet { return }
+            if calibrationFailure != nil { return }
             if sourceMetadata == nil, let m = rawFrame.metadata {
                 captureSourceMetadataIfNeeded(m)
                 // No explicit calibrator (empty-folder live start): resolve one now from
                 // this first frame's header. Once only; serial consume task → no lock.
                 if calibrator == nil, !providerAttempted, let provider = calibratorProvider {
                     providerAttempted = true
-                    providerCalibrator = provider(m)
+                    do { providerCalibrator = try provider(m) }
+                    catch {
+                        calibrationFailure = error
+                        onCalibrationFailure?(error)
+                        return
+                    }
                     providerCalibrator?.onLog = { [weak self] in self?.onLog?($0) }
                 }
             }
@@ -2412,6 +2421,7 @@ public final class SessionPipeline {
                 watcher?.stop(timeout: Self.seconds(drainPrimaryTimeout))
                 try drainConsumeTaskOrThrow()
             }
+            if let calibrationFailure { throw calibrationFailure }
             if let meta = sourceMetadata { session.fillMissingMetadata(from: meta) }
             guard let dir = session.sessionDirectory else {
                 throw SessionError.notRunning

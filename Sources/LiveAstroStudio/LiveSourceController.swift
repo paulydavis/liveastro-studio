@@ -17,6 +17,8 @@ final class LiveSourceController {
     private let surface: AppSurface
     private let relayRoot: URL
     private var relayAccess: OperationFileAccess?
+    private var detectionGeneration = 0
+    private var manualPreparationTask: Task<Void, Never>?
 
     /// True while an auto-detect path is scanning for a share off the main
     /// thread. Gates the start*Live entry points and disables their buttons.
@@ -43,6 +45,12 @@ final class LiveSourceController {
     /// Stop the frame relay. Called by `AppModel.endSession()` (before the
     /// pipeline drains) and by the willTerminate observer. Idempotent.
     func stopRelay() {
+        if let manualPreparationTask {
+            detectionGeneration += 1
+            manualPreparationTask.cancel()
+            self.manualPreparationTask = nil
+            isDetecting = false
+        }
         frameRelay?.stop()
         frameRelay = nil
         relayAccess = nil
@@ -91,13 +99,27 @@ final class LiveSourceController {
         let source = access?.input ?? source
         surface.resetZoomPan?()
         isDetecting = true
+        detectionGeneration += 1
+        let generation = detectionGeneration
         surface.log("Reading subs in \(source.lastPathComponent)…")
-        Task.detached { [weak self, access] in
+        manualPreparationTask = Task.detached { [weak self, access] in
             defer { withExtendedLifetime(access) {} }
             guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
+            do { try access?.validateAvailability(); try Task.checkCancellation() }
+            catch {
+                await MainActor.run {
+                    guard self.detectionGeneration == generation else { return }
+                    self.isDetecting = false
+                    self.manualPreparationTask = nil
+                    self.surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again.")
+                }
+                return
+            }
             let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: source)   // SMB header read, off main
             await MainActor.run {
+                guard self.detectionGeneration == generation else { return }
                 self.isDetecting = false
+                self.manualPreparationTask = nil
                 guard self.canApplyDetectedLiveSource() else {
                     self.surface.log("Live source detection ignored — a session or import started while detection was running.")
                     return

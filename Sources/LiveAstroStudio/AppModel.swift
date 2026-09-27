@@ -397,6 +397,10 @@ final class AppModel {
     private var pipeline: SessionPipeline?
     let distribution: StorePreviewConfiguration
     let authorizedLocations: AuthorizedLocations
+    let locationAvailability: any LocationAvailabilityChecking
+    var accessRestorationID: UUID?
+    var accessRestorationTask: Task<Void, Never>?
+    var isRestoringLocationAccess: Bool { accessRestorationID != nil }
     var selectedOutputFolder: URL?
     private var pendingFileAccess: OperationFileAccess?
     private var sessionFileAccess: OperationFileAccess?
@@ -444,8 +448,10 @@ final class AppModel {
     init(userDefaults: UserDefaults = .standard, calibrationLibrary: CalibrationLibrary? = nil,
          relayRoot: URL? = nil,
          configuration: StorePreviewConfiguration = StorePreviewConfiguration(),
-         bookmarkBackend: any BookmarkAccessing = FoundationBookmarkAccessor()) {
+         bookmarkBackend: any BookmarkAccessing = FoundationBookmarkAccessor(),
+         locationAvailability: any LocationAvailabilityChecking = FileLocationAvailability()) {
         self.userDefaults = userDefaults
+        self.locationAvailability = locationAvailability
         self.distribution = configuration
         self.authorizedLocations = AuthorizedLocations(defaults: userDefaults,
             policy: configuration.isStorePreview ? .sandboxed : .direct,
@@ -1119,39 +1125,40 @@ final class AppModel {
     /// (FileManager + pipeline); the pure matcher/scaler/library are unit-tested.
     func resolveCalibration(watchFolder: URL, prefix: String?, excludingPreExisting: WatchFolderInput.Snapshot? = nil,
                             access: OperationFileAccess? = nil)
-        -> (calibrator: Calibrator?, messages: [String], foundMetadata: Bool, metadata: SourceMetadata?) {
+        -> (calibrator: Calibrator?, messages: [String], foundMetadata: Bool, metadata: SourceMetadata?, failure: CalibrationReadError?) {
         // Old files were explicitly excluded. Even a newly arrived file may still be writing;
         // resolve on the first frame the source actually ingests, using its captured metadata.
         if excludingPreExisting != nil {
             calibrationStatus = statusLine(dark: false, flat: false)
-            return (nil, ["Calibration: matching from the first new sub as it arrives."], false, nil)
+            return (nil, ["Calibration: matching from the first new sub as it arrives."], false, nil, nil)
         }
         // Peek a representative sub already in the folder. If none (empty-folder live
         // start), report foundMetadata: false so the caller attaches the first-sub
         // provider instead — calibration then resolves as the first sub lands.
-        guard let meta = representativeMetadata(in: watchFolder, prefix: prefix) else {
+        guard let meta = Self.representativeMetadata(in: watchFolder, prefix: prefix) else {
             calibrationStatus = statusLine(dark: false, flat: false)
-            return (nil, ["Calibration: no subs yet — matching from the first sub as it arrives."], false, nil)
+            return (nil, ["Calibration: no subs yet — matching from the first sub as it arrives."], false, nil, nil)
         }
         let r = CalibrationResolver.resolve(
             metadata: meta, library: calibrationLibrary, scaleEnabled: scaleDarksAcrossExposures,
             flatsFolder: access == nil ? sessionFlatsFolder : access?.flats,
             darkFlatsFolder: access == nil ? sessionDarkFlatsFolder : access?.darkFlats,
             legacyDarkPath: (access?.calibration ?? calibration).darkPath, legacyFlatPath: (access?.calibration ?? calibration).flatPath,
-            useDarkFlatAsLightOffset: useDarkFlatAsLightOffset)
+            useDarkFlatAsLightOffset: useDarkFlatAsLightOffset, failOnSelectedReadError: isStorePreview)
         calibrationStatus = statusLine(dark: r.hasDark, flat: r.hasFlat, lightOffset: r.hasLightOffset)
-        return (r.calibrator, r.messages, true, meta)
+        return (r.calibrator, r.messages, true, meta, r.readFailure)
     }
 
     /// First-sub calibrator provider for empty-folder starts: the pipeline calls this
     /// with the first frame's header on the consume task; it resolves calibration and
     /// hops to the main actor to log + update the status line.
-    func makeCalibratorProvider(access: OperationFileAccess? = nil) -> ((SourceMetadata) -> Calibrator?) {
+    func makeCalibratorProvider(access: OperationFileAccess? = nil) -> ((SourceMetadata) throws -> Calibrator?) {
         let library = calibrationLibrary
         let scale = scaleDarksAcrossExposures
         let flats = access == nil ? sessionFlatsFolder : access?.flats
         let darkFlats = access == nil ? sessionDarkFlatsFolder : access?.darkFlats
         let lightOffset = useDarkFlatAsLightOffset
+        let strict = isStorePreview
         let legacyDark = (access?.calibration ?? calibration).darkPath, legacyFlat = (access?.calibration ?? calibration).flatPath
         return { [weak self, access] meta in
             defer { withExtendedLifetime(access) {} }
@@ -1159,7 +1166,8 @@ final class AppModel {
                 metadata: meta, library: library, scaleEnabled: scale,
                 flatsFolder: flats, darkFlatsFolder: darkFlats,
                 legacyDarkPath: legacyDark, legacyFlatPath: legacyFlat,
-                useDarkFlatAsLightOffset: lightOffset)
+                useDarkFlatAsLightOffset: lightOffset, failOnSelectedReadError: strict)
+            if let failure = r.readFailure { throw failure }
             DispatchQueue.main.async {
                 guard let self else { return }
                 r.messages.forEach { self.log.append($0) }
@@ -1170,7 +1178,7 @@ final class AppModel {
     }
 
 
-    private func representativeMetadata(in folder: URL, prefix: String?) -> SourceMetadata? {
+    private nonisolated static func representativeMetadata(in folder: URL, prefix: String?) -> SourceMetadata? {
         var files = CalibrationLibrary.fitsFiles(in: folder)
         if let prefix, !prefix.isEmpty { files = files.filter { $0.lastPathComponent.hasPrefix(prefix) } }
         for url in files.sorted(by: { $0.lastPathComponent > $1.lastPathComponent }) {   // newest first
@@ -1209,10 +1217,8 @@ final class AppModel {
         let access: FileAccessLease
         do { access = try acquireReadableLocation(folder) }
         catch { reportFileAccess(error); return }
-        let urls = CalibrationLibrary.fitsFiles(in: access.url)
-        guard !urls.isEmpty else { log.append("Calibration: no FITS frames in that folder."); return }
         calibrationBusy = true
-        log.append("Calibration: building \(kind.rawValue) master from \(urls.count) frames…")
+        log.append("Calibration: preparing \(kind.rawValue) master…")
         let lib = calibrationLibrary
         let sourceDirectory = isStorePreview ? access.url : nil
         Task.detached { [weak self, access] in
@@ -1220,6 +1226,16 @@ final class AppModel {
             // Swift 6: rebind weak self to a strong immutable up front — nested
             // @Sendable closures may not reference a captured weak *var*.
             guard let self else { return }
+            let urls: [URL]
+            do { urls = try CalibrationLibrary.fitsFilesRequiringAccess(in: access.url) }
+            catch {
+                await MainActor.run { self.calibrationBusy = false; self.reportFileAccess(error) }
+                return
+            }
+            guard !urls.isEmpty else {
+                await MainActor.run { self.calibrationBusy = false; self.log.append("Calibration: no FITS frames in that folder.") }
+                return
+            }
             // Key the master from the first READABLE frame's header — not urls[0], which may be the
             // corrupt/unreadable file MasterBuilder silently skips. Keying off a skipped file would
             // stamp the master with generic/nil camera+gain so it never matches lights later.
@@ -1428,7 +1444,7 @@ final class AppModel {
         } else {
             log.append("Stacking \(pending.snapshot.count) subs already in the folder, plus new arrivals.")
         }
-        completion(beginSession(excludingPreExisting: excluding))
+        prepareAndBeginSession(excludingPreExisting: excluding, completion: completion)
     }
 
     /// Clears waiting when the pipeline processes an accepted OR rejected frame,
@@ -1465,7 +1481,8 @@ final class AppModel {
             completion(false)
             return
         }
-        guard sourceMode == .nativeStack else { completion(beginSession(excludingPreExisting: nil)); return }
+        let native = sourceMode == .nativeStack
+        guard native || isStorePreview else { completion(beginSession(excludingPreExisting: nil)); return }
         guard let folder = watchFolder else {
             errorMessage = "Pick a watch folder first."
             completion(false)
@@ -1481,6 +1498,23 @@ final class AppModel {
             let owner = self
             let result: Result<WatchFolderInput.Snapshot, Error>
             do {
+                try access?.validateAvailability()
+                if !native {
+                    await MainActor.run {
+                        guard let owner, owner.inputPreparationID == id else { return }
+                        owner.inputPreparationID = nil
+                        owner.inputPreparationTask = nil
+                        owner.pendingStartCompletion = nil
+                        owner.sessionInputStatus = nil
+                        guard owner.watchFolder?.standardizedFileURL == folder.standardizedFileURL,
+                              (owner.fileNamePrefix.isEmpty ? nil : owner.fileNamePrefix) == filter,
+                              owner.sourceMode != .nativeStack else {
+                            owner.pendingFileAccess = nil; completion(false); return
+                        }
+                        completion(owner.beginSession(excludingPreExisting: nil))
+                    }
+                    return
+                }
                 let snapshot = try WatchFolderInput.snapshot(folder: folder, fileNamePrefix: filter)
                 result = .success(try snapshot.addingContentBaseline(shouldCancel: { Task.isCancelled }) { done, total in
                     Task { @MainActor in
@@ -1489,12 +1523,12 @@ final class AppModel {
                     }
                 })
             } catch { result = .failure(error) }
-            await owner?.finishInputPreparation(result, id: id, folder: folder, filter: filter)
+            await owner?.finishInputPreparation(result, id: id, folder: folder, filter: filter, native: native)
         }
     }
 
     private func finishInputPreparation(_ result: Result<WatchFolderInput.Snapshot, Error>,
-                                        id: UUID, folder: URL, filter: String?) {
+                                        id: UUID, folder: URL, filter: String?, native: Bool = true) {
         guard inputPreparationID == id else { return }
         inputPreparationID = nil
         inputPreparationTask = nil
@@ -1502,7 +1536,7 @@ final class AppModel {
         pendingStartCompletion = nil
         sessionInputStatus = nil
         guard watchFolder?.standardizedFileURL == folder.standardizedFileURL,
-              (fileNamePrefix.isEmpty ? nil : fileNamePrefix) == filter, sourceMode == .nativeStack else {
+              (fileNamePrefix.isEmpty ? nil : fileNamePrefix) == filter, (sourceMode == .nativeStack) == native else {
             log.append("Watch folder or filename filter changed during baseline preparation — re-checking the folder.")
             if watchFolder?.standardizedFileURL == folder.standardizedFileURL, sourceMode == .nativeStack {
                 startSession(completion: completion)
@@ -1534,13 +1568,73 @@ final class AppModel {
                     ? "No subs \(where_) — \(unmatched) other file(s) are present. Waiting for new files."
                     : "No subs \(where_) yet. Waiting for new files.")
             }
-            completion(beginSession(excludingPreExisting: nil))
+            prepareAndBeginSession(excludingPreExisting: nil, completion: completion)
+        }
+    }
+
+    private typealias PreparedCalibration = (calibrator: Calibrator?, messages: [String], foundMetadata: Bool,
+                                              metadata: SourceMetadata?, failure: CalibrationReadError?)
+
+    /// Preview validation and calibration I/O remain cancellable preparation, including
+    /// after the pre-existing-input dialog. Ownership stays with a parked worker.
+    private func prepareAndBeginSession(excludingPreExisting excluded: WatchFolderInput.Snapshot?,
+                                        completion: @escaping (Bool) -> Void) {
+        guard isStorePreview, let access = pendingFileAccess else {
+            completion(beginSession(excludingPreExisting: excluded)); return
+        }
+        let id = UUID(), folder = access.input
+        let preparedInputStatus = sessionInputStatus
+        let prefix = fileNamePrefix.isEmpty ? nil : fileNamePrefix
+        let library = calibrationLibrary, scale = scaleDarksAcrossExposures, lightOffset = useDarkFlatAsLightOffset
+        inputPreparationID = id
+        pendingStartCompletion = completion
+        sessionInputStatus = .preparingBaseline(completed: 0, total: 0)
+        inputPreparationTask = Task.detached { [weak self, access] in
+            defer { withExtendedLifetime(access) {} }
+            let owner = self
+            let result: Result<(PreparedCalibration, (dark: Bool, flat: Bool, offset: Bool)), Error>
+            do {
+                try access.validateAvailability()
+                let meta = excluded == nil ? Self.representativeMetadata(in: folder, prefix: prefix) : nil
+                if let meta {
+                    let r = CalibrationResolver.resolve(metadata: meta, library: library, scaleEnabled: scale,
+                        flatsFolder: access.flats, darkFlatsFolder: access.darkFlats,
+                        legacyDarkPath: access.darkPath, legacyFlatPath: access.flatPath,
+                        useDarkFlatAsLightOffset: lightOffset, failOnSelectedReadError: true)
+                    if let failure = r.readFailure { throw failure }
+                    try Task.checkCancellation()
+                    result = .success(((r.calibrator, r.messages, true, meta, nil), (r.hasDark, r.hasFlat, r.hasLightOffset)))
+                } else {
+                    try Task.checkCancellation()
+                    result = .success(((nil, ["Calibration: matching from the first sub as it arrives."], false, nil, nil), (false, false, false)))
+                }
+            } catch { result = .failure(error) }
+            await MainActor.run {
+                guard let self = owner, self.inputPreparationID == id else { return }
+                self.inputPreparationID = nil
+                self.inputPreparationTask = nil
+                self.pendingStartCompletion = nil
+                self.sessionInputStatus = nil
+                guard self.watchFolder?.standardizedFileURL == folder.standardizedFileURL,
+                      (self.fileNamePrefix.isEmpty ? nil : self.fileNamePrefix) == prefix,
+                      self.sourceMode == .nativeStack else {
+                    self.pendingFileAccess = nil; completion(false); return
+                }
+                switch result {
+                case .failure(let error):
+                    self.pendingFileAccess = nil; self.reportFileAccess(error); completion(false)
+                case .success(let (prepared, flags)):
+                    self.sessionInputStatus = preparedInputStatus
+                    self.calibrationStatus = self.statusLine(dark: flags.dark, flat: flags.flat, lightOffset: flags.offset)
+                    completion(self.beginSession(excludingPreExisting: excluded, prepared: prepared))
+                }
+            }
         }
     }
 
     /// Not unit-testable: needs FileManager, a live pipeline, and a real watch
     /// folder — the end-to-end test covers this path.
-    private func beginSession(excludingPreExisting excluded: WatchFolderInput.Snapshot?) -> Bool {
+    private func beginSession(excludingPreExisting excluded: WatchFolderInput.Snapshot?, prepared: PreparedCalibration? = nil) -> Bool {
         let access = pendingFileAccess
         pendingFileAccess = nil
         defer { withExtendedLifetime(access) {} }
@@ -1565,9 +1659,10 @@ final class AppModel {
                                             fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
                                             excludingPreExisting: excluded, accessLifetime: access)
             let engine = makeStackEngine()
-            let cal = resolveCalibration(
+            let cal = prepared ?? resolveCalibration(
                 watchFolder: folder, prefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
                 excludingPreExisting: excluded, access: access)
+            if let failure = cal.failure { reportFileAccess(failure); return false }
             // Use the same peek as calibration, never a second scan whose result can race
             // it. The first ingested sub is independently delivered through wireCallbacks.
             if let metadata = cal.metadata { adoptSourceMetadata(metadata) }
@@ -1698,14 +1793,14 @@ final class AppModel {
         notes = "Generated by LiveAstro Try Demo."
         log.append("Try Demo — writing sample stack updates to \(folder.path)")
 
-        startSession()
-        guard isRunning else {
-            // Session didn't start (e.g. an import is running) — undo the demo override
-            // so it doesn't leave "Demo Nebula"/DemoInput branding armed on the real fields.
-            restoreMetadataAfterDemoIfNeeded()
-            return
+        startSession { [weak self, output] started in
+            guard let self else { return }
+            guard started else { self.restoreMetadataAfterDemoIfNeeded(); return }
+            self.runDemoGenerator(folder: folder, output: output)
         }
+    }
 
+    private func runDemoGenerator(folder: URL, output: FileAccessLease) {
         let args = ["demo-stack", folder.path, "--interval", "3", "--count", "30"]
         demoTask = Task.detached { [weak self, output] in
             defer { withExtendedLifetime(output) {} }
@@ -1840,6 +1935,14 @@ final class AppModel {
         }
         pipeline.onLog = { [weak self] message in
             Task { @MainActor in self?.log.append("⚠ \(message)") }
+        }
+        pipeline.onCalibrationFailure = { [weak self] error in
+            Task { @MainActor in
+                guard let self, self.displayPresentation.belongs(to: sessionID) else { return }
+                self.reportFileAccess(error)
+                self.sessionInputStatus = .failed(error.localizedDescription)
+                if self.isRunning { self.endSession() }
+            }
         }
         // Watcher detection stalled (a hung folder read froze the poll queue) — make it loud:
         // a system notification for an away/asleep operator, plus a visible error so it can't
@@ -2350,6 +2453,22 @@ final class AppModel {
                 shouldCompleteSession = true
             } catch {
                 shouldCompleteSession = await MainActor.run {
+                    if error is CalibrationReadError {
+                        guard self.pipeline === p else { return false }
+                        // The provider's read failure is latched, so retrying finalization
+                        // cannot recover it. End already drained/stopped the source. Retire
+                        // only this presentation without committing a successful session.
+                        self.reportFileAccess(error)
+                        self.sessionInputStatus = .failed(error.localizedDescription)
+                        self.log.append("Session stopped after calibration access failed; no successful master or replay was finalized.")
+                        self.isRunning = false
+                        self.importer.isGeneratingReplay = false
+                        self.setPipeline(nil)
+                        self.sessionFileAccess = nil
+                        self.sessionEnd = Date()
+                        self.broadcast.stopBroadcastAfterSessionEnd()
+                        return false
+                    }
                     if p.session.state == .running {
                         // Core finalization failed before the manifest commit point (for example:
                         // master.fit or manifest persistence could not complete). The End Session

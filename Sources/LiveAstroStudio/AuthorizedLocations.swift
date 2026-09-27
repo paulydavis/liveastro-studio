@@ -83,6 +83,7 @@ extension AuthorizedLocationError: LocalizedError {
 
 @MainActor
 final class AuthorizedLocations {
+    enum Request { case key(String), url(URL) }
     static let defaultsKey = "AuthorizedLocations.records"
 
     private static let storageVersion = 1
@@ -163,7 +164,37 @@ final class AuthorizedLocations {
 
     func acquire(key: String) throws -> FileAccessLease {
         var envelope = try loadEnvelope()
-        guard let record = envelope.records[key] else {
+        return try acquire(key: key, record: envelope.records[key], envelope: &envelope)
+    }
+
+    /// Match every request against this call's original roots, while persisting
+    /// renewals into one current envelope. The old matching roots never escape.
+    /// Callers own all successful leases, including when other requests fail.
+    func acquireGroup(_ requests: [Request]) -> [Result<FileAccessLease, Error>] {
+        do {
+            var envelope = try loadEnvelope()
+            let original = envelope.records
+            return requests.map { request in
+                Result {
+                    switch request {
+                    case .key(let key): return try acquire(key: key, record: original[key], envelope: &envelope)
+                    case .url(let url): return try acquire(url: Self.normalize(url), matching: original, envelope: &envelope)
+                    }
+                }
+            }
+        } catch {
+            return requests.map { request in
+                // Path-only direct/container access never depends on saved storage.
+                if case .url(let url) = request, policy == .direct || isInContainer(url) {
+                    return .success(FileAccessLease(url: Self.normalize(url)))
+                }
+                return .failure(error)
+            }
+        }
+    }
+
+    private func acquire(key: String, record: Record?, envelope: inout Envelope) throws -> FileAccessLease {
+        guard let record else {
             throw AuthorizedLocationError.missingSelection(key)
         }
         let displayedURL = Self.fileURL(path: record.displayPath)
@@ -195,7 +226,14 @@ final class AuthorizedLocations {
         }
 
         var envelope = try loadEnvelope()
-        let candidates = envelope.records.sorted {
+        let original = envelope.records
+        return try acquire(url: requestedURL, matching: original, envelope: &envelope)
+    }
+
+    private func acquire(url requestedURL: URL, matching records: [String: Record],
+                         envelope: inout Envelope) throws -> FileAccessLease {
+        if policy == .direct || isInContainer(requestedURL) { return FileAccessLease(url: requestedURL) }
+        let candidates = records.sorted {
             Self.fileURL(path: $0.value.displayPath).pathComponents.count
                 > Self.fileURL(path: $1.value.displayPath).pathComponents.count
         }

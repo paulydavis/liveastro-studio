@@ -56,6 +56,7 @@ final class ImportController {
     }
     private var importPrepareGeneration = 0
     private var importPrepareInFlight = false
+    private var importPreparationTask: Task<Void, Never>?
 
     init(surface: AppSurface) {
         self.surface = surface
@@ -84,7 +85,6 @@ final class ImportController {
         // stats/re-stack state now — otherwise Stats would show a prior live session's rows and
         // a re-stack could target the prior session's folder (Fix P2-import). Full import
         // stats-wiring (populating subFrames for imports) is a future feature.
-        surface.resetSessionStatsForImport?()
         let prefix = surface.currentFileNamePrefix?() ?? ""
         importProcessed = 0
         importTotal = 0
@@ -94,13 +94,32 @@ final class ImportController {
         let generation = importPrepareGeneration
         surface.log("Preparing import from \(folder.path)…")
 
-        Task.detached { [weak self, folder, prefix, access] in
+        let strict = surface.isStorePreview
+        importPreparationTask = Task.detached { [weak self, folder, prefix, access] in
             defer { withExtendedLifetime(access) {} }
             guard let self else { return }
-            let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder)
-            await MainActor.run {
-                self.beginImport(from: folder, meta: meta, prefix: prefix, generation: generation,
-                                 output: output, calibration: calibration, access: access)
+            do {
+                try access?.validateAvailability()
+                try Task.checkCancellation()
+                let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder)
+                try Task.checkCancellation()
+                let dark = calibration.darkPath.map { URL(fileURLWithPath: $0) }
+                let flat = calibration.flatPath.map { URL(fileURLWithPath: $0) }
+                let loaded: (Calibrator?, [String])
+                if strict { loaded = (try CalibrationLoader.makeCalibratorRequiringAccess(dark: dark, flat: flat), []) }
+                else { loaded = CalibrationLoader.makeCalibrator(dark: dark, flat: flat) }
+                await MainActor.run {
+                    self.beginImport(from: folder, meta: meta, prefix: prefix, generation: generation,
+                                     output: output, calibration: calibration, access: access, loaded: loaded)
+                }
+            } catch {
+                await MainActor.run {
+                    guard self.importPrepareGeneration == generation else { return }
+                    self.importPrepareInFlight = false
+                    self.importPreparationTask = nil
+                    self.isImporting = false
+                    self.surface.presentError("Import preparation failed: \(error.localizedDescription) Reconnect or choose the folder again.")
+                }
             }
         }
     }
@@ -109,14 +128,16 @@ final class ImportController {
                              meta: (object: String?, exposureSeconds: Double?, fileExtension: String)?,
                              prefix: String,
                              generation: Int, output: URL, calibration: CalibrationSelection,
-                             access: OperationFileAccess?) {
+                             access: OperationFileAccess?, loaded: (Calibrator?, [String])) {
         guard generation == importPrepareGeneration, isImporting else { return }
         importPrepareInFlight = false
+        importPreparationTask = nil
         guard !surface.isSessionRunning() else {
             surface.presentError("End the session before importing.")
             isImporting = false
             return
         }
+        surface.resetSessionStatsForImport?()
         // Reflect the imported subs' actual target/exposure in the profile + Live
         // overlay instead of showing stale form values from a prior session (matches
         // the live/auto-detect paths, which fill these from the newest sub's header).
@@ -130,9 +151,7 @@ final class ImportController {
         let source = FolderFrameSource(folder: folder, mode: .importOnce,
                                         fileNamePrefix: prefix.isEmpty ? nil : prefix, accessLifetime: access)
         let engine = surface.makeStackEngine!()
-        let (importCalibrator, importCalWarnings) = CalibrationLoader.makeCalibrator(
-            dark: calibration.darkPath.map { URL(fileURLWithPath: $0) },
-            flat: calibration.flatPath.map { URL(fileURLWithPath: $0) })
+        let (importCalibrator, importCalWarnings) = loaded
         importCalWarnings.forEach { surface.log("⚠ \($0)") }
         surface.persistCalibration?(calibration)
         surface.saveSettings?()
@@ -194,6 +213,8 @@ final class ImportController {
     func cancelImport() {
         if importPipeline == nil {
             if importPrepareInFlight {
+                importPreparationTask?.cancel()
+                importPreparationTask = nil
                 importPrepareGeneration += 1
                 importPrepareInFlight = false
                 isImporting = false

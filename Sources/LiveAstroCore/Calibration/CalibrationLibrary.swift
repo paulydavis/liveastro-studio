@@ -200,9 +200,14 @@ public final class CalibrationLibrary: Sendable {
     }
 
     public static func fitsFiles(in folder: URL) -> [URL] {
+        (try? fitsFilesRequiringAccess(in: folder)) ?? []
+    }
+
+    public static func fitsFilesRequiringAccess(in folder: URL) throws -> [URL] {
         let exts: Set<String> = ["fit", "fits"]
-        let items = (try? FileManager.default.contentsOfDirectory(
-            at: folder, includingPropertiesForKeys: nil)) ?? []
+        let items: [URL]
+        do { items = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) }
+        catch { throw CalibrationReadError(url: folder, underlying: error) }
         return items.filter { exts.contains($0.pathExtension.lowercased()) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }

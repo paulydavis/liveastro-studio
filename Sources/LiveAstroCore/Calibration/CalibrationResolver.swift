@@ -13,14 +13,25 @@ public enum CalibrationResolver {
         public var hasFlat: Bool
         /// A dark-flat was explicitly reused as a light offset, NOT as a matched light dark.
         public var hasLightOffset: Bool = false
+        public var readFailure: CalibrationReadError? = nil
     }
 
     public static func resolve(
         metadata: SourceMetadata, library: CalibrationLibrary, scaleEnabled: Bool,
         flatsFolder: URL?, darkFlatsFolder: URL?,
-        legacyDarkPath: String?, legacyFlatPath: String?, useDarkFlatAsLightOffset: Bool = false) -> Resolution {
+        legacyDarkPath: String?, legacyFlatPath: String?, useDarkFlatAsLightOffset: Bool = false,
+        failOnSelectedReadError: Bool = false) -> Resolution {
 
         var messages: [String] = []
+        var readFailure: CalibrationReadError?
+        func record(_ error: Error) {
+            if failOnSelectedReadError, let failure = error as? CalibrationReadError { readFailure = readFailure ?? failure }
+        }
+        func selectedFiles(_ folder: URL) -> [URL] {
+            guard failOnSelectedReadError else { return CalibrationLibrary.fitsFiles(in: folder) }
+            do { return try CalibrationLibrary.fitsFilesRequiringAccess(in: folder) }
+            catch { record(error); return [] }
+        }
         let entries = library.all()
         var darkImage: AstroImage?
         var biasImage: AstroImage?
@@ -93,7 +104,7 @@ public enum CalibrationResolver {
         // Legacy explicit dark selection as a fallback when the library had no match.
         if darkImage == nil, let p = legacyDarkPath {
             do {
-                let img = try MasterBuilder.load(URL(fileURLWithPath: p))
+                let img = try MasterBuilder.load(URL(fileURLWithPath: p), failOnReadError: failOnSelectedReadError)
                 if dimensionsOK(img, metadata) {
                     darkImage = img
                     messages.append("Calibration: using selected dark file.")
@@ -102,6 +113,7 @@ public enum CalibrationResolver {
                     messages.append("Calibration: selected dark doesn't match these lights' size — skipping it.")
                 }
             } catch {
+                record(error)
                 messages.append("Calibration: selected dark could not be read — \(error.localizedDescription).")
             }
         }
@@ -119,24 +131,24 @@ public enum CalibrationResolver {
             var offset = biasImage
             var darkFlatImage: AstroImage?
             if let dfFolder = darkFlatsFolder {
-                let dfURLs = CalibrationLibrary.fitsFiles(in: dfFolder)
+                let dfURLs = selectedFiles(dfFolder)
                 if dfURLs.isEmpty {
                     messages.append("Calibration: no dark-flats in that folder — using bias as the flat offset.")
                 } else {
                     do {
-                        let built = try MasterBuilder.combineDetailed(fitsURLs: dfURLs, kind: .bias, bias: nil, expected: targetDims)
+                        let built = try MasterBuilder.combineDetailed(fitsURLs: dfURLs, kind: .bias, bias: nil, expected: targetDims, failOnReadError: failOnSelectedReadError)
                         offset = built.image
                         darkFlatImage = built.image
                     }
-                    catch { messages.append("Calibration: dark-flats build failed — \(error.localizedDescription); using bias instead.") }
+                    catch { record(error); messages.append("Calibration: dark-flats build failed — \(error.localizedDescription); using bias instead.") }
                 }
             }
-            let urls = CalibrationLibrary.fitsFiles(in: flatsFolder)
+            let urls = selectedFiles(flatsFolder)
             if urls.isEmpty {
                 messages.append("Calibration: no flats found in the flats folder — continuing without a flat.")
             } else {
                 do {
-                    let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .flat, bias: offset, expected: targetDims)
+                    let built = try MasterBuilder.combineDetailed(fitsURLs: urls, kind: .flat, bias: offset, expected: targetDims, failOnReadError: failOnSelectedReadError)
                     if dimensionsOK(built.image, metadata) {
                         flatImage = built.image
                         // Only the explicitly selected, successfully applied dark-flat qualifies.
@@ -154,6 +166,7 @@ public enum CalibrationResolver {
                         messages.append("Calibration: built flat doesn't match these lights' size — skipping the flat.")
                     }
                 } catch {
+                    record(error)
                     messages.append("Calibration: flat build failed — \(error.localizedDescription); continuing without a flat.")
                 }
             }
@@ -161,7 +174,7 @@ public enum CalibrationResolver {
             do {
                 // Normalize legacy/external master flats (idempotent) so a non-normalized
                 // file can't over/under-correct — matches the session-flat path.
-                let img = MasterBuilder.normalizedFlat(try MasterBuilder.load(URL(fileURLWithPath: p)))
+                let img = MasterBuilder.normalizedFlat(try MasterBuilder.load(URL(fileURLWithPath: p), failOnReadError: failOnSelectedReadError))
                 if dimensionsOK(img, metadata) {
                     flatImage = img
                     messages.append("Calibration: using selected flat file.")
@@ -169,6 +182,7 @@ public enum CalibrationResolver {
                     messages.append("Calibration: selected flat doesn't match these lights' size — skipping it.")
                 }
             } catch {
+                record(error)
                 messages.append("Calibration: selected flat could not be read — \(error.localizedDescription).")
             }
         }
@@ -186,7 +200,8 @@ public enum CalibrationResolver {
         // Keep reporting separate: an offset fallback is not full dark calibration.
         let cal = (darkImage != nil || flatImage != nil) ? Calibrator(dark: darkImage ?? lightOffset, flat: flatImage) : nil
         return Resolution(calibrator: cal, messages: messages,
-                          hasDark: darkImage != nil, hasFlat: flatImage != nil, hasLightOffset: lightOffset != nil)
+                          hasDark: darkImage != nil, hasFlat: flatImage != nil, hasLightOffset: lightOffset != nil,
+                          readFailure: readFailure)
     }
 
     /// A loaded master must match the lights' sensor dimensions when they're known. When the light

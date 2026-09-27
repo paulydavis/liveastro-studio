@@ -46,6 +46,9 @@ struct CaptureSettingsView: View {
                             VStack(alignment: .leading, spacing: 8) {
                                 Text(model.selectedOutputFolder?.path ?? "Choose a folder before Start or Import")
                                     .font(.callout).textSelection(.enabled)
+                                if model.isRestoringLocationAccess {
+                                    Text("Checking saved folder access…").font(.caption).foregroundStyle(.secondary)
+                                }
                                 Button(model.selectedOutputFolder == nil ? "Choose…" : "Change…") { model.chooseSessionOutputFolder() }
                             }
                         }

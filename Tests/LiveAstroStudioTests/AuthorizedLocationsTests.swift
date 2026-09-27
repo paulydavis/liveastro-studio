@@ -4,6 +4,46 @@ import XCTest
 
 @MainActor
 final class AuthorizedLocationsTests: XCTestCase {
+    func testGroupUsesOriginalMovedParentOnlyWithinItsAcquisition() throws {
+        let defaults = try isolatedDefaults(), backend = FakeBookmarkBackend()
+        let original = temporaryURL("original"), moved = temporaryURL("moved")
+        let store = makeStore(defaults, backend)
+        _ = try store.select(original, key: "masters")
+        let bookmark = try XCTUnwrap(backend.createdBookmarks.first)
+        backend.resolutions[bookmark] = BookmarkResolution(url: moved, isStale: true)
+        var results: [Result<FileAccessLease, Error>]? = store.acquireGroup([
+            .url(original.appendingPathComponent("dark.fit")), .url(original.appendingPathComponent("flat.fit"))])
+        XCTAssertEqual(try results?[0].get().url.path, moved.appendingPathComponent("dark.fit").path)
+        XCTAssertEqual(try results?[1].get().url.path, moved.appendingPathComponent("flat.fit").path)
+        XCTAssertEqual(store.displayURL(key: "masters")?.path, moved.path)
+        results = nil
+        XCTAssertEqual(backend.stoppedURLs.filter { $0.path == moved.path }.count, 2)
+        XCTAssertThrowsError(try store.acquire(url: original.appendingPathComponent("replacement.fit")))
+        XCTAssertEqual(try store.acquire(url: moved.appendingPathComponent("flat.fit")).url.path,
+                       moved.appendingPathComponent("flat.fit").path)
+    }
+
+    func testGroupFailuresKeepRecordsAndSuccessfulLeasesBalanceIndependently() throws {
+        let defaults = try isolatedDefaults(), backend = FakeBookmarkBackend()
+        let output = temporaryURL("output"), input = temporaryURL("input")
+        let store = makeStore(defaults, backend)
+        _ = try store.select(output, key: "output")
+        _ = try store.select(input, key: "capture")
+        let before = defaults.data(forKey: AuthorizedLocations.defaultsKey)
+        backend.deniedStarts.insert(output.standardizedFileURL)
+        var results: [Result<FileAccessLease, Error>]? = store.acquireGroup([
+            .key("output"), .url(input), .url(temporaryURL("not-authorized"))])
+        XCTAssertThrowsError(try results?[0].get()) {
+            guard case .accessDenied = $0 as? AuthorizedLocationError else { return XCTFail("output failure must remain first") }
+        }
+        XCTAssertEqual(try results?[1].get().url.path, input.path)
+        XCTAssertThrowsError(try results?[2].get())
+        XCTAssertEqual(defaults.data(forKey: AuthorizedLocations.defaultsKey), before)
+        XCTAssertEqual(backend.stoppedURLs.filter { $0.path == input.path }.count, 1)
+        results = nil
+        XCTAssertEqual(backend.stoppedURLs.filter { $0.path == input.path }.count, 2)
+        XCTAssertEqual(backend.stoppedURLs.filter { $0.path == output.path }.count, 1, "denied starts are never stopped")
+    }
     func testFreshStoreRestoresPersistedGrant() throws {
         let defaults = try isolatedDefaults()
         let backend = FakeBookmarkBackend()

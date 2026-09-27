@@ -6,6 +6,289 @@ import Darwin
 
 @MainActor
 final class StorePreviewAccessTests: XCTestCase {
+    func testRelayStopDoesNotRetireUnownedDirectDiscoveryState() throws {
+        let (_, _, _, root) = try fixture()
+        let controller = LiveSourceController(surface: AppSurface(log: { _ in }, presentError: { _ in },
+            isSessionRunning: { false }), relayRoot: root.appendingPathComponent("relay"))
+        // Auto discovery owns this public controller state, not the newly added
+        // manual-preparation task. No /Volumes scan is needed for this boundary.
+        controller.isDetecting = true
+        controller.stopRelay()
+        XCTAssertTrue(controller.isDetecting)
+    }
+    func testMovedParentResolvesBothCalibrationChildrenAcrossOperationAndRelaunch() async throws {
+        let (model, backend, defaults, root) = try fixture()
+        let input = try directory(root, "input"), output = try directory(root, "output")
+        let original = try directory(root, "masters"), moved = root.appendingPathComponent("moved-masters")
+        try writeFITS(original.appendingPathComponent("dark.fit"))
+        try writeFITS(original.appendingPathComponent("flat.fit"))
+        XCTAssertNotNil(model.selectSourceFolder(original))
+        model.calibration.darkPath = original.appendingPathComponent("dark.fit").path
+        model.calibration.flatPath = original.appendingPathComponent("flat.fit").path
+        XCTAssertTrue(model.selectLocation(input, key: "capture"))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.saveSettings()
+        try FileManager.default.moveItem(at: original, to: moved)
+        backend.moves[original.path] = moved
+        XCTAssertEqual(try model.acquireOperationAccess(input: input).flatPath, moved.appendingPathComponent("flat.fit").path)
+        XCTAssertEqual(try model.acquireOperationAccess(input: input).darkPath, moved.appendingPathComponent("dark.fit").path)
+        let reopened = AppModel(userDefaults: defaults, configuration: config(root), bookmarkBackend: backend)
+        for _ in 0..<500 where reopened.isRestoringLocationAccess { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertNil(reopened.errorMessage)
+        XCTAssertEqual(try reopened.acquireOperationAccess(input: input).flatPath, moved.appendingPathComponent("flat.fit").path)
+        XCTAssertThrowsError(try reopened.acquireReadableLocation(original.appendingPathComponent("dark.fit")),
+                             "a later unrelated acquisition must not authorize the obsolete root")
+        XCTAssertEqual(backend.balance(moved), 0)
+        XCTAssertEqual(backend.balance(output), 0)
+    }
+
+    func testFreshRestoreResolvesBothChildrenOfMovedCalibrationParent() async throws {
+        let (model, backend, defaults, root) = try fixture()
+        let original = try directory(root, "masters"), moved = root.appendingPathComponent("moved-masters")
+        try writeFITS(original.appendingPathComponent("dark.fit"))
+        try writeFITS(original.appendingPathComponent("flat.fit"))
+        XCTAssertNotNil(model.selectSourceFolder(original))
+        model.calibration.darkPath = original.appendingPathComponent("dark.fit").path
+        model.calibration.flatPath = original.appendingPathComponent("flat.fit").path
+        model.saveSettings()
+        try FileManager.default.moveItem(at: original, to: moved)
+        backend.moves[original.path] = moved
+        let reopened = AppModel(userDefaults: defaults, configuration: config(root), bookmarkBackend: backend)
+        for _ in 0..<500 where reopened.isRestoringLocationAccess { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertNil(reopened.errorMessage)
+        XCTAssertEqual(reopened.calibration.darkPath, moved.appendingPathComponent("dark.fit").path)
+        XCTAssertEqual(reopened.calibration.flatPath, moved.appendingPathComponent("flat.fit").path)
+        XCTAssertEqual(CalibrationStore.load(defaults).flatPath, moved.appendingPathComponent("flat.fit").path)
+        XCTAssertEqual(backend.balance(moved), 0)
+    }
+    func testAsynchronousCalibrationPreparationPublishesAppliedFlatStatus() async throws {
+        let (model, _, _, root) = try fixture()
+        let input = try directory(root, "input"), output = try directory(root, "output"), flats = try directory(root, "flats")
+        try writeFITS(input.appendingPathComponent("Light_old.fit"))
+        try writeFITS(flats.appendingPathComponent("flat.fit"))
+        model.setCalibrationFolder(flats, darkFlats: false)
+        XCTAssertTrue(model.selectLocation(input, key: "capture"))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.sourceMode = .nativeStack
+        model.startSession()
+        for _ in 0..<500 where model.isPreparingSessionInput { try await Task.sleep(nanoseconds: 1_000_000) }
+        model.resolvePendingSessionStart(.stackExistingAndNew)
+        for _ in 0..<500 where model.isPreparingSessionInput { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertTrue(model.isRunning)
+        XCTAssertTrue(model.calibrationStatus.contains("flat"))
+        model.endSession()
+        for _ in 0..<500 where model.isRunning { try await Task.sleep(nanoseconds: 1_000_000) }
+    }
+    func testDemoWaitsForAsynchronousStartAndRestoresSettingsOnCancellation() async throws {
+        let (_, backend, defaults, root) = try fixture()
+        let output = try directory(root, "output")
+        let gate = GatedAvailability(target: output)
+        let model = AppModel(userDefaults: defaults, configuration: config(root), bookmarkBackend: backend, locationAvailability: gate)
+        model.targetName = "Original target"
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.startDemoSession()
+        XCTAssertTrue(model.isPreparingSessionInput)
+        XCTAssertEqual(model.targetName, "Demo Nebula")
+        for _ in 0..<500 where !gate.hasEntered { try await Task.sleep(nanoseconds: 1_000_000) }
+        model.cancelSessionInputPreparation()
+        XCTAssertEqual(model.targetName, "Original target")
+        gate.release.signal()
+        for _ in 0..<500 where backend.balance(output) != 0 { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertEqual(backend.balance(output), 0)
+        XCTAssertFalse(model.isRunning)
+    }
+
+    func testManualLiveAvailabilityCancellationDoesNotStartAfterParkedCheckReturns() async throws {
+        let (_, backend, defaults, root) = try fixture()
+        let input = try directory(root, "input"), output = try directory(root, "output")
+        let gate = GatedAvailability(target: input)
+        let model = AppModel(userDefaults: defaults, configuration: config(root), bookmarkBackend: backend, locationAvailability: gate)
+        XCTAssertTrue(model.selectLocation(input, key: "capture"))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.liveSource.startWatchFolderLive(source: input)
+        for _ in 0..<500 where !gate.hasEntered { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertFalse(gate.ranOnMain)
+        model.liveSource.stopRelay()
+        XCTAssertFalse(model.liveSource.isDetecting)
+        XCTAssertEqual(backend.balance(input), 1)
+        gate.release.signal()
+        for _ in 0..<500 where backend.balance(input) != 0 { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertEqual(backend.balance(input), 0)
+        XCTAssertFalse(model.isRunning)
+        XCTAssertNil(model.errorMessage)
+    }
+
+    func testOldCalibrationFailureCannotEndNewPresentation() async throws {
+        let (model, _, _, root) = try fixture()
+        let input = try directory(root, "input"), output = try directory(root, "output")
+        let old = SessionPipeline(watchFolder: input, profile: model.profile, rootDirectory: output,
+                                  catalogURL: config(root).catalogURL)
+        model.wireCallbacks(to: old)
+        XCTAssertTrue(model.selectLocation(input, key: "capture"))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.sourceMode = .nativeStack
+        model.startSession()
+        for _ in 0..<500 where model.isPreparingSessionInput { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertTrue(model.isRunning)
+        old.onCalibrationFailure?(CalibrationReadError(url: input, underlying: CocoaError(.fileReadNoPermission)))
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertTrue(model.isRunning)
+        XCTAssertNil(model.errorMessage)
+        model.endSession()
+        for _ in 0..<500 where model.isRunning { try await Task.sleep(nanoseconds: 1_000_000) }
+    }
+    func testAvailabilityStartIsOffMainAndCancellationKeepsParkedWorkerAccess() async throws {
+        let (_, backend, defaults, root) = try fixture()
+        let input = try directory(root, "input"), output = try directory(root, "output")
+        let gate = GatedAvailability(target: input)
+        let model = AppModel(userDefaults: defaults, configuration: config(root), bookmarkBackend: backend, locationAvailability: gate)
+        XCTAssertTrue(model.selectLocation(input, key: "capture"))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.sourceMode = .nativeStack
+        var results: [Bool] = []
+        model.startSession { results.append($0) }
+        for _ in 0..<500 where !gate.hasEntered { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertFalse(gate.ranOnMain)
+        XCTAssertTrue(model.isPreparingSessionInput)
+        model.cancelSessionInputPreparation()
+        XCTAssertEqual(results, [false])
+        XCTAssertEqual(backend.balance(input), 1)
+        gate.release.signal()
+        for _ in 0..<500 where backend.balance(input) != 0 { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertEqual(backend.balance(input), 0)
+        XCTAssertFalse(model.isRunning)
+        XCTAssertEqual(results, [false])
+    }
+
+    func testAvailabilityImportIsOffMainAndCancellationKeepsParkedWorkerAccess() async throws {
+        let (_, backend, defaults, root) = try fixture()
+        let input = try directory(root, "input"), output = try directory(root, "output")
+        let gate = GatedAvailability(target: input)
+        let model = AppModel(userDefaults: defaults, configuration: config(root), bookmarkBackend: backend, locationAvailability: gate)
+        XCTAssertNotNil(model.selectSourceFolder(input))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.importer.importSubs(from: input)
+        for _ in 0..<500 where !gate.hasEntered { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertFalse(gate.ranOnMain)
+        model.importer.cancelImport()
+        XCTAssertFalse(model.importer.isImporting)
+        XCTAssertEqual(backend.balance(input), 1)
+        gate.release.signal()
+        for _ in 0..<500 where backend.balance(input) != 0 { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertEqual(backend.balance(input), 0)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: output.path).isEmpty)
+    }
+
+    func testAvailabilityRestoreIsOffMainAndDoesNotOverwriteReselection() async throws {
+        let (initial, backend, defaults, root) = try fixture()
+        let input = try directory(root, "input"), replacement = try directory(root, "replacement")
+        XCTAssertTrue(initial.selectLocation(input, key: "capture"))
+        initial.saveSettings()
+        let gate = GatedAvailability(target: input)
+        let model = AppModel(userDefaults: defaults, configuration: config(root), bookmarkBackend: backend, locationAvailability: gate)
+        XCTAssertEqual(model.watchFolder?.path, input.path)
+        for _ in 0..<500 where !gate.hasEntered { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertFalse(gate.ranOnMain)
+        XCTAssertEqual(backend.balance(input), 1)
+        XCTAssertTrue(model.selectLocation(replacement, key: "capture"))
+        try FileManager.default.removeItem(at: input)
+        gate.release.signal()
+        for _ in 0..<500 where backend.balance(input) != 0 { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertEqual(model.watchFolder?.path, replacement.path)
+        XCTAssertNil(model.errorMessage, "superseded restore validation must not publish its old failure")
+    }
+    func testUnreadableFlatChildFailsAfterPendingQuestionInsteadOfStartingUncalibrated() async throws {
+        let (model, _, _, root) = try fixture()
+        let input = try directory(root, "input"), output = try directory(root, "output"), flats = try directory(root, "flats")
+        try writeFITS(input.appendingPathComponent("Light_old.fit"))
+        let child = flats.appendingPathComponent("flat.fit")
+        try writeFITS(child)
+        model.setCalibrationFolder(flats, darkFlats: false)
+        XCTAssertTrue(model.selectLocation(input, key: "capture"))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.sourceMode = .nativeStack
+        var result: Bool?
+        model.startSession { result = $0 }
+        for _ in 0..<500 where model.isPreparingSessionInput { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNotNil(model.pendingSessionStart)
+        XCTAssertEqual(chmod(child.path, 0), 0)
+        defer { chmod(child.path, 0o600) }
+        model.resolvePendingSessionStart(.stackExistingAndNew)
+        for _ in 0..<500 where model.isPreparingSessionInput { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(result, false)
+        XCTAssertFalse(model.isRunning)
+        XCTAssertNotNil(model.errorMessage)
+        if model.isRunning { model.endSession() }
+        for _ in 0..<500 where model.isRunning { try await Task.sleep(nanoseconds: 10_000_000) }
+    }
+
+    func testFirstSubCalibrationLossFailsBeforeProcessingAnyFrame() async throws {
+        let (model, _, _, root) = try fixture()
+        let input = try directory(root, "input"), output = try directory(root, "output"), flats = try directory(root, "flats")
+        try writeFITS(flats.appendingPathComponent("flat.fit"))
+        model.setCalibrationFolder(flats, darkFlats: false)
+        XCTAssertTrue(model.selectLocation(input, key: "capture"))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.sourceMode = .nativeStack
+        model.startSession()
+        for _ in 0..<500 where model.isPreparingSessionInput { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(model.isRunning)
+        if case .waitingForFirstSub = model.sessionInputStatus {} else {
+            XCTFail("off-main calibration preparation must preserve the empty-input waiting status")
+        }
+        try FileManager.default.removeItem(at: flats)
+        try writeFITS(input.appendingPathComponent("Light_new.fit"))
+        for _ in 0..<600 where model.errorMessage == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertEqual(model.acceptedCount, 0)
+        XCTAssertEqual(model.rejectedCount, 0, "calibration failure must precede engine processing, not just acceptance")
+        if model.isRunning { model.endSession() }
+        for _ in 0..<500 where model.isRunning { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertNil(model.replayURL)
+        XCTAssertFalse(model.isRunning, "latched fatal calibration failure must not require retrying an impossible End")
+        if case .failed = model.sessionInputStatus {} else {
+            XCTFail("a fatal calibration failure must not continue displaying waiting for input")
+        }
+        model.setCalibrationFolder(nil, darkFlats: false)
+        try FileManager.default.removeItem(at: input.appendingPathComponent("Light_new.fit"))
+        model.errorMessage = nil
+        model.startSession()
+        for _ in 0..<500 where model.isPreparingSessionInput { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertTrue(model.isRunning, "reselection and a new session are admitted without relaunch")
+        model.endSession()
+        for _ in 0..<500 where model.isRunning { try await Task.sleep(nanoseconds: 1_000_000) }
+    }
+
+    func testImportMasterLossAfterMetadataPreparationFailsWithoutOutput() async throws {
+        let (model, _, _, root) = try fixture()
+        let input = try directory(root, "input"), output = try directory(root, "output"), masters = try directory(root, "masters")
+        let master = masters.appendingPathComponent("dark.fit")
+        try writeFITS(master)
+        XCTAssertNotNil(model.selectSourceFolder(masters))
+        model.calibration.darkPath = master.path
+        let fifo = input.appendingPathComponent("Light_blocked.fit")
+        XCTAssertEqual(mkfifo(fifo.path, 0o600), 0)
+        XCTAssertNotNil(model.selectSourceFolder(input))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.importer.importSubs(from: input)
+        var writer: Int32 = -1
+        for _ in 0..<500 where writer < 0 {
+            writer = Darwin.open(fifo.path, O_WRONLY | O_NONBLOCK)
+            if writer < 0 { try await Task.sleep(nanoseconds: 10_000_000) }
+        }
+        defer { if writer >= 0 { Darwin.close(writer) } }
+        XCTAssertGreaterThanOrEqual(writer, 0)
+        try FileManager.default.removeItem(at: master)
+        try FileManager.default.removeItem(at: fifo)
+        try writeFITS(input.appendingPathComponent("Light_real.fit"))
+        Darwin.close(writer); writer = -1
+        for _ in 0..<1000 where model.importer.isImporting { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertFalse(model.importer.isImporting)
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: output.path).isEmpty)
+    }
+
     func testManualLiveMetadataPreparationPinsFutureSessionDestination() async throws {
         let (model, backend, _, root) = try fixture()
         let input = try directory(root, "input"), output = try directory(root, "output"), future = try directory(root, "future")
@@ -297,6 +580,64 @@ final class StorePreviewAccessTests: XCTestCase {
         XCTAssertNil(again.errorMessage)
     }
 
+    func testOperationRenewalPersistsMovedFlatsForNextOperationAndRelaunch() throws {
+        let (model, backend, defaults, root) = try fixture()
+        let input = try directory(root, "input"), output = try directory(root, "output")
+        let old = try directory(root, "flats"), moved = root.appendingPathComponent("moved-flats")
+        model.setCalibrationFolder(old, darkFlats: false)
+        XCTAssertTrue(model.selectLocation(input, key: "capture"))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        try FileManager.default.moveItem(at: old, to: moved)
+        backend.moves[old.path] = moved
+        XCTAssertEqual(try model.acquireOperationAccess(input: input).flats?.path, moved.path)
+        XCTAssertEqual(model.sessionFlatsFolder?.path, moved.path)
+        XCTAssertEqual(try model.acquireOperationAccess(input: input).flats?.path, moved.path)
+        let reopened = AppModel(userDefaults: defaults, configuration: config(root), bookmarkBackend: backend)
+        XCTAssertEqual(try reopened.acquireOperationAccess(input: input).flats?.path, moved.path)
+        XCTAssertNil(reopened.errorMessage)
+    }
+
+    func testMovedInputRemainsUsableAfterLaterCalibrationAcquisitionFails() throws {
+        let (model, backend, defaults, root) = try fixture()
+        let old = try directory(root, "input"), moved = root.appendingPathComponent("moved-input")
+        let output = try directory(root, "output")
+        XCTAssertTrue(model.selectLocation(old, key: "capture"))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        model.calibration.darkPath = root.appendingPathComponent("not-authorized.fit").path
+        model.saveSettings()
+        try FileManager.default.moveItem(at: old, to: moved)
+        backend.moves[old.path] = moved
+        XCTAssertThrowsError(try model.acquireOperationAccess(input: old))
+        XCTAssertEqual(model.watchFolder?.path, moved.path)
+        model.calibration.darkPath = nil
+        let selected = try XCTUnwrap(model.watchFolder)
+        XCTAssertEqual(try model.acquireOperationAccess(input: selected).input.path, moved.path)
+        let reopened = AppModel(userDefaults: defaults, configuration: config(root), bookmarkBackend: backend)
+        XCTAssertEqual(try reopened.acquireOperationAccess(input: XCTUnwrap(reopened.watchFolder)).input.path, moved.path)
+    }
+
+    func testOperationRenewalPersistsMovedLegacyMasterForNextOperationAndRelaunch() throws {
+        let (model, backend, defaults, root) = try fixture()
+        let input = try directory(root, "input"), output = try directory(root, "output")
+        let old = try directory(root, "masters"), moved = root.appendingPathComponent("moved-masters")
+        try writeFITS(old.appendingPathComponent("dark.fit"))
+        XCTAssertNotNil(model.selectSourceFolder(old))
+        model.calibration.darkPath = old.appendingPathComponent("dark.fit").path
+        model.saveSettings()
+        XCTAssertTrue(model.selectLocation(input, key: "capture"))
+        XCTAssertTrue(model.selectLocation(output, key: "output"))
+        try FileManager.default.moveItem(at: old, to: moved)
+        backend.moves[old.path] = moved
+        let expected = moved.appendingPathComponent("dark.fit").path
+        XCTAssertEqual(try model.acquireOperationAccess(input: input).darkPath, expected)
+        XCTAssertEqual(model.calibration.darkPath, expected)
+        XCTAssertEqual(try model.acquireOperationAccess(input: input).darkPath, expected)
+        let reopened = AppModel(userDefaults: defaults, configuration: config(root), bookmarkBackend: backend)
+        XCTAssertEqual(try reopened.acquireOperationAccess(input: input).darkPath, expected)
+        XCTAssertEqual(CalibrationStore.load(defaults).darkPath, expected)
+        XCTAssertNil(reopened.errorMessage)
+    }
+
     func testImportCapturesOutputBeforeMetadataAndReleasesAfterTerminalWork() async throws {
         let (model, backend, defaults, root) = try fixture()
         let input = try directory(root, "input"), output = try directory(root, "output"), future = try directory(root, "future")
@@ -410,7 +751,7 @@ final class StorePreviewAccessTests: XCTestCase {
         XCTAssertEqual(backend.balance(output), 0)
     }
 
-    func testUnavailableCalibrationBlocksStartExplicitly() throws {
+    func testUnavailableCalibrationBlocksStartExplicitly() async throws {
         let (model, _, _, root) = try fixture()
         let input = try directory(root, "input"), output = try directory(root, "output")
         let missing = root.appendingPathComponent("disconnected")
@@ -420,6 +761,7 @@ final class StorePreviewAccessTests: XCTestCase {
         model.watchFolder = input; model.sourceMode = .nativeStack; model.sessionFlatsFolder = missing
         var started: Bool?
         model.startSession { started = $0 }
+        for _ in 0..<500 where model.isPreparingSessionInput { try await Task.sleep(nanoseconds: 1_000_000) }
         XCTAssertEqual(started, false)
         XCTAssertFalse(model.isPreparingSessionInput)
         XCTAssertNotNil(model.errorMessage)
@@ -473,10 +815,13 @@ private final class PreviewBookmarkBackend: BookmarkAccessing, @unchecked Sendab
     private let lock = NSLock()
     var denied: URL?
     var moved: URL?
+    var moves: [String: URL] = [:]
     private var counts: [String: Int] = [:]
     func createBookmark(for url: URL) throws -> Data { Data(url.path.utf8) }
     func resolveBookmark(_ data: Data) throws -> BookmarkResolution {
-        BookmarkResolution(url: moved ?? URL(fileURLWithPath: String(decoding: data, as: UTF8.self)), isStale: moved != nil)
+        let path = String(decoding: data, as: UTF8.self)
+        let resolved = moves[path] ?? moved
+        return BookmarkResolution(url: resolved ?? URL(fileURLWithPath: path), isStale: resolved != nil)
     }
     func startAccessing(_ url: URL) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -499,5 +844,24 @@ private final class GatedRealFrameLoader: FrameLoader, @unchecked Sendable {
         if first && release.wait(timeout: .now() + 5) != .success { throw CocoaError(.fileReadUnknown) }
         return try ProductionFrameLoader(calibratorProvider: { nil }, demosaic: .bilinear)
             .loadRegisteredInput(url: url, expectedContentDigest: expectedContentDigest)
+    }
+}
+
+private final class GatedAvailability: LocationAvailabilityChecking, @unchecked Sendable {
+    let target: URL
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var entered = false
+    private var main = false
+    var hasEntered: Bool { lock.lock(); defer { lock.unlock() }; return entered }
+    var ranOnMain: Bool { lock.lock(); defer { lock.unlock() }; return main }
+    init(target: URL) { self.target = target }
+    func check(_ url: URL, forWriting: Bool) throws {
+        if url.path == target.path {
+            lock.lock(); entered = true; main = Thread.isMainThread; lock.unlock()
+            // Bound a broken main-actor implementation so RED reports, never hangs.
+            _ = release.wait(timeout: .now() + (Thread.isMainThread ? 0.5 : 5))
+        }
+        try FileLocationAvailability().check(url, forWriting: forWriting)
     }
 }
