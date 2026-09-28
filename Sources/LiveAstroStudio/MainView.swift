@@ -23,8 +23,7 @@ struct MainView: View {
                     Image(systemName: model.nightVisionOn ? "moon.fill" : "moon")
                         .foregroundStyle(model.nightVisionOn ? Color.red : Color.primary)
                 }
-                .help("Red night-vision screen tint (whole display) — for dark-adapted viewing at the scope. Fine-tune brightness under Setup ▸ Night vision.")
-                .disabled(model.isStorePreview)
+                .help("Red night-vision tint for the whole display. Fine-tune brightness under Display ▸ Night vision. Check every screen after wake or reconnect.")
                 if model.selectedTab == .live {
                     Button { openWindow(id: "broadcast"); model.isDetached = true } label: {
                         Image(systemName: "rectangle.portrait.and.arrow.right")

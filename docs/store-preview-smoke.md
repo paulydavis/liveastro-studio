@@ -128,3 +128,27 @@ Cancellation releases the UI's request ownership; it cannot forcibly interrupt
 a filesystem call already blocked inside macOS. Its worker keeps any acquired
 security scope until that call returns. Automated blocked-call and moved-folder
 tests cover these contracts, not the behavior of a particular SMB server.
+
+## Whole-display night tint — integrated runtime checks
+
+The standalone sandbox API probe succeeded on the operator's built-in display on
+2026-09-28. That is feasibility evidence, not a test of the integrated app or App
+Store approval. The controls now use the same whole-display API in both editions.
+
+- [ ] Launch the signed integrated preview with tint off. Use its moon button and
+  verify OTHER apps, the menu bar and every connected display turn red. Screenshots
+  do not prove physical display output.
+- [ ] Change brightness under **Display → Night vision**, then toggle off and
+  confirm normal colours return. Saved FITS/PNG/replay files must remain unchanged;
+  check captured checksums and view the broadcast output on an untinted display
+  where available rather than inferring its pixels from the tinted screen.
+- [ ] With tint on, quit the preview completely. Verify normal colours return and
+  relaunch starts with tint off.
+- [ ] With tint on, let the displays sleep, wake them and confirm tint returns.
+  Record any normal-colour interval. Repeat system sleep/reconnect where practical;
+  do not claim lock/login screens or untested external/HDR displays are protected.
+
+Automated injected-display tests cover API errors and late lifecycle events without
+altering test-runner hardware. They do not replace these physical observations.
+The app attempts reapplication; it cannot promise zero white flashes during macOS
+transitions. A physical filter is needed where that guarantee is essential.

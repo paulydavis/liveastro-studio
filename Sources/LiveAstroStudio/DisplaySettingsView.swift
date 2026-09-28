@@ -62,11 +62,7 @@ struct DisplaySettingsView: View {
                 Form {
                     Section("Night vision") {
                         helpToggle("Red screen", isOn: $model.nightVisionOn)
-                            .disabled(model.isStorePreview)
                             .onChange(of: model.nightVisionOn) { _, _ in model.applyNightVision() }
-                        if model.isStorePreview {
-                            Text("Whole-screen tint is unavailable in this preview.").font(.caption).foregroundStyle(.secondary)
-                        }
                         if model.nightVisionOn {
                             HStack {
                                 Text("Brightness").frame(width: 90, alignment: .leading)
@@ -80,6 +76,8 @@ struct DisplaySettingsView: View {
                             .help("Lower = dimmer and deeper red. Your keyboard brightness keys still work on top.")
                         }
                         Text("A screenshot still looks normal — macOS captures the image before the display tint is applied.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                        Text("Check every screen after wake or reconnect: macOS may briefly show normal colours before the tint returns. Turning this off or quitting restores normal display colours.")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                     Section("Display Adjustments") {

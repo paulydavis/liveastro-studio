@@ -208,6 +208,12 @@ Rotates the display so celestial north is up. It requires a star catalog and a s
 
 Tints the whole Mac display red to help preserve dark adaptation—not just the LiveAstro window. It takes effect immediately, without Apply, and clears when you quit. Lower brightness means a dimmer, deeper red. Screenshots remain normal because macOS captures them before the display tint.
 
+Available in both the direct edition and Store preview. Use the moon button or **Display → Night vision → Red screen**. Saved images, replay files and the broadcast image are not tinted; this changes the physical display, not the image data.
+
+Before observing, check that every connected display—including other apps and the menu bar—is red. Check again after sleep, unlocking, changing display settings or reconnecting a monitor. LiveAstro attempts to reapply the tint, but macOS may show normal colours first, and the login screen is outside LiveAstro's control. This is not a guarantee against every flash of white light; use a physical screen filter if that guarantee is essential.
+
+If macOS reports a display error, LiveAstro switches Red screen off and reports the failure. If it had already attempted a tint, it also requests normal display colours. Turn it off yourself with the moon button or **Red screen**, or quit LiveAstro. It starts off each launch. Avoid running another display-tint utility at the same time because both can change the same display settings.
+
 ---
 
 ## Calibration

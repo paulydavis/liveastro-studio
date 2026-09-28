@@ -1233,10 +1233,8 @@ final class StorePreviewAccessTests: XCTestCase {
     func testPreviewEntryMethodsRejectUnprovenIntegrations() async throws {
         let (model, _, _, root) = try fixture()
         // Camera-share entry points have their own authorized discovery coverage.
-        model.nightVisionOn = true; model.applyNightVision()
-        XCTAssertFalse(model.nightVisionOn)
-        XCTAssertNotNil(model.errorMessage)
-        model.errorMessage = nil
+        // Whole-display tint is covered with an injected hardware boundary in
+        // NightModeControllerTests; never change the operator's screen in tests.
         model.processorBackend = .graxpert
         model.importer.processMaster(sessionDirectory: root)
         XCTAssertFalse(model.importer.isProcessing)

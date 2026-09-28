@@ -322,18 +322,14 @@ final class AppModel {
     var nightVisionOn = false
     /// Tint brightness 1...100 (Double for the slider); lower is dimmer.
     var nightVisionLevel = Double(NightVision.defaultLevel)
-    private let nightMode = NightModeController()
+    private let nightMode: NightModeController
 
     /// Apply the current night-vision on/off + level to the display. Called from the
     /// control-panel toggle and slider.
     func applyNightVision() {
-        guard !isStorePreview else {
-            nightVisionOn = false
-            errorMessage = "Whole-screen tint is unavailable in this preview."
-            return
-        }
         if nightVisionOn { nightMode.enable(level: Int(nightVisionLevel)) }
         else { nightMode.disable() }
+        nightVisionOn = nightMode.isActive
     }
 
     /// True once the reference frame has been plate-solved — gates the "North up" toggle. Refreshed on
@@ -487,7 +483,9 @@ final class AppModel {
          configuration: StorePreviewConfiguration = StorePreviewConfiguration(),
          bookmarkBackend: any BookmarkAccessing = FoundationBookmarkAccessor(),
          locationAvailability: any LocationAvailabilityChecking = FileLocationAvailability(),
+         nightMode: NightModeController? = nil,
          makeNativeProcessor: @escaping @Sendable () -> any Processor = { NativeDenoiseProcessor() }) {
+        self.nightMode = nightMode ?? NightModeController()
         self.userDefaults = userDefaults
         self.locationAvailability = locationAvailability
         self.distribution = configuration
@@ -607,6 +605,14 @@ final class AppModel {
                 CalibrationStore.save(selection, to: self.userDefaults)
             }), makeNativeProcessor: makeNativeProcessor)
         loadSettings()
+
+        self.nightMode.onFailure = { [weak self] message in
+            MainActor.assumeIsolated {
+                self?.nightVisionOn = false
+                self?.errorMessage = message
+                self?.log.append(message)
+            }
+        }
 
         // Save settings and stop the relay when the app is about to terminate.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
