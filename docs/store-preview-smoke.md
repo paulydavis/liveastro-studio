@@ -77,3 +77,31 @@ Keep the manual result labelled **pending** unless every relevant behavior was
 observed in the signed sandboxed process. Fake bookmark tests, the standalone
 completion harness, screenshots, and static codesign inspection cannot substitute
 for this checkpoint.
+
+## Authorized camera shares — separate runtime checkpoint
+
+The Store preview's **Live from Seestar** and **Live from ASIAIR** actions ask for
+the camera's mounted share on first use. Mount it in Finder first and select the
+top-level folder containing `MyWorks` (Seestar) or `Autorun/Light` (ASIAIR).
+Discovery searches only inside that saved share; it does not scan `/Volumes`.
+Use **Choose Seestar share…** or **Choose ASIAIR share…** to replace a selection.
+Cancelling replacement keeps the previous permission. These changes do not alter
+the direct GitHub edition's discovery behavior.
+
+The existing relay still copies only newly arriving subs. Its start baseline is
+not changed by authorization; pre-existing subs on the camera are not suddenly
+imported. Session-start confirmation still applies to matching files already in
+the local relay destination.
+
+- [ ] In the signed preview, select one real mounted camera share and start its
+  workflow. Verify the chosen target and a newly arriving file actually relays
+  and is processed, then End and check counts/exposure/output.
+- [ ] Quit completely, reopen, and repeat without selecting the share again.
+- [ ] Disconnect the share, retry, and confirm an actionable access error rather
+  than empty-folder waiting or selection of another mounted camera/copy.
+- [ ] Reconnect; retry using the saved permission. If macOS cannot restore it,
+  choose the share again and verify a new frame is processed.
+- [ ] Repeat for the other camera before claiming both real-share paths tested.
+
+Automated fixtures with fake bookmark services do not establish real SMB or
+macOS sandbox behavior. These items remain pending until observed.

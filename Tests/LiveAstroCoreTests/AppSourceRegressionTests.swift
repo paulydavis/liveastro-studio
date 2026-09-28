@@ -180,11 +180,21 @@ final class AppSourceRegressionTests: XCTestCase {
             source.contains("private func canApplyDetectedLiveSource() -> Bool"),
             "Live auto-detect completions need one shared post-await guard before mutating profile, starting relay, or starting a session."
         )
-        XCTAssertEqual(
-            source.components(separatedBy: "guard self.canApplyDetectedLiveSource() else").count - 1,
-            3,
-            "Watch-folder, Seestar, and ASIAIR detect completions must all re-check that no session/import started while detection was in flight."
-        )
+        // Scope this legacy source guard to each original completion. Counting the
+        // whole file both rejects added guarded paths and can hide a missing guard
+        // in one original path behind extra guards elsewhere. The new authorized
+        // camera flow is exercised behaviorally in StoreCameraShareTests.
+        for (start, end) in [
+            ("func startWatchFolderLive(", "private func configureAndStartWatchFolder("),
+            ("func startSeestarLive()", "private func configureAndStartSeestar("),
+            ("func startASIAIRLive()", "private func configureAndStartASIAIR(")
+        ] {
+            let startRange = try XCTUnwrap(source.range(of: start))
+            let tail = source[startRange.upperBound...]
+            let endRange = try XCTUnwrap(tail.range(of: end))
+            XCTAssertTrue(tail[..<endRange.lowerBound].contains("guard self.canApplyDetectedLiveSource() else"),
+                          "\(start) must re-check session ownership in its completion")
+        }
         XCTAssertTrue(
             source.contains("if !canApplyDetectedLiveSource() { return }"),
             "Configure helpers must also guard direct/internal calls before creating a relay."

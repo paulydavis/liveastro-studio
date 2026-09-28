@@ -1028,14 +1028,7 @@ final class StorePreviewAccessTests: XCTestCase {
 
     func testPreviewEntryMethodsRejectUnprovenIntegrations() async throws {
         let (model, _, _, root) = try fixture()
-        model.liveSource.startSeestarLive()
-        XCTAssertFalse(model.liveSource.isDetecting)
-        XCTAssertNotNil(model.errorMessage)
-        model.errorMessage = nil
-        model.liveSource.startASIAIRLive()
-        XCTAssertFalse(model.liveSource.isDetecting)
-        XCTAssertNotNil(model.errorMessage)
-        model.errorMessage = nil
+        // Camera-share entry points have their own authorized discovery coverage.
         model.nightVisionOn = true; model.applyNightVision()
         XCTAssertFalse(model.nightVisionOn)
         XCTAssertNotNil(model.errorMessage)

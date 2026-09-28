@@ -533,6 +533,9 @@ final class AppModel {
             acquireOperationAccess: { [weak self] url in
                 guard let self else { throw CocoaError(.userCancelled) }
                 return try self.acquireOperationAccess(input: url)
+            }, acquireCameraShare: { [weak self] kind, replacing in
+                guard let self else { throw CocoaError(.userCancelled) }
+                return try CameraShareAuthorization(locations: self.authorizedLocations).acquire(kind, replacing: replacing)
             }, startAuthorizedSession: { [weak self] access, completion in
                 guard let self else { completion(false); return }
                 self.startSession(access: access, completion: completion)

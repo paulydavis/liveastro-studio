@@ -95,6 +95,7 @@ struct AppSurface {
     // Authorization stays at the app boundary; controllers capture these owners
     // before metadata reads and carry them through their existing start paths.
     var acquireOperationAccess: (@MainActor (URL) throws -> OperationFileAccess)?
+    var acquireCameraShare: (@MainActor (CameraShareKind, Bool) throws -> FileAccessLease?)?
     var acquireLocationAccess: (@MainActor (URL) throws -> SessionDirectoryAccess)?
     var startAuthorizedSession: (@MainActor (OperationFileAccess, @escaping (Bool) -> Void) -> Void)?
     var isStorePreview: Bool
@@ -127,6 +128,7 @@ struct AppSurface {
          setReplayURL: ((URL) -> Void)? = nil,
          setLastSessionDirectory: ((URL, OperationFileAccess?) -> Void)? = nil,
          acquireOperationAccess: (@MainActor (URL) throws -> OperationFileAccess)? = nil,
+         acquireCameraShare: (@MainActor (CameraShareKind, Bool) throws -> FileAccessLease?)? = nil,
          acquireLocationAccess: (@MainActor (URL) throws -> SessionDirectoryAccess)? = nil,
          startAuthorizedSession: (@MainActor (OperationFileAccess, @escaping (Bool) -> Void) -> Void)? = nil,
          isStorePreview: Bool = false, catalogURL: URL? = nil,
@@ -157,6 +159,7 @@ struct AppSurface {
         self.setReplayURL = setReplayURL
         self.setLastSessionDirectory = setLastSessionDirectory
         self.acquireOperationAccess = acquireOperationAccess
+        self.acquireCameraShare = acquireCameraShare
         self.acquireLocationAccess = acquireLocationAccess
         self.startAuthorizedSession = startAuthorizedSession
         self.isStorePreview = isStorePreview

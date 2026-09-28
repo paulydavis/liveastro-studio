@@ -161,14 +161,18 @@ struct CaptureSettingsView: View {
 
     @ViewBuilder private var workflowActions: some View {
         if model.isStorePreview {
-            Text("Automatic share discovery is unavailable in this preview. Use Live from Folder / NINA to select a mounted share.")
+            Text("On first use, choose the mounted camera share. LiveAstro remembers permission and searches only inside that share.")
                 .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button("Choose Seestar share…") { model.liveSource.chooseCameraShare(.seestar) }
+                Button("Choose ASIAIR share…") { model.liveSource.chooseCameraShare(.asiair) }
+            }.disabled(liveWorkflowDisabled)
         }
         WorkflowActionRow(
             title: "Live from Seestar",
             subtitle: "Auto-detect the mounted Seestar folder, relay new subs, and start native live stacking.",
             systemImage: "dot.radiowaves.left.and.right",
-            disabled: liveWorkflowDisabled || model.isStorePreview
+            disabled: liveWorkflowDisabled
         ) {
             model.liveSource.startSeestarLive()
         }
@@ -177,7 +181,7 @@ struct CaptureSettingsView: View {
             title: "Live from ASIAIR",
             subtitle: "Auto-detect the ASIAIR Autorun/Light folder and start native live stacking.",
             systemImage: "camera.aperture",
-            disabled: liveWorkflowDisabled || model.isStorePreview
+            disabled: liveWorkflowDisabled
         ) {
             model.liveSource.startASIAIRLive()
         }

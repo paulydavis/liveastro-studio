@@ -154,10 +154,7 @@ final class LiveSourceController {
     }
 
     func startSeestarLive() {
-        guard !surface.isStorePreview else {
-            surface.presentError("Automatic discovery is unavailable in this preview. Choose Live from Folder / NINA.")
-            return
-        }
+        if surface.isStorePreview { startAuthorizedCamera(.seestar); return }
         guard canApplyDetectedLiveSource(), !isDetecting else { return }
         surface.resetZoomPan?()
         isDetecting = true
@@ -197,22 +194,19 @@ final class LiveSourceController {
             .appendingPathComponent("\(found.target)-\(df.string(from: Date()))\(expToken.map { "-\($0)s" } ?? "")",
                                     isDirectory: true)
         pruneRelay(excluding: relayDir)
-        let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob)
+        let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob, accessLifetime: relayAccess)
         relay.onLog = { [weak self] msg in
             Task { @MainActor in self?.surface.log(msg) }
         }
-        do { try relay.start() } catch { surface.presentError("Relay failed to start: \(error)"); return }
+        do { try relay.start() } catch { relayAccess = nil; surface.presentError("Relay failed to start: \(error)"); return }
         frameRelay = relay
         surface.applyDetectedProfile?(DetectedProfile(watchFolder: relayDir))
         surface.saveSettings?()
-        startConfiguredSession()
+        startConfiguredSession(relayDirectory: relayDir)
     }
 
     func startASIAIRLive() {
-        guard !surface.isStorePreview else {
-            surface.presentError("Automatic discovery is unavailable in this preview. Choose Live from Folder / NINA.")
-            return
-        }
+        if surface.isStorePreview { startAuthorizedCamera(.asiair); return }
         guard canApplyDetectedLiveSource(), !isDetecting else { return }
         surface.resetZoomPan?()
         isDetecting = true
@@ -254,12 +248,87 @@ final class LiveSourceController {
             .appendingPathComponent("\(found.target)-\(df.string(from: Date()))",
                                     isDirectory: true)
         pruneRelay(excluding: relayDir)
-        let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob)
+        let relay = FrameRelay(source: found.subDir, destination: relayDir, glob: glob, accessLifetime: relayAccess)
         relay.onLog = { [weak self] msg in Task { @MainActor in self?.surface.log(msg) } }
-        do { try relay.start() } catch { surface.presentError("Relay failed to start: \(error)"); return }
+        do { try relay.start() } catch { relayAccess = nil; surface.presentError("Relay failed to start: \(error)"); return }
         frameRelay = relay
         surface.applyDetectedProfile?(DetectedProfile(watchFolder: relayDir))
         surface.saveSettings?()
-        startConfiguredSession()
+        startConfiguredSession(relayDirectory: relayDir)
+    }
+
+    func chooseCameraShare(_ kind: CameraShareKind) {
+        guard surface.isStorePreview, canApplyDetectedLiveSource(), !isDetecting else { return }
+        isDetecting = true
+        defer { isDetecting = false }
+        do { _ = try surface.acquireCameraShare?(kind, true) }
+        catch { surface.presentError("Camera share access failed: \(error.localizedDescription) Reconnect the camera share or choose it again.") }
+    }
+
+    private func startAuthorizedCamera(_ kind: CameraShareKind) {
+        guard canApplyDetectedLiveSource(), !isDetecting else { return }
+        isDetecting = true // includes the picker's nested event loop
+        detectionGeneration += 1
+        let generation = detectionGeneration
+        let lease: FileAccessLease
+        do {
+            guard let selected = try surface.acquireCameraShare?(kind, false) else { isDetecting = false; return }
+            lease = selected
+        } catch {
+            isDetecting = false
+            surface.presentError("Camera share access failed: \(error.localizedDescription) Reconnect the camera share or choose it again.")
+            return
+        }
+        guard canApplyDetectedLiveSource() else { isDetecting = false; return }
+        surface.log("Looking for \(kind.displayName) targets inside \(lease.url.path)…")
+        manualPreparationTask = Task.detached { [weak self, lease] in
+            defer { withExtendedLifetime(lease) {} }
+            guard let self else { return }
+            do {
+                guard let found = try CameraShareDiscovery.detect(in: lease.url, kind: kind) else {
+                    await MainActor.run {
+                        guard self.detectionGeneration == generation else { return }
+                        self.isDetecting = false; self.manualPreparationTask = nil
+                        guard self.canApplyDetectedLiveSource() else { return }
+                        self.surface.presentError("No \(kind.displayName) capture target found inside the chosen share. Check the folder or choose the camera share again.")
+                    }
+                    return
+                }
+                let access = try await MainActor.run { () throws -> OperationFileAccess? in
+                    guard self.detectionGeneration == generation, self.canApplyDetectedLiveSource() else { return nil }
+                    guard let acquire = self.surface.acquireOperationAccess else { throw CocoaError(.fileReadNoPermission) }
+                    return try acquire(found.directory)
+                }
+                guard let access else {
+                    await MainActor.run {
+                        guard self.detectionGeneration == generation else { return }
+                        self.isDetecting = false; self.manualPreparationTask = nil
+                    }
+                    return
+                }
+                try access.validateAvailability()
+                try Task.checkCancellation()
+                await MainActor.run {
+                    guard self.detectionGeneration == generation else { return }
+                    self.isDetecting = false; self.manualPreparationTask = nil
+                    guard self.canApplyDetectedLiveSource() else { return }
+                    self.relayAccess = access
+                    self.surface.resetZoomPan?()
+                    switch kind {
+                    case .seestar:
+                        self.configureAndStartSeestar(.init(subDir: access.input, target: found.name, subExposure: found.exposure))
+                    case .asiair:
+                        self.configureAndStartASIAIR(.init(subDir: access.input, target: found.name, subExposure: found.exposure, subFileExtension: found.fileExtension))
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    guard self.detectionGeneration == generation else { return }
+                    self.isDetecting = false; self.manualPreparationTask = nil
+                    guard self.canApplyDetectedLiveSource() else { return }
+                    self.surface.presentError("Camera share preparation failed: \(error.localizedDescription) Reconnect the camera share or choose it again; also check the selected output and calibration folders.")
+                }
+            }
+        }
     }
 }
