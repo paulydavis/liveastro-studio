@@ -91,6 +91,14 @@ extension AppModel {
         CalibrationStore.save(calibration, to: userDefaults)
         saveSettings()
         if !libraryUpdates.isEmpty { refreshLibraryEntries() }
+        // A master being built may not have an index entry yet. It can publish
+        // its captured old source after this snapshot. Preserve that matching
+        // root until a later acquisition can reconcile the completed entry.
+        if let pendingSource = calibrationAdditionSource {
+            withheld.formUnion(relocations.filter {
+                AuthorizedLocationResolver.suffix(pendingSource, under: $0.oldRoot) != nil
+            }.map(\.key))
+        }
         return prepared.changes.filter { !withheld.contains($0.key) }
     }
 }

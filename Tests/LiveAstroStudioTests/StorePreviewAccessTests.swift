@@ -6,6 +6,39 @@ import Darwin
 
 @MainActor
 final class StorePreviewAccessTests: XCTestCase {
+    func testGrantRenewalWaitsForInFlightLibraryAdditionToRecordItsSource() async throws {
+        let entered = expectation(description: "master pixels built, source not yet recorded")
+        let release = DispatchSemaphore(value: 0)
+        let (model, backend, defaults, root) = try fixture(beforeLibraryAdd: {
+            entered.fulfill()
+            _ = release.wait(timeout: .now() + 10)
+        })
+        defer { release.signal() }
+        let source = try directory(root, "shared-source")
+        let moved = root.appendingPathComponent("moved-source")
+        try writeFITS(source.appendingPathComponent("bias.fit"))
+        await model.setCalibrationFolder(source, darkFlats: true)
+        let saved = defaults.data(forKey: AuthorizedLocations.defaultsKey)
+        model.addMasterFromFolder(source, kind: .bias)
+        await fulfillment(of: [entered], timeout: 5)
+        XCTAssertTrue(model.calibrationBusy)
+        XCTAssertTrue(model.calibrationLibrary.all().isEmpty)
+        try FileManager.default.moveItem(at: source, to: moved)
+        backend.moves = [source.path: moved]
+        _ = try await model.acquireReadableLocation(source)
+        XCTAssertEqual(defaults.data(forKey: AuthorizedLocations.defaultsKey), saved,
+                       "a late library addition still needs the old matching root")
+        release.signal()
+        try await waitForAccess { !model.calibrationBusy }
+        let entry = try XCTUnwrap(model.calibrationLibrary.all().first)
+        XCTAssertEqual(entry.sourcePath, source.path, "the real in-flight build captured the old source")
+        let reopened = AppModel(userDefaults: defaults, calibrationLibrary: model.calibrationLibrary,
+                                configuration: config(root), bookmarkBackend: backend)
+        let access = try await reopened.acquireReadableLocation(URL(fileURLWithPath: try XCTUnwrap(entry.sourcePath)))
+        XCTAssertEqual(access.url.path, moved.path)
+        XCTAssertEqual(reopened.calibrationLibrary.all().first?.sourcePath, moved.path)
+        XCTAssertEqual(reopened.sessionDarkFlatsFolder?.path, moved.path)
+    }
     func testPreviewLibraryAddFailsOnUnreadableChildDespiteReadableSibling() async throws {
         let (model, backend, _, root) = try fixture()
         let source = try directory(root, "darks")
@@ -1223,13 +1256,16 @@ final class StorePreviewAccessTests: XCTestCase {
                                   containerRoot: root.appendingPathComponent("container"))
     }
 
-    private func fixture(makeNativeProcessor: @escaping @Sendable () -> any Processor = { NativeDenoiseProcessor() }) throws -> (AppModel, PreviewBookmarkBackend, UserDefaults, URL) {
+    private func fixture(makeNativeProcessor: @escaping @Sendable () -> any Processor = { NativeDenoiseProcessor() },
+                         beforeLibraryAdd: (@Sendable () -> Void)? = nil) throws -> (AppModel, PreviewBookmarkBackend, UserDefaults, URL) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("StorePreviewTests-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let suite = "StorePreviewTests.\(UUID())", defaults = UserDefaults(suiteName: suite)!
         let backend = PreviewBookmarkBackend()
         addTeardownBlock { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: root) }
-        return (AppModel(userDefaults: defaults, calibrationLibrary: CalibrationLibrary(baseDirectory: root.appendingPathComponent("container/library")), configuration: config(root), bookmarkBackend: backend, makeNativeProcessor: makeNativeProcessor), backend, defaults, root)
+        let library = CalibrationLibrary(baseDirectory: root.appendingPathComponent("container/library"),
+                                         beforeRebuild: {}, beforeAdd: beforeLibraryAdd)
+        return (AppModel(userDefaults: defaults, calibrationLibrary: library, configuration: config(root), bookmarkBackend: backend, makeNativeProcessor: makeNativeProcessor), backend, defaults, root)
     }
 
     private func directory(_ root: URL, _ name: String) throws -> URL {

@@ -401,6 +401,7 @@ final class AppModel {
     var locationSelectionGeneration: UInt64 = 0
     private var calibrationPreparationID: UUID?
     private var calibrationPreparationTask: Task<Void, Never>?
+    private(set) var calibrationAdditionSource: URL?
     var accessRestorationID: UUID?
     var accessRestorationTask: Task<Void, Never>?
     var isRestoringLocationAccess: Bool { accessRestorationID != nil }
@@ -1286,6 +1287,7 @@ final class AppModel {
             let lib = calibrationLibrary
             let sourceDirectory = isStorePreview ? access.url : nil
             let strict = isStorePreview
+            calibrationAdditionSource = sourceDirectory
             Task.detached { [weak self, access] in
                 defer { withExtendedLifetime(access) {} }
                 // Swift 6: rebind weak self to a strong immutable up front — nested
@@ -1294,11 +1296,11 @@ final class AppModel {
                 let urls: [URL]
                 do { urls = try CalibrationLibrary.fitsFilesRequiringAccess(in: access.url) }
                 catch {
-                    await MainActor.run { self.calibrationBusy = false; self.reportFileAccess(error) }
+                    await MainActor.run { self.calibrationAdditionSource = nil; self.calibrationBusy = false; self.reportFileAccess(error) }
                     return
                 }
                 guard !urls.isEmpty else {
-                    await MainActor.run { self.calibrationBusy = false; self.log.append("Calibration: no FITS frames in that folder.") }
+                    await MainActor.run { self.calibrationAdditionSource = nil; self.calibrationBusy = false; self.log.append("Calibration: no FITS frames in that folder.") }
                     return
                 }
                 // Key the master from the first READABLE frame's header — not urls[0], which may be the
@@ -1324,12 +1326,14 @@ final class AppModel {
                         sourceDirectory: sourceDirectory, failOnReadError: strict)
                     await MainActor.run {
                         self.calibrationBusy = false
+                        self.calibrationAdditionSource = nil
                         self.refreshLibraryEntries()
                         self.log.append("Calibration: added \(frame.camera) \(kind.rawValue).")
                     }
                 } catch {
                     await MainActor.run {
                         self.calibrationBusy = false
+                        self.calibrationAdditionSource = nil
                         if error is CalibrationReadError { self.reportFileAccess(error) }
                         self.log.append("Calibration: build failed — \(error.localizedDescription)")
                     }

@@ -85,6 +85,7 @@ public final class CalibrationLibrary: Sendable {
 
     private let baseDir: URL
     private let beforeRebuild: (@Sendable () -> Void)?
+    private let beforeAdd: (@Sendable () -> Void)?
     // Pixel work is deliberately outside this lock. Only short index
     // read/modify/write transactions and the final master replacement hold it.
     private let indexLock = NSRecursiveLock()
@@ -93,12 +94,15 @@ public final class CalibrationLibrary: Sendable {
     public init(baseDirectory: URL? = nil) {
         self.baseDir = baseDirectory ?? Self.defaultDirectory()
         self.beforeRebuild = nil
+        self.beforeAdd = nil
     }
 
     /// Deterministic scheduling seam; never installed by production callers.
-    init(baseDirectory: URL, beforeRebuild: @escaping @Sendable () -> Void) {
+    init(baseDirectory: URL, beforeRebuild: @escaping @Sendable () -> Void,
+         beforeAdd: (@Sendable () -> Void)? = nil) {
         self.baseDir = baseDirectory
         self.beforeRebuild = beforeRebuild
+        self.beforeAdd = beforeAdd
     }
 
     public static func defaultDirectory() -> URL {
@@ -157,6 +161,7 @@ public final class CalibrationLibrary: Sendable {
                                                        failOnReadError: failOnReadError)
         let master = built.image
         let id = UUID()
+        beforeAdd?()
         let fileName = "master-\(id.uuidString).fit"
         try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
         try MasterBuilder.save(master, to: baseDir.appendingPathComponent(fileName))
