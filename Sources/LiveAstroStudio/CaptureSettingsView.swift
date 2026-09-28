@@ -340,7 +340,7 @@ struct CaptureSettingsView: View {
 
     private func pickFolder() {
         let panel = model.makeDirectoryPanel()
-        if panel.runModal() == .OK, let url = panel.url { model.selectLocation(url, key: "capture") }
+        if panel.runModal() == .OK, let url = panel.url { Task { await model.selectLocation(url, key: "capture") } }
     }
 
     private func pickStackerOutputWatchFolder() {

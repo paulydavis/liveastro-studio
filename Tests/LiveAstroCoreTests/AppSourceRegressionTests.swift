@@ -150,10 +150,9 @@ final class AppSourceRegressionTests: XCTestCase {
             source.contains("private var importPrepareInFlight = false"),
             "ImportController must distinguish prepare-with-no-pipeline from cancel-drain-with-no-pipeline; double cancel must not unlock UI mid-finalization."
         )
-        XCTAssertTrue(
-            source.contains("self.beginImport(from: folder, meta: meta, prefix: prefix, generation: generation,\n                                     output: output, calibration: calibration, access: access, loaded: loaded)"),
-            "The detached prepare completion must carry its original generation, captured destination/calibration/access, and prepared calibration result."
-        )
+        // Captured output/calibration ownership is exercised behaviorally by
+        // StorePreviewAccessTests.testImportCapturesOutputBeforeMetadataAndReleasesAfterTerminalWork.
+        // Do not pin the indentation of the asynchronous handoff here.
         XCTAssertTrue(
             source.contains("guard generation == importPrepareGeneration"),
             "beginImport must reject stale/cancelled prepare completions before starting a pipeline."

@@ -105,3 +105,26 @@ the local relay destination.
 
 Automated fixtures with fake bookmark services do not establish real SMB or
 macOS sandbox behavior. These items remain pending until observed.
+
+## Permission preparation repair — runtime checks still pending
+
+- [ ] With a saved share unavailable, begin access and verify the app remains
+  responsive during permission preparation. Cancel, then reconnect or choose a
+  different folder; a late completion must not restore the old selection or start
+  the cancelled operation. Repeat for import and camera discovery.
+- [ ] Use the same selected raw folder for a calibration-library source and
+  session dark-flats. Move it in Finder. Start a session, then rebuild the master;
+  repeat in reverse order with another move. Both consumers must follow the moved
+  folder, including after quitting and reopening the signed preview.
+- [ ] While calibration permission preparation is stalled, clear or reselect its
+  folder. Busy preparation must retire immediately; the late result must not
+  build from the old source or overwrite the new selection.
+- [ ] Finish a session under a symlinked output folder, then select a different
+  output. The old session's replay/processing must still work, without granting
+  access to its sibling sessions. Session-output buttons may populate after the
+  background availability check; a disconnected share must not freeze Setup.
+
+Cancellation releases the UI's request ownership; it cannot forcibly interrupt
+a filesystem call already blocked inside macOS. Its worker keeps any acquired
+security scope until that call returns. Automated blocked-call and moved-folder
+tests cover these contracts, not the behavior of a particular SMB server.

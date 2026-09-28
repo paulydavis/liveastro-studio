@@ -2,8 +2,66 @@ import XCTest
 @testable import LiveAstroCore
 
 final class CalibrationLibraryTests: XCTestCase {
+    func testRebuildDoesNotOverwriteConcurrentMovedSourceUpdate() async throws {
+        let entered = expectation(description: "rebuild captured its entry")
+        let release = DispatchSemaphore(value: 0)
+        let library = CalibrationLibrary(baseDirectory: tmp.appendingPathComponent("lib")) {
+            entered.fulfill()
+            _ = release.wait(timeout: .now() + 10)
+        }
+        let raws = writeRaws(1, value: 0.2)
+        let first = try library.add(kind: .bias, camera: "A", gain: nil, exposureSeconds: nil,
+                                    setTempC: nil, binning: nil, fitsURLs: raws,
+                                    sourceDirectory: rawDir.appendingPathComponent("original-A"))
+        let second = try library.add(kind: .bias, camera: "B", gain: nil, exposureSeconds: nil,
+                                     setTempC: nil, binning: nil, fitsURLs: raws)
+        let worker = Task.detached { try library.rebuild(id: second.id, failOnReadError: true) }
+        await fulfillment(of: [entered], timeout: 5)
+        defer { release.signal() }
+        let moved = rawDir.appendingPathComponent("moved-A")
+        try library.updateSourceDirectories([first.id: moved])
+        release.signal()
+        try await worker.value
+        XCTAssertEqual(library.all().first { $0.id == first.id }?.sourcePath, moved.path,
+                       "a completed rebuild must not restore another entry's old source root")
+    }
+
     private var tmp: URL!
     private var rawDir: URL!
+
+    func testConditionalSourceUpdatePreservesNewerChoiceAndDoesNotResurrectRemoval() throws {
+        let library = lib()
+        let frame = try library.add(kind: .bias, camera: "A", gain: nil, exposureSeconds: nil,
+                                    setTempC: nil, binning: nil, fitsURLs: writeRaws(1, value: 0.2))
+        let chosen = rawDir.appendingPathComponent("chosen")
+        try library.updateSourceDirectories([frame.id: chosen])
+        try library.updateSourceDirectories([frame.id: rawDir.appendingPathComponent("stale")],
+                                             expectedSourcePaths: [frame.id: rawDir.path])
+        XCTAssertEqual(library.all().first?.sourcePath, chosen.path)
+        try library.remove(id: frame.id)
+        try library.updateSourceDirectories([frame.id: chosen], expectedSourcePaths: [frame.id: rawDir.path])
+        XCTAssertTrue(library.all().isEmpty)
+    }
+
+    func testRemovalDuringRebuildDoesNotResurrectEntryOrMaster() async throws {
+        let entered = expectation(description: "captured rebuild")
+        let release = DispatchSemaphore(value: 0)
+        let base = tmp.appendingPathComponent("lib")
+        let library = CalibrationLibrary(baseDirectory: base) {
+            entered.fulfill()
+            _ = release.wait(timeout: .now() + 10)
+        }
+        let frame = try library.add(kind: .bias, camera: "A", gain: nil, exposureSeconds: nil,
+                                    setTempC: nil, binning: nil, fitsURLs: writeRaws(1, value: 0.2))
+        let worker = Task.detached { try library.rebuild(id: frame.id, failOnReadError: true) }
+        await fulfillment(of: [entered], timeout: 5)
+        defer { release.signal() }
+        try library.remove(id: frame.id)
+        release.signal()
+        try await worker.value
+        XCTAssertTrue(library.all().isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: base.appendingPathComponent(frame.fileName).path))
+    }
 
     override func setUpWithError() throws {
         tmp = FileManager.default.temporaryDirectory

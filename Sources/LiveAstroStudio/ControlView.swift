@@ -6,39 +6,44 @@ struct ControlView: View {
     @Environment(AppModel.self) private var model
 
     @State private var outputFootprintText = "not checked"
+    @State private var artifactDirectory: URL?
+    @State private var artifactNames: Set<String> = []
+    private struct ArtifactRequest: Hashable {
+        let directory: URL?
+        let running: Bool
+    }
+    private var artifactRequest: ArtifactRequest {
+        ArtifactRequest(directory: model.lastSessionDirectory, running: model.isRunning || model.importer.isImporting)
+    }
 
     private var hasSessionOutputs: Bool {
         !model.isRunning && (model.replayURL != nil || model.lastSessionDirectory != nil)
     }
 
     private var latestMasterURL: URL? {
-        guard let dir = model.lastSessionDirectory else { return nil }
-        let master = dir.appendingPathComponent("master.fit")
-        return FileManager.default.fileExists(atPath: master.path) ? master : nil
+        artifactURL("master.fit")
     }
 
     private var latestImageURL: URL? {
-        guard let dir = model.lastSessionDirectory else { return nil }
-        let latest = dir.appendingPathComponent("latest.png")
-        return FileManager.default.fileExists(atPath: latest.path) ? latest : nil
+        artifactURL("latest.png")
     }
 
     private var sessionSummaryURL: URL? {
-        guard let dir = model.lastSessionDirectory else { return nil }
-        let summary = dir.appendingPathComponent("session-summary.md")
-        return FileManager.default.fileExists(atPath: summary.path) ? summary : nil
+        artifactURL("session-summary.md")
     }
 
     private var frameSummaryURL: URL? {
-        guard let dir = model.lastSessionDirectory else { return nil }
-        let csv = dir.appendingPathComponent("frame-summary.csv")
-        return FileManager.default.fileExists(atPath: csv.path) ? csv : nil
+        artifactURL("frame-summary.csv")
     }
 
     private var subFramesURL: URL? {
-        guard let dir = model.lastSessionDirectory else { return nil }
-        let csv = dir.appendingPathComponent(SubFrameCSV.filename)
-        return FileManager.default.fileExists(atPath: csv.path) ? csv : nil
+        artifactURL(SubFrameCSV.filename)
+    }
+
+    private func artifactURL(_ name: String) -> URL? {
+        guard let directory = model.lastSessionDirectory, directory == artifactDirectory,
+              artifactNames.contains(name) else { return nil }
+        return directory.appendingPathComponent(name)
     }
 
     private var appVersionText: String {
@@ -96,6 +101,21 @@ struct ControlView: View {
         .background(SetupStyle.background)
         .environment(\.colorScheme, .dark)
         .tint(SetupStyle.accent)
+        .task(id: artifactRequest) {
+            let request = artifactRequest
+            artifactDirectory = nil
+            artifactNames = []
+            guard !request.running, let directory = request.directory else { return }
+            do {
+                let names = try await model.sessionArtifactNames(in: directory)
+                guard !Task.isCancelled, artifactRequest == request else { return }
+                artifactNames = names
+                artifactDirectory = directory
+            } catch {
+                guard !Task.isCancelled, artifactRequest == request else { return }
+                model.log.append("Could not check session outputs: \(error.localizedDescription)")
+            }
+        }
         .alert("LiveAstro", isPresented: $model.isShowingError) {
             Button("OK") { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
@@ -362,8 +382,10 @@ struct ControlView: View {
             panel.directoryURL = liveAstro
         }
         if panel.runModal() == .OK, let url = panel.url {
-            guard let selected = model.selectSourceFolder(url) else { return }
+            Task {
+            guard let selected = await model.selectSourceFolder(url) else { return }
             model.importer.regenerateReplay(sessionDirectory: selected)
+            }
         }
     }
 
@@ -403,22 +425,29 @@ struct ControlView: View {
     }
 
     private func refreshOutputFootprint() {
-        do {
-            let access = try model.acquireOutputLocation()
-            defer { withExtendedLifetime(access) {} }
-            let rootBytes = try DirectoryFootprint.byteCount(at: access.url)
-            let rootSize = ByteCountFormatter.string(fromByteCount: rootBytes, countStyle: .file)
-            if let session = model.lastSessionDirectory {
-                let sessionBytes = try DirectoryFootprint.byteCount(at: session)
-                let sessionSize = ByteCountFormatter.string(fromByteCount: sessionBytes, countStyle: .file)
-                outputFootprintText = "root \(rootSize) · last session \(sessionSize)"
-            } else {
-                outputFootprintText = "root \(rootSize)"
+        Task {
+            do {
+                let access = try await model.acquireOutputLocation()
+                defer { withExtendedLifetime(access) {} }
+                let session = model.lastSessionDirectory
+                let counts = try await Task.detached { [access] in
+                    defer { withExtendedLifetime(access) {} }
+                    return (try DirectoryFootprint.byteCount(at: access.url),
+                            try session.map { try DirectoryFootprint.byteCount(at: $0) })
+                }.value
+                let rootBytes = counts.0
+                let rootSize = ByteCountFormatter.string(fromByteCount: rootBytes, countStyle: .file)
+                if let sessionBytes = counts.1 {
+                    let sessionSize = ByteCountFormatter.string(fromByteCount: sessionBytes, countStyle: .file)
+                    outputFootprintText = "root \(rootSize) · last session \(sessionSize)"
+                } else {
+                    outputFootprintText = "root \(rootSize)"
+                }
+                model.log.append("Refreshed output footprint")
+            } catch {
+                outputFootprintText = "unavailable"
+                model.log.append("Could not calculate output footprint: \(error.localizedDescription)")
             }
-            model.log.append("Refreshed output footprint")
-        } catch {
-            outputFootprintText = "unavailable"
-            model.log.append("Could not calculate output footprint: \(error.localizedDescription)")
         }
     }
 
@@ -428,15 +457,20 @@ struct ControlView: View {
     }
 
     private func openSessionsRoot() {
-        do {
-            let access = try model.acquireOutputLocation()
-            defer { withExtendedLifetime(access) {} }
-            let url = access.url
-            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-            NSWorkspace.shared.open(url)
-            model.log.append("Opened sessions folder")
-        } catch {
-            model.errorMessage = "Could not open sessions folder: \(error.localizedDescription)"
+        Task {
+            do {
+                let access = try await model.acquireOutputLocation()
+                defer { withExtendedLifetime(access) {} }
+                let url = access.url
+                try await Task.detached { [access] in
+                    defer { withExtendedLifetime(access) {} }
+                    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                }.value
+                NSWorkspace.shared.open(url)
+                model.log.append("Opened sessions folder")
+            } catch {
+                model.errorMessage = "Could not open sessions folder: \(error.localizedDescription)"
+            }
         }
     }
 

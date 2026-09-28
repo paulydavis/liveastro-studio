@@ -94,9 +94,9 @@ struct AppSurface {
 
     // Authorization stays at the app boundary; controllers capture these owners
     // before metadata reads and carry them through their existing start paths.
-    var acquireOperationAccess: (@MainActor (URL) throws -> OperationFileAccess)?
-    var acquireCameraShare: (@MainActor (CameraShareKind, Bool) throws -> FileAccessLease?)?
-    var acquireLocationAccess: (@MainActor (URL) throws -> SessionDirectoryAccess)?
+    var acquireOperationAccess: (@MainActor (URL) async throws -> OperationFileAccess)?
+    var acquireCameraShare: (@MainActor (CameraShareKind, Bool) async throws -> FileAccessLease?)?
+    var acquireLocationAccess: (@MainActor (URL) async throws -> SessionDirectoryAccess)?
     var startAuthorizedSession: (@MainActor (OperationFileAccess, @escaping (Bool) -> Void) -> Void)?
     var isStorePreview: Bool
     var catalogURL: URL?
@@ -127,9 +127,9 @@ struct AppSurface {
          isRestacking: (() -> Bool)? = nil,
          setReplayURL: ((URL) -> Void)? = nil,
          setLastSessionDirectory: ((URL, OperationFileAccess?) -> Void)? = nil,
-         acquireOperationAccess: (@MainActor (URL) throws -> OperationFileAccess)? = nil,
-         acquireCameraShare: (@MainActor (CameraShareKind, Bool) throws -> FileAccessLease?)? = nil,
-         acquireLocationAccess: (@MainActor (URL) throws -> SessionDirectoryAccess)? = nil,
+         acquireOperationAccess: (@MainActor (URL) async throws -> OperationFileAccess)? = nil,
+         acquireCameraShare: (@MainActor (CameraShareKind, Bool) async throws -> FileAccessLease?)? = nil,
+         acquireLocationAccess: (@MainActor (URL) async throws -> SessionDirectoryAccess)? = nil,
          startAuthorizedSession: (@MainActor (OperationFileAccess, @escaping (Bool) -> Void) -> Void)? = nil,
          isStorePreview: Bool = false, catalogURL: URL? = nil,
          persistCalibration: (@MainActor (CalibrationSelection) -> Void)? = nil) {

@@ -44,10 +44,14 @@ final class FoundationBookmarkAccessor: BookmarkAccessing {
 
 final class FileAccessLease: Sendable {
     let url: URL
+    /// Captured off-main while access is held; never re-resolve a retained
+    /// session's old root after the operator has selected a different one.
+    let canonicalURL: URL
     private let cleanup: (@Sendable () -> Void)?
 
-    init(url: URL, cleanup: (@Sendable () -> Void)? = nil) {
+    init(url: URL, canonicalURL: URL? = nil, cleanup: (@Sendable () -> Void)? = nil) {
         self.url = url
+        self.canonicalURL = canonicalURL ?? url.standardizedFileURL
         self.cleanup = cleanup
     }
 
@@ -83,7 +87,7 @@ extension AuthorizedLocationError: LocalizedError {
 
 @MainActor
 final class AuthorizedLocations {
-    enum Request { case key(String), url(URL) }
+    enum Request: Sendable { case key(String), url(URL) }
     static let defaultsKey = "AuthorizedLocations.records"
 
     private static let storageVersion = 1
@@ -93,7 +97,7 @@ final class AuthorizedLocations {
         var records: [String: Record]
     }
 
-    private struct Record: Codable {
+    struct Record: Codable, Equatable, Sendable {
         var purpose: String
         var displayPath: String
         var bookmark: Data?
@@ -107,182 +111,130 @@ final class AuthorizedLocations {
     private let policy: FileAccessPolicy
     private let containerRoots: [URL]
     private let backend: any BookmarkAccessing
+    private let canonicalizer: any LocationCanonicalizing
+    private var selectionGenerations: [String: UUID] = [:]
+
+    struct ResolutionInput: Sendable {
+        let requests: [Request]
+        let records: [String: Record]
+        let policy: FileAccessPolicy
+        let containerRoots: [URL]
+        let backend: any BookmarkAccessing
+        let canonicalizer: any LocationCanonicalizing
+        let storageError: AuthorizedLocationError?
+    }
+    struct GrantChange: Sendable {
+        let key: String
+        let original: Record?
+        let replacement: Record
+        var selectionID: UUID? = nil
+    }
+    struct Relocation: Sendable {
+        let key: String
+        let original: Record
+        let oldRoot: URL
+        let newRoot: URL
+    }
+    struct PreparedAccess: Sendable {
+        let results: [Result<FileAccessLease, Error>]
+        let relocations: [Relocation]
+        let changes: [GrantChange]
+    }
 
     init(defaults: UserDefaults,
          policy: FileAccessPolicy,
          containerRoots: [URL],
-         backend: any BookmarkAccessing = FoundationBookmarkAccessor()) {
+         backend: any BookmarkAccessing = FoundationBookmarkAccessor(),
+         canonicalizer: any LocationCanonicalizing = FileLocationCanonicalizer()) {
         self.defaults = defaults
         self.policy = policy
         self.containerRoots = containerRoots.map(Self.normalize)
         self.backend = backend
+        self.canonicalizer = canonicalizer
     }
 
-    func select(_ url: URL, key: String) throws -> FileAccessLease {
-        var envelope = try loadEnvelope()
-        let selectedURL = Self.normalize(url)
+    func snapshot(_ requests: [Request]) -> ResolutionInput {
+        let records: [String: Record]
+        let storageFailure: AuthorizedLocationError?
+        do { records = try loadEnvelope().records; storageFailure = nil }
+        catch let failure as AuthorizedLocationError { records = [:]; storageFailure = failure }
+        catch { records = [:]; storageFailure = .malformedStorage }
+        return ResolutionInput(requests: requests, records: records, policy: policy,
+                               containerRoots: containerRoots, backend: backend,
+                               canonicalizer: canonicalizer, storageError: storageFailure)
+    }
 
-        switch policy {
-        case .direct:
-            envelope.records[key] = Record(purpose: key,
-                                           displayPath: selectedURL.path,
-                                           bookmark: nil)
-            try persist(envelope)
-            return FileAccessLease(url: selectedURL)
-
-        case .sandboxed where isInContainer(selectedURL):
-            envelope.records[key] = Record(purpose: key,
-                                           displayPath: selectedURL.path,
-                                           bookmark: nil)
-            try persist(envelope)
-            return FileAccessLease(url: selectedURL)
-
-        case .sandboxed:
-            let bookmark = try backend.createBookmark(for: selectedURL)
-            let resolution = try backend.resolveBookmark(bookmark)
-            let resolvedURL = Self.normalize(resolution.url)
-            guard backend.startAccessing(resolvedURL) else {
-                throw AuthorizedLocationError.accessDenied(resolvedURL)
-            }
-
-            do {
-                let storedBookmark = resolution.isStale
-                    ? try backend.createBookmark(for: resolvedURL)
-                    : bookmark
-                envelope.records[key] = Record(purpose: key,
-                                               displayPath: resolvedURL.path,
-                                               bookmark: storedBookmark)
-                try persist(envelope)
-            } catch {
-                backend.stopAccessing(resolvedURL)
-                throw error
-            }
-
-            return scopedLease(url: resolvedURL, scopeURL: resolvedURL)
+    func prepare(_ requests: [Request]) async throws -> PreparedAccess {
+        let input = snapshot(requests)
+        let worker = Task.detached(priority: .userInitiated) {
+            var resolver = AuthorizedLocationResolver(input)
+            return resolver.resolve()
         }
+        let result = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+        try Task.checkCancellation()
+        return result
     }
 
-    func acquire(key: String) throws -> FileAccessLease {
+    func prepareSelection(_ url: URL, key: String) async throws -> PreparedAccess {
+        let id = UUID()
+        selectionGenerations[key] = id
+        let input = snapshot([])
+        let worker = Task.detached(priority: .userInitiated) {
+            var resolver = AuthorizedLocationResolver(input)
+            return try resolver.select(url, key: key)
+        }
+        let result = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+        try Task.checkCancellation()
+        guard selectionGenerations[key] == id else { throw CancellationError() }
+        return PreparedAccess(results: result.results, relocations: result.relocations,
+                              changes: result.changes.map { change in
+            var change = change
+            change.selectionID = id
+            return change
+        })
+    }
+
+    func matches(_ relocation: Relocation) -> Bool {
+        (try? loadEnvelope().records[relocation.key]) == relocation.original
+    }
+
+    func commit(_ changes: [GrantChange]) throws {
+        guard !changes.isEmpty else { return }
         var envelope = try loadEnvelope()
-        return try acquire(key: key, record: envelope.records[key], envelope: &envelope)
+        for change in changes {
+            if let id = change.selectionID {
+                // A still-current operator choice wins over an intervening
+                // background renewal, but never over a newer explicit choice.
+                guard selectionGenerations[change.key] == id else { throw CancellationError() }
+                envelope.records[change.key] = change.replacement
+            } else if envelope.records[change.key] == change.original {
+                envelope.records[change.key] = change.replacement
+            }
+        }
+        try persist(envelope)
     }
 
-    /// Match every request against this call's original roots, while persisting
-    /// renewals into one current envelope. The old matching roots never escape.
-    /// Callers own all successful leases, including when other requests fail.
-    func acquireGroup(_ requests: [Request]) -> [Result<FileAccessLease, Error>] {
+    func select(_ url: URL, key: String) async throws -> FileAccessLease {
+        let prepared = try await prepareSelection(url, key: key)
+        try commit(prepared.changes)
+        return try prepared.results[0].get()
+    }
+    func acquire(key: String) async throws -> FileAccessLease {
+        let prepared = try await prepare([.key(key)])
+        try commit(prepared.changes)
+        return try prepared.results[0].get()
+    }
+    func acquire(url: URL) async throws -> FileAccessLease {
+        let prepared = try await prepare([.url(url)])
+        try commit(prepared.changes)
+        return try prepared.results[0].get()
+    }
+    func acquireGroup(_ requests: [Request]) async -> [Result<FileAccessLease, Error>] {
         do {
-            var envelope = try loadEnvelope()
-            let original = envelope.records
-            return requests.map { request in
-                Result {
-                    switch request {
-                    case .key(let key): return try acquire(key: key, record: original[key], envelope: &envelope)
-                    case .url(let url): return try acquire(url: Self.normalize(url), matching: original, envelope: &envelope)
-                    }
-                }
-            }
-        } catch {
-            return requests.map { request in
-                // Path-only direct/container access never depends on saved storage.
-                if case .url(let url) = request, policy == .direct || isInContainer(url) {
-                    return .success(FileAccessLease(url: Self.normalize(url)))
-                }
-                return .failure(error)
-            }
-        }
-    }
-
-    private func acquire(key: String, record: Record?, envelope: inout Envelope) throws -> FileAccessLease {
-        guard let record else {
-            throw AuthorizedLocationError.missingSelection(key)
-        }
-        let displayedURL = Self.fileURL(path: record.displayPath)
-
-        if policy == .direct || isInContainer(displayedURL) {
-            return FileAccessLease(url: displayedURL)
-        }
-
-        guard let bookmark = record.bookmark else {
-            throw AuthorizedLocationError.notAuthorized(displayedURL)
-        }
-        let resolution = try backend.resolveBookmark(bookmark)
-        let resolvedURL = Self.normalize(resolution.url)
-        guard backend.startAccessing(resolvedURL) else {
-            throw AuthorizedLocationError.accessDenied(resolvedURL)
-        }
-
-        renewIfStale(resolution,
-                     key: key,
-                     purpose: record.purpose,
-                     envelope: &envelope)
-        return scopedLease(url: resolvedURL, scopeURL: resolvedURL)
-    }
-
-    func acquire(url: URL) throws -> FileAccessLease {
-        let requestedURL = Self.normalize(url)
-        if policy == .direct || isInContainer(requestedURL) {
-            return FileAccessLease(url: requestedURL)
-        }
-
-        var envelope = try loadEnvelope()
-        let original = envelope.records
-        return try acquire(url: requestedURL, matching: original, envelope: &envelope)
-    }
-
-    private func acquire(url requestedURL: URL, matching records: [String: Record],
-                         envelope: inout Envelope) throws -> FileAccessLease {
-        if policy == .direct || isInContainer(requestedURL) { return FileAccessLease(url: requestedURL) }
-        let candidates = records.sorted {
-            Self.fileURL(path: $0.value.displayPath).pathComponents.count
-                > Self.fileURL(path: $1.value.displayPath).pathComponents.count
-        }
-        var matchingError: (any Error)?
-
-        for (key, record) in candidates {
-            guard let bookmark = record.bookmark else { continue }
-            let displayedRoot = Self.fileURL(path: record.displayPath)
-            let displayedSuffix = Self.relativeComponents(of: requestedURL, under: displayedRoot)
-            let resolution: BookmarkResolution
-            do {
-                resolution = try backend.resolveBookmark(bookmark)
-            } catch {
-                if displayedSuffix != nil, matchingError == nil {
-                    matchingError = error
-                }
-                continue
-            }
-
-            let resolvedRoot = Self.normalize(resolution.url)
-            let operationURL: URL
-            if let displayedSuffix {
-                operationURL = displayedSuffix.reduce(resolvedRoot) {
-                    $0.appendingPathComponent($1)
-                }.standardizedFileURL
-            } else if Self.relativeComponents(of: requestedURL, under: resolvedRoot) != nil {
-                operationURL = requestedURL
-            } else {
-                continue
-            }
-
-            guard backend.startAccessing(resolvedRoot) else {
-                if matchingError == nil {
-                    matchingError = AuthorizedLocationError.accessDenied(resolvedRoot)
-                }
-                continue
-            }
-
-            renewIfStale(resolution,
-                         key: key,
-                         purpose: record.purpose,
-                         envelope: &envelope)
-            return scopedLease(url: operationURL, scopeURL: resolvedRoot)
-        }
-
-        if let matchingError {
-            throw matchingError
-        }
-        throw AuthorizedLocationError.notAuthorized(requestedURL)
+            let prepared = try await prepare(requests)
+            try commit(prepared.changes)
+            return prepared.results
+        } catch { return requests.map { _ in .failure(error) } }
     }
 
     func displayURL(key: String) -> URL? {
@@ -332,73 +284,6 @@ final class AuthorizedLocations {
         defaults.set(try encoder.encode(envelope), forKey: Self.defaultsKey)
     }
 
-    private func renewIfStale(_ resolution: BookmarkResolution,
-                              key: String,
-                              purpose: String,
-                              envelope: inout Envelope) {
-        guard resolution.isStale else { return }
-        let resolvedURL = Self.normalize(resolution.url)
-        do {
-            let renewedBookmark = try backend.createBookmark(for: resolvedURL)
-            envelope.records[key] = Record(purpose: purpose,
-                                           displayPath: resolvedURL.path,
-                                           bookmark: renewedBookmark)
-            try persist(envelope)
-        } catch {
-            // Current access remains valid. Keep the prior record if best-effort
-            // renewal fails, rather than destroying the user's saved selection.
-        }
-    }
-
-    private func scopedLease(url: URL, scopeURL: URL) -> FileAccessLease {
-        FileAccessLease(url: url) { [backend] in
-            backend.stopAccessing(scopeURL)
-        }
-    }
-
-    private func isInContainer(_ url: URL) -> Bool {
-        let canonicalURL = Self.canonicalForContainment(url)
-        return containerRoots.contains {
-            Self.relativeComponents(of: canonicalURL,
-                                    under: Self.canonicalForContainment($0)) != nil
-        }
-    }
-
-    private static func normalize(_ url: URL) -> URL {
-        url.standardizedFileURL
-    }
-
-    private static func canonicalForContainment(_ url: URL) -> URL {
-        var existingAncestor = normalize(url)
-        var missingComponents: [String] = []
-        while !FileManager.default.fileExists(atPath: existingAncestor.path),
-              existingAncestor.path != "/" {
-            missingComponents.insert(existingAncestor.lastPathComponent, at: 0)
-            existingAncestor.deleteLastPathComponent()
-        }
-        return missingComponents.reduce(existingAncestor.resolvingSymlinksInPath()) {
-            $0.appendingPathComponent($1)
-        }.standardizedFileURL
-    }
-
-    private static func fileURL(path: String) -> URL {
-        URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
-    }
-
-    private static func relativeComponents(of child: URL, under parent: URL) -> ArraySlice<String>? {
-        let child = normalize(child)
-        let parent = normalize(parent)
-        guard child.isFileURL,
-              parent.isFileURL,
-              child.host == parent.host else {
-            return nil
-        }
-        let childComponents = child.pathComponents
-        let parentComponents = parent.pathComponents
-        guard childComponents.count >= parentComponents.count,
-              Array(childComponents.prefix(parentComponents.count)) == parentComponents else {
-            return nil
-        }
-        return childComponents.dropFirst(parentComponents.count)
-    }
+    private static func normalize(_ url: URL) -> URL { url.standardizedFileURL }
+    private static func fileURL(path: String) -> URL { URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL }
 }

@@ -9,7 +9,7 @@ protocol LocationAvailabilityChecking: Sendable {
 
 struct FileLocationAvailability: LocationAvailabilityChecking {
     func check(_ url: URL, forWriting: Bool) throws {
-        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isWritableKey])
+        let values = try url.resolvingSymlinksInPath().resourceValues(forKeys: [.isDirectoryKey, .isWritableKey])
         if forWriting {
             guard values.isDirectory == true, values.isWritable == true else { throw CocoaError(.fileWriteNoPermission) }
         } else if values.isDirectory == true {
@@ -64,12 +64,17 @@ struct SessionDirectoryAccess: Sendable {
     }
 
     init(url: URL, operation: OperationFileAccess) {
-        self.url = url.standardizedFileURL.resolvingSymlinksInPath()
+        if let output = operation.leases.first,
+           let suffix = AuthorizedLocationResolver.suffix(url, under: operation.output) {
+            self.url = suffix.reduce(output.canonicalURL) { $0.appendingPathComponent($1) }.standardizedFileURL
+        } else {
+            self.url = url.standardizedFileURL
+        }
         self.owner = .operation(operation)
     }
 
     init(lease: FileAccessLease) {
-        self.url = lease.url
+        self.url = lease.canonicalURL
         self.owner = .independent(lease)
     }
 }
@@ -78,55 +83,65 @@ extension AppModel {
     var isStorePreview: Bool { distribution.isStorePreview }
 
     @discardableResult
-    func selectLocation(_ url: URL, key: String) -> Bool {
+    func selectLocation(_ url: URL, key: String) async -> Bool {
+        cancelCalibrationPreparation()
+        locationSelectionGeneration &+= 1
+        let generation = locationSelectionGeneration
+        invalidateAccessRestoration()
         do {
-            let lease = try authorizedLocations.select(url, key: key)
+            let prepared = try await authorizedLocations.prepareSelection(url, key: key)
+            guard generation == locationSelectionGeneration else { return false }
+            try authorizedLocations.commit(prepared.changes)
+            let lease = try prepared.results[0].get()
             invalidateAccessRestoration()
             if key == "output" { selectedOutputFolder = lease.url }
             if key == "capture" { watchFolder = lease.url }
             return true
-        } catch { reportFileAccess(error); return false }
+        } catch { if generation == locationSelectionGeneration, !(error is CancellationError) { reportFileAccess(error) }; return false }
     }
 
     func chooseSessionOutputFolder() {
         let panel = makeDirectoryPanel(title: "Save sessions to", message: "Choose where LiveAstro Store Preview saves session output.")
-        if panel.runModal() == .OK, let url = panel.url { selectLocation(url, key: "output") }
+        if panel.runModal() == .OK, let url = panel.url { Task { await selectLocation(url, key: "output") } }
     }
 
-    func selectSourceFolder(_ url: URL) -> URL? {
-        do { return try authorizedLocations.select(url, key: "source:" + url.standardizedFileURL.absoluteString).url }
-        catch { reportFileAccess(error); return nil }
+    func selectSourceFolder(_ url: URL) async -> URL? {
+        let key = "source:" + url.standardizedFileURL.absoluteString
+        guard await selectLocation(url, key: key) else { return nil }
+        return authorizedLocations.displayURL(key: key)
     }
 
     func reportFileAccess(_ error: Error) {
         errorMessage = "Folder access failed: \(error.localizedDescription) Reconnect the location or choose the folder again."
     }
 
-    func setCalibrationFolder(_ url: URL?, darkFlats: Bool) {
+    func setCalibrationFolder(_ url: URL?, darkFlats: Bool) async {
         let selected: URL?
         if let url {
-            guard let resolved = selectSourceFolder(url) else { return }
+            guard let resolved = await selectSourceFolder(url) else { return }
             selected = resolved
-        } else { selected = nil }
+        } else { cancelCalibrationPreparation(); locationSelectionGeneration &+= 1; selected = nil }
         invalidateAccessRestoration()
         if darkFlats { sessionDarkFlatsFolder = selected } else { sessionFlatsFolder = selected }
         if isStorePreview { userDefaults.set(selected?.path, forKey: darkFlats ? "StorePreview.darkFlatsPath" : "StorePreview.flatsPath") }
     }
 
-    func acquireReadableLocation(_ url: URL) throws -> FileAccessLease {
-        try authorizedLocations.acquire(url: url)
+    func acquireReadableLocation(_ url: URL) async throws -> FileAccessLease {
+        let results = try await acquireLocations([.url(url)])
+        return try results[0].get()
     }
 
-    func acquireOutputLocation() throws -> FileAccessLease {
+    func acquireOutputLocation() async throws -> FileAccessLease {
         guard isStorePreview else { return FileAccessLease(url: liveAstroRoot) }
-        let lease = try authorizedLocations.acquire(key: "output")
+        let results = try await acquireLocations([.key("output")])
+        let lease = try results[0].get()
         selectedOutputFolder = lease.url
         return lease
     }
 
-    func acquireOperationAccess(input: URL) throws -> OperationFileAccess {
+    func acquireOperationAccess(input: URL) async throws -> OperationFileAccess {
         if isStorePreview { invalidateAccessRestoration() }
-        let results = acquireSelections(input: input, includeOutput: true)
+        let results = try await acquireSelections(input: input, includeOutput: true)
         var locations: [SelectionRole: FileAccessLease] = [:]
         var leases: [FileAccessLease] = []
         // Preserve output-first error precedence. No filesystem work starts unless
@@ -145,9 +160,9 @@ extension AppModel {
 
     private enum SelectionRole: Hashable { case output, input, dark, flat, bias, flats, darkFlats }
 
-    /// One synchronous authorization batch. Current selections change only from
+    /// One captured authorization batch. Current selections change only from
     /// successfully resolved tokens, even when another required location fails.
-    private func acquireSelections(input: URL?, includeOutput: Bool) -> [(SelectionRole, Result<FileAccessLease, Error>)] {
+    private func acquireSelections(input: URL?, includeOutput: Bool) async throws -> [(SelectionRole, Result<FileAccessLease, Error>)] {
         var requests: [(SelectionRole, AuthorizedLocations.Request)] = []
         if includeOutput { requests.append((.output, isStorePreview ? .key("output") : .url(liveAstroRoot))) }
         if let input { requests.append((.input, .url(input))) }
@@ -156,7 +171,8 @@ extension AppModel {
         }
         if let url = sessionFlatsFolder { requests.append((.flats, .url(url))) }
         if let url = sessionDarkFlatsFolder { requests.append((.darkFlats, .url(url))) }
-        let results = zip(requests, authorizedLocations.acquireGroup(requests.map(\.1))).map { ($0.0.0, $0.1) }
+        let acquired = try await acquireLocations(requests.map(\.1))
+        let results = zip(requests, acquired).map { ($0.0.0, $0.1) }
         guard isStorePreview else { return results }
         for (role, result) in results {
             guard case .success(let lease) = result else { continue }
@@ -187,7 +203,6 @@ extension AppModel {
     func restoreAuthorizedSelections() {
         guard isStorePreview else { return }
         invalidateAccessRestoration()
-        var checks: [(FileAccessLease, Bool)] = []
         selectedOutputFolder = authorizedLocations.displayURL(key: "output")
         for dark in [false, true] {
             guard let path = userDefaults.string(forKey: dark ? "StorePreview.darkFlatsPath" : "StorePreview.flatsPath") else { continue }
@@ -195,33 +210,37 @@ extension AppModel {
             if dark { sessionDarkFlatsFolder = displayed } else { sessionFlatsFolder = displayed }
         }
         if let displayed = authorizedLocations.displayURL(key: "capture") { watchFolder = displayed }
-        for (role, result) in acquireSelections(input: watchFolder, includeOutput: selectedOutputFolder != nil) {
-            switch result {
-            case .success(let lease): checks.append((lease, role == .output))
-            case .failure(let error): reportFileAccess(error)
-            }
-        }
-        guard !checks.isEmpty else { return }
         let id = UUID()
         accessRestorationID = id
-        let checker = locationAvailability
-        accessRestorationTask = Task.detached { [weak self, checks] in
-            defer { withExtendedLifetime(checks) {} }
-            let owner = self
-            var failure: Error?
+        accessRestorationTask = Task { [weak self] in
+            guard let self else { return }
             do {
-                for (lease, writing) in checks {
-                    try Task.checkCancellation()
-                    try checker.check(lease.url, forWriting: writing)
+                let results = try await self.acquireSelections(input: self.watchFolder, includeOutput: self.selectedOutputFolder != nil)
+                guard self.accessRestorationID == id else { return }
+                var checks: [(FileAccessLease, Bool)] = []
+                for (role, result) in results {
+                    switch result {
+                    case .success(let lease): checks.append((lease, role == .output))
+                    case .failure(let error): self.reportFileAccess(error)
+                    }
                 }
-            } catch { failure = error }
-            let result = failure
-            await MainActor.run {
-                guard let self = owner, self.accessRestorationID == id else { return }
-                self.accessRestorationID = nil
-                self.accessRestorationTask = nil
-                if let result { self.reportFileAccess(result) }
+                let checker = self.locationAvailability
+                let captured = checks
+                let worker = Task.detached {
+                    defer { withExtendedLifetime(captured) {} }
+                    for (lease, writing) in captured {
+                        try Task.checkCancellation()
+                        try checker.check(lease.url, forWriting: writing)
+                    }
+                }
+                try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+            } catch {
+                guard self.accessRestorationID == id else { return }
+                if !(error is CancellationError) { self.reportFileAccess(error) }
             }
+            guard self.accessRestorationID == id else { return }
+            self.accessRestorationID = nil
+            self.accessRestorationTask = nil
         }
     }
 }

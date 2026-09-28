@@ -6,33 +6,33 @@ import XCTest
 final class StoreCameraShareTests: XCTestCase {
     // Break caught: cancelled replacement erases the saved grant, or Start prompts
     // again rather than resolving the stored bookmark in a fresh service.
-    func testPickerCancelPreservesSavedShareAndRestartReusesIt() throws {
+    func testPickerCancelPreservesSavedShareAndRestartReusesIt() async throws {
         let suite = "CameraAuthorization.\(UUID())", defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let backend = CameraBookmarkBackend()
         func locations() -> AuthorizedLocations { AuthorizedLocations(defaults: defaults, policy: .sandboxed, containerRoots: [], backend: backend) }
         let selected = URL(fileURLWithPath: "/chosen-camera")
         let first = CameraShareAuthorization(locations: locations(), choose: { _ in selected })
-        XCTAssertEqual(try first.acquire(.seestar)?.url, selected)
+        await assertAccessEqual(try await first.acquire(.seestar)?.url, selected)
         let reopened = CameraShareAuthorization(locations: locations(), choose: { _ in XCTFail("saved grant must avoid picker"); return nil })
-        XCTAssertEqual(try reopened.acquire(.seestar)?.url, selected)
+        await assertAccessEqual(try await reopened.acquire(.seestar)?.url, selected)
         let cancel = CameraShareAuthorization(locations: locations(), choose: { _ in nil })
-        XCTAssertNil(try cancel.acquire(.seestar, replacing: true))
-        XCTAssertEqual(try reopened.acquire(.seestar)?.url, selected)
-        XCTAssertNil(try cancel.acquire(.asiair))
+        await assertAccessNil(try await cancel.acquire(.seestar, replacing: true))
+        await assertAccessEqual(try await reopened.acquire(.seestar)?.url, selected)
+        await assertAccessNil(try await cancel.acquire(.asiair))
         XCTAssertNil(locations().displayURL(key: "camera:asiair"))
     }
 
-    func testDeniedRememberedShareDoesNotFallBackToPickerOrOtherLocation() throws {
+    func testDeniedRememberedShareDoesNotFallBackToPickerOrOtherLocation() async throws {
         let suite = "CameraAuthorization.\(UUID())", defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let backend = CameraBookmarkBackend()
         let locations = AuthorizedLocations(defaults: defaults, policy: .sandboxed, containerRoots: [], backend: backend)
         let share = URL(fileURLWithPath: "/chosen-camera")
-        _ = try locations.select(share, key: "camera:asiair")
+        _ = try await locations.select(share, key: "camera:asiair")
         backend.denied = true
         let service = CameraShareAuthorization(locations: locations, choose: { _ in XCTFail("denial must not silently replace selection"); return nil })
-        XCTAssertThrowsError(try service.acquire(.asiair))
+        await assertAccessThrows(try await service.acquire(.asiair))
         XCTAssertEqual(locations.displayURL(key: "camera:asiair")?.path, share.path)
     }
 
@@ -130,8 +130,8 @@ final class StoreCameraShareTests: XCTestCase {
                      configuration: configuration, bookmarkBackend: backend)
         }
         var original: AppModel? = makeModel()
-        XCTAssertTrue(original!.selectLocation(share, key: seestar ? "camera:seestar" : "camera:asiair"))
-        XCTAssertTrue(original!.selectLocation(output, key: "output"))
+        await assertAccessTrue(await original!.selectLocation(share, key: seestar ? "camera:seestar" : "camera:asiair"))
+        await assertAccessTrue(await original!.selectLocation(output, key: "output"))
         original = nil
         let model = makeModel()
         if seestar { model.liveSource.startSeestarLive() } else { model.liveSource.startASIAIRLive() }

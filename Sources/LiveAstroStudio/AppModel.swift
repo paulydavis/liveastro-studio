@@ -398,6 +398,9 @@ final class AppModel {
     let distribution: StorePreviewConfiguration
     let authorizedLocations: AuthorizedLocations
     let locationAvailability: any LocationAvailabilityChecking
+    var locationSelectionGeneration: UInt64 = 0
+    private var calibrationPreparationID: UUID?
+    private var calibrationPreparationTask: Task<Void, Never>?
     var accessRestorationID: UUID?
     var accessRestorationTask: Task<Void, Never>?
     var isRestoringLocationAccess: Bool { accessRestorationID != nil }
@@ -411,14 +414,33 @@ final class AppModel {
         completedSessionAccess = isStorePreview ? access.map { SessionDirectoryAccess(url: url, operation: $0) } : nil
     }
 
-    private func acquireSessionDirectoryAccess(_ url: URL) throws -> SessionDirectoryAccess {
+    private func acquireSessionDirectoryAccess(_ url: URL) async throws -> SessionDirectoryAccess {
+        let canonical = await Task.detached { try? FileLocationCanonicalizer().canonicalURL(url) }.value
+        try Task.checkCancellation()
         if let retained = completedSessionAccess,
-           retained.url.path == url.standardizedFileURL.resolvingSymlinksInPath().path {
+           retained.url.path == canonical?.path {
             return retained
         }
-        return SessionDirectoryAccess(lease: try acquireReadableLocation(url))
+        return SessionDirectoryAccess(lease: try await acquireReadableLocation(url))
+    }
+
+    func sessionArtifactNames(in directory: URL,
+                              scan: @escaping @Sendable (URL) throws -> Set<String> = { directory in
+        let names = ["master.fit", "latest.png", "session-summary.md", "frame-summary.csv", SubFrameCSV.filename]
+        return Set(names.filter { FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path) })
+    }) async throws -> Set<String> {
+        let access = try await acquireSessionDirectoryAccess(directory)
+        let worker = Task.detached { [access] in
+            defer { withExtendedLifetime(access) {} }
+            try Task.checkCancellation()
+            return try scan(access.url)
+        }
+        let names = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+        try Task.checkCancellation()
+        return names
     }
     private var demoTask: Task<Void, Never>?
+    private var demoPreparationID: UUID?
 
     /// Where session/calibration settings persist. Defaults to `.standard` (production); tests
     /// inject a per-test temporary suite (`UserDefaults(suiteName:)`) so a test run never reads
@@ -532,10 +554,13 @@ final class AppModel {
             isRestacking: { [weak self] in MainActor.assumeIsolated { self?.isRestacking ?? false } },
             acquireOperationAccess: { [weak self] url in
                 guard let self else { throw CocoaError(.userCancelled) }
-                return try self.acquireOperationAccess(input: url)
+                return try await self.acquireOperationAccess(input: url)
             }, acquireCameraShare: { [weak self] kind, replacing in
                 guard let self else { throw CocoaError(.userCancelled) }
-                return try CameraShareAuthorization(locations: self.authorizedLocations).acquire(kind, replacing: replacing)
+                return try await CameraShareAuthorization(locations: self.authorizedLocations, acquireSaved: { key in
+                    let results = try await self.acquireLocations([.key(key)])
+                    return try results[0].get()
+                }).acquire(kind, replacing: replacing)
             }, startAuthorizedSession: { [weak self] access, completion in
                 guard let self else { completion(false); return }
                 self.startSession(access: access, completion: completion)
@@ -571,10 +596,10 @@ final class AppModel {
                 MainActor.assumeIsolated { self?.publishFinishedSession(url, access: access) } },
             acquireOperationAccess: { [weak self] url in
                 guard let self else { throw CocoaError(.userCancelled) }
-                return try self.acquireOperationAccess(input: url)
+                return try await self.acquireOperationAccess(input: url)
             }, acquireLocationAccess: { [weak self] url in
                 guard let self else { throw CocoaError(.userCancelled) }
-                return try self.acquireSessionDirectoryAccess(url)
+                return try await self.acquireSessionDirectoryAccess(url)
             }, isStorePreview: configuration.isStorePreview, catalogURL: configuration.catalogURL,
             persistCalibration: { [weak self] selection in
                 guard let self else { return }
@@ -1228,65 +1253,86 @@ final class AppModel {
 
     // MARK: - Calibration library management
 
+    func cancelCalibrationPreparation() {
+        guard calibrationPreparationID != nil else { return }
+        calibrationPreparationID = nil
+        calibrationPreparationTask?.cancel()
+        calibrationPreparationTask = nil
+        calibrationBusy = false
+    }
+
     func refreshLibraryEntries() { libraryEntries = calibrationLibrary.all() }
 
     /// Build a master (dark or bias) from a folder of raw frames, keyed automatically
     /// from the first frame's FITS header, and add it to the library. Off the main thread.
     func addMasterFromFolder(_ folder: URL, kind: MasterKind) {
-        let access: FileAccessLease
-        do { access = try acquireReadableLocation(folder) }
-        catch { reportFileAccess(error); return }
+        guard !calibrationBusy else { return }
         calibrationBusy = true
-        log.append("Calibration: preparing \(kind.rawValue) master…")
-        let lib = calibrationLibrary
-        let sourceDirectory = isStorePreview ? access.url : nil
-        let strict = isStorePreview
-        Task.detached { [weak self, access] in
-            defer { withExtendedLifetime(access) {} }
-            // Swift 6: rebind weak self to a strong immutable up front — nested
-            // @Sendable closures may not reference a captured weak *var*.
-            guard let self else { return }
-            let urls: [URL]
-            do { urls = try CalibrationLibrary.fitsFilesRequiringAccess(in: access.url) }
+        let preparationID = UUID()
+        calibrationPreparationID = preparationID
+        calibrationPreparationTask = Task {
+            let access: FileAccessLease
+            do { access = try await acquireReadableLocation(folder) }
             catch {
-                await MainActor.run { self.calibrationBusy = false; self.reportFileAccess(error) }
+                guard calibrationPreparationID == preparationID else { return }
+                cancelCalibrationPreparation()
+                if !(error is CancellationError) { reportFileAccess(error) }
                 return
             }
-            guard !urls.isEmpty else {
-                await MainActor.run { self.calibrationBusy = false; self.log.append("Calibration: no FITS frames in that folder.") }
-                return
-            }
-            // Key the master from the first READABLE frame's header — not urls[0], which may be the
-            // corrupt/unreadable file MasterBuilder silently skips. Keying off a skipped file would
-            // stamp the master with generic/nil camera+gain so it never matches lights later.
-            var meta = SourceMetadata()
-            for url in urls {
-                guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
-                defer { try? fh.close() }
-                if let head = try? fh.read(upToCount: 256 * 1024),
-                   let header = try? FITSReader.readHeader(head) {
-                    meta = SourceMetadata(fitsKeywords: header.keywords)
-                    break
+            guard calibrationPreparationID == preparationID, !Task.isCancelled else { return }
+            calibrationPreparationID = nil
+            calibrationPreparationTask = nil
+            log.append("Calibration: preparing \(kind.rawValue) master…")
+            let lib = calibrationLibrary
+            let sourceDirectory = isStorePreview ? access.url : nil
+            let strict = isStorePreview
+            Task.detached { [weak self, access] in
+                defer { withExtendedLifetime(access) {} }
+                // Swift 6: rebind weak self to a strong immutable up front — nested
+                // @Sendable closures may not reference a captured weak *var*.
+                guard let self else { return }
+                let urls: [URL]
+                do { urls = try CalibrationLibrary.fitsFilesRequiringAccess(in: access.url) }
+                catch {
+                    await MainActor.run { self.calibrationBusy = false; self.reportFileAccess(error) }
+                    return
                 }
-            }
-            do {
-                let frame = try lib.add(kind: kind, camera: meta.instrument ?? "Camera",
-                    gain: meta.gain, exposureSeconds: kind == .bias ? nil : meta.exposureSeconds,
-                    // Store only the controlled SET-TEMP as the master's setpoint. CCD-TEMP (actual,
-                    // uncontrolled) must not masquerade as a setpoint — that made uncooled darks carry
-                    // a spurious temperature that then false-rejected uncooled lights.
-                    setTempC: meta.setTempC, binning: meta.binning, fitsURLs: urls,
-                    sourceDirectory: sourceDirectory, failOnReadError: strict)
-                await MainActor.run {
-                    self.calibrationBusy = false
-                    self.refreshLibraryEntries()
-                    self.log.append("Calibration: added \(frame.camera) \(kind.rawValue).")
+                guard !urls.isEmpty else {
+                    await MainActor.run { self.calibrationBusy = false; self.log.append("Calibration: no FITS frames in that folder.") }
+                    return
                 }
-            } catch {
-                await MainActor.run {
-                    self.calibrationBusy = false
-                    if error is CalibrationReadError { self.reportFileAccess(error) }
-                    self.log.append("Calibration: build failed — \(error.localizedDescription)")
+                // Key the master from the first READABLE frame's header — not urls[0], which may be the
+                // corrupt/unreadable file MasterBuilder silently skips. Keying off a skipped file would
+                // stamp the master with generic/nil camera+gain so it never matches lights later.
+                var meta = SourceMetadata()
+                for url in urls {
+                    guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
+                    defer { try? fh.close() }
+                    if let head = try? fh.read(upToCount: 256 * 1024),
+                       let header = try? FITSReader.readHeader(head) {
+                        meta = SourceMetadata(fitsKeywords: header.keywords)
+                        break
+                    }
+                }
+                do {
+                    let frame = try lib.add(kind: kind, camera: meta.instrument ?? "Camera",
+                        gain: meta.gain, exposureSeconds: kind == .bias ? nil : meta.exposureSeconds,
+                        // Store only the controlled SET-TEMP as the master's setpoint. CCD-TEMP (actual,
+                        // uncontrolled) must not masquerade as a setpoint — that made uncooled darks carry
+                        // a spurious temperature that then false-rejected uncooled lights.
+                        setTempC: meta.setTempC, binning: meta.binning, fitsURLs: urls,
+                        sourceDirectory: sourceDirectory, failOnReadError: strict)
+                    await MainActor.run {
+                        self.calibrationBusy = false
+                        self.refreshLibraryEntries()
+                        self.log.append("Calibration: added \(frame.camera) \(kind.rawValue).")
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.calibrationBusy = false
+                        if error is CalibrationReadError { self.reportFileAccess(error) }
+                        self.log.append("Calibration: build failed — \(error.localizedDescription)")
+                    }
                 }
             }
         }
@@ -1300,43 +1346,40 @@ final class AppModel {
     func rebuildMaster(_ id: UUID) {
         let entries = calibrationLibrary.all()
         guard let selected = entries.first(where: { $0.id == id }), let path = selected.sourcePath else { return }
-        let access: FileAccessLease
-        do {
-            if isStorePreview {
-                // Resolve all remembered siblings against ONE original grant snapshot.
-                // Renewal must not strand another child of the same moved grant.
-                let sources = [selected] + entries.filter { $0.id != id && $0.sourcePath != nil }
-                let results = authorizedLocations.acquireGroup(sources.map { .url(URL(fileURLWithPath: $0.sourcePath!)) })
-                var resolved: [UUID: URL] = [:]
-                for (entry, result) in zip(sources, results) {
-                    if case .success(let lease) = result { resolved[entry.id] = lease.url }
-                }
-                // Save successful identities even if the selected acquisition/build
-                // fails; unrelated failed grants do not block this entry's rebuild.
-                try calibrationLibrary.updateSourceDirectories(resolved)
-                refreshLibraryEntries()
-                access = try results[0].get()
-            } else { access = try acquireReadableLocation(URL(fileURLWithPath: path)) }
-        }
-        catch { reportFileAccess(error); return }
+        guard !calibrationBusy else { return }
         calibrationBusy = true
-        let lib = calibrationLibrary
-        let strict = isStorePreview
-        Task.detached { [weak self, access] in
-            defer { withExtendedLifetime(access) {} }
-            guard let self else { return }   // Swift 6: strong immutable for nested closures
-            do {
-                try lib.rebuild(id: id, sourceDirectory: access.url, failOnReadError: strict)
-                await MainActor.run { self.log.append("Calibration: rebuilt master.") }
-            } catch {
-                await MainActor.run {
-                    if error is CalibrationReadError { self.reportFileAccess(error) }
-                    self.log.append("Calibration: rebuild failed — \(error.localizedDescription)")
-                }
+        let preparationID = UUID()
+        calibrationPreparationID = preparationID
+        calibrationPreparationTask = Task {
+            let access: FileAccessLease
+            do { access = try await acquireReadableLocation(URL(fileURLWithPath: path)) }
+            catch {
+                guard calibrationPreparationID == preparationID else { return }
+                cancelCalibrationPreparation()
+                if !(error is CancellationError) { reportFileAccess(error) }
+                return
             }
-            await MainActor.run {
-                self.calibrationBusy = false
-                self.refreshLibraryEntries()
+            guard calibrationPreparationID == preparationID, !Task.isCancelled else { return }
+            calibrationPreparationID = nil
+            calibrationPreparationTask = nil
+            let lib = calibrationLibrary
+            let strict = isStorePreview
+            Task.detached { [weak self, access] in
+                defer { withExtendedLifetime(access) {} }
+                guard let self else { return }   // Swift 6: strong immutable for nested closures
+                do {
+                    try lib.rebuild(id: id, sourceDirectory: access.url, failOnReadError: strict)
+                    await MainActor.run { self.log.append("Calibration: rebuilt master.") }
+                } catch {
+                    await MainActor.run {
+                        if error is CalibrationReadError { self.reportFileAccess(error) }
+                        self.log.append("Calibration: rebuild failed — \(error.localizedDescription)")
+                    }
+                }
+                await MainActor.run {
+                    self.calibrationBusy = false
+                    self.refreshLibraryEntries()
+                }
             }
         }
     }
@@ -1381,9 +1424,14 @@ final class AppModel {
     private var inputPreparationID: UUID?
     private var inputPreparationTask: Task<Void, Never>?
     var isPreparingSessionInput: Bool { inputPreparationID != nil }
-    var hasPendingSessionStart: Bool { isPreparingSessionInput || pendingSessionStart != nil }
+    var hasPendingSessionStart: Bool { isPreparingSessionInput || pendingSessionStart != nil || demoPreparationID != nil }
 
     func cancelSessionInputPreparation() {
+        if demoPreparationID != nil {
+            demoPreparationID = nil
+            demoTask?.cancel()
+            demoTask = nil
+        }
         guard isPreparingSessionInput else { return }
         inputPreparationID = nil // retire ownership before the worker can complete
         inputPreparationTask?.cancel()
@@ -1515,28 +1563,68 @@ final class AppModel {
             return
         }
         sessionInputStatus = nil
-        do {
-            guard let folder = watchFolder else { throw AuthorizedLocationError.missingSelection("capture") }
-            pendingFileAccess = try access ?? acquireOperationAccess(input: folder)
-            watchFolder = pendingFileAccess?.input
-        } catch {
-            pendingFileAccess = nil
-            reportFileAccess(error)
+        guard let folder = watchFolder else {
+            reportFileAccess(AuthorizedLocationError.missingSelection("capture"))
             completion(false)
             return
         }
+        let id = UUID()
+        let requestedFilter = fileNamePrefix.isEmpty ? nil : fileNamePrefix
+        let requestedNative = sourceMode == .nativeStack
+        inputPreparationID = id
+        pendingStartCompletion = completion
+        sessionInputStatus = .preparingBaseline(completed: 0, total: 0)
+        inputPreparationTask = Task { [weak self] in
+            guard let self else { return }
+            guard self.inputPreparationID == id else { return }
+            guard self.watchFolder?.standardizedFileURL == folder.standardizedFileURL,
+                  (self.fileNamePrefix.isEmpty ? nil : self.fileNamePrefix) == requestedFilter,
+                  (self.sourceMode == .nativeStack) == requestedNative else {
+                self.finishInputPreparation(.failure(CancellationError()), id: id, folder: folder,
+                                            filter: requestedFilter, native: requestedNative)
+                return
+            }
+            do {
+                let acquired: OperationFileAccess
+                if let access { acquired = access }
+                else { acquired = try await self.acquireOperationAccess(input: folder) }
+                try Task.checkCancellation()
+                guard self.inputPreparationID == id else { return }
+                guard (self.fileNamePrefix.isEmpty ? nil : self.fileNamePrefix) == requestedFilter,
+                      (self.sourceMode == .nativeStack) == requestedNative else {
+                    self.finishInputPreparation(.failure(CancellationError()), id: id, folder: acquired.input,
+                                                filter: requestedFilter, native: requestedNative)
+                    return
+                }
+                self.pendingFileAccess = acquired
+                self.watchFolder = acquired.input
+                self.continueAuthorizedStart(id: id, completion: completion)
+            } catch {
+                guard self.inputPreparationID == id else { return }
+                if self.watchFolder?.standardizedFileURL != folder.standardizedFileURL {
+                    self.finishInputPreparation(.failure(error), id: id, folder: folder,
+                                                filter: requestedFilter, native: requestedNative)
+                    return
+                }
+                self.cancelSessionInputPreparation()
+                if !(error is CancellationError) { self.reportFileAccess(error) }
+            }
+        }
+    }
+
+    private func continueAuthorizedStart(id: UUID, completion: @escaping (Bool) -> Void) {
         let native = sourceMode == .nativeStack
-        guard native || isStorePreview else { completion(beginSession(excludingPreExisting: nil)); return }
+        guard native || isStorePreview else {
+            inputPreparationID = nil; inputPreparationTask = nil; pendingStartCompletion = nil
+            sessionInputStatus = nil
+            completion(beginSession(excludingPreExisting: nil)); return
+        }
         guard let folder = watchFolder else {
             errorMessage = "Pick a watch folder first."
             completion(false)
             return
         }
         let filter = fileNamePrefix.isEmpty ? nil : fileNamePrefix
-        let id = UUID()
-        inputPreparationID = id
-        pendingStartCompletion = completion
-        sessionInputStatus = .preparingBaseline(completed: 0, total: 0)
         inputPreparationTask = Task.detached(priority: .userInitiated) { [weak self, access = pendingFileAccess] in
             defer { withExtendedLifetime(access) {} }
             let owner = self
@@ -1801,47 +1889,61 @@ final class AppModel {
             return
         }
 
-        let output: FileAccessLease
-        do { output = try acquireOutputLocation() }
-        catch { reportFileAccess(error); return }
-        defer { withExtendedLifetime(output) {} }
-        let folder = output.url.appendingPathComponent("DemoInput", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        } catch {
-            errorMessage = "Could not create demo folder: \(error.localizedDescription)"
-            return
-        }
+        guard !hasPendingSessionStart, demoTask == nil else { return }
+        let preparationID = UUID()
+        demoPreparationID = preparationID
+        demoTask = Task {
+            defer {
+                if demoPreparationID == preparationID { demoPreparationID = nil; demoTask = nil }
+            }
+            let output: FileAccessLease
+            do { output = try await acquireOutputLocation() }
+            catch { if demoPreparationID == preparationID, !(error is CancellationError) { reportFileAccess(error) }; return }
+            defer { withExtendedLifetime(output) {} }
+            let folder = output.url.appendingPathComponent("DemoInput", isDirectory: true)
+            do {
+                try await Task.detached { [output] in
+                    defer { withExtendedLifetime(output) {} }
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                }.value
+                try Task.checkCancellation()
+            } catch {
+                if demoPreparationID == preparationID, !(error is CancellationError) { errorMessage = "Could not create demo folder: \(error.localizedDescription)" }
+                return
+            }
 
-        demoTask?.cancel()
-        // Snapshot the user's real settings so ending the demo restores them — the
-        // demo must leave no "Demo Nebula"/30 s branding, and no DemoInput folder /
-        // stacker-output mode / demo prefix, on a later real session or in saved
-        // settings (see metadataBeforeDemo, saveSettings, endSession). Captured
-        // BEFORE the overrides below.
-        metadataBeforeDemo = DemoMetadataSnapshot(
-            targetName: targetName, telescope: telescope, camera: camera, mount: mount,
-            filter: filter, locationLabel: locationLabel, bortleText: bortleText,
-            subExposureText: subExposureText, notes: notes,
-            sourceMode: sourceMode, watchFolder: watchFolder, fileNamePrefix: fileNamePrefix)
-        sourceMode = .stackerOutput
-        watchFolder = folder
-        fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
-        targetName = "Demo Nebula"
-        telescope = "Demo Stack Generator"
-        camera = "Synthetic FITS"
-        mount = "Demo"
-        filter = "Synthetic luminance"
-        locationLabel = "No-sky demo"
-        bortleText = ""
-        subExposureText = "30"
-        notes = "Generated by LiveAstro Try Demo."
-        log.append("Try Demo — writing sample stack updates to \(folder.path)")
+            guard demoPreparationID == preparationID, !isRunning, !importer.isImporting else { return }
+            demoPreparationID = nil
+            demoTask = nil
+            // Snapshot the user's real settings so ending the demo restores them — the
+            // demo must leave no "Demo Nebula"/30 s branding, and no DemoInput folder /
+            // stacker-output mode / demo prefix, on a later real session or in saved
+            // settings (see metadataBeforeDemo, saveSettings, endSession). Captured
+            // BEFORE the overrides below.
+            metadataBeforeDemo = DemoMetadataSnapshot(
+                targetName: targetName, telescope: telescope, camera: camera, mount: mount,
+                filter: filter, locationLabel: locationLabel, bortleText: bortleText,
+                subExposureText: subExposureText, notes: notes,
+                sourceMode: sourceMode, watchFolder: watchFolder, fileNamePrefix: fileNamePrefix)
+            sourceMode = .stackerOutput
+            watchFolder = folder
+            fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
+            targetName = "Demo Nebula"
+            telescope = "Demo Stack Generator"
+            camera = "Synthetic FITS"
+            mount = "Demo"
+            filter = "Synthetic luminance"
+            locationLabel = "No-sky demo"
+            bortleText = ""
+            subExposureText = "30"
+            notes = "Generated by LiveAstro Try Demo."
+            log.append("Try Demo — writing sample stack updates to \(folder.path)")
 
-        startSession { [weak self, output] started in
-            guard let self else { return }
-            guard started else { self.restoreMetadataAfterDemoIfNeeded(); return }
-            self.runDemoGenerator(folder: folder, output: output)
+            startSession { [weak self, output] started in
+                guard let self else { return }
+                guard started else { self.restoreMetadataAfterDemoIfNeeded(); return }
+                self.runDemoGenerator(folder: folder, output: output)
+            }
         }
     }
 
@@ -2680,9 +2782,11 @@ final class AppModel {
         let panel = makeDirectoryPanel(title: title, message: message)
         panel.prompt = "Watch"
         if panel.runModal() == .OK, let url = panel.url {
-            guard selectLocation(url, key: "capture") else { return }
+            Task {
+            guard await selectLocation(url, key: "capture") else { return }
             self.sourceMode = sourceMode
             self.liveSource.startWatchFolderLive(source: watchFolder ?? url, sourceMode: sourceMode)
+            }
         }
     }
 
@@ -2690,8 +2794,10 @@ final class AppModel {
         let panel = makeDirectoryPanel(title: "Choose Subs Folder",
                                        message: "Select a folder containing raw FITS subs to import")
         if panel.runModal() == .OK, let url = panel.url {
-            guard let selected = selectSourceFolder(url) else { return }
+            Task {
+            guard let selected = await selectSourceFolder(url) else { return }
             importer.importSubs(from: selected)
+            }
         }
     }
 }

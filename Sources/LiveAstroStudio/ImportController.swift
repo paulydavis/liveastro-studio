@@ -78,50 +78,58 @@ final class ImportController {
             surface.presentError("Finish the re-stack before importing."); return
         }
         guard !isImporting else { return }
-        let access: OperationFileAccess?
-        do { access = try surface.acquireOperationAccess?(folder) }
-        catch { surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again."); return }
-        let folder = access?.input ?? folder
-        let output = access?.output ?? surface.currentLiveAstroRoot!()
-        let calibration = access?.calibration ?? surface.currentCalibration!()
-        // Offline import: `onSubFrame` fires native-only, so clear the native-session-only
-        // stats/re-stack state now — otherwise Stats would show a prior live session's rows and
-        // a re-stack could target the prior session's folder (Fix P2-import). Full import
-        // stats-wiring (populating subFrames for imports) is a future feature.
-        let prefix = surface.currentFileNamePrefix?() ?? ""
-        importProcessed = 0
-        importTotal = 0
         isImporting = true
         importPrepareGeneration += 1
         importPrepareInFlight = true
         let generation = importPrepareGeneration
-        surface.log("Preparing import from \(folder.path)…")
+        importPreparationTask = Task {
+            let access: OperationFileAccess?
+            do { access = try await surface.acquireOperationAccess?(folder) }
+            catch {
+                guard importPrepareGeneration == generation else { return }
+                importPrepareInFlight = false; isImporting = false; importPreparationTask = nil
+                if !(error is CancellationError) { surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again.") }
+                return
+            }
+            guard importPrepareGeneration == generation, !Task.isCancelled else { return }
+            let folder = access?.input ?? folder
+            let output = access?.output ?? surface.currentLiveAstroRoot!()
+            let calibration = access?.calibration ?? surface.currentCalibration!()
+            // Offline import: `onSubFrame` fires native-only, so clear the native-session-only
+            // stats/re-stack state now — otherwise Stats would show a prior live session's rows and
+            // a re-stack could target the prior session's folder (Fix P2-import). Full import
+            // stats-wiring (populating subFrames for imports) is a future feature.
+            let prefix = surface.currentFileNamePrefix?() ?? ""
+            importProcessed = 0
+            importTotal = 0
+            surface.log("Preparing import from \(folder.path)…")
 
-        let strict = surface.isStorePreview
-        importPreparationTask = Task.detached { [weak self, folder, prefix, access] in
-            defer { withExtendedLifetime(access) {} }
-            guard let self else { return }
-            do {
-                try access?.validateAvailability()
-                try Task.checkCancellation()
-                let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder)
-                try Task.checkCancellation()
-                let dark = calibration.darkPath.map { URL(fileURLWithPath: $0) }
-                let flat = calibration.flatPath.map { URL(fileURLWithPath: $0) }
-                let loaded: (Calibrator?, [String])
-                if strict { loaded = (try CalibrationLoader.makeCalibratorRequiringAccess(dark: dark, flat: flat), []) }
-                else { loaded = CalibrationLoader.makeCalibrator(dark: dark, flat: flat) }
-                await MainActor.run {
-                    self.beginImport(from: folder, meta: meta, prefix: prefix, generation: generation,
-                                     output: output, calibration: calibration, access: access, loaded: loaded)
-                }
-            } catch {
-                await MainActor.run {
-                    guard self.importPrepareGeneration == generation else { return }
-                    self.importPrepareInFlight = false
-                    self.importPreparationTask = nil
-                    self.isImporting = false
-                    self.surface.presentError("Import preparation failed: \(error.localizedDescription) Reconnect or choose the folder again.")
+            let strict = surface.isStorePreview
+            importPreparationTask = Task.detached { [weak self, folder, prefix, access] in
+                defer { withExtendedLifetime(access) {} }
+                guard let self else { return }
+                do {
+                    try access?.validateAvailability()
+                    try Task.checkCancellation()
+                    let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder)
+                    try Task.checkCancellation()
+                    let dark = calibration.darkPath.map { URL(fileURLWithPath: $0) }
+                    let flat = calibration.flatPath.map { URL(fileURLWithPath: $0) }
+                    let loaded: (Calibrator?, [String])
+                    if strict { loaded = (try CalibrationLoader.makeCalibratorRequiringAccess(dark: dark, flat: flat), []) }
+                    else { loaded = CalibrationLoader.makeCalibrator(dark: dark, flat: flat) }
+                    await MainActor.run {
+                        self.beginImport(from: folder, meta: meta, prefix: prefix, generation: generation,
+                                         output: output, calibration: calibration, access: access, loaded: loaded)
+                    }
+                } catch {
+                    await MainActor.run {
+                        guard self.importPrepareGeneration == generation else { return }
+                        self.importPrepareInFlight = false
+                        self.importPreparationTask = nil
+                        self.isImporting = false
+                        self.surface.presentError("Import preparation failed: \(error.localizedDescription) Reconnect or choose the folder again.")
+                    }
                 }
             }
         }
@@ -237,82 +245,96 @@ final class ImportController {
 
     func regenerateReplay(sessionDirectory: URL) {
         guard !surface.isSessionRunning() && !isGeneratingReplay else { return }
-        let access: SessionDirectoryAccess?
-        do { access = try surface.acquireLocationAccess?(sessionDirectory) }
-        catch { surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again."); return }
-        let sessionDirectory = access?.url ?? sessionDirectory
         isGeneratingReplay = true
-        surface.log("Regenerating replay for \(sessionDirectory.lastPathComponent)…")
-        Task.detached { [weak self, access] in
-            defer { withExtendedLifetime(access) {} }
-            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
-            do {
-                let url = try ReplayService.regenerate(sessionDirectory: sessionDirectory)
-                await MainActor.run {
-                    self.surface.setReplayURL?(url)
-                    self.surface.log("Replay ready: \(url.lastPathComponent)")
+        Task {
+            let access: SessionDirectoryAccess?
+            do { access = try await surface.acquireLocationAccess?(sessionDirectory) }
+            catch { isGeneratingReplay = false; surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again."); return }
+            let sessionDirectory = access?.url ?? sessionDirectory
+            isGeneratingReplay = true
+            surface.log("Regenerating replay for \(sessionDirectory.lastPathComponent)…")
+            Task.detached { [weak self, access] in
+                defer { withExtendedLifetime(access) {} }
+                guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
+                do {
+                    let url = try ReplayService.regenerate(sessionDirectory: sessionDirectory)
+                    await MainActor.run {
+                        self.surface.setReplayURL?(url)
+                        self.surface.log("Replay ready: \(url.lastPathComponent)")
+                    }
+                } catch {
+                    await MainActor.run { self.surface.presentError("Regenerate failed: \(error)") }
                 }
-            } catch {
-                await MainActor.run { self.surface.presentError("Regenerate failed: \(error)") }
+                await MainActor.run { self.isGeneratingReplay = false }
             }
-            await MainActor.run { self.isGeneratingReplay = false }
         }
     }
 
     func processMaster(sessionDirectory: URL) {
         guard !isProcessing, !isImporting, !surface.isSessionRunning() else { return }
         let backend = surface.currentProcessorBackend?() ?? ProcessorBackend.none
+        guard backend != .none else { return }
         guard !(surface.isStorePreview && backend == .graxpert) else {
             surface.presentError("External processors are unavailable in this preview. Choose Native NR.")
             return
         }
-        let access: SessionDirectoryAccess?
-        do { access = try surface.acquireLocationAccess?(sessionDirectory) }
-        catch { surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again."); return }
-        let sessionDirectory = access?.url ?? sessionDirectory
-        let graxpertExe = GraXpertProcessor.defaultExecutable()
-        switch backend {
-        case .none:
-            return
-        case .graxpert:
-            guard graxpertExe != nil else {
-                surface.presentError("GraXpert not found — install it from graxpert.com"); return
-            }
-        case .nativeDenoise:
-            break   // always available (spec §2.3)
-        }
-        let master = sessionDirectory.appendingPathComponent("master.fit")
-        guard FileManager.default.fileExists(atPath: master.path) else {
-            surface.presentError("No master.fit in this session — post-processing needs a natively-stacked master (Raw subs mode).")
-            return
-        }
         isProcessing = true
-        let makeNativeProcessor = makeNativeProcessor
-        surface.log(backend == .graxpert ? "Processing master with GraXpert…"
-                                         : "Processing master with Native NR…")
-        Task.detached { [weak self, access] in
-            defer { withExtendedLifetime(access) {} }
-            guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
-            do {
-                let out = sessionDirectory.appendingPathComponent("master_processed.fit")
-                // graxpertExe was nil-checked above for the .graxpert arm; the force
-                // unwrap is unreachable otherwise.
-                let proc: any Processor = backend == .graxpert
-                    ? GraXpertProcessor(executable: graxpertExe!)
-                    : makeNativeProcessor()
-                // process() runs synchronously within this task, so the strong `self`
-                // let is safely captured by the progress callback for its duration.
-                let produced = try proc.process(masterURL: master, outputURL: out) { m in
-                    Task { @MainActor in self.surface.log(m) }
+        Task {
+            let access: SessionDirectoryAccess?
+            do { access = try await surface.acquireLocationAccess?(sessionDirectory) }
+            catch { isProcessing = false; surface.presentError("Folder access failed: \(error.localizedDescription) Choose the folder again."); return }
+            let sessionDirectory = access?.url ?? sessionDirectory
+            let graxpertExe = GraXpertProcessor.defaultExecutable()
+            switch backend {
+            case .none:
+                isProcessing = false
+                return
+            case .graxpert:
+                guard graxpertExe != nil else {
+                    isProcessing = false
+                    surface.presentError("GraXpert not found — install it from graxpert.com"); return
                 }
-                await MainActor.run {
-                    self.isProcessing = false
-                    self.surface.log("Processed → \(produced.lastPathComponent)")
-                }
-            } catch {
-                await MainActor.run {
-                    self.isProcessing = false
-                    self.surface.presentError("Processing failed: \(error)")
+            case .nativeDenoise:
+                break   // always available (spec §2.3)
+            }
+            let master = sessionDirectory.appendingPathComponent("master.fit")
+            let exists = await Task.detached { [access] in
+                defer { withExtendedLifetime(access) {} }
+                return FileManager.default.fileExists(atPath: master.path)
+            }.value
+            guard exists else {
+                isProcessing = false
+                surface.presentError("No master.fit in this session — post-processing needs a natively-stacked master (Raw subs mode).")
+                return
+            }
+            isProcessing = true
+            let makeNativeProcessor = makeNativeProcessor
+            surface.log(backend == .graxpert ? "Processing master with GraXpert…"
+                                             : "Processing master with Native NR…")
+            Task.detached { [weak self, access] in
+                defer { withExtendedLifetime(access) {} }
+                guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
+                do {
+                    let out = sessionDirectory.appendingPathComponent("master_processed.fit")
+                    // graxpertExe was nil-checked above for the .graxpert arm; the force
+                    // unwrap is unreachable otherwise.
+                    let proc: any Processor = backend == .graxpert
+                        ? GraXpertProcessor(executable: graxpertExe!)
+                        : makeNativeProcessor()
+                    // process() runs synchronously within this task, so the strong `self`
+                    // let is safely captured by the progress callback for its duration.
+                    let produced = try proc.process(masterURL: master, outputURL: out) { m in
+                        Task { @MainActor in self.surface.log(m) }
+                    }
+                    await MainActor.run {
+                        self.isProcessing = false
+                        self.surface.log("Processed → \(produced.lastPathComponent)")
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.isProcessing = false
+                        self.surface.presentError("Processing failed: \(error)")
+                    }
                 }
             }
         }
