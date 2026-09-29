@@ -100,7 +100,7 @@ final class OBSConnectionCheck {
         socket?.close()
     }
 
-    private var endpointURL: URL? {
+    var endpointURL: URL? {
         let host = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let port = port.trimmingCharacters(in: .whitespacesAndNewlines)
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:[]")

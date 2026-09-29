@@ -8,8 +8,30 @@ private enum AppLayout {
     static let mainDefaultSize = CGSize(width: 900, height: 720)
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+    weak var model: AppModel?
+    var confirmRecordingQuit: () -> Bool = {
+        OBSRecordingWarning.confirm(title: "Quit while OBS may be recording?", action: "Quit without stopping OBS")
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if model?.obsLocalRecording?.requiresAttention == true, !confirmRecordingQuit() {
+            return .terminateCancel
+        }
+        return .terminateNow
+    }
+}
+
+@MainActor enum OBSRecordingWarning {
+    static func confirm(title: String, action: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = "This does not stop OBS recording. Stop it separately in Broadcast, or in OBS if the connection is uncertain."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: action)
+        return alert.runModal() == .alertSecondButtonReturn
+    }
 }
 
 @main
@@ -25,6 +47,7 @@ struct LiveAstroApp: App {
     var body: some Scene {
         WindowGroup("LiveAstro") {
             MainView().environment(model)
+                .onAppear { appDelegate.model = model }
         }
         .defaultSize(AppLayout.mainDefaultSize)
 

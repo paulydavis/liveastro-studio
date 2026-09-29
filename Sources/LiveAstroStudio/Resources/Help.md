@@ -102,9 +102,15 @@ This checks folder watching, display updates, the broadcast window, snapshots, a
 
 ## OBS and Go Live
 
-**Store preview:** Setup → Broadcast offers **Check connection and status** only. Open OBS yourself, enable its WebSocket server under Tools, keep authentication enabled, and enter the host (127.0.0.1 on this Mac), port and password manually. The check reads streaming/recording status and disconnects. Its time-stamped result is not ongoing monitoring. Cancel or leave the panel to stop an in-progress check. A failed check does not mean OBS stopped streaming.
+**Store preview:** Setup → Broadcast offers **Check connection and status** and separate **local recording** controls. Open OBS yourself, enable its WebSocket server under Tools, keep authentication enabled, and enter the host (127.0.0.1 on this Mac), port and password manually. The connection check reads streaming/recording status and disconnects. Its time-stamped result is not ongoing monitoring. Cancel or leave the panel to stop an in-progress check. A failed check does not mean OBS stopped streaming.
 
-The preview does not read OBS's settings files, save the entered password, launch OBS, change scenes, or start/stop streaming or recording. Connection details stay in memory until quit. You can detach the Live display and capture it in OBS, controlling your stream from OBS itself. Remote checks use unencrypted WebSocket; use only a trusted network.
+To record locally, first check OBS's picture and audio: its current scene is what gets recorded, not automatically the LiveAstro image. Click **Start local recording…**, confirm, and wait until LiveAstro confirms recording. Click **Stop recording** when finished; wait for confirmation and the file path reported by OBS. Open that file from OBS's recording folder to check it. No public stream is started. LiveAstro refuses to take over an already-active recording or start while streaming is active.
+
+Recording is independent of your astronomy session. Changing tabs does not stop it. **End Session** and normal **Quit** warn when recording may still be active, but do not stop it; automatic session completion logs the same reminder. Stop separately first, or continue knowingly. A crash or force quit cannot show that warning.
+
+If the connection fails or OBS's recording changes unexpectedly, LiveAstro gives up control and displays **Check OBS** rather than reconnecting and blindly stopping. Stop recording in OBS, then use **Check that recording is stopped** to clear the warning. This recovery reads status only, on the original endpoint; it cannot take over an active recording. Do not operate recording through another controller at the same time. OBS provides no recording ownership token, so external stop/restart races cannot be ruled out completely.
+
+The preview does not read OBS's settings files, save the entered password, launch OBS, change scenes, or start/stop public streaming. Connection details stay in memory until quit. You can detach the Live display and capture it in OBS, controlling your stream from OBS itself. Remote connections use unencrypted WebSocket; use only a trusted network.
 
 **Direct GitHub edition:** the full OBS controls described below remain available.
 

@@ -155,13 +155,17 @@ transitions. A physical filter is needed where that guarantee is essential.
 
 ## OBS read-only check — integrated runtime checkpoint
 
+The later local-recording controls are a separate capability; the connection-check
+button itself remains read-only. See the local-recording checklist below.
+
 The separate signed sandbox probe connected and read status on the operator's Mac.
 That does not prove this integrated UI works or that the Store edition can control OBS.
 
 - [ ] Open OBS manually; enable its WebSocket server with authentication. In the
   signed Store preview's Broadcast tab, enter the connection details. Verify the
-  check reports streaming/recording status and disconnects. No Go Live, recording,
-  scene selection or auto-launch controls should appear in the preview.
+  check reports streaming/recording status and disconnects. No Go Live,
+  scene selection or auto-launch controls should appear. The separate recording
+  section must not start anything when a connection check succeeds.
 - [ ] Repeat with a wrong password, then the correct one. Failure must not claim
   outputs are inactive. Passwords must not appear in logs or persisted settings.
 - [ ] Cancel or leave the Broadcast tab during a pending check; the check must
@@ -172,3 +176,29 @@ That does not prove this integrated UI works or that the Store edition can contr
 Do not start a public stream just to exercise this check. Automated tests cover
 active-output responses, cancellation, malformed responses and wire-level rejection
 of modifying requests; live stream/record/control testing is outside this milestone.
+
+## OBS local recording — integrated runtime checkpoint
+
+The separate signed sandbox recording probe passed start/stop and the operator
+verified playback. That is feasibility evidence only, not an integrated-app pass.
+
+- [ ] In the signed Store preview, check OBS's current picture/audio and save
+  folder. Start local recording explicitly and confirm the prompt. The app must
+  wait for actual active status, not just the StartRecord acknowledgment.
+- [ ] Change tabs and return; recording continues and Stop remains available.
+- [ ] Stop recording. Wait for actual inactive status and the reported output path.
+  Open the saved clip and check picture/audio. No public stream was started.
+- [ ] Start a recording directly in OBS, then try Start in LiveAstro. It refuses
+  without taking over. Stop that recording in OBS yourself.
+- [ ] During an app-started recording, try End Session and normal Quit. Cancel
+  leaves the operation alone; proceeding warns that OBS continues. Stop in OBS
+  after quitting. Force quit/crash cannot provide that warning.
+- [ ] During an app-started recording, disconnect/stop OBS's WebSocket server.
+  LiveAstro must show uncertainty rather than stopped. Stop recording in OBS;
+  restore the server and use the read-only recovery check. It must not send Stop
+  or take over an existing recording. Re-enter password if required.
+- [ ] After relaunch, no previous recording is adopted and no password is saved.
+
+Keep other OBS recording controllers idle. OBS has no per-recording ownership
+token: status reads/events narrow external stop/restart races but cannot eliminate
+them. Public streaming, scene setup, auto-launch and OBS file access are excluded.

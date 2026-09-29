@@ -80,8 +80,8 @@ struct ControlView: View {
                     .tabItem { Label("Stats", systemImage: "chart.bar") }
                     .tag(AppModel.SetupSubTab.stats)
                 Group {
-                    if let check = model.obsConnectionCheck {
-                        OBSConnectionCheckView(check: check)
+                    if let check = model.obsConnectionCheck, let recording = model.obsLocalRecording {
+                        OBSConnectionCheckView(check: check, recording: recording)
                     } else { BroadcastSettingsView(model: model) }
                 }
                     .tabItem { Label("Broadcast", systemImage: "dot.radiowaves.left.and.right") }
@@ -214,7 +214,11 @@ struct ControlView: View {
             }
             HStack {
                 if model.isRunning {
-                    Button("End Session", role: .destructive) { model.endSession() }
+                    Button("End Session", role: .destructive) {
+                        model.requestEndSession {
+                            OBSRecordingWarning.confirm(title: "End session while OBS may be recording?", action: "End session; keep recording")
+                        }
+                    }
                         .disabled(model.importer.isGeneratingReplay)
                 } else {
                     Button("Start Session") { model.startSession() }
@@ -228,7 +232,9 @@ struct ControlView: View {
             // Go Live / End Broadcast — decoupled from session start.
             HStack {
                 if model.isStorePreview {
-                    Text("OBS: read-only connection check in Broadcast. Use OBS itself to stream.")
+                    Text(model.obsLocalRecording?.requiresAttention == true
+                         ? "OBS may be recording — controls in Broadcast. End Session does not stop it."
+                         : "OBS: connection check and local recording in Broadcast. Use OBS itself to stream.")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
                 switch model.broadcast.broadcastState {

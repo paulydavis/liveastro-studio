@@ -366,6 +366,7 @@ final class AppModel {
     var broadcast: BroadcastController!
     /// Store preview inspection is not a broadcast session and cannot own outputs.
     let obsConnectionCheck: OBSConnectionCheck?
+    let obsLocalRecording: OBSLocalRecording?
 
     /// Set by `MainView` (the only View with `@Environment(\.openWindow)` in
     /// scope) so `BroadcastDeps.openBroadcastWindow` can request the
@@ -487,9 +488,11 @@ final class AppModel {
          locationAvailability: any LocationAvailabilityChecking = FileLocationAvailability(),
          nightMode: NightModeController? = nil,
          makeOBSCheckSocket: @escaping () -> any OBSSocket = { URLSessionOBSSocket() },
+         makeOBSRecordingSocket: @escaping () -> any OBSSocket = { URLSessionOBSSocket() },
          makeNativeProcessor: @escaping @Sendable () -> any Processor = { NativeDenoiseProcessor() }) {
         self.nightMode = nightMode ?? NightModeController()
         self.obsConnectionCheck = configuration.isStorePreview ? OBSConnectionCheck(makeSocket: makeOBSCheckSocket) : nil
+        self.obsLocalRecording = configuration.isStorePreview ? OBSLocalRecording(makeSocket: makeOBSRecordingSocket) : nil
         self.userDefaults = userDefaults
         self.locationAvailability = locationAvailability
         self.distribution = configuration
@@ -533,7 +536,7 @@ final class AppModel {
                         .first
                 }
             }, unavailableReason: {
-                configuration.isStorePreview ? "OBS control is unavailable in this preview. Use Broadcast to check the connection without changing OBS. The separate broadcast window remains available." : nil
+                configuration.isStorePreview ? "Public-stream and scene controls are unavailable in this preview. Broadcast offers a read-only connection check and separate local-recording controls. The detached broadcast window remains available." : nil
             }))
 
         // Live-source cluster: same seam, plus the T2 closures for the detect
@@ -625,6 +628,7 @@ final class AppModel {
                 self?.liveSource.stopRelay()
                 self?.demoTask?.cancel()
                 self?.obsConnectionCheck?.cancel()
+                self?.obsLocalRecording?.disconnect()
                 self?.saveSettings()
             }
         }
@@ -2571,7 +2575,15 @@ final class AppModel {
         }
     }
 
+    func requestEndSession(confirmRecordingContinues: () -> Bool) {
+        if obsLocalRecording?.requiresAttention == true, !confirmRecordingContinues() { return }
+        endSession()
+    }
+
     func endSession() {
+        if obsLocalRecording?.requiresAttention == true {
+            log.append("Ending this session does not stop OBS recording. Stop it separately in Broadcast or check OBS directly.")
+        }
         sessionInputStatus = nil
         restoreMetadataAfterDemoIfNeeded()   // undo demo branding before it can be persisted
         saveSettings()
