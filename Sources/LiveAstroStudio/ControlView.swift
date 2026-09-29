@@ -80,9 +80,8 @@ struct ControlView: View {
                     .tabItem { Label("Stats", systemImage: "chart.bar") }
                     .tag(AppModel.SetupSubTab.stats)
                 Group {
-                    if model.isStorePreview {
-                        Text("OBS integration is unavailable in this preview. You can still detach the Live display into its own window.")
-                            .foregroundStyle(.secondary).padding()
+                    if let check = model.obsConnectionCheck {
+                        OBSConnectionCheckView(check: check)
                     } else { BroadcastSettingsView(model: model) }
                 }
                     .tabItem { Label("Broadcast", systemImage: "dot.radiowaves.left.and.right") }
@@ -228,6 +227,10 @@ struct ControlView: View {
             }
             // Go Live / End Broadcast — decoupled from session start.
             HStack {
+                if model.isStorePreview {
+                    Text("OBS: read-only connection check in Broadcast. Use OBS itself to stream.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
                 switch model.broadcast.broadcastState {
                 case .idle:
                     Button("Go Live") { model.broadcast.goLive() }
@@ -282,6 +285,7 @@ struct ControlView: View {
                         Button("Retry") { model.broadcast.retryStop() }
                             .help("Re-attempt the stop and confirm the stream and recording are down.")
                     }
+                }
                 }
                 Spacer()
             }

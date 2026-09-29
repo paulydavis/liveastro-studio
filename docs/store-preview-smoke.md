@@ -152,3 +152,23 @@ Automated injected-display tests cover API errors and late lifecycle events with
 altering test-runner hardware. They do not replace these physical observations.
 The app attempts reapplication; it cannot promise zero white flashes during macOS
 transitions. A physical filter is needed where that guarantee is essential.
+
+## OBS read-only check — integrated runtime checkpoint
+
+The separate signed sandbox probe connected and read status on the operator's Mac.
+That does not prove this integrated UI works or that the Store edition can control OBS.
+
+- [ ] Open OBS manually; enable its WebSocket server with authentication. In the
+  signed Store preview's Broadcast tab, enter the connection details. Verify the
+  check reports streaming/recording status and disconnects. No Go Live, recording,
+  scene selection or auto-launch controls should appear in the preview.
+- [ ] Repeat with a wrong password, then the correct one. Failure must not claim
+  outputs are inactive. Passwords must not appear in logs or persisted settings.
+- [ ] Cancel or leave the Broadcast tab during a pending check; the check must
+  retire without a late result replacing the cancelled/newer state.
+- [ ] Quit/relaunch: connection status starts unverified and the password is empty.
+  Direct-edition OBS controls remain unchanged.
+
+Do not start a public stream just to exercise this check. Automated tests cover
+active-output responses, cancellation, malformed responses and wire-level rejection
+of modifying requests; live stream/record/control testing is outside this milestone.

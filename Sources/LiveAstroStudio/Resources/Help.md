@@ -102,6 +102,12 @@ This checks folder watching, display updates, the broadcast window, snapshots, a
 
 ## OBS and Go Live
 
+**Store preview:** Setup → Broadcast offers **Check connection and status** only. Open OBS yourself, enable its WebSocket server under Tools, keep authentication enabled, and enter the host (127.0.0.1 on this Mac), port and password manually. The check reads streaming/recording status and disconnects. Its time-stamped result is not ongoing monitoring. Cancel or leave the panel to stop an in-progress check. A failed check does not mean OBS stopped streaming.
+
+The preview does not read OBS's settings files, save the entered password, launch OBS, change scenes, or start/stop streaming or recording. Connection details stay in memory until quit. You can detach the Live display and capture it in OBS, controlling your stream from OBS itself. Remote checks use unencrypted WebSocket; use only a trusted network.
+
+**Direct GitHub edition:** the full OBS controls described below remain available.
+
 LiveAstro broadcasts through OBS Studio.
 
 1. In OBS, enable **Tools → WebSocket Server Settings**.

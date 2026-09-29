@@ -364,6 +364,8 @@ final class AppModel {
     /// is required only so SwiftUI can form writable bindings through it
     /// (`$model.broadcast.obsHost`); the reference itself is never rebound.
     var broadcast: BroadcastController!
+    /// Store preview inspection is not a broadcast session and cannot own outputs.
+    let obsConnectionCheck: OBSConnectionCheck?
 
     /// Set by `MainView` (the only View with `@Environment(\.openWindow)` in
     /// scope) so `BroadcastDeps.openBroadcastWindow` can request the
@@ -484,8 +486,10 @@ final class AppModel {
          bookmarkBackend: any BookmarkAccessing = FoundationBookmarkAccessor(),
          locationAvailability: any LocationAvailabilityChecking = FileLocationAvailability(),
          nightMode: NightModeController? = nil,
+         makeOBSCheckSocket: @escaping () -> any OBSSocket = { URLSessionOBSSocket() },
          makeNativeProcessor: @escaping @Sendable () -> any Processor = { NativeDenoiseProcessor() }) {
         self.nightMode = nightMode ?? NightModeController()
+        self.obsConnectionCheck = configuration.isStorePreview ? OBSConnectionCheck(makeSocket: makeOBSCheckSocket) : nil
         self.userDefaults = userDefaults
         self.locationAvailability = locationAvailability
         self.distribution = configuration
@@ -529,7 +533,7 @@ final class AppModel {
                         .first
                 }
             }, unavailableReason: {
-                configuration.isStorePreview ? "OBS integration is unavailable in this preview. The separate broadcast window remains available." : nil
+                configuration.isStorePreview ? "OBS control is unavailable in this preview. Use Broadcast to check the connection without changing OBS. The separate broadcast window remains available." : nil
             }))
 
         // Live-source cluster: same seam, plus the T2 closures for the detect
@@ -620,6 +624,7 @@ final class AppModel {
             MainActor.assumeIsolated {
                 self?.liveSource.stopRelay()
                 self?.demoTask?.cancel()
+                self?.obsConnectionCheck?.cancel()
                 self?.saveSettings()
             }
         }
