@@ -357,6 +357,29 @@ Useful buttons:
 
 `latest.png` is for quick viewing, OBS/web overlays, and support checks. Use `master.fit` for serious post-processing when a native master is available.
 
+### Post-processing in the Store preview
+
+The Store preview offers **None** or the built-in **Native NR** denoiser. Native NR
+writes a separate `master_processed` FITS file and leaves `master.fit` unchanged.
+It is not a replacement for GraXpert's background-extraction workflow.
+
+Automatic GraXpert processing is not included in the Store preview. You can still
+use GraXpert yourself:
+
+1. End the session and wait for finalization. If LiveAstro offers **Finish clean
+   stack**, resolve that first if you want the completed trail-rejected master.
+2. Use **Open Sessions Folder**, then open the session's folder in Finder.
+3. Open GraXpert separately and load that session's `master.fit`—the linear stack,
+   not the stretched `latest.png` or replay.
+4. Save the processed result under a different name or in another folder so you
+   keep LiveAstro's original master. LiveAstro does not automatically reload it or
+   replace the live display/replay with it.
+
+If an older Store-preview preference selected GraXpert, it now opens with **None**;
+LiveAstro does not silently substitute Native NR. The direct GitHub edition's
+automatic GraXpert integration is unchanged. This is a Store feature decision,
+not a claim that external processing is impossible under every sandbox design.
+
 ---
 
 ## Troubleshooting

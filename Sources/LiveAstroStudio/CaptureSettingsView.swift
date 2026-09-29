@@ -285,9 +285,11 @@ struct CaptureSettingsView: View {
         }
         .pickerStyle(.segmented)
         .disabled(model.isRunning || model.importer.isImporting || model.importer.isProcessing)
-        .help("After stacking, optionally post-process the master to a master_processed FITS: GraXpert (background extraction + denoise, requires install) or the built-in Native NR denoiser.")
+        .help(model.isStorePreview
+              ? "After stacking, Native NR can write a separate master_processed FITS without changing master.fit. For other processing, open master.fit in your chosen application."
+              : "After stacking, optionally post-process the master to a master_processed FITS: GraXpert (background extraction + denoise, requires install) or the built-in Native NR denoiser.")
         if model.isStorePreview {
-            Text("External processors are unavailable in this preview. Native NR is available.").font(.caption).foregroundStyle(.secondary)
+            Text("Native NR is built in. For GraXpert, open the saved master.fit in GraXpert separately; see Help → Session Outputs.").font(.caption).foregroundStyle(.secondary)
         }
     }
 

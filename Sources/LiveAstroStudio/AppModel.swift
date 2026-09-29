@@ -777,7 +777,9 @@ final class AppModel {
         scaleNormalizationEnabled = s.scaleNormalizationEnabled
         liveSource.relayRetentionDays = s.relayRetentionDays
         demosaic = s.demosaic
-        processorBackend = s.processorBackend
+        // Do not restore an unavailable hidden picker choice or silently opt the
+        // operator into a different processor. Direct-edition settings are unchanged.
+        processorBackend = isStorePreview && s.processorBackend == .graxpert ? .none : s.processorBackend
         // Fresh install (no saved settings) starts with the recommended DBE-on look;
         // a returning user keeps whatever they last had.
         staged = StagedAdjustments(committed: SessionSettingsStore.exists(userDefaults) ? s.displayAdjustments : .liveDefault)
