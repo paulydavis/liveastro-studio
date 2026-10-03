@@ -4,6 +4,166 @@ import XCTest
 
 @MainActor
 final class StoreCameraShareTests: XCTestCase {
+    // Task-local teardown observes the original production Task finishing, not
+    // merely the injected permission closure returning before its caller resumes.
+    func testLateNilPermissionReplyCannotClearReplacementSearch() async throws {
+        let rig = try CameraControllerRig()
+        defer { rig.close() }
+        let old = CameraShareWaiter(), replacement = CameraShareWaiter()
+        defer { old.finish(nil); replacement.finish(nil) }
+        let retired = expectation(description: "original request task finished")
+        rig.acquireShare = { _, _ in try await old.acquire() }
+        CameraRequestLifetime.$token.withValue(CameraRequestToken { retired.fulfill() }) {
+            rig.controller.startSeestarLive()
+        }
+        try await rig.wait { old.isWaiting }
+        rig.controller.cancelDetection()
+        rig.acquireShare = { _, _ in try await replacement.acquire() }
+        rig.controller.startASIAIRLive()
+        try await rig.wait { replacement.isWaiting }
+        old.finish(nil)
+        await fulfillment(of: [retired], timeout: 5)
+        XCTAssertTrue(rig.controller.isDetecting)
+        XCTAssertTrue(rig.controller.canCancelDetection)
+        XCTAssertTrue(rig.errors.isEmpty)
+        XCTAssertTrue(rig.profiles.isEmpty)
+        rig.controller.cancelDetection()
+        replacement.finish(nil)
+    }
+
+    func testCancelSearchDoesNotReleaseAlreadyStartedRelayAccess() async throws {
+        let rig = try CameraControllerRig()
+        defer { rig.close() }
+        rig.controller.startSeestarLive()
+        try await rig.wait { rig.gate.entered }
+        rig.gate.release.signal()
+        try await rig.wait { rig.startedAccess != nil }
+        rig.startCompletion?(true)
+        rig.startCompletion = nil
+        rig.startedAccess = nil
+        try await rig.wait { rig.rootScopes.active == 0 }
+        let scopeCount = rig.operationScopes.active
+        XCTAssertGreaterThan(scopeCount, 0)
+        XCTAssertFalse(rig.controller.canCancelDetection)
+        rig.controller.cancelDetection()
+        XCTAssertEqual(rig.operationScopes.active, scopeCount)
+        XCTAssertFalse(rig.controller.isDetecting)
+        XCTAssertFalse(rig.controller.isStarting)
+        // Only production now owns this grant. Real teardown releases it, whereas
+        // a stale UI cancel action must not. No test-held access can mask release.
+        rig.controller.stopRelay()
+        try await rig.wait { rig.operationScopes.active == 0 }
+    }
+
+    // A no-op Cancel leaves the UI busy and allows the parked result to start.
+    func testUserCancelRetiresSearchButKeepsBlockedReadAccessAlive() async throws {
+        let rig = try CameraControllerRig()
+        defer { rig.close() }
+        rig.controller.startSeestarLive()
+        try await rig.wait { rig.gate.entered }
+        XCTAssertTrue(rig.controller.canCancelDetection)
+        rig.controller.cancelDetection()
+        XCTAssertFalse(rig.controller.isDetecting)
+        XCTAssertFalse(rig.controller.canCancelDetection)
+        XCTAssertEqual(rig.rootScopes.active, 1)
+        XCTAssertEqual(rig.operationScopes.active, 1)
+        rig.gate.release.signal()
+        try await rig.wait { rig.rootScopes.active == 0 && rig.operationScopes.active == 0 }
+        XCTAssertTrue(rig.profiles.isEmpty)
+        XCTAssertNil(rig.startedAccess)
+        XCTAssertTrue(rig.errors.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: rig.relay.path))
+    }
+
+    // Removing generation checks lets an old error retire a newer pending request.
+    func testCancelledReadFailureCannotRetireReplacementSearch() async throws {
+        let rig = try CameraControllerRig()
+        defer { rig.close() }
+        rig.controller.startSeestarLive()
+        try await rig.wait { rig.gate.entered }
+        rig.controller.cancelDetection()
+        let replacement = CameraShareWaiter()
+        rig.acquireShare = { _, _ in try await replacement.acquire() }
+        rig.controller.startASIAIRLive()
+        try await rig.wait { replacement.isWaiting }
+        defer { replacement.finish(nil) }
+        rig.gate.failure = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError,
+            userInfo: [NSLocalizedDescriptionKey: "The file Macintosh HD could not be opened."])
+        rig.gate.release.signal()
+        try await rig.wait { rig.rootScopes.active == 0 && rig.operationScopes.active == 0 }
+        XCTAssertTrue(rig.controller.isDetecting, "old failure must not clear replacement ownership")
+        XCTAssertTrue(rig.controller.canCancelDetection)
+        XCTAssertTrue(rig.errors.isEmpty)
+        XCTAssertTrue(rig.profiles.isEmpty)
+        replacement.finish(nil)
+        try await rig.wait { !rig.controller.isDetecting }
+    }
+
+    func testPermissionCancellationAllowsRetryWithoutLateStart() async throws {
+        let rig = try CameraControllerRig()
+        defer { rig.close() }
+        let permission = CameraShareWaiter()
+        defer { permission.finish(nil) }
+        rig.acquireShare = { _, _ in try await permission.acquire() }
+        rig.controller.startSeestarLive()
+        try await rig.wait { permission.isWaiting }
+        rig.controller.cancelDetection()
+        XCTAssertFalse(rig.controller.isDetecting)
+        rig.acquireShare = nil
+        rig.controller.startSeestarLive()
+        try await rig.wait { rig.gate.entered }
+        permission.finish(rig.rootScopes.lease(rig.share))
+        try await rig.wait { rig.rootScopes.active == 1 }
+        XCTAssertTrue(rig.controller.isDetecting)
+        XCTAssertTrue(rig.profiles.isEmpty)
+        rig.gate.release.signal()
+        try await rig.wait { rig.startedAccess != nil }
+        XCTAssertEqual(rig.profiles.filter { $0.targetName != nil }.count, 1)
+    }
+
+    func testCameraPermissionErrorNamesCameraAndKeepsTechnicalDetailInLog() async throws {
+        let rig = try CameraControllerRig()
+        defer { rig.close() }
+        rig.acquireShare = { _, _ in throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError,
+            userInfo: [NSLocalizedDescriptionKey: "Macintosh HD unavailable"] ) }
+        rig.controller.startASIAIRLive()
+        try await rig.wait { !rig.errors.isEmpty }
+        XCTAssertTrue(rig.errors[0].contains("ASIAIR"))
+        XCTAssertTrue(rig.errors[0].contains("permission"))
+        XCTAssertFalse(rig.errors[0].contains("Macintosh HD"))
+        XCTAssertTrue(rig.logs.contains { $0.contains("Macintosh HD") })
+        XCTAssertFalse(rig.controller.isDetecting)
+    }
+
+    func testCameraDiscoveryErrorIsNotReportedAsSessionFolderFailure() async throws {
+        let rig = try CameraControllerRig()
+        defer { rig.close() }
+        // A missing selected share exercises the real detector's listing error.
+        rig.acquireShare = { _, _ in rig.rootScopes.lease(rig.root.appendingPathComponent("missing-share")) }
+        rig.controller.startSeestarLive()
+        try await rig.wait { !rig.errors.isEmpty }
+        XCTAssertTrue(rig.errors[0].contains("Seestar"))
+        XCTAssertTrue(rig.errors[0].contains("searching"))
+        XCTAssertFalse(rig.errors[0].contains("calibration"))
+        XCTAssertFalse(rig.controller.isDetecting)
+    }
+
+    func testCameraSessionFolderFailureDoesNotBlameCameraSearch() async throws {
+        let rig = try CameraControllerRig()
+        defer { rig.close() }
+        rig.gate.failure = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError,
+            userInfo: [NSLocalizedDescriptionKey: "Macintosh HD unavailable"])
+        rig.controller.startSeestarLive()
+        try await rig.wait { rig.gate.entered }
+        rig.gate.release.signal()
+        try await rig.wait { !rig.errors.isEmpty }
+        XCTAssertTrue(rig.errors[0].contains("Seestar"))
+        XCTAssertTrue(rig.errors[0].contains("session folders"))
+        XCTAssertFalse(rig.errors[0].contains("Macintosh HD"))
+        XCTAssertTrue(rig.logs.contains { $0.contains("Macintosh HD") })
+        XCTAssertNil(rig.startedAccess)
+    }
+
     // Break caught: cancelled replacement erases the saved grant, or Start prompts
     // again rather than resolving the stored bookmark in a fresh service.
     func testPickerCancelPreservesSavedShareAndRestartReusesIt() async throws {
@@ -167,6 +327,11 @@ private final class CameraBookmarkBackend: BookmarkAccessing, @unchecked Sendabl
 private final class CameraAvailabilityGate: LocationAvailabilityChecking, @unchecked Sendable {
     private let lock = NSLock()
     private var didEnter = false, didFinish = false
+    private var storedFailure: NSError?
+    var failure: NSError? {
+        get { lock.withLock { storedFailure } }
+        set { lock.withLock { storedFailure = newValue } }
+    }
     var entered: Bool { lock.withLock { didEnter } }
     var finished: Bool { lock.withLock { didFinish } }
     let release = DispatchSemaphore(value: 0)
@@ -175,6 +340,7 @@ private final class CameraAvailabilityGate: LocationAvailabilityChecking, @unche
             lock.withLock { didEnter = true }
             guard release.wait(timeout: .now() + 10) == .success else { throw CocoaError(.userCancelled) }
             lock.withLock { didFinish = true }
+            if let failure { throw failure }
         }
         try FileLocationAvailability().check(url, forWriting: forWriting)
     }
@@ -197,6 +363,8 @@ private final class CameraControllerRig {
     let rootScopes = CameraScopeCounter(), operationScopes = CameraScopeCounter()
     var pending = false
     var errors: [String] = []
+    var logs: [String] = []
+    var acquireShare: ((CameraShareKind, Bool) async throws -> FileAccessLease?)?
     var profiles: [DetectedProfile] = []
     var startedAccess: OperationFileAccess?
     var startCompletion: ((Bool) -> Void)?
@@ -210,7 +378,7 @@ private final class CameraControllerRig {
         for url in [share.appendingPathComponent("MyWorks/M 31_sub"), output] {
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         }
-        controller = LiveSourceController(surface: AppSurface(log: { _ in }, presentError: { [weak self] in self?.errors.append($0) },
+        controller = LiveSourceController(surface: AppSurface(log: { [weak self] in self?.logs.append($0) }, presentError: { [weak self] in self?.errors.append($0) },
             isSessionRunning: { false }, applyDetectedProfile: { [weak self] in self?.profiles.append($0) },
             startSession: { _ in XCTFail("sandbox discovery must use authorized start") },
             isSessionStartPending: { [weak self] in self?.pending ?? false },
@@ -218,7 +386,11 @@ private final class CameraControllerRig {
                 guard let self else { throw CocoaError(.userCancelled) }
                 return OperationFileAccess(input: input, output: self.output, darkPath: nil, flatPath: nil, biasPath: nil,
                     flats: nil, darkFlats: nil, leases: [FileAccessLease(url: self.output), self.operationScopes.lease(input)], availability: self.gate)
-            }, acquireCameraShare: { [weak self] _, _ in self.map { $0.rootScopes.lease($0.share) } },
+            }, acquireCameraShare: { [weak self] kind, replacing in
+                guard let self else { return nil }
+                if let acquireShare = self.acquireShare { return try await acquireShare(kind, replacing) }
+                return self.rootScopes.lease(self.share)
+            },
             startAuthorizedSession: { [weak self] access, completion in
                 self?.startedAccess = access; self?.startCompletion = completion
             }, isStorePreview: true), relayRoot: relay)
@@ -234,6 +406,33 @@ private final class CameraControllerRig {
     func close() {
         gate.release.signal()
         controller.stopRelay()
+        acquireShare = nil
+        startedAccess = nil
+        startCompletion = nil
         try? FileManager.default.removeItem(at: root)
     }
+}
+
+@MainActor
+private final class CameraShareWaiter {
+    private var continuation: CheckedContinuation<FileAccessLease?, Error>?
+    var isWaiting: Bool { continuation != nil }
+    func acquire() async throws -> FileAccessLease? {
+        try await withCheckedThrowingContinuation { continuation = $0 }
+    }
+    func finish(_ lease: FileAccessLease?) {
+        let pending = continuation
+        continuation = nil
+        pending?.resume(returning: lease)
+    }
+}
+
+private enum CameraRequestLifetime {
+    @TaskLocal static var token: CameraRequestToken?
+}
+
+private final class CameraRequestToken: @unchecked Sendable {
+    private let finished: @Sendable () -> Void
+    init(_ finished: @escaping @Sendable () -> Void) { self.finished = finished }
+    deinit { finished() }
 }

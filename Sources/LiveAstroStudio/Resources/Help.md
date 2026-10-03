@@ -33,6 +33,12 @@ LiveAstro reads files from your capture app; it does not take exposures or point
 
 These shortcuts live under **Setup → Capture → Other ways to start**. For a native start onto existing matching files, the confirmation determines whether they are included. **New arrivals only** excludes the captured baseline; files arriving during the question remain eligible. Do not assume every existing file is ignored automatically. External stacker output is a different mode and does not use this raw-sub choice.
 
+In the Store preview, use **Cancel source search** in the Setup footer if camera
+or folder discovery is taking too long. The controls become available immediately;
+macOS may finish a blocked network read in the background, but its result will not
+start a session. You can then reconnect or choose another source. If camera preparation
+fails, the alert names the step; **Diagnostics** keeps the technical error details.
+
 ---
 
 ## Capture settings

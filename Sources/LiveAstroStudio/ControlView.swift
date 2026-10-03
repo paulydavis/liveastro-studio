@@ -189,6 +189,14 @@ struct ControlView: View {
     private var controlFooter: some View {
         VStack(spacing: 8) {
             sessionInputBanner
+            if model.liveSource.canCancelDetection {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Looking for camera or folder input…").font(.callout)
+                    Button("Cancel source search") { model.liveSource.cancelDetection() }
+                        .help("Return to idle now. A blocked filesystem read may finish later, but its result will not start a session.")
+                }
+            }
             if let status = model.cleanStackStatus {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(status.message).font(.caption)
@@ -223,7 +231,7 @@ struct ControlView: View {
                 } else {
                     Button("Start Session") { model.startSession() }
                         .buttonStyle(.borderedProminent)
-                        .disabled(model.importer.isImporting || model.isRestacking)
+                        .disabled(model.importer.isImporting || model.isRestacking || model.liveSource.canCancelDetection)
                 }
                 Spacer()
                 Text(model.sessionStateText)

@@ -108,6 +108,13 @@ macOS sandbox behavior. These items remain pending until observed.
 
 ## Permission preparation repair — runtime checks still pending
 
+While Store camera/folder detection is pending, **Cancel source search** is in
+the fixed Setup footer, including when another Setup sub-tab is selected. Cancel
+must immediately restore the controls and prevent any late result from starting
+a session or replacing a newer search. It does not stop an active session/relay.
+Camera errors identify permission acquisition, share search, or session-folder
+preparation; underlying macOS details are retained in Diagnostics.
+
 - [ ] With a saved share unavailable, begin access and verify the app remains
   responsive during permission preparation. Cancel, then reconnect or choose a
   different folder; a late completion must not restore the old selection or start

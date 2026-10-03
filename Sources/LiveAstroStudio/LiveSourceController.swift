@@ -23,6 +23,22 @@ final class LiveSourceController {
     /// True while an auto-detect path is scanning for a share off the main
     /// thread. Gates the start*Live entry points and disables their buttons.
     var isDetecting = false
+    /// Store preparation can be retired even while macOS is blocked in I/O.
+    /// The direct edition's legacy discovery is unchanged.
+    var canCancelDetection: Bool { surface.isStorePreview && isDetecting }
+
+    func cancelDetection() {
+        guard canCancelDetection else { return }
+        retireDetection()
+        surface.log("Source search cancelled. Any pending filesystem read may finish in the background; it will not start a session.")
+    }
+
+    private func retireDetection() {
+        detectionGeneration += 1
+        manualPreparationTask?.cancel()
+        manualPreparationTask = nil
+        isDetecting = false
+    }
     /// A relay remains live while its session is awaiting operator confirmation.
     private(set) var isStarting = false
 
@@ -45,12 +61,7 @@ final class LiveSourceController {
     /// Stop the frame relay. Called by `AppModel.endSession()` (before the
     /// pipeline drains) and by the willTerminate observer. Idempotent.
     func stopRelay() {
-        if let manualPreparationTask {
-            detectionGeneration += 1
-            manualPreparationTask.cancel()
-            self.manualPreparationTask = nil
-            isDetecting = false
-        }
+        if manualPreparationTask != nil { retireDetection() }
         frameRelay?.stop()
         frameRelay = nil
         relayAccess = nil
@@ -274,7 +285,10 @@ final class LiveSourceController {
         manualPreparationTask = Task {
             defer { if detectionGeneration == generation { isDetecting = false; manualPreparationTask = nil } }
             do { _ = try await surface.acquireCameraShare?(kind, true) }
-            catch { guard detectionGeneration == generation, !(error is CancellationError) else { return }; surface.presentError("Camera share access failed: \(error.localizedDescription) Reconnect the camera share or choose it again.") }
+            catch {
+                guard detectionGeneration == generation else { return }
+                reportCameraFailure(kind, stage: .permission, error: error)
+            }
         }
     }
 
@@ -294,22 +308,25 @@ final class LiveSourceController {
         manualPreparationTask = Task {
             let lease: FileAccessLease
             do {
-                guard let selected = try await surface.acquireCameraShare?(kind, false) else { isDetecting = false; return }
+                let selected = try await surface.acquireCameraShare?(kind, false)
+                // Even a nil (picker-cancel) reply belongs to its original request.
+                guard detectionGeneration == generation, !Task.isCancelled else { return }
+                guard let selected else { isDetecting = false; manualPreparationTask = nil; return }
                 lease = selected
             } catch {
                 guard detectionGeneration == generation else { return }
                 isDetecting = false
                 manualPreparationTask = nil
-                if error is CancellationError { return }
-                surface.presentError("Camera share access failed: \(error.localizedDescription) Reconnect the camera share or choose it again.")
+                reportCameraFailure(kind, stage: .permission, error: error)
                 return
             }
             guard detectionGeneration == generation, !Task.isCancelled else { return }
-            guard canApplyDetectedLiveSource() else { isDetecting = false; return }
+            guard canApplyDetectedLiveSource() else { isDetecting = false; manualPreparationTask = nil; return }
             surface.log("Looking for \(kind.displayName) targets inside \(lease.url.path)…")
             manualPreparationTask = Task.detached { [weak self, lease] in
                 defer { withExtendedLifetime(lease) {} }
                 guard let self else { return }
+                var stage = CameraPreparationStage.search
                 do {
                     guard let found = try CameraShareDiscovery.detect(in: lease.url, kind: kind) else {
                         await MainActor.run {
@@ -320,6 +337,7 @@ final class LiveSourceController {
                         }
                         return
                     }
+                    stage = .sessionFolders
                     let access = try await self.acquireDetectedAccess(found.directory, generation: generation)
 
                     guard let access else {
@@ -345,14 +363,38 @@ final class LiveSourceController {
                         }
                     }
                 } catch {
+                    let failedStage = stage
                     await MainActor.run {
                         guard self.detectionGeneration == generation else { return }
                         self.isDetecting = false; self.manualPreparationTask = nil
                         guard self.canApplyDetectedLiveSource() else { return }
-                        self.surface.presentError("Camera share preparation failed: \(error.localizedDescription) Reconnect the camera share or choose it again; also check the selected output and calibration folders.")
+                        self.reportCameraFailure(kind, stage: failedStage, error: error)
                     }
                 }
             }
         }
+    }
+
+    private enum CameraPreparationStage: String, Sendable {
+        case permission = "accessing the selected share permission"
+        case search = "searching the selected share"
+        case sessionFolders = "checking session folders"
+
+        var recovery: String {
+            switch self {
+            case .permission, .search:
+                return "Check that the camera is on and its share opens in Finder, then retry or choose the share again."
+            case .sessionFolders:
+                return "Check the camera share and the selected output and calibration folders, then retry."
+            }
+        }
+    }
+
+    private func reportCameraFailure(_ kind: CameraShareKind, stage: CameraPreparationStage, error: Error) {
+        guard !(error is CancellationError) else { return }
+        // macOS can name an unrelated volume. Preserve its detail in Diagnostics
+        // without presenting that name as the cause of the failed operation.
+        surface.log("\(kind.displayName) failed while \(stage.rawValue): \(error.localizedDescription) [\(error as NSError)]")
+        surface.presentError("\(kind.displayName) could not finish \(stage.rawValue). \(stage.recovery) Technical details are in Diagnostics.")
     }
 }
