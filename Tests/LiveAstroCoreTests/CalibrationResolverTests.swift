@@ -5,6 +5,32 @@ import XCTest
 /// flat → Calibrator). Uses a real on-disk library + synthetic FITS, so it exercises
 /// exactly what runs at Start and on the first sub.
 final class CalibrationResolverTests: XCTestCase {
+    func testStrictSelectedReadFailureDoesNotChangeDirectFallback() throws {
+        let folder = rawFolder("flats", count: 2, value: 0.5)
+        let denied = folder.appendingPathComponent("f_01.fit")
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: denied.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: denied.path) }
+        let library = CalibrationLibrary(baseDirectory: tmp.appendingPathComponent("library"))
+        let direct = CalibrationResolver.resolve(metadata: SourceMetadata(), library: library, scaleEnabled: false,
+            flatsFolder: folder, darkFlatsFolder: nil, legacyDarkPath: nil, legacyFlatPath: nil)
+        XCTAssertTrue(direct.hasFlat, "direct edition keeps its existing unreadable-frame skip policy")
+        XCTAssertNil(direct.readFailure)
+        let strict = CalibrationResolver.resolve(metadata: SourceMetadata(), library: library, scaleEnabled: false,
+            flatsFolder: folder, darkFlatsFolder: nil, legacyDarkPath: nil, legacyFlatPath: nil, failOnSelectedReadError: true)
+        XCTAssertEqual(strict.readFailure?.url.lastPathComponent, "f_01.fit")
+        XCTAssertFalse(strict.hasFlat, "a readable sibling must not hide a selected read failure")
+    }
+
+    func testStrictMasterReadFailureAndDirectWarningRemainDistinct() throws {
+        let missing = tmp.appendingPathComponent("missing.fit")
+        let direct = CalibrationLoader.makeCalibrator(dark: missing, flat: nil)
+        XCTAssertNil(direct.0)
+        XCTAssertEqual(direct.1.count, 1)
+        XCTAssertThrowsError(try CalibrationLoader.makeCalibratorRequiringAccess(dark: missing, flat: nil)) {
+            XCTAssertEqual(($0 as? CalibrationReadError)?.url, missing)
+        }
+    }
+
     private var tmp: URL!
 
     override func setUpWithError() throws {

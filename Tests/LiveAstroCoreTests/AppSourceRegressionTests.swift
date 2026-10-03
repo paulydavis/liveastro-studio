@@ -20,8 +20,8 @@ final class AppSourceRegressionTests: XCTestCase {
         let appModel = try String(contentsOf: appModelURL, encoding: .utf8)
 
         XCTAssertTrue(
-            appModel.contains("startWatchFolderLive(source: url, sourceMode: sourceMode)"),
-            "pickWatchFolderLive must forward the REQUESTED sourceMode into LiveSourceController, not read back mutable AppModel state."
+            appModel.contains("startWatchFolderLive(source: watchFolder ?? url, sourceMode: sourceMode)"),
+            "pickWatchFolderLive must forward the permission-resolved folder and REQUESTED sourceMode into LiveSourceController, not read back mutable AppModel.sourceMode."
         )
         XCTAssertTrue(
             captureView.contains("sourceMode: .stackerOutput"),
@@ -119,8 +119,8 @@ final class AppSourceRegressionTests: XCTestCase {
         let appModel = try String(contentsOf: appModelURL, encoding: .utf8)
 
         XCTAssertTrue(
-            source.contains("Task.detached { [weak self, folder, prefix] in"),
-            "importSubs must move the initial newest-FITS metadata scan off MainActor; SMB enumeration/header reads can be slow."
+            source.contains("importPreparationTask = Task.detached { [weak self, folder, prefix, access] in"),
+            "importSubs must move the initial newest-FITS metadata scan off MainActor with its captured folder access; SMB enumeration/header reads can be slow."
         )
         XCTAssertTrue(
             source.contains("let meta = LiveSourceMetadata.newestFITSMetadata(inFolder: folder)"),
@@ -150,10 +150,9 @@ final class AppSourceRegressionTests: XCTestCase {
             source.contains("private var importPrepareInFlight = false"),
             "ImportController must distinguish prepare-with-no-pipeline from cancel-drain-with-no-pipeline; double cancel must not unlock UI mid-finalization."
         )
-        XCTAssertTrue(
-            source.contains("beginImport(from: folder, meta: meta, prefix: prefix, generation: generation)"),
-            "The detached prepare completion must carry the generation it started under."
-        )
+        // Captured output/calibration ownership is exercised behaviorally by
+        // StorePreviewAccessTests.testImportCapturesOutputBeforeMetadataAndReleasesAfterTerminalWork.
+        // Do not pin the indentation of the asynchronous handoff here.
         XCTAssertTrue(
             source.contains("guard generation == importPrepareGeneration"),
             "beginImport must reject stale/cancelled prepare completions before starting a pipeline."
@@ -180,11 +179,21 @@ final class AppSourceRegressionTests: XCTestCase {
             source.contains("private func canApplyDetectedLiveSource() -> Bool"),
             "Live auto-detect completions need one shared post-await guard before mutating profile, starting relay, or starting a session."
         )
-        XCTAssertEqual(
-            source.components(separatedBy: "guard self.canApplyDetectedLiveSource() else").count - 1,
-            3,
-            "Watch-folder, Seestar, and ASIAIR detect completions must all re-check that no session/import started while detection was in flight."
-        )
+        // Scope this legacy source guard to each original completion. Counting the
+        // whole file both rejects added guarded paths and can hide a missing guard
+        // in one original path behind extra guards elsewhere. The new authorized
+        // camera flow is exercised behaviorally in StoreCameraShareTests.
+        for (start, end) in [
+            ("func startWatchFolderLive(", "private func configureAndStartWatchFolder("),
+            ("func startSeestarLive()", "private func configureAndStartSeestar("),
+            ("func startASIAIRLive()", "private func configureAndStartASIAIR(")
+        ] {
+            let startRange = try XCTUnwrap(source.range(of: start))
+            let tail = source[startRange.upperBound...]
+            let endRange = try XCTUnwrap(tail.range(of: end))
+            XCTAssertTrue(tail[..<endRange.lowerBound].contains("guard self.canApplyDetectedLiveSource() else"),
+                          "\(start) must re-check session ownership in its completion")
+        }
         XCTAssertTrue(
             source.contains("if !canApplyDetectedLiveSource() { return }"),
             "Configure helpers must also guard direct/internal calls before creating a relay."

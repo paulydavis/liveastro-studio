@@ -43,21 +43,26 @@ import Foundation
 /// throw the supplied error. Call `finish()` to throw `CancellationError`.
 ///
 /// ## Thread safety
-/// All state is guarded by a simple actor (`InboundQueue`). Safe to call from
-/// concurrent tasks in tests.
+/// Inbound frames are guarded by `InboundQueue`; other mutable state shares
+/// `stateLock`. Hooks and continuation resumes run outside the lock, and no
+/// suspension holds it. Observing a parked count means registration is complete.
 final class MockOBSSocket: OBSSocket {
 
     // MARK: - Public state (test-readable)
 
     /// All frames passed to `send(_:)`, in order.
-    private(set) var sentFrames: [String] = []
+    var sentFrames: [String] { stateLock.withLock { recordedFrames } }
+    private let stateLock = NSLock()
+    private var recordedFrames: [String] = []
 
     /// Number of `close()` calls observed (review10 finding 6: every failed
     /// post-connect handshake must close the socket it opened).
-    private(set) var closeCount = 0
+    var closeCount: Int { stateLock.withLock { recordedCloseCount } }
+    private var recordedCloseCount = 0
 
     /// Number of transport connect attempts observed.
-    private(set) var connectStartedCount = 0
+    var connectStartedCount: Int { stateLock.withLock { recordedConnectCount } }
+    private var recordedConnectCount = 0
 
     // MARK: - Private
 
@@ -81,6 +86,11 @@ final class MockOBSSocket: OBSSocket {
     /// chained task (so callers like `close()` can expose it for awaiting).
     @discardableResult
     private func chainInboundMutation(_ operation: @escaping () async -> Void) -> Task<Void, Never> {
+        stateLock.withLock { chainInboundMutationLocked(operation) }
+    }
+
+    /// Caller holds stateLock so concurrent enqueue/close cannot fork the FIFO.
+    private func chainInboundMutationLocked(_ operation: @escaping () async -> Void) -> Task<Void, Never> {
         let previous = inboundChainTail
         let task = Task {
             await previous?.value   // FIFO: never overtake an earlier mutation
@@ -93,16 +103,21 @@ final class MockOBSSocket: OBSSocket {
     // MARK: - OBSSocket
 
     func connect(url: URL) async throws {
-        connectStartedCount += 1
+        let controls = stateLock.withLock {
+            recordedConnectCount += 1
+            return (resetTerminalOnConnect, shouldParkConnect)
+        }
         // Most tests use terminal errors to model a dead socket that stays
         // dead. A few OBSClient-level reconnect tests deliberately reuse the
         // same mock as a fresh transport; they opt in to clearing the receive
         // terminal state while preserving any queued Hello frame.
-        if clearsTerminalOnConnect {
+        if controls.0 {
             await queue.resetForConnect()
         }
-        if parkConnect {
-            await withCheckedContinuation { parkedConnects.append($0) }
+        if controls.1 {
+            await withCheckedContinuation { continuation in
+                stateLock.withLock { parkedConnects.append(continuation) }
+            }
         }
     }
 
@@ -112,12 +127,19 @@ final class MockOBSSocket: OBSSocket {
         // `releaseParkedSends()`. On release it completes normally (recorded
         // + reply hook): a frame whose `socket.send` began cannot be
         // retracted, mirroring URLSessionWebSocketTask semantics.
-        if let match = parkSendsMatching, match(text) {
-            parkedSendCount += 1
-            await withCheckedContinuation { parkedSends.append($0) }
+        if let match = stateLock.withLock({ parkSendPredicate }), match(text) {
+            await withCheckedContinuation { continuation in
+                stateLock.withLock {
+                    parkedSends.append(continuation)
+                    recordedParkedSendCount += 1
+                }
+            }
         }
-        sentFrames.append(text)
-        if let hook = replyHook, let reply = hook(text) {
+        let hook = stateLock.withLock {
+            recordedFrames.append(text)
+            return replyHook
+        }
+        if let hook, let reply = hook(text) {
             await queue.enqueue(reply)
         }
     }
@@ -127,11 +149,13 @@ final class MockOBSSocket: OBSSocket {
     }
 
     func close() {
-        closeCount += 1
-        releaseParkedConnects()
-        lastCloseTask = chainInboundMutation { [queue] in
-            await queue.finish(throwing: CancellationError())
+        stateLock.withLock {
+            recordedCloseCount += 1
+            lastCloseTask = chainInboundMutationLocked { [queue] in
+                await queue.finish(throwing: CancellationError())
+            }
         }
+        releaseParkedConnects()
     }
 
     // MARK: - Test-control API
@@ -145,7 +169,7 @@ final class MockOBSSocket: OBSSocket {
     /// the just-sent frame and may return a reply frame to inject as inbound.
     /// Pass `nil` to clear the hook.
     func replyToLastSent(_ hook: ((String) -> String?)?) {
-        replyHook = hook
+        stateLock.withLock { replyHook = hook }
     }
 
     /// Make the next (or pending) `receive()` throw `error`.
@@ -164,26 +188,39 @@ final class MockOBSSocket: OBSSocket {
     /// landed. Tests that reconnect the same mock use this to avoid racing a
     /// fresh connect against the previous close's async receive termination.
     func waitForCloseEffects() async {
-        await lastCloseTask?.value
+        let task = stateLock.withLock { lastCloseTask }
+        await task?.value
     }
 
     /// Test seam: let a single mock model a fresh transport after close.
-    var clearsTerminalOnConnect = false
+    var clearsTerminalOnConnect: Bool {
+        get { stateLock.withLock { resetTerminalOnConnect } }
+        set { stateLock.withLock { resetTerminalOnConnect = newValue } }
+    }
+    private var resetTerminalOnConnect = false
 
     // MARK: - Park-send knob (review11 finding 1)
 
     /// When set, `send(_:)` calls whose frame matches suspend before the
     /// frame is recorded/answered, until `releaseParkedSends()` runs —
     /// deterministic "send in flight, delivery pending" parking.
-    var parkSendsMatching: ((String) -> Bool)?
+    var parkSendsMatching: ((String) -> Bool)? {
+        get { stateLock.withLock { parkSendPredicate } }
+        set { stateLock.withLock { parkSendPredicate = newValue } }
+    }
+    private var parkSendPredicate: ((String) -> Bool)?
     /// Number of sends currently or ever parked (monotonic).
-    private(set) var parkedSendCount = 0
+    var parkedSendCount: Int { stateLock.withLock { recordedParkedSendCount } }
+    private var recordedParkedSendCount = 0
     private var parkedSends: [CheckedContinuation<Void, Never>] = []
 
     /// Resume every parked send: the frames reach the wire in call order.
     func releaseParkedSends() {
-        let waiting = parkedSends
-        parkedSends = []
+        let waiting = stateLock.withLock {
+            let waiting = parkedSends
+            parkedSends = []
+            return waiting
+        }
         for continuation in waiting { continuation.resume() }
     }
 
@@ -192,13 +229,20 @@ final class MockOBSSocket: OBSSocket {
     /// When set, `connect(url:)` suspends before the OBS Hello/Identify
     /// exchange begins, modeling a transport dial/WebSocket open that never
     /// completes.
-    var parkConnect = false
+    var parkConnect: Bool {
+        get { stateLock.withLock { shouldParkConnect } }
+        set { stateLock.withLock { shouldParkConnect = newValue } }
+    }
+    private var shouldParkConnect = false
     private var parkedConnects: [CheckedContinuation<Void, Never>] = []
 
     /// Resume every parked connect attempt.
     func releaseParkedConnects() {
-        let waiting = parkedConnects
-        parkedConnects = []
+        let waiting = stateLock.withLock {
+            let waiting = parkedConnects
+            parkedConnects = []
+            return waiting
+        }
         for continuation in waiting { continuation.resume() }
     }
 }

@@ -37,7 +37,8 @@ public final class CleanStackCompletion {
 
     init(directory: URL, survivors: [SubRegistration], generation: Int, kappa: Float,
          budget: Int, minSubs: Int, loader: FrameLoader, metadata: SourceMetadata?,
-         neutralize: Bool, fallbackSeconds: Double, status: CleanStackStatus) throws {
+         neutralize: Bool, fallbackSeconds: Double, status: CleanStackStatus,
+         accessLifetime: (any Sendable)? = nil) throws {
         self.status = status
         self.directory = directory
         self.survivors = survivors
@@ -50,7 +51,7 @@ public final class CleanStackCompletion {
         self.fallbackSeconds = fallbackSeconds
         originalManifest = try Data(contentsOf: directory.appendingPathComponent("manifest.json"))
         originalMasterDigest = try Self.digest(directory.appendingPathComponent("master.fit"))
-        refiner = GlobalRefiner(loader: loader, onLog: { _ in })
+        refiner = GlobalRefiner(loader: loader, onLog: { _ in }, accessLifetime: accessLifetime)
     }
 
     public func finish(isCancelled: @escaping () -> Bool = { false },

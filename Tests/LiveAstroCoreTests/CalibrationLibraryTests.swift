@@ -2,8 +2,66 @@ import XCTest
 @testable import LiveAstroCore
 
 final class CalibrationLibraryTests: XCTestCase {
+    func testRebuildDoesNotOverwriteConcurrentMovedSourceUpdate() async throws {
+        let entered = expectation(description: "rebuild captured its entry")
+        let release = DispatchSemaphore(value: 0)
+        let library = CalibrationLibrary(baseDirectory: tmp.appendingPathComponent("lib")) {
+            entered.fulfill()
+            _ = release.wait(timeout: .now() + 10)
+        }
+        let raws = writeRaws(1, value: 0.2)
+        let first = try library.add(kind: .bias, camera: "A", gain: nil, exposureSeconds: nil,
+                                    setTempC: nil, binning: nil, fitsURLs: raws,
+                                    sourceDirectory: rawDir.appendingPathComponent("original-A"))
+        let second = try library.add(kind: .bias, camera: "B", gain: nil, exposureSeconds: nil,
+                                     setTempC: nil, binning: nil, fitsURLs: raws)
+        let worker = Task.detached { try library.rebuild(id: second.id, failOnReadError: true) }
+        await fulfillment(of: [entered], timeout: 5)
+        defer { release.signal() }
+        let moved = rawDir.appendingPathComponent("moved-A")
+        try library.updateSourceDirectories([first.id: moved])
+        release.signal()
+        try await worker.value
+        XCTAssertEqual(library.all().first { $0.id == first.id }?.sourcePath, moved.path,
+                       "a completed rebuild must not restore another entry's old source root")
+    }
+
     private var tmp: URL!
     private var rawDir: URL!
+
+    func testConditionalSourceUpdatePreservesNewerChoiceAndDoesNotResurrectRemoval() throws {
+        let library = lib()
+        let frame = try library.add(kind: .bias, camera: "A", gain: nil, exposureSeconds: nil,
+                                    setTempC: nil, binning: nil, fitsURLs: writeRaws(1, value: 0.2))
+        let chosen = rawDir.appendingPathComponent("chosen")
+        try library.updateSourceDirectories([frame.id: chosen])
+        try library.updateSourceDirectories([frame.id: rawDir.appendingPathComponent("stale")],
+                                             expectedSourcePaths: [frame.id: rawDir.path])
+        XCTAssertEqual(library.all().first?.sourcePath, chosen.path)
+        try library.remove(id: frame.id)
+        try library.updateSourceDirectories([frame.id: chosen], expectedSourcePaths: [frame.id: rawDir.path])
+        XCTAssertTrue(library.all().isEmpty)
+    }
+
+    func testRemovalDuringRebuildDoesNotResurrectEntryOrMaster() async throws {
+        let entered = expectation(description: "captured rebuild")
+        let release = DispatchSemaphore(value: 0)
+        let base = tmp.appendingPathComponent("lib")
+        let library = CalibrationLibrary(baseDirectory: base) {
+            entered.fulfill()
+            _ = release.wait(timeout: .now() + 10)
+        }
+        let frame = try library.add(kind: .bias, camera: "A", gain: nil, exposureSeconds: nil,
+                                    setTempC: nil, binning: nil, fitsURLs: writeRaws(1, value: 0.2))
+        let worker = Task.detached { try library.rebuild(id: frame.id, failOnReadError: true) }
+        await fulfillment(of: [entered], timeout: 5)
+        defer { release.signal() }
+        try library.remove(id: frame.id)
+        release.signal()
+        try await worker.value
+        XCTAssertTrue(library.all().isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: base.appendingPathComponent(frame.fileName).path))
+    }
 
     override func setUpWithError() throws {
         tmp = FileManager.default.temporaryDirectory
@@ -29,6 +87,71 @@ final class CalibrationLibraryTests: XCTestCase {
 
     private func lib() -> CalibrationLibrary {
         CalibrationLibrary(baseDirectory: tmp.appendingPathComponent("lib", isDirectory: true))
+    }
+
+    func testDefaultReadPolicyStillSkipsMissingChildAndReportsNoFramesForMissingFolder() throws {
+        let library = lib()
+        let good = writeRaws(1, value: 0.2)
+        let missing = rawDir.appendingPathComponent("disappeared.fit")
+        let frame = try library.add(kind: .dark, camera: "cam", gain: nil, exposureSeconds: nil,
+            setTempC: nil, binning: nil, fitsURLs: good + [missing])
+        XCTAssertEqual(frame.frameCount, 1)
+        // A dangling child is returned by enumeration but its data read fails.
+        try FileManager.default.createSymbolicLink(at: rawDir.appendingPathComponent("gone.fit"), withDestinationURL: missing)
+        try library.rebuild(id: frame.id)
+        XCTAssertEqual(library.all().first?.frameCount, 1)
+        try FileManager.default.removeItem(at: rawDir)
+        XCTAssertThrowsError(try library.rebuild(id: frame.id)) {
+            XCTAssertEqual($0 as? CalibrationLibrary.LibraryError, .noFramesInSource)
+        }
+    }
+
+    func testStrictAddFailsOnDisappearedChildWithoutCreatingPartialLibrary() throws {
+        let library = lib(), good = writeRaws(1, value: 0.2)
+        let missing = rawDir.appendingPathComponent("disappeared.fit")
+        XCTAssertThrowsError(try library.add(kind: .dark, camera: "cam", gain: nil, exposureSeconds: nil,
+            setTempC: nil, binning: nil, fitsURLs: good + [missing], failOnReadError: true)) {
+            XCTAssertEqual(($0 as? CalibrationReadError)?.url.path, missing.path)
+        }
+        XCTAssertTrue(library.all().isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.appendingPathComponent("lib").path))
+    }
+
+    func testStrictRebuildMissingChildAndEnumerationFailurePreserveBytes() throws {
+        let library = lib()
+        let frame = try library.add(kind: .dark, camera: "cam", gain: nil, exposureSeconds: nil,
+            setTempC: nil, binning: nil, fitsURLs: writeRaws(1, value: 0.2))
+        let indexURL = tmp.appendingPathComponent("lib/index.json")
+        let masterURL = tmp.appendingPathComponent("lib/" + frame.fileName)
+        let index = try Data(contentsOf: indexURL), master = try Data(contentsOf: masterURL)
+        let missing = rawDir.appendingPathComponent("gone.fit")
+        try FileManager.default.createSymbolicLink(at: missing, withDestinationURL: tmp.appendingPathComponent("absent.fit"))
+        XCTAssertThrowsError(try library.rebuild(id: frame.id, failOnReadError: true)) {
+            let failed = ($0 as? CalibrationReadError)?.url
+            XCTAssertEqual(failed?.lastPathComponent, missing.lastPathComponent)
+            XCTAssertEqual(failed?.deletingLastPathComponent().resolvingSymlinksInPath().path,
+                           self.rawDir.resolvingSymlinksInPath().path)
+        }
+        XCTAssertEqual(try Data(contentsOf: indexURL), index)
+        XCTAssertEqual(try Data(contentsOf: masterURL), master)
+        try FileManager.default.removeItem(at: rawDir)
+        XCTAssertThrowsError(try library.rebuild(id: frame.id, failOnReadError: true)) {
+            XCTAssertEqual(($0 as? CalibrationReadError)?.url.path, self.rawDir.path)
+        }
+        XCTAssertEqual(try Data(contentsOf: indexURL), index)
+        XCTAssertEqual(try Data(contentsOf: masterURL), master)
+    }
+
+    func testStrictReadPolicyStillRejectsFormatAndSizeWithoutChangingPixelSelection() throws {
+        let library = lib(), good = writeRaws(1, value: 0.2)
+        let invalid = rawDir.appendingPathComponent("invalid.fit")
+        try Data("not FITS".utf8).write(to: invalid)
+        let wrongSize = rawDir.appendingPathComponent("other-size.fit")
+        try FITSWriter.float32(width: 8, height: 8, channels: 1, pixels: [Float](repeating: 0.9, count: 64)).write(to: wrongSize)
+        let frame = try library.add(kind: .dark, camera: "cam", gain: nil, exposureSeconds: nil,
+            setTempC: nil, binning: nil, fitsURLs: good + [invalid, wrongSize], failOnReadError: true)
+        XCTAssertEqual(frame.frameCount, 1)
+        XCTAssertEqual(try XCTUnwrap(library.master(for: frame)).pixels[0], 0.2, accuracy: 1e-5)
     }
 
     /// One malformed/legacy entry in the index must not hide every good master — all() skips it.

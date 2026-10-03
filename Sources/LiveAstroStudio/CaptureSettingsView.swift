@@ -41,6 +41,19 @@ struct CaptureSettingsView: View {
                         }
                     }
 
+                    if model.isStorePreview {
+                        SetupCard(title: "Save sessions to", symbol: "folder.badge.plus") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(model.selectedOutputFolder?.path ?? "Choose a folder before Start or Import")
+                                    .font(.callout).textSelection(.enabled)
+                                if model.isRestoringLocationAccess {
+                                    Text("Checking saved folder access…").font(.caption).foregroundStyle(.secondary)
+                                }
+                                Button(model.selectedOutputFolder == nil ? "Choose…" : "Change…") { model.chooseSessionOutputFolder() }
+                            }
+                        }
+                    }
+
                     DisclosureGroup {
                         VStack(alignment: .leading, spacing: 12) { stackingControls }
                             .padding(.top, 10)
@@ -147,6 +160,14 @@ struct CaptureSettingsView: View {
     }
 
     @ViewBuilder private var workflowActions: some View {
+        if model.isStorePreview {
+            Text("On first use, choose the mounted camera share. LiveAstro remembers permission and searches only inside that share.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button("Choose Seestar share…") { model.liveSource.chooseCameraShare(.seestar) }
+                Button("Choose ASIAIR share…") { model.liveSource.chooseCameraShare(.asiair) }
+            }.disabled(liveWorkflowDisabled)
+        }
         WorkflowActionRow(
             title: "Live from Seestar",
             subtitle: "Auto-detect the mounted Seestar folder, relay new subs, and start native live stacking.",
@@ -259,12 +280,17 @@ struct CaptureSettingsView: View {
         }
         Picker("Post-process", selection: $model.processorBackend) {
             Text("None").tag(ProcessorBackend.none)
-            Text("GraXpert").tag(ProcessorBackend.graxpert)
+            if !model.isStorePreview { Text("GraXpert").tag(ProcessorBackend.graxpert) }
             Text("Native NR").tag(ProcessorBackend.nativeDenoise)
         }
         .pickerStyle(.segmented)
         .disabled(model.isRunning || model.importer.isImporting || model.importer.isProcessing)
-        .help("After stacking, optionally post-process the master to a master_processed FITS: GraXpert (background extraction + denoise, requires install) or the built-in Native NR denoiser.")
+        .help(model.isStorePreview
+              ? "After stacking, Native NR can write a separate master_processed FITS without changing master.fit. For other processing, open master.fit in your chosen application."
+              : "After stacking, optionally post-process the master to a master_processed FITS: GraXpert (background extraction + denoise, requires install) or the built-in Native NR denoiser.")
+        if model.isStorePreview {
+            Text("Native NR is built in. For GraXpert, open the saved master.fit in GraXpert separately; see Help → Session Outputs.").font(.caption).foregroundStyle(.secondary)
+        }
     }
 
     @ViewBuilder private var sessionDetails: some View {
@@ -316,7 +342,7 @@ struct CaptureSettingsView: View {
 
     private func pickFolder() {
         let panel = model.makeDirectoryPanel()
-        if panel.runModal() == .OK { model.watchFolder = panel.url }
+        if panel.runModal() == .OK, let url = panel.url { Task { await model.selectLocation(url, key: "capture") } }
     }
 
     private func pickStackerOutputWatchFolder() {

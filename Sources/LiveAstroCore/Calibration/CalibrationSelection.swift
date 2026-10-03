@@ -1,5 +1,13 @@
 import Foundation
 
+/// An actual selected calibration read failed; distinct from size/format rejection.
+public struct CalibrationReadError: Error, LocalizedError, Sendable {
+    public let url: URL
+    public let reason: String
+    public init(url: URL, underlying: Error) { self.url = url; self.reason = underlying.localizedDescription }
+    public var errorDescription: String? { "Calibration access failed at \(url.path): \(reason). Reconnect or choose the calibration location again." }
+}
+
 /// Persistable choice of master files for calibration (last-used paths).
 public struct CalibrationSelection: Codable, Equatable {
     public var darkPath: String?
@@ -35,6 +43,11 @@ public enum CalibrationStore {
 }
 
 public enum CalibrationLoader {
+    public static func makeCalibratorRequiringAccess(dark: URL?, flat: URL?) throws -> Calibrator? {
+        let d = try dark.map { try MasterBuilder.load($0, failOnReadError: true) }
+        let f = try flat.map { MasterBuilder.normalizedFlat(try MasterBuilder.load($0, failOnReadError: true)) }
+        return d != nil || f != nil ? Calibrator(dark: d, flat: f) : nil
+    }
     /// Load master files into a Calibrator. Returns (nil, []) when neither is set,
     /// and a warning per file that is set but unreadable. Bias/dark-flat is not
     /// loaded here — it is folded into the flat at build time.

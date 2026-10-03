@@ -89,8 +89,18 @@ struct AppSurface {
 
     /// Publishes the generated replay URL.
     var setReplayURL: ((URL) -> Void)?
-    /// Publishes the finished session directory.
-    var setLastSessionDirectory: ((URL) -> Void)?
+    /// Publishes the finished session directory together with its captured owner.
+    var setLastSessionDirectory: ((URL, OperationFileAccess?) -> Void)?
+
+    // Authorization stays at the app boundary; controllers capture these owners
+    // before metadata reads and carry them through their existing start paths.
+    var acquireOperationAccess: (@MainActor (URL) async throws -> OperationFileAccess)?
+    var acquireCameraShare: (@MainActor (CameraShareKind, Bool) async throws -> FileAccessLease?)?
+    var acquireLocationAccess: (@MainActor (URL) async throws -> SessionDirectoryAccess)?
+    var startAuthorizedSession: (@MainActor (OperationFileAccess, @escaping (Bool) -> Void) -> Void)?
+    var isStorePreview: Bool
+    var catalogURL: URL?
+    var persistCalibration: (@MainActor (CalibrationSelection) -> Void)?
 
     init(log: @escaping (String) -> Void,
          presentError: @escaping (String) -> Void,
@@ -116,7 +126,13 @@ struct AppSurface {
          resetSessionStatsForImport: (() -> Void)? = nil,
          isRestacking: (() -> Bool)? = nil,
          setReplayURL: ((URL) -> Void)? = nil,
-         setLastSessionDirectory: ((URL) -> Void)? = nil) {
+         setLastSessionDirectory: ((URL, OperationFileAccess?) -> Void)? = nil,
+         acquireOperationAccess: (@MainActor (URL) async throws -> OperationFileAccess)? = nil,
+         acquireCameraShare: (@MainActor (CameraShareKind, Bool) async throws -> FileAccessLease?)? = nil,
+         acquireLocationAccess: (@MainActor (URL) async throws -> SessionDirectoryAccess)? = nil,
+         startAuthorizedSession: (@MainActor (OperationFileAccess, @escaping (Bool) -> Void) -> Void)? = nil,
+         isStorePreview: Bool = false, catalogURL: URL? = nil,
+         persistCalibration: (@MainActor (CalibrationSelection) -> Void)? = nil) {
         self.log = log
         self.presentError = presentError
         self.isSessionRunning = isSessionRunning
@@ -142,6 +158,13 @@ struct AppSurface {
         self.isRestacking = isRestacking
         self.setReplayURL = setReplayURL
         self.setLastSessionDirectory = setLastSessionDirectory
+        self.acquireOperationAccess = acquireOperationAccess
+        self.acquireCameraShare = acquireCameraShare
+        self.acquireLocationAccess = acquireLocationAccess
+        self.startAuthorizedSession = startAuthorizedSession
+        self.isStorePreview = isStorePreview
+        self.catalogURL = catalogURL
+        self.persistCalibration = persistCalibration
     }
 }
 

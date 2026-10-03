@@ -77,6 +77,8 @@ struct DisplaySettingsView: View {
                         }
                         Text("A screenshot still looks normal — macOS captures the image before the display tint is applied.")
                             .font(.caption2).foregroundStyle(.secondary)
+                        Text("Check every screen after wake or reconnect: macOS may briefly show normal colours before the tint returns. Turning this off or quitting restores normal display colours.")
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                     Section("Display Adjustments") {
                         VStack(alignment: .leading) {

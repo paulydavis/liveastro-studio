@@ -33,6 +33,12 @@ LiveAstro reads files from your capture app; it does not take exposures or point
 
 These shortcuts live under **Setup → Capture → Other ways to start**. For a native start onto existing matching files, the confirmation determines whether they are included. **New arrivals only** excludes the captured baseline; files arriving during the question remain eligible. Do not assume every existing file is ignored automatically. External stacker output is a different mode and does not use this raw-sub choice.
 
+In the Store preview, use **Cancel source search** in the Setup footer if camera
+or folder discovery is taking too long. The controls become available immediately;
+macOS may finish a blocked network read in the background, but its result will not
+start a session. You can then reconnect or choose another source. If camera preparation
+fails, the alert names the step; **Diagnostics** keeps the technical error details.
+
 ---
 
 ## Capture settings
@@ -101,6 +107,18 @@ This checks folder watching, display updates, the broadcast window, snapshots, a
 ---
 
 ## OBS and Go Live
+
+**Store preview:** Setup → Broadcast offers **Check connection and status** and separate **local recording** controls. Open OBS yourself, enable its WebSocket server under Tools, keep authentication enabled, and enter the host (127.0.0.1 on this Mac), port and password manually. The connection check reads streaming/recording status and disconnects. Its time-stamped result is not ongoing monitoring. Cancel or leave the panel to stop an in-progress check. A failed check does not mean OBS stopped streaming.
+
+To record locally, first check OBS's picture and audio: its current scene is what gets recorded, not automatically the LiveAstro image. Click **Start local recording…**, confirm, and wait until LiveAstro confirms recording. Click **Stop recording** when finished; wait for confirmation and the file path reported by OBS. Open that file from OBS's recording folder to check it. No public stream is started. LiveAstro refuses to take over an already-active recording or start while streaming is active.
+
+Recording is independent of your astronomy session. Changing tabs does not stop it. **End Session** and normal **Quit** warn when recording may still be active, but do not stop it; automatic session completion logs the same reminder. Stop separately first, or continue knowingly. A crash or force quit cannot show that warning.
+
+If the connection fails or OBS's recording changes unexpectedly, LiveAstro gives up control and displays **Check OBS** rather than reconnecting and blindly stopping. Stop recording in OBS, then use **Check that recording is stopped** to clear the warning. This recovery reads status only, on the original endpoint; it cannot take over an active recording. Do not operate recording through another controller at the same time. OBS provides no recording ownership token, so external stop/restart races cannot be ruled out completely.
+
+The preview does not read OBS's settings files, save the entered password, launch OBS, change scenes, or start/stop public streaming. Connection details stay in memory until quit. You can detach the Live display and capture it in OBS, controlling your stream from OBS itself. Remote connections use unencrypted WebSocket; use only a trusted network.
+
+**Direct GitHub edition:** the full OBS controls described below remain available.
 
 LiveAstro broadcasts through OBS Studio.
 
@@ -207,6 +225,12 @@ Rotates the display so celestial north is up. It requires a star catalog and a s
 ### Red screen
 
 Tints the whole Mac display red to help preserve dark adaptation—not just the LiveAstro window. It takes effect immediately, without Apply, and clears when you quit. Lower brightness means a dimmer, deeper red. Screenshots remain normal because macOS captures them before the display tint.
+
+Available in both the direct edition and Store preview. Use the moon button or **Display → Night vision → Red screen**. Saved images, replay files and the broadcast image are not tinted; this changes the physical display, not the image data.
+
+Before observing, check that every connected display—including other apps and the menu bar—is red. Check again after sleep, unlocking, changing display settings or reconnecting a monitor. LiveAstro attempts to reapply the tint, but macOS may show normal colours first, and the login screen is outside LiveAstro's control. This is not a guarantee against every flash of white light; use a physical screen filter if that guarantee is essential.
+
+If macOS reports a display error, LiveAstro switches Red screen off and reports the failure. If it had already attempted a tint, it also requests normal display colours. Turn it off yourself with the moon button or **Red screen**, or quit LiveAstro. It starts off each launch. Avoid running another display-tint utility at the same time because both can change the same display settings.
 
 ---
 
@@ -338,6 +362,29 @@ Useful buttons:
 - **Copy Log Tail** copies only the recent log.
 
 `latest.png` is for quick viewing, OBS/web overlays, and support checks. Use `master.fit` for serious post-processing when a native master is available.
+
+### Post-processing in the Store preview
+
+The Store preview offers **None** or the built-in **Native NR** denoiser. Native NR
+writes a separate `master_processed` FITS file and leaves `master.fit` unchanged.
+It is not a replacement for GraXpert's background-extraction workflow.
+
+Automatic GraXpert processing is not included in the Store preview. You can still
+use GraXpert yourself:
+
+1. End the session and wait for finalization. If LiveAstro offers **Finish clean
+   stack**, resolve that first if you want the completed trail-rejected master.
+2. Use **Open Sessions Folder**, then open the session's folder in Finder.
+3. Open GraXpert separately and load that session's `master.fit`—the linear stack,
+   not the stretched `latest.png` or replay.
+4. Save the processed result under a different name or in another folder so you
+   keep LiveAstro's original master. LiveAstro does not automatically reload it or
+   replace the live display/replay with it.
+
+If an older Store-preview preference selected GraXpert, it now opens with **None**;
+LiveAstro does not silently substitute Native NR. The direct GitHub edition's
+automatic GraXpert integration is unchanged. This is a Store feature decision,
+not a claim that external processing is impossible under every sandbox design.
 
 ---
 

@@ -168,7 +168,8 @@ final class AppModel {
         let cancellation = CleanStackCancellation()
         cleanStackCancellation = cancellation
         cleanStackProgress = "Preparing full clean stack…"
-        Task.detached { [weak self] in
+        Task.detached { [weak self, access = sessionFileAccess] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }
             do {
                 let result = try request.finish(isCancelled: { cancellation.isCancelled }, progress: { [weak self] message in
@@ -321,13 +322,14 @@ final class AppModel {
     var nightVisionOn = false
     /// Tint brightness 1...100 (Double for the slider); lower is dimmer.
     var nightVisionLevel = Double(NightVision.defaultLevel)
-    private let nightMode = NightModeController()
+    private let nightMode: NightModeController
 
     /// Apply the current night-vision on/off + level to the display. Called from the
     /// control-panel toggle and slider.
     func applyNightVision() {
         if nightVisionOn { nightMode.enable(level: Int(nightVisionLevel)) }
         else { nightMode.disable() }
+        nightVisionOn = nightMode.isActive
     }
 
     /// True once the reference frame has been plate-solved — gates the "North up" toggle. Refreshed on
@@ -336,7 +338,7 @@ final class AppModel {
 
     /// Whether the (download-on-demand) star catalog needed for plate-solving / north-up is present.
     enum CatalogState: Equatable { case notInstalled, downloading(Double), installed, failed(String) }
-    private(set) var catalogState: CatalogState = CatalogInstaller.isInstalled() ? .installed : .notInstalled
+    private(set) var catalogState: CatalogState = .notInstalled
 
     private(set) var lastSessionDirectory: URL?
     var errorMessage: String?
@@ -362,6 +364,9 @@ final class AppModel {
     /// is required only so SwiftUI can form writable bindings through it
     /// (`$model.broadcast.obsHost`); the reference itself is never rebound.
     var broadcast: BroadcastController!
+    /// Store preview inspection is not a broadcast session and cannot own outputs.
+    let obsConnectionCheck: OBSConnectionCheck?
+    let obsLocalRecording: OBSLocalRecording?
 
     /// Set by `MainView` (the only View with `@Environment(\.openWindow)` in
     /// scope) so `BroadcastDeps.openBroadcastWindow` can request the
@@ -389,7 +394,53 @@ final class AppModel {
     var importer: ImportController!
 
     private var pipeline: SessionPipeline?
+    let distribution: StorePreviewConfiguration
+    let authorizedLocations: AuthorizedLocations
+    let locationAvailability: any LocationAvailabilityChecking
+    var locationSelectionGeneration: UInt64 = 0
+    private var calibrationPreparationID: UUID?
+    private var calibrationPreparationTask: Task<Void, Never>?
+    private(set) var calibrationAdditionSource: URL?
+    var accessRestorationID: UUID?
+    var accessRestorationTask: Task<Void, Never>?
+    var isRestoringLocationAccess: Bool { accessRestorationID != nil }
+    var selectedOutputFolder: URL?
+    private var pendingFileAccess: OperationFileAccess?
+    private var sessionFileAccess: OperationFileAccess?
+    private var completedSessionAccess: SessionDirectoryAccess?
+
+    private func publishFinishedSession(_ url: URL, access: OperationFileAccess?) {
+        lastSessionDirectory = url
+        completedSessionAccess = isStorePreview ? access.map { SessionDirectoryAccess(url: url, operation: $0) } : nil
+    }
+
+    private func acquireSessionDirectoryAccess(_ url: URL) async throws -> SessionDirectoryAccess {
+        let canonical = await Task.detached { try? FileLocationCanonicalizer().canonicalURL(url) }.value
+        try Task.checkCancellation()
+        if let retained = completedSessionAccess,
+           retained.url.path == canonical?.path {
+            return retained
+        }
+        return SessionDirectoryAccess(lease: try await acquireReadableLocation(url))
+    }
+
+    func sessionArtifactNames(in directory: URL,
+                              scan: @escaping @Sendable (URL) throws -> Set<String> = { directory in
+        let names = ["master.fit", "latest.png", "session-summary.md", "frame-summary.csv", SubFrameCSV.filename]
+        return Set(names.filter { FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path) })
+    }) async throws -> Set<String> {
+        let access = try await acquireSessionDirectoryAccess(directory)
+        let worker = Task.detached { [access] in
+            defer { withExtendedLifetime(access) {} }
+            try Task.checkCancellation()
+            return try scan(access.url)
+        }
+        let names = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+        try Task.checkCancellation()
+        return names
+    }
     private var demoTask: Task<Void, Never>?
+    private var demoPreparationID: UUID?
 
     /// Where session/calibration settings persist. Defaults to `.standard` (production); tests
     /// inject a per-test temporary suite (`UserDefaults(suiteName:)`) so a test run never reads
@@ -397,7 +448,7 @@ final class AppModel {
     /// `CalibrationStore.load`/`SessionSettingsStore.load` (below) read through this SAME
     /// property, not `.standard` directly, precisely so an injected suite is honestly isolated
     /// on both the read and the write path, not just the write path.
-    private let userDefaults: UserDefaults
+    let userDefaults: UserDefaults
 
     /// Snapshot of the user's real session settings, captured when a Try-Demo
     /// session overrides them with demo values (branding: "Demo Nebula", 30 s,
@@ -430,10 +481,26 @@ final class AppModel {
     /// `userDefaults` defaults to `.standard` for every production call site (`AppModel()`
     /// unchanged). Tests pass a temporary suite so no test run reads or writes the real user's
     /// persisted settings.
-    init(userDefaults: UserDefaults = .standard, calibrationLibrary: CalibrationLibrary = CalibrationLibrary(),
-         relayRoot: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("LiveAstro/relay", isDirectory: true)) {
+    init(userDefaults: UserDefaults = .standard, calibrationLibrary: CalibrationLibrary? = nil,
+         relayRoot: URL? = nil,
+         configuration: StorePreviewConfiguration = StorePreviewConfiguration(),
+         bookmarkBackend: any BookmarkAccessing = FoundationBookmarkAccessor(),
+         locationAvailability: any LocationAvailabilityChecking = FileLocationAvailability(),
+         nightMode: NightModeController? = nil,
+         makeOBSCheckSocket: @escaping () -> any OBSSocket = { URLSessionOBSSocket() },
+         makeOBSRecordingSocket: @escaping () -> any OBSSocket = { URLSessionOBSSocket() },
+         makeNativeProcessor: @escaping @Sendable () -> any Processor = { NativeDenoiseProcessor() }) {
+        self.nightMode = nightMode ?? NightModeController()
+        self.obsConnectionCheck = configuration.isStorePreview ? OBSConnectionCheck(makeSocket: makeOBSCheckSocket) : nil
+        self.obsLocalRecording = configuration.isStorePreview ? OBSLocalRecording(makeSocket: makeOBSRecordingSocket) : nil
         self.userDefaults = userDefaults
-        self.calibrationLibrary = calibrationLibrary
+        self.locationAvailability = locationAvailability
+        self.distribution = configuration
+        self.authorizedLocations = AuthorizedLocations(defaults: userDefaults,
+            policy: configuration.isStorePreview ? .sandboxed : .direct,
+            containerRoots: configuration.isStorePreview ? [configuration.containerRoot] : [], backend: bookmarkBackend)
+        self.calibrationLibrary = calibrationLibrary ?? CalibrationLibrary(baseDirectory: configuration.libraryRoot)
+        self.catalogState = CatalogInstaller.isInstalled(at: configuration.catalogURL) ? .installed : .notInstalled
         self.calibration = CalibrationStore.load(userDefaults)
         // Build the seam bundle and the Broadcast controller first. The closures
         // capture `self` (safe: they only fire after init completes), and
@@ -468,6 +535,8 @@ final class AppModel {
                         }
                         .first
                 }
+            }, unavailableReason: {
+                configuration.isStorePreview ? "Public-stream and scene controls are unavailable in this preview. Broadcast offers a read-only connection check and separate local-recording controls. The detached broadcast window remains available." : nil
             }))
 
         // Live-source cluster: same seam, plus the T2 closures for the detect
@@ -488,7 +557,20 @@ final class AppModel {
             } },
             saveSettings: { [weak self] in MainActor.assumeIsolated { self?.saveSettings() } },
             isSessionStartPending: { [weak self] in MainActor.assumeIsolated { self?.hasPendingSessionStart ?? false } },
-            isRestacking: { [weak self] in MainActor.assumeIsolated { self?.isRestacking ?? false } }), relayRoot: relayRoot)
+            isRestacking: { [weak self] in MainActor.assumeIsolated { self?.isRestacking ?? false } },
+            acquireOperationAccess: { [weak self] url in
+                guard let self else { throw CocoaError(.userCancelled) }
+                return try await self.acquireOperationAccess(input: url)
+            }, acquireCameraShare: { [weak self] kind, replacing in
+                guard let self else { throw CocoaError(.userCancelled) }
+                return try await CameraShareAuthorization(locations: self.authorizedLocations, acquireSaved: { key in
+                    let results = try await self.acquireLocations([.key(key)])
+                    return try results[0].get()
+                }).acquire(kind, replacing: replacing)
+            }, startAuthorizedSession: { [weak self] access, completion in
+                guard let self else { completion(false); return }
+                self.startSession(access: access, completion: completion)
+            }, isStorePreview: configuration.isStorePreview), relayRoot: relayRoot ?? configuration.relayRoot)
 
         // Import + post-processing cluster: the shared log/error/session-running
         // seam plus the T3 reads the moved bodies need (stacker engine,
@@ -516,8 +598,28 @@ final class AppModel {
             resetSessionStatsForImport: { [weak self] in MainActor.assumeIsolated { self?.resetSessionStatsForImport() } },
             isRestacking: { [weak self] in MainActor.assumeIsolated { self?.isRestacking ?? false } },
             setReplayURL: { [weak self] url in MainActor.assumeIsolated { self?.replayURL = url } },
-            setLastSessionDirectory: { [weak self] url in MainActor.assumeIsolated { self?.lastSessionDirectory = url } }))
+            setLastSessionDirectory: { [weak self] url, access in
+                MainActor.assumeIsolated { self?.publishFinishedSession(url, access: access) } },
+            acquireOperationAccess: { [weak self] url in
+                guard let self else { throw CocoaError(.userCancelled) }
+                return try await self.acquireOperationAccess(input: url)
+            }, acquireLocationAccess: { [weak self] url in
+                guard let self else { throw CocoaError(.userCancelled) }
+                return try await self.acquireSessionDirectoryAccess(url)
+            }, isStorePreview: configuration.isStorePreview, catalogURL: configuration.catalogURL,
+            persistCalibration: { [weak self] selection in
+                guard let self else { return }
+                CalibrationStore.save(selection, to: self.userDefaults)
+            }), makeNativeProcessor: makeNativeProcessor)
         loadSettings()
+
+        self.nightMode.onFailure = { [weak self] message in
+            MainActor.assumeIsolated {
+                self?.nightVisionOn = false
+                self?.errorMessage = message
+                self?.log.append(message)
+            }
+        }
 
         // Save settings and stop the relay when the app is about to terminate.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
@@ -525,6 +627,8 @@ final class AppModel {
             MainActor.assumeIsolated {
                 self?.liveSource.stopRelay()
                 self?.demoTask?.cancel()
+                self?.obsConnectionCheck?.cancel()
+                self?.obsLocalRecording?.disconnect()
                 self?.saveSettings()
             }
         }
@@ -673,7 +777,9 @@ final class AppModel {
         scaleNormalizationEnabled = s.scaleNormalizationEnabled
         liveSource.relayRetentionDays = s.relayRetentionDays
         demosaic = s.demosaic
-        processorBackend = s.processorBackend
+        // Do not restore an unavailable hidden picker choice or silently opt the
+        // operator into a different processor. Direct-edition settings are unchanged.
+        processorBackend = isStorePreview && s.processorBackend == .graxpert ? .none : s.processorBackend
         // Fresh install (no saved settings) starts with the recommended DBE-on look;
         // a returning user keeps whatever they last had.
         staged = StagedAdjustments(committed: SessionSettingsStore.exists(userDefaults) ? s.displayAdjustments : .liveDefault)
@@ -682,6 +788,7 @@ final class AppModel {
         plannedStopEnabled = s.plannedStopEnabled
         plannedStopHour = s.plannedStopHour
         plannedStopMinute = s.plannedStopMinute
+        restoreAuthorizedSelections()
     }
 
     /// Download the star catalog on demand (3c). The download itself runs off-main (CatalogInstaller
@@ -691,9 +798,10 @@ final class AppModel {
     func downloadCatalog() {
         if case .downloading = catalogState { return }
         catalogState = .downloading(0)
+        let catalogURL = distribution.catalogURL
         Task { [weak self] in
             do {
-                try await CatalogInstaller.download(progress: { p in
+                try await CatalogInstaller.download(to: catalogURL, progress: { p in
                     Task { @MainActor [weak self] in
                         if case .downloading = self?.catalogState { self?.catalogState = .downloading(p) }
                     }
@@ -1036,7 +1144,8 @@ final class AppModel {
     /// Root for all session output; every session/import directory lives under here.
     static let sessionRootName = "LiveAstro"
     var liveAstroRoot: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        if isStorePreview { return selectedOutputFolder ?? distribution.containerRoot }
+        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(Self.sessionRootName, isDirectory: true)
     }
 
@@ -1076,45 +1185,51 @@ final class AppModel {
     /// A session begun on an EMPTY folder can't be matched yet — that's logged and left
     /// uncalibrated (resolve-on-first-sub is a documented follow-up). Not CI-testable
     /// (FileManager + pipeline); the pure matcher/scaler/library are unit-tested.
-    func resolveCalibration(watchFolder: URL, prefix: String?, excludingPreExisting: WatchFolderInput.Snapshot? = nil)
-        -> (calibrator: Calibrator?, messages: [String], foundMetadata: Bool, metadata: SourceMetadata?) {
+    func resolveCalibration(watchFolder: URL, prefix: String?, excludingPreExisting: WatchFolderInput.Snapshot? = nil,
+                            access: OperationFileAccess? = nil)
+        -> (calibrator: Calibrator?, messages: [String], foundMetadata: Bool, metadata: SourceMetadata?, failure: CalibrationReadError?) {
         // Old files were explicitly excluded. Even a newly arrived file may still be writing;
         // resolve on the first frame the source actually ingests, using its captured metadata.
         if excludingPreExisting != nil {
             calibrationStatus = statusLine(dark: false, flat: false)
-            return (nil, ["Calibration: matching from the first new sub as it arrives."], false, nil)
+            return (nil, ["Calibration: matching from the first new sub as it arrives."], false, nil, nil)
         }
         // Peek a representative sub already in the folder. If none (empty-folder live
         // start), report foundMetadata: false so the caller attaches the first-sub
         // provider instead — calibration then resolves as the first sub lands.
-        guard let meta = representativeMetadata(in: watchFolder, prefix: prefix) else {
+        guard let meta = Self.representativeMetadata(in: watchFolder, prefix: prefix) else {
             calibrationStatus = statusLine(dark: false, flat: false)
-            return (nil, ["Calibration: no subs yet — matching from the first sub as it arrives."], false, nil)
+            return (nil, ["Calibration: no subs yet — matching from the first sub as it arrives."], false, nil, nil)
         }
         let r = CalibrationResolver.resolve(
             metadata: meta, library: calibrationLibrary, scaleEnabled: scaleDarksAcrossExposures,
-            flatsFolder: sessionFlatsFolder, darkFlatsFolder: sessionDarkFlatsFolder,
-            legacyDarkPath: calibration.darkPath, legacyFlatPath: calibration.flatPath,
-            useDarkFlatAsLightOffset: useDarkFlatAsLightOffset)
+            flatsFolder: access == nil ? sessionFlatsFolder : access?.flats,
+            darkFlatsFolder: access == nil ? sessionDarkFlatsFolder : access?.darkFlats,
+            legacyDarkPath: (access?.calibration ?? calibration).darkPath, legacyFlatPath: (access?.calibration ?? calibration).flatPath,
+            useDarkFlatAsLightOffset: useDarkFlatAsLightOffset, failOnSelectedReadError: isStorePreview)
         calibrationStatus = statusLine(dark: r.hasDark, flat: r.hasFlat, lightOffset: r.hasLightOffset)
-        return (r.calibrator, r.messages, true, meta)
+        return (r.calibrator, r.messages, true, meta, r.readFailure)
     }
 
     /// First-sub calibrator provider for empty-folder starts: the pipeline calls this
     /// with the first frame's header on the consume task; it resolves calibration and
     /// hops to the main actor to log + update the status line.
-    func makeCalibratorProvider() -> ((SourceMetadata) -> Calibrator?) {
+    func makeCalibratorProvider(access: OperationFileAccess? = nil) -> ((SourceMetadata) throws -> Calibrator?) {
         let library = calibrationLibrary
         let scale = scaleDarksAcrossExposures
-        let flats = sessionFlatsFolder, darkFlats = sessionDarkFlatsFolder
+        let flats = access == nil ? sessionFlatsFolder : access?.flats
+        let darkFlats = access == nil ? sessionDarkFlatsFolder : access?.darkFlats
         let lightOffset = useDarkFlatAsLightOffset
-        let legacyDark = calibration.darkPath, legacyFlat = calibration.flatPath
-        return { [weak self] meta in
+        let strict = isStorePreview
+        let legacyDark = (access?.calibration ?? calibration).darkPath, legacyFlat = (access?.calibration ?? calibration).flatPath
+        return { [weak self, access] meta in
+            defer { withExtendedLifetime(access) {} }
             let r = CalibrationResolver.resolve(
                 metadata: meta, library: library, scaleEnabled: scale,
                 flatsFolder: flats, darkFlatsFolder: darkFlats,
                 legacyDarkPath: legacyDark, legacyFlatPath: legacyFlat,
-                useDarkFlatAsLightOffset: lightOffset)
+                useDarkFlatAsLightOffset: lightOffset, failOnSelectedReadError: strict)
+            if let failure = r.readFailure { throw failure }
             DispatchQueue.main.async {
                 guard let self else { return }
                 r.messages.forEach { self.log.append($0) }
@@ -1125,7 +1240,7 @@ final class AppModel {
     }
 
 
-    private func representativeMetadata(in folder: URL, prefix: String?) -> SourceMetadata? {
+    private nonisolated static func representativeMetadata(in folder: URL, prefix: String?) -> SourceMetadata? {
         var files = CalibrationLibrary.fitsFiles(in: folder)
         if let prefix, !prefix.isEmpty { files = files.filter { $0.lastPathComponent.hasPrefix(prefix) } }
         for url in files.sorted(by: { $0.lastPathComponent > $1.lastPathComponent }) {   // newest first
@@ -1156,49 +1271,89 @@ final class AppModel {
 
     // MARK: - Calibration library management
 
+    func cancelCalibrationPreparation() {
+        guard calibrationPreparationID != nil else { return }
+        calibrationPreparationID = nil
+        calibrationPreparationTask?.cancel()
+        calibrationPreparationTask = nil
+        calibrationBusy = false
+    }
+
     func refreshLibraryEntries() { libraryEntries = calibrationLibrary.all() }
 
     /// Build a master (dark or bias) from a folder of raw frames, keyed automatically
     /// from the first frame's FITS header, and add it to the library. Off the main thread.
     func addMasterFromFolder(_ folder: URL, kind: MasterKind) {
-        let urls = CalibrationLibrary.fitsFiles(in: folder)
-        guard !urls.isEmpty else { log.append("Calibration: no FITS frames in that folder."); return }
+        guard !calibrationBusy else { return }
         calibrationBusy = true
-        log.append("Calibration: building \(kind.rawValue) master from \(urls.count) frames…")
-        let lib = calibrationLibrary
-        Task.detached { [weak self] in
-            // Swift 6: rebind weak self to a strong immutable up front — nested
-            // @Sendable closures may not reference a captured weak *var*.
-            guard let self else { return }
-            // Key the master from the first READABLE frame's header — not urls[0], which may be the
-            // corrupt/unreadable file MasterBuilder silently skips. Keying off a skipped file would
-            // stamp the master with generic/nil camera+gain so it never matches lights later.
-            var meta = SourceMetadata()
-            for url in urls {
-                guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
-                defer { try? fh.close() }
-                if let head = try? fh.read(upToCount: 256 * 1024),
-                   let header = try? FITSReader.readHeader(head) {
-                    meta = SourceMetadata(fitsKeywords: header.keywords)
-                    break
-                }
+        let preparationID = UUID()
+        calibrationPreparationID = preparationID
+        calibrationPreparationTask = Task {
+            let access: FileAccessLease
+            do { access = try await acquireReadableLocation(folder) }
+            catch {
+                guard calibrationPreparationID == preparationID else { return }
+                cancelCalibrationPreparation()
+                if !(error is CancellationError) { reportFileAccess(error) }
+                return
             }
-            do {
-                let frame = try lib.add(kind: kind, camera: meta.instrument ?? "Camera",
-                    gain: meta.gain, exposureSeconds: kind == .bias ? nil : meta.exposureSeconds,
-                    // Store only the controlled SET-TEMP as the master's setpoint. CCD-TEMP (actual,
-                    // uncontrolled) must not masquerade as a setpoint — that made uncooled darks carry
-                    // a spurious temperature that then false-rejected uncooled lights.
-                    setTempC: meta.setTempC, binning: meta.binning, fitsURLs: urls)
-                await MainActor.run {
-                    self.calibrationBusy = false
-                    self.refreshLibraryEntries()
-                    self.log.append("Calibration: added \(frame.camera) \(kind.rawValue).")
+            guard calibrationPreparationID == preparationID, !Task.isCancelled else { return }
+            calibrationPreparationID = nil
+            calibrationPreparationTask = nil
+            log.append("Calibration: preparing \(kind.rawValue) master…")
+            let lib = calibrationLibrary
+            let sourceDirectory = isStorePreview ? access.url : nil
+            let strict = isStorePreview
+            calibrationAdditionSource = sourceDirectory
+            Task.detached { [weak self, access] in
+                defer { withExtendedLifetime(access) {} }
+                // Swift 6: rebind weak self to a strong immutable up front — nested
+                // @Sendable closures may not reference a captured weak *var*.
+                guard let self else { return }
+                let urls: [URL]
+                do { urls = try CalibrationLibrary.fitsFilesRequiringAccess(in: access.url) }
+                catch {
+                    await MainActor.run { self.calibrationAdditionSource = nil; self.calibrationBusy = false; self.reportFileAccess(error) }
+                    return
                 }
-            } catch {
-                await MainActor.run {
-                    self.calibrationBusy = false
-                    self.log.append("Calibration: build failed — \(error.localizedDescription)")
+                guard !urls.isEmpty else {
+                    await MainActor.run { self.calibrationAdditionSource = nil; self.calibrationBusy = false; self.log.append("Calibration: no FITS frames in that folder.") }
+                    return
+                }
+                // Key the master from the first READABLE frame's header — not urls[0], which may be the
+                // corrupt/unreadable file MasterBuilder silently skips. Keying off a skipped file would
+                // stamp the master with generic/nil camera+gain so it never matches lights later.
+                var meta = SourceMetadata()
+                for url in urls {
+                    guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
+                    defer { try? fh.close() }
+                    if let head = try? fh.read(upToCount: 256 * 1024),
+                       let header = try? FITSReader.readHeader(head) {
+                        meta = SourceMetadata(fitsKeywords: header.keywords)
+                        break
+                    }
+                }
+                do {
+                    let frame = try lib.add(kind: kind, camera: meta.instrument ?? "Camera",
+                        gain: meta.gain, exposureSeconds: kind == .bias ? nil : meta.exposureSeconds,
+                        // Store only the controlled SET-TEMP as the master's setpoint. CCD-TEMP (actual,
+                        // uncontrolled) must not masquerade as a setpoint — that made uncooled darks carry
+                        // a spurious temperature that then false-rejected uncooled lights.
+                        setTempC: meta.setTempC, binning: meta.binning, fitsURLs: urls,
+                        sourceDirectory: sourceDirectory, failOnReadError: strict)
+                    await MainActor.run {
+                        self.calibrationBusy = false
+                        self.calibrationAdditionSource = nil
+                        self.refreshLibraryEntries()
+                        self.log.append("Calibration: added \(frame.camera) \(kind.rawValue).")
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.calibrationBusy = false
+                        self.calibrationAdditionSource = nil
+                        if error is CalibrationReadError { self.reportFileAccess(error) }
+                        self.log.append("Calibration: build failed — \(error.localizedDescription)")
+                    }
                 }
             }
         }
@@ -1210,17 +1365,42 @@ final class AppModel {
     }
 
     func rebuildMaster(_ id: UUID) {
+        let entries = calibrationLibrary.all()
+        guard let selected = entries.first(where: { $0.id == id }), let path = selected.sourcePath else { return }
+        guard !calibrationBusy else { return }
         calibrationBusy = true
-        let lib = calibrationLibrary
-        Task.detached { [weak self] in
-            guard let self else { return }   // Swift 6: strong immutable for nested closures
-            let message: String
-            do { try lib.rebuild(id: id); message = "Calibration: rebuilt master." }
-            catch { message = "Calibration: rebuild failed — \(error.localizedDescription)" }
-            await MainActor.run {
-                self.calibrationBusy = false
-                self.refreshLibraryEntries()
-                self.log.append(message)
+        let preparationID = UUID()
+        calibrationPreparationID = preparationID
+        calibrationPreparationTask = Task {
+            let access: FileAccessLease
+            do { access = try await acquireReadableLocation(URL(fileURLWithPath: path)) }
+            catch {
+                guard calibrationPreparationID == preparationID else { return }
+                cancelCalibrationPreparation()
+                if !(error is CancellationError) { reportFileAccess(error) }
+                return
+            }
+            guard calibrationPreparationID == preparationID, !Task.isCancelled else { return }
+            calibrationPreparationID = nil
+            calibrationPreparationTask = nil
+            let lib = calibrationLibrary
+            let strict = isStorePreview
+            Task.detached { [weak self, access] in
+                defer { withExtendedLifetime(access) {} }
+                guard let self else { return }   // Swift 6: strong immutable for nested closures
+                do {
+                    try lib.rebuild(id: id, sourceDirectory: access.url, failOnReadError: strict)
+                    await MainActor.run { self.log.append("Calibration: rebuilt master.") }
+                } catch {
+                    await MainActor.run {
+                        if error is CalibrationReadError { self.reportFileAccess(error) }
+                        self.log.append("Calibration: rebuild failed — \(error.localizedDescription)")
+                    }
+                }
+                await MainActor.run {
+                    self.calibrationBusy = false
+                    self.refreshLibraryEntries()
+                }
             }
         }
     }
@@ -1265,13 +1445,19 @@ final class AppModel {
     private var inputPreparationID: UUID?
     private var inputPreparationTask: Task<Void, Never>?
     var isPreparingSessionInput: Bool { inputPreparationID != nil }
-    var hasPendingSessionStart: Bool { isPreparingSessionInput || pendingSessionStart != nil }
+    var hasPendingSessionStart: Bool { isPreparingSessionInput || pendingSessionStart != nil || demoPreparationID != nil }
 
     func cancelSessionInputPreparation() {
+        if demoPreparationID != nil {
+            demoPreparationID = nil
+            demoTask?.cancel()
+            demoTask = nil
+        }
         guard isPreparingSessionInput else { return }
         inputPreparationID = nil // retire ownership before the worker can complete
         inputPreparationTask?.cancel()
         inputPreparationTask = nil
+        pendingFileAccess = nil
         sessionInputStatus = nil
         let completion = pendingStartCompletion
         pendingStartCompletion = nil
@@ -1342,11 +1528,12 @@ final class AppModel {
         let completion = pendingStartCompletion ?? { _ in }
         pendingStartCompletion = nil
         guard choice != .cancel else {
+            pendingFileAccess = nil
             log.append("Start cancelled — \(pending.snapshot.count) subs were already in the folder.")
             completion(false)
             return
         }
-        guard let folder = watchFolder else { completion(false); return }
+        guard let folder = watchFolder else { pendingFileAccess = nil; completion(false); return }
         let filter = fileNamePrefix.isEmpty ? nil : fileNamePrefix
         let excluding = Self.exclusion(for: choice, snapshot: pending.snapshot,
                                        folder: folder, fileNamePrefix: filter)
@@ -1370,7 +1557,7 @@ final class AppModel {
         } else {
             log.append("Stacking \(pending.snapshot.count) subs already in the folder, plus new arrivals.")
         }
-        completion(beginSession(excludingPreExisting: excluding))
+        prepareAndBeginSession(excludingPreExisting: excluding, completion: completion)
     }
 
     /// Clears waiting when the pipeline processes an accepted OR rejected frame,
@@ -1384,7 +1571,7 @@ final class AppModel {
     /// Preflight first: read the folder, and either ask about subs already in it, stand up a
     /// "waiting" status for a filter matching nothing, or report a read failure as a failure.
     /// `beginSession` is the part that actually starts anything.
-    func startSession(completion: @escaping (Bool) -> Void = { _ in }) {
+    func startSession(access: OperationFileAccess? = nil, completion: @escaping (Bool) -> Void = { _ in }) {
         guard !hasPendingSessionStart else {
             log.append("Start is already awaiting input confirmation or baseline preparation.")
             completion(false)
@@ -1397,21 +1584,90 @@ final class AppModel {
             return
         }
         sessionInputStatus = nil
-        guard sourceMode == .nativeStack else { completion(beginSession(excludingPreExisting: nil)); return }
+        guard let folder = watchFolder else {
+            reportFileAccess(AuthorizedLocationError.missingSelection("capture"))
+            completion(false)
+            return
+        }
+        let id = UUID()
+        let requestedFilter = fileNamePrefix.isEmpty ? nil : fileNamePrefix
+        let requestedNative = sourceMode == .nativeStack
+        inputPreparationID = id
+        pendingStartCompletion = completion
+        sessionInputStatus = .preparingBaseline(completed: 0, total: 0)
+        inputPreparationTask = Task { [weak self] in
+            guard let self else { return }
+            guard self.inputPreparationID == id else { return }
+            guard self.watchFolder?.standardizedFileURL == folder.standardizedFileURL,
+                  (self.fileNamePrefix.isEmpty ? nil : self.fileNamePrefix) == requestedFilter,
+                  (self.sourceMode == .nativeStack) == requestedNative else {
+                self.finishInputPreparation(.failure(CancellationError()), id: id, folder: folder,
+                                            filter: requestedFilter, native: requestedNative)
+                return
+            }
+            do {
+                let acquired: OperationFileAccess
+                if let access { acquired = access }
+                else { acquired = try await self.acquireOperationAccess(input: folder) }
+                try Task.checkCancellation()
+                guard self.inputPreparationID == id else { return }
+                guard (self.fileNamePrefix.isEmpty ? nil : self.fileNamePrefix) == requestedFilter,
+                      (self.sourceMode == .nativeStack) == requestedNative else {
+                    self.finishInputPreparation(.failure(CancellationError()), id: id, folder: acquired.input,
+                                                filter: requestedFilter, native: requestedNative)
+                    return
+                }
+                self.pendingFileAccess = acquired
+                self.watchFolder = acquired.input
+                self.continueAuthorizedStart(id: id, completion: completion)
+            } catch {
+                guard self.inputPreparationID == id else { return }
+                if self.watchFolder?.standardizedFileURL != folder.standardizedFileURL {
+                    self.finishInputPreparation(.failure(error), id: id, folder: folder,
+                                                filter: requestedFilter, native: requestedNative)
+                    return
+                }
+                self.cancelSessionInputPreparation()
+                if !(error is CancellationError) { self.reportFileAccess(error) }
+            }
+        }
+    }
+
+    private func continueAuthorizedStart(id: UUID, completion: @escaping (Bool) -> Void) {
+        let native = sourceMode == .nativeStack
+        guard native || isStorePreview else {
+            inputPreparationID = nil; inputPreparationTask = nil; pendingStartCompletion = nil
+            sessionInputStatus = nil
+            completion(beginSession(excludingPreExisting: nil)); return
+        }
         guard let folder = watchFolder else {
             errorMessage = "Pick a watch folder first."
             completion(false)
             return
         }
         let filter = fileNamePrefix.isEmpty ? nil : fileNamePrefix
-        let id = UUID()
-        inputPreparationID = id
-        pendingStartCompletion = completion
-        sessionInputStatus = .preparingBaseline(completed: 0, total: 0)
-        inputPreparationTask = Task.detached(priority: .userInitiated) { [weak self] in
+        inputPreparationTask = Task.detached(priority: .userInitiated) { [weak self, access = pendingFileAccess] in
+            defer { withExtendedLifetime(access) {} }
             let owner = self
             let result: Result<WatchFolderInput.Snapshot, Error>
             do {
+                try access?.validateAvailability()
+                if !native {
+                    await MainActor.run {
+                        guard let owner, owner.inputPreparationID == id else { return }
+                        owner.inputPreparationID = nil
+                        owner.inputPreparationTask = nil
+                        owner.pendingStartCompletion = nil
+                        owner.sessionInputStatus = nil
+                        guard owner.watchFolder?.standardizedFileURL == folder.standardizedFileURL,
+                              (owner.fileNamePrefix.isEmpty ? nil : owner.fileNamePrefix) == filter,
+                              owner.sourceMode != .nativeStack else {
+                            owner.pendingFileAccess = nil; completion(false); return
+                        }
+                        completion(owner.beginSession(excludingPreExisting: nil))
+                    }
+                    return
+                }
                 let snapshot = try WatchFolderInput.snapshot(folder: folder, fileNamePrefix: filter)
                 result = .success(try snapshot.addingContentBaseline(shouldCancel: { Task.isCancelled }) { done, total in
                     Task { @MainActor in
@@ -1420,12 +1676,12 @@ final class AppModel {
                     }
                 })
             } catch { result = .failure(error) }
-            await owner?.finishInputPreparation(result, id: id, folder: folder, filter: filter)
+            await owner?.finishInputPreparation(result, id: id, folder: folder, filter: filter, native: native)
         }
     }
 
     private func finishInputPreparation(_ result: Result<WatchFolderInput.Snapshot, Error>,
-                                        id: UUID, folder: URL, filter: String?) {
+                                        id: UUID, folder: URL, filter: String?, native: Bool = true) {
         guard inputPreparationID == id else { return }
         inputPreparationID = nil
         inputPreparationTask = nil
@@ -1433,7 +1689,7 @@ final class AppModel {
         pendingStartCompletion = nil
         sessionInputStatus = nil
         guard watchFolder?.standardizedFileURL == folder.standardizedFileURL,
-              (fileNamePrefix.isEmpty ? nil : fileNamePrefix) == filter, sourceMode == .nativeStack else {
+              (fileNamePrefix.isEmpty ? nil : fileNamePrefix) == filter, (sourceMode == .nativeStack) == native else {
             log.append("Watch folder or filename filter changed during baseline preparation — re-checking the folder.")
             if watchFolder?.standardizedFileURL == folder.standardizedFileURL, sourceMode == .nativeStack {
                 startSession(completion: completion)
@@ -1445,6 +1701,7 @@ final class AppModel {
         }
         switch result {
         case .failure(let error):
+            pendingFileAccess = nil
             let reason = error.localizedDescription
             // A folder that cannot be read is a failure, never "no matching subs found".
             sessionInputStatus = .failed(reason)
@@ -1464,45 +1721,112 @@ final class AppModel {
                     ? "No subs \(where_) — \(unmatched) other file(s) are present. Waiting for new files."
                     : "No subs \(where_) yet. Waiting for new files.")
             }
-            completion(beginSession(excludingPreExisting: nil))
+            prepareAndBeginSession(excludingPreExisting: nil, completion: completion)
+        }
+    }
+
+    private typealias PreparedCalibration = (calibrator: Calibrator?, messages: [String], foundMetadata: Bool,
+                                              metadata: SourceMetadata?, failure: CalibrationReadError?)
+
+    /// Preview validation and calibration I/O remain cancellable preparation, including
+    /// after the pre-existing-input dialog. Ownership stays with a parked worker.
+    private func prepareAndBeginSession(excludingPreExisting excluded: WatchFolderInput.Snapshot?,
+                                        completion: @escaping (Bool) -> Void) {
+        guard isStorePreview, let access = pendingFileAccess else {
+            completion(beginSession(excludingPreExisting: excluded)); return
+        }
+        let id = UUID(), folder = access.input
+        let preparedInputStatus = sessionInputStatus
+        let prefix = fileNamePrefix.isEmpty ? nil : fileNamePrefix
+        let library = calibrationLibrary, scale = scaleDarksAcrossExposures, lightOffset = useDarkFlatAsLightOffset
+        inputPreparationID = id
+        pendingStartCompletion = completion
+        sessionInputStatus = .preparingBaseline(completed: 0, total: 0)
+        inputPreparationTask = Task.detached { [weak self, access] in
+            defer { withExtendedLifetime(access) {} }
+            let owner = self
+            let result: Result<(PreparedCalibration, (dark: Bool, flat: Bool, offset: Bool)), Error>
+            do {
+                try access.validateAvailability()
+                let meta = excluded == nil ? Self.representativeMetadata(in: folder, prefix: prefix) : nil
+                if let meta {
+                    let r = CalibrationResolver.resolve(metadata: meta, library: library, scaleEnabled: scale,
+                        flatsFolder: access.flats, darkFlatsFolder: access.darkFlats,
+                        legacyDarkPath: access.darkPath, legacyFlatPath: access.flatPath,
+                        useDarkFlatAsLightOffset: lightOffset, failOnSelectedReadError: true)
+                    if let failure = r.readFailure { throw failure }
+                    try Task.checkCancellation()
+                    result = .success(((r.calibrator, r.messages, true, meta, nil), (r.hasDark, r.hasFlat, r.hasLightOffset)))
+                } else {
+                    try Task.checkCancellation()
+                    result = .success(((nil, ["Calibration: matching from the first sub as it arrives."], false, nil, nil), (false, false, false)))
+                }
+            } catch { result = .failure(error) }
+            await MainActor.run {
+                guard let self = owner, self.inputPreparationID == id else { return }
+                self.inputPreparationID = nil
+                self.inputPreparationTask = nil
+                self.pendingStartCompletion = nil
+                self.sessionInputStatus = nil
+                guard self.watchFolder?.standardizedFileURL == folder.standardizedFileURL,
+                      (self.fileNamePrefix.isEmpty ? nil : self.fileNamePrefix) == prefix,
+                      self.sourceMode == .nativeStack else {
+                    self.pendingFileAccess = nil; completion(false); return
+                }
+                switch result {
+                case .failure(let error):
+                    self.pendingFileAccess = nil; self.reportFileAccess(error); completion(false)
+                case .success(let (prepared, flags)):
+                    self.sessionInputStatus = preparedInputStatus
+                    self.calibrationStatus = self.statusLine(dark: flags.dark, flat: flags.flat, lightOffset: flags.offset)
+                    completion(self.beginSession(excludingPreExisting: excluded, prepared: prepared))
+                }
+            }
         }
     }
 
     /// Not unit-testable: needs FileManager, a live pipeline, and a real watch
     /// folder — the end-to-end test covers this path.
-    private func beginSession(excludingPreExisting excluded: WatchFolderInput.Snapshot?) -> Bool {
+    private func beginSession(excludingPreExisting excluded: WatchFolderInput.Snapshot?, prepared: PreparedCalibration? = nil) -> Bool {
+        let access = pendingFileAccess
+        pendingFileAccess = nil
+        defer { withExtendedLifetime(access) {} }
         guard !isRestacking else { errorMessage = "Finish the re-stack before starting a session."; return false }
         saveSettings()
         guard !isRunning else { return false }
         guard !importer.isImporting else { errorMessage = "Finish the import before starting a session."; return false }
         guard let folder = watchFolder else { errorMessage = "Pick a watch folder first."; return false }
         zoomPan = .fit
-        let root = liveAstroRoot
+        guard let access else { errorMessage = "Choose authorized input and output folders before starting."; return false }
+        let root = access.output
 
         let p: SessionPipeline
         switch sourceMode {
         case .stackerOutput:
             p = SessionPipeline(watchFolder: folder, profile: profile, rootDirectory: root,
                                fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
-                               neutralizeBackground: neutralizeBackground)
+                               neutralizeBackground: neutralizeBackground,
+                               catalogURL: distribution.catalogURL, accessLifetime: access)
         case .nativeStack:
             let source = FolderFrameSource(folder: folder, mode: .live,
                                             fileNamePrefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
-                                            excludingPreExisting: excluded)
+                                            excludingPreExisting: excluded, accessLifetime: access)
             let engine = makeStackEngine()
-            let cal = resolveCalibration(
+            let cal = prepared ?? resolveCalibration(
                 watchFolder: folder, prefix: fileNamePrefix.isEmpty ? nil : fileNamePrefix,
-                excludingPreExisting: excluded)
+                excludingPreExisting: excluded, access: access)
+            if let failure = cal.failure { reportFileAccess(failure); return false }
             // Use the same peek as calibration, never a second scan whose result can race
             // it. The first ingested sub is independently delivered through wireCallbacks.
             if let metadata = cal.metadata { adoptSourceMetadata(metadata) }
             cal.messages.forEach { log.append($0) }
             CalibrationStore.save(calibration, to: userDefaults)
             // Empty folder at Start → resolve calibration from the first sub that lands.
-            let provider = cal.foundMetadata ? nil : makeCalibratorProvider()
+            let provider = cal.foundMetadata ? nil : makeCalibratorProvider(access: access)
             p = SessionPipeline(nativeSource: source, engine: engine, profile: profile,
                 rootDirectory: root, neutralizeBackground: neutralizeBackground,
-                calibrator: cal.calibrator, calibratorProvider: provider)
+                calibrator: cal.calibrator, calibratorProvider: provider,
+                catalogURL: distribution.catalogURL, accessLifetime: access)
             // Pin the session's own subs folder so a later re-stack resolves the recorded
             // subs under IT, not whatever the operator has since changed the live controls to (Fix 4).
             restackSourceDir = folder
@@ -1548,6 +1872,8 @@ final class AppModel {
         wireCallbacks(to: p, onAccepted: onAccepted)
         do {
             try p.start()
+            sessionFileAccess = access
+            completedSessionAccess = nil
             setPipeline(p)
             refreshPreview(force: true)   // fill the panel as soon as there is data
             isRunning = true
@@ -1584,49 +1910,68 @@ final class AppModel {
             return
         }
 
-        let folder = liveAstroRoot.appendingPathComponent("DemoInput", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        } catch {
-            errorMessage = "Could not create demo folder: \(error.localizedDescription)"
-            return
+        guard !hasPendingSessionStart, demoTask == nil else { return }
+        let preparationID = UUID()
+        demoPreparationID = preparationID
+        demoTask = Task {
+            defer {
+                if demoPreparationID == preparationID { demoPreparationID = nil; demoTask = nil }
+            }
+            let output: FileAccessLease
+            do { output = try await acquireOutputLocation() }
+            catch { if demoPreparationID == preparationID, !(error is CancellationError) { reportFileAccess(error) }; return }
+            defer { withExtendedLifetime(output) {} }
+            let folder = output.url.appendingPathComponent("DemoInput", isDirectory: true)
+            do {
+                try await Task.detached { [output] in
+                    defer { withExtendedLifetime(output) {} }
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                }.value
+                try Task.checkCancellation()
+            } catch {
+                if demoPreparationID == preparationID, !(error is CancellationError) { errorMessage = "Could not create demo folder: \(error.localizedDescription)" }
+                return
+            }
+
+            guard demoPreparationID == preparationID, !isRunning, !importer.isImporting else { return }
+            demoPreparationID = nil
+            demoTask = nil
+            // Snapshot the user's real settings so ending the demo restores them — the
+            // demo must leave no "Demo Nebula"/30 s branding, and no DemoInput folder /
+            // stacker-output mode / demo prefix, on a later real session or in saved
+            // settings (see metadataBeforeDemo, saveSettings, endSession). Captured
+            // BEFORE the overrides below.
+            metadataBeforeDemo = DemoMetadataSnapshot(
+                targetName: targetName, telescope: telescope, camera: camera, mount: mount,
+                filter: filter, locationLabel: locationLabel, bortleText: bortleText,
+                subExposureText: subExposureText, notes: notes,
+                sourceMode: sourceMode, watchFolder: watchFolder, fileNamePrefix: fileNamePrefix)
+            sourceMode = .stackerOutput
+            watchFolder = folder
+            fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
+            targetName = "Demo Nebula"
+            telescope = "Demo Stack Generator"
+            camera = "Synthetic FITS"
+            mount = "Demo"
+            filter = "Synthetic luminance"
+            locationLabel = "No-sky demo"
+            bortleText = ""
+            subExposureText = "30"
+            notes = "Generated by LiveAstro Try Demo."
+            log.append("Try Demo — writing sample stack updates to \(folder.path)")
+
+            startSession { [weak self, output] started in
+                guard let self else { return }
+                guard started else { self.restoreMetadataAfterDemoIfNeeded(); return }
+                self.runDemoGenerator(folder: folder, output: output)
+            }
         }
+    }
 
-        demoTask?.cancel()
-        // Snapshot the user's real settings so ending the demo restores them — the
-        // demo must leave no "Demo Nebula"/30 s branding, and no DemoInput folder /
-        // stacker-output mode / demo prefix, on a later real session or in saved
-        // settings (see metadataBeforeDemo, saveSettings, endSession). Captured
-        // BEFORE the overrides below.
-        metadataBeforeDemo = DemoMetadataSnapshot(
-            targetName: targetName, telescope: telescope, camera: camera, mount: mount,
-            filter: filter, locationLabel: locationLabel, bortleText: bortleText,
-            subExposureText: subExposureText, notes: notes,
-            sourceMode: sourceMode, watchFolder: watchFolder, fileNamePrefix: fileNamePrefix)
-        sourceMode = .stackerOutput
-        watchFolder = folder
-        fileNamePrefix = SourceMode.stackerOutput.defaultFileNamePrefix
-        targetName = "Demo Nebula"
-        telescope = "Demo Stack Generator"
-        camera = "Synthetic FITS"
-        mount = "Demo"
-        filter = "Synthetic luminance"
-        locationLabel = "No-sky demo"
-        bortleText = ""
-        subExposureText = "30"
-        notes = "Generated by LiveAstro Try Demo."
-        log.append("Try Demo — writing sample stack updates to \(folder.path)")
-
-        startSession()
-        guard isRunning else {
-            // Session didn't start (e.g. an import is running) — undo the demo override
-            // so it doesn't leave "Demo Nebula"/DemoInput branding armed on the real fields.
-            restoreMetadataAfterDemoIfNeeded()
-            return
-        }
-
+    private func runDemoGenerator(folder: URL, output: FileAccessLease) {
         let args = ["demo-stack", folder.path, "--interval", "3", "--count", "30"]
-        demoTask = Task.detached { [weak self] in
+        demoTask = Task.detached { [weak self, output] in
+            defer { withExtendedLifetime(output) {} }
             guard let model = self else { return }
             do {
                 try DemoStackGenerator.run(
@@ -1758,6 +2103,14 @@ final class AppModel {
         }
         pipeline.onLog = { [weak self] message in
             Task { @MainActor in self?.log.append("⚠ \(message)") }
+        }
+        pipeline.onCalibrationFailure = { [weak self] error in
+            Task { @MainActor in
+                guard let self, self.displayPresentation.belongs(to: sessionID) else { return }
+                self.reportFileAccess(error)
+                self.sessionInputStatus = .failed(error.localizedDescription)
+                if self.isRunning { self.endSession() }
+            }
         }
         // Watcher detection stalled (a hung folder read froze the poll queue) — make it loud:
         // a system notification for an away/asleep operator, plus a visible error so it can't
@@ -1926,6 +2279,8 @@ final class AppModel {
     /// stats-wiring (populating `subFrames` for imports) is a future feature (Fix P2-import).
     func resetSessionStatsForImport() {
         guard !isRestacking else { return }
+        sessionFileAccess = nil
+        completedSessionAccess = nil
         presentCleanStackCompletion(nil, status: nil)
         subFrames = []
         restackSourceDir = nil
@@ -1999,9 +2354,10 @@ final class AppModel {
         // Capture on the main actor everything the off-actor write needs: the session's metadata
         // (Fix P1b — write master.fit with the SAME header the live master had), the pinned
         // session directory, and the sub exposure (for TOTALEXP).
-        Task.detached { [weak self, sessionCalibrator, sessionSourceMetadata,
+        Task.detached { [weak self, sessionCalibrator, sessionSourceMetadata, access = sessionFileAccess,
                          sessionDir = lastSessionDirectory, sessionNeutralizeBackground,
                          sessionSubExposureSeconds, survivorSubs] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }
             let report: RestackReport
             do {
@@ -2221,7 +2577,15 @@ final class AppModel {
         }
     }
 
+    func requestEndSession(confirmRecordingContinues: () -> Bool) {
+        if obsLocalRecording?.requiresAttention == true, !confirmRecordingContinues() { return }
+        endSession()
+    }
+
     func endSession() {
+        if obsLocalRecording?.requiresAttention == true {
+            log.append("Ending this session does not stop OBS recording. Stop it separately in Broadcast or check OBS directly.")
+        }
         sessionInputStatus = nil
         restoreMetadataAfterDemoIfNeeded()   // undo demo branding before it can be persisted
         saveSettings()
@@ -2245,14 +2609,15 @@ final class AppModel {
         // the detached replay task).
         broadcast.sessionDidEnd()
 
-        Task.detached { [weak self] in
+        Task.detached { [weak self, access = sessionFileAccess] in
+            defer { withExtendedLifetime(access) {} }
             guard let self else { return }   // Swift 6: nested closures need a let, not a weak var
             let shouldCompleteSession: Bool
             do {
                 let url = try p.end()
                 await MainActor.run {
                     self.replayURL = url
-                    self.lastSessionDirectory = url.deletingLastPathComponent()
+                    self.publishFinishedSession(url.deletingLastPathComponent(), access: access)
                     self.log.append("Replay ready: \(url.lastPathComponent)")
                     // Overwrite the Core-written sub-frames.csv (rejectedByUser=false at
                     // persist time — Core has no durable flag-setter, see Fix D) with one
@@ -2265,6 +2630,22 @@ final class AppModel {
                 shouldCompleteSession = true
             } catch {
                 shouldCompleteSession = await MainActor.run {
+                    if error is CalibrationReadError {
+                        guard self.pipeline === p else { return false }
+                        // The provider's read failure is latched, so retrying finalization
+                        // cannot recover it. End already drained/stopped the source. Retire
+                        // only this presentation without committing a successful session.
+                        self.reportFileAccess(error)
+                        self.sessionInputStatus = .failed(error.localizedDescription)
+                        self.log.append("Session stopped after calibration access failed; no successful master or replay was finalized.")
+                        self.isRunning = false
+                        self.importer.isGeneratingReplay = false
+                        self.setPipeline(nil)
+                        self.sessionFileAccess = nil
+                        self.sessionEnd = Date()
+                        self.broadcast.stopBroadcastAfterSessionEnd()
+                        return false
+                    }
                     if p.session.state == .running {
                         // Core finalization failed before the manifest commit point (for example:
                         // master.fit or manifest persistence could not complete). The End Session
@@ -2284,7 +2665,7 @@ final class AppModel {
                     // committed session ends with a stale/nil lastSessionDirectory and an all-false
                     // sub-frames.csv (Fix 3). Use the committed session's own directory.
                     if let dir = p.sessionDir {
-                        self.lastSessionDirectory = dir
+                        self.publishFinishedSession(dir, access: access)
                         if !self.subFrames.isEmpty {
                             try? SubFrameCSV.write(subFrames: self.subFrames, to: dir)
                         }
@@ -2430,8 +2811,11 @@ final class AppModel {
         let panel = makeDirectoryPanel(title: title, message: message)
         panel.prompt = "Watch"
         if panel.runModal() == .OK, let url = panel.url {
+            Task {
+            guard await selectLocation(url, key: "capture") else { return }
             self.sourceMode = sourceMode
-            self.liveSource.startWatchFolderLive(source: url, sourceMode: sourceMode)
+            self.liveSource.startWatchFolderLive(source: watchFolder ?? url, sourceMode: sourceMode)
+            }
         }
     }
 
@@ -2439,7 +2823,10 @@ final class AppModel {
         let panel = makeDirectoryPanel(title: "Choose Subs Folder",
                                        message: "Select a folder containing raw FITS subs to import")
         if panel.runModal() == .OK, let url = panel.url {
-            importer.importSubs(from: url)
+            Task {
+            guard let selected = await selectSourceFolder(url) else { return }
+            importer.importSubs(from: selected)
+            }
         }
     }
 }

@@ -70,6 +70,8 @@ public final class GlobalRefiner {
     }
 
     private let loader: FrameLoader
+    /// A timed-out load is still reading. Its dispatched closure owns an independent copy.
+    private let accessLifetime: (any Sendable)?
     private let onLog: (String) -> Void
 
     /// Concrete NSLock-guarded cancellation flag (C3/step 7) — NOT `Task.isCancelled`, since a
@@ -122,7 +124,9 @@ public final class GlobalRefiner {
     }
 
     init(loader: FrameLoader, onLog: @escaping (String) -> Void,
-               maxConcurrentLoads: Int = GlobalRefiner.defaultMaxConcurrentLoads) {
+               maxConcurrentLoads: Int = GlobalRefiner.defaultMaxConcurrentLoads,
+               accessLifetime: (any Sendable)? = nil) {
+        self.accessLifetime = accessLifetime
         self.loader = loader
         self.onLog = onLog
         self.maxConcurrentLoads = maxConcurrentLoads
@@ -418,7 +422,8 @@ public final class GlobalRefiner {
             let semaphore = DispatchSemaphore(value: 0)
             let loaderRef = loader
             let pool = loaderPool
-            DispatchQueue.global(qos: .utility).async {
+            DispatchQueue.global(qos: .utility).async { [accessLifetime] in
+                defer { withExtendedLifetime(accessLifetime) {} }
                 // Releases the pool slot whenever THIS worker's read() actually returns — success,
                 // failure, or (for an abandoned/wedged worker) however long that eventually takes.
                 // This is the crux of the fix: a wedged worker holds its slot for its whole

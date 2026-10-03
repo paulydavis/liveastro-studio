@@ -59,8 +59,10 @@ public enum MasterBuilder {
     ///   frame that happens to sort first can't hijack the reference and discard the valid frames.
     ///   When nil, the first successfully-read frame sets the reference (later mismatches skipped).
     /// - Unreadable/mismatched frames are excluded from `contributingCount`. Throws if none contribute.
+    /// - `failOnReadError`: propagate filesystem reads as CalibrationReadError; decoding/size policy is unchanged.
     public static func combineDetailed(fitsURLs: [URL], kind: MasterKind, bias: AstroImage?,
-                                       expected: (width: Int, height: Int, channels: Int)? = nil) throws -> BuildResult {
+                                       expected: (width: Int, height: Int, channels: Int)? = nil,
+                                       failOnReadError: Bool = false) throws -> BuildResult {
         guard !fitsURLs.isEmpty else { throw BuildError.noFrames }
 
         var sum: [Double] = []
@@ -76,7 +78,12 @@ public enum MasterBuilder {
         }
 
         for url in fitsURLs {
-            guard let data = try? Data(contentsOf: url) else { continue }
+            let data: Data
+            do { data = try Data(contentsOf: url) }
+            catch {
+                if failOnReadError { throw CalibrationReadError(url: url, underlying: error) }
+                continue
+            }
             // Reject an oversized frame from its HEADER, BEFORE decoding its pixels. A syntactically
             // valid but hostile header (large-but-allowed axes, e.g. 25001×20000) would otherwise
             // force a multi-GB decode allocation in FITSReader.read just to be rejected by the ceiling
@@ -153,8 +160,13 @@ public enum MasterBuilder {
     }
 
     /// Load a pre-built master as a canonical top-down AstroImage.
-    public static func load(_ url: URL) throws -> AstroImage {
-        let data = try Data(contentsOf: url)
+    public static func load(_ url: URL, failOnReadError: Bool = false) throws -> AstroImage {
+        let data: Data
+        do { data = try Data(contentsOf: url) }
+        catch {
+            if failOnReadError { throw CalibrationReadError(url: url, underlying: error) }
+            throw error
+        }
         let img = try FITSReader.readLinear(data, normalizeRowOrder: true)
         // Master frames are always linear calibration data (dark/flat/bias-or-dark-flat),
         // never raw Bayer.

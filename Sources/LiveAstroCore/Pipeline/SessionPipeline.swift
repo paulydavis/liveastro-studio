@@ -445,7 +445,10 @@ public final class SessionPipeline {
     private var solveAttempted = false          // guarded by plateSolveLock
     private var solveGeneration = 0             // guarded by plateSolveLock; bumped on reseed to void stale solves
     private let plateSolveQueue = DispatchQueue(label: "com.liveastro.platesolve")
-    private var _plateSolveCatalog: StarCatalog? = StarCatalog.installed()   // guarded by plateSolveLock
+    private let catalogURL: URL?
+    /// Opaque caller-owned file access; propagated to readers that can outlive End's wait.
+    private let accessLifetime: (any Sendable)?
+    private var _plateSolveCatalog: StarCatalog?   // guarded by plateSolveLock
     /// The catalog plate-solving uses (the injection seam for tests; `installed()` in production).
     /// Lock-guarded because `reloadCatalog()` may swap it from the UI thread while the frame path reads it.
     var plateSolveCatalog: StarCatalog? {
@@ -491,7 +494,7 @@ public final class SessionPipeline {
     /// restart. A no-op-safe: if nothing is installed, plateSolveCatalog becomes nil and plate-solve
     /// stays the usual no-op.
     public func reloadCatalog() {
-        plateSolveCatalog = StarCatalog.installed()
+        plateSolveCatalog = StarCatalog.installed(at: catalogURL)
         invalidatePlateSolve()
     }
 
@@ -890,7 +893,7 @@ public final class SessionPipeline {
         let loader: FrameLoader = refinerLoaderOverride
             ?? ProductionFrameLoader(calibratorProvider: { [weak self] in self?.effectiveCalibrator },
                                      demosaic: demosaic)
-        let refiner = GlobalRefiner(loader: loader, onLog: { [weak self] msg in self?.onLog?(msg) })
+        let refiner = GlobalRefiner(loader: loader, onLog: { [weak self] msg in self?.onLog?(msg) }, accessLifetime: accessLifetime)
         if let cap = refinerPerSubLoadCapOverride { refiner.perSubLoadCap = cap }
         refiner.makeSnapshot = { [weak self] in self?.makeRefinerSnapshot() }
         refiner.publish = { [weak self] result, key in self?.publishRefineResult(result, key: key) }
@@ -999,7 +1002,10 @@ public final class SessionPipeline {
     /// started on an empty folder, where the lights' camera/gain/exposure aren't
     /// known until the first sub lands. Called at most once, on the serial consume
     /// task inside handleNative, so its state needs no extra locking.
-    private let calibratorProvider: ((SourceMetadata) -> Calibrator?)?
+    private let calibratorProvider: ((SourceMetadata) throws -> Calibrator?)?
+    private var calibrationFailure: Error? // serial consume; read by End only after drain
+    /// Delivered outside locks before any frame reaches the engine. End drains normally, then throws this failure.
+    public var onCalibrationFailure: ((Error) -> Void)?
     private var providerCalibrator: Calibrator?
     private var providerAttempted = false
     /// The calibrator the pipeline ACTUALLY applied to frames before stacking: the
@@ -1121,7 +1127,11 @@ public final class SessionPipeline {
     public init(watchFolder: URL, profile: SessionProfile, rootDirectory: URL,
                 replaySettings: ReplaySettings = .init(),
                 maxKeyframes: Int = FrameSelector.defaultMaxKeyframes,
-                fileNamePrefix: String? = nil, neutralizeBackground: Bool = false) {
+                fileNamePrefix: String? = nil, neutralizeBackground: Bool = false,
+                catalogURL: URL? = nil, accessLifetime: (any Sendable)? = nil) {
+        self.catalogURL = catalogURL
+        self.accessLifetime = accessLifetime
+        self._plateSolveCatalog = StarCatalog.installed(at: catalogURL)
         // Review7 P2 / review9 item 1: Siril watcher mode matches BOTH the classic
         // in-place live_stack.fit AND the immutable numbered revisions
         // (live_stack_00001.fit …) Siril 1.4+ writes under the same prefix.
@@ -1133,7 +1143,7 @@ public final class SessionPipeline {
         // (same stat-stability + digest-stability gates) they cost one fstat per
         // poll instead of re-hashing an ever-growing revision history.
         self.watcher = StackFileWatcher(folder: watchFolder, fileNamePrefix: fileNamePrefix,
-                                        digestPolicy: .mutableStackerOutput)
+                                        digestPolicy: .mutableStackerOutput, accessLifetime: accessLifetime)
         self.source = nil
         self.engine = nil
         self.profile = profile
@@ -1151,7 +1161,11 @@ public final class SessionPipeline {
                 rootDirectory: URL, replaySettings: ReplaySettings = .init(),
                 maxKeyframes: Int = FrameSelector.defaultMaxKeyframes,
                 neutralizeBackground: Bool = false, calibrator: Calibrator? = nil,
-                calibratorProvider: ((SourceMetadata) -> Calibrator?)? = nil) {
+                calibratorProvider: ((SourceMetadata) throws -> Calibrator?)? = nil,
+                catalogURL: URL? = nil, accessLifetime: (any Sendable)? = nil) {
+        self.catalogURL = catalogURL
+        self.accessLifetime = accessLifetime
+        self._plateSolveCatalog = StarCatalog.installed(at: catalogURL)
         self.watcher = nil
         self.source = nativeSource
         self.engine = engine
@@ -1788,13 +1802,19 @@ public final class SessionPipeline {
     private func handleNative(_ rawFrame: RawFrame, engine: StackEngine) {
         withCallbackDelivery {
             if cancelled.isSet { return }
+            if calibrationFailure != nil { return }
             if sourceMetadata == nil, let m = rawFrame.metadata {
                 captureSourceMetadataIfNeeded(m)
                 // No explicit calibrator (empty-folder live start): resolve one now from
                 // this first frame's header. Once only; serial consume task → no lock.
                 if calibrator == nil, !providerAttempted, let provider = calibratorProvider {
                     providerAttempted = true
-                    providerCalibrator = provider(m)
+                    do { providerCalibrator = try provider(m) }
+                    catch {
+                        calibrationFailure = error
+                        onCalibrationFailure?(error)
+                        return
+                    }
                     providerCalibrator?.onLog = { [weak self] in self?.onLog?($0) }
                 }
             }
@@ -2401,6 +2421,7 @@ public final class SessionPipeline {
                 watcher?.stop(timeout: Self.seconds(drainPrimaryTimeout))
                 try drainConsumeTaskOrThrow()
             }
+            if let calibrationFailure { throw calibrationFailure }
             if let meta = sourceMetadata { session.fillMissingMetadata(from: meta) }
             guard let dir = session.sessionDirectory else {
                 throw SessionError.notRunning
@@ -2481,10 +2502,11 @@ public final class SessionPipeline {
                         makeCleanCompletion = { [survivors = frozen.survivors, generation = frozenGen,
                             kappa = frozen.kappa, budget = frozen.budget, minSubs = liveRejectionMinSubs,
                             metadata = sourceMetadata, neutralize = neutralizeBackground,
-                            fallback = profile.subExposureSeconds] in
+                            fallback = profile.subExposureSeconds, accessLifetime] in
                             try CleanStackCompletion(directory: dir, survivors: survivors, generation: generation,
                                 kappa: kappa, budget: budget, minSubs: minSubs, loader: loader,
-                                metadata: metadata, neutralize: neutralize, fallbackSeconds: fallback, status: status)
+                                metadata: metadata, neutralize: neutralize, fallbackSeconds: fallback, status: status,
+                                accessLifetime: accessLifetime)
                         }
                     }
                     finalBroadcast = (cropToCoverage(report.master, coverage: report.coverage),
