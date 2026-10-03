@@ -80,7 +80,9 @@ struct SessionDirectoryAccess: Sendable {
 }
 
 extension AppModel {
-    var isStorePreview: Bool { distribution.isStorePreview }
+    /// Both Store Preview and the App Store edition use the sandboxed access
+    /// boundary; the direct edition retains unrestricted local-path behavior.
+    var isStorePreview: Bool { distribution.isSandboxedDistribution }
 
     @discardableResult
     func selectLocation(_ url: URL, key: String) async -> Bool {

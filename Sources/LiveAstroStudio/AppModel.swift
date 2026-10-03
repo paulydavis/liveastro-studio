@@ -491,14 +491,14 @@ final class AppModel {
          makeOBSRecordingSocket: @escaping () -> any OBSSocket = { URLSessionOBSSocket() },
          makeNativeProcessor: @escaping @Sendable () -> any Processor = { NativeDenoiseProcessor() }) {
         self.nightMode = nightMode ?? NightModeController()
-        self.obsConnectionCheck = configuration.isStorePreview ? OBSConnectionCheck(makeSocket: makeOBSCheckSocket) : nil
-        self.obsLocalRecording = configuration.isStorePreview ? OBSLocalRecording(makeSocket: makeOBSRecordingSocket) : nil
+        self.obsConnectionCheck = configuration.isSandboxedDistribution ? OBSConnectionCheck(makeSocket: makeOBSCheckSocket) : nil
+        self.obsLocalRecording = configuration.isSandboxedDistribution ? OBSLocalRecording(makeSocket: makeOBSRecordingSocket) : nil
         self.userDefaults = userDefaults
         self.locationAvailability = locationAvailability
         self.distribution = configuration
         self.authorizedLocations = AuthorizedLocations(defaults: userDefaults,
-            policy: configuration.isStorePreview ? .sandboxed : .direct,
-            containerRoots: configuration.isStorePreview ? [configuration.containerRoot] : [], backend: bookmarkBackend)
+            policy: configuration.isSandboxedDistribution ? .sandboxed : .direct,
+            containerRoots: configuration.isSandboxedDistribution ? [configuration.containerRoot] : [], backend: bookmarkBackend)
         self.calibrationLibrary = calibrationLibrary ?? CalibrationLibrary(baseDirectory: configuration.libraryRoot)
         self.catalogState = CatalogInstaller.isInstalled(at: configuration.catalogURL) ? .installed : .notInstalled
         self.calibration = CalibrationStore.load(userDefaults)
@@ -536,7 +536,7 @@ final class AppModel {
                         .first
                 }
             }, unavailableReason: {
-                configuration.isStorePreview ? "Public-stream and scene controls are unavailable in this preview. Broadcast offers a read-only connection check and separate local-recording controls. The detached broadcast window remains available." : nil
+                configuration.isSandboxedDistribution ? "Public-stream and scene controls are unavailable in this sandboxed edition. Broadcast offers a read-only connection check and separate local-recording controls. The detached broadcast window remains available." : nil
             }))
 
         // Live-source cluster: same seam, plus the T2 closures for the detect
@@ -570,7 +570,7 @@ final class AppModel {
             }, startAuthorizedSession: { [weak self] access, completion in
                 guard let self else { completion(false); return }
                 self.startSession(access: access, completion: completion)
-            }, isStorePreview: configuration.isStorePreview), relayRoot: relayRoot ?? configuration.relayRoot)
+            }, isStorePreview: configuration.isSandboxedDistribution), relayRoot: relayRoot ?? configuration.relayRoot)
 
         // Import + post-processing cluster: the shared log/error/session-running
         // seam plus the T3 reads the moved bodies need (stacker engine,
@@ -606,7 +606,7 @@ final class AppModel {
             }, acquireLocationAccess: { [weak self] url in
                 guard let self else { throw CocoaError(.userCancelled) }
                 return try await self.acquireSessionDirectoryAccess(url)
-            }, isStorePreview: configuration.isStorePreview, catalogURL: configuration.catalogURL,
+            }, isStorePreview: configuration.isSandboxedDistribution, catalogURL: configuration.catalogURL,
             persistCalibration: { [weak self] selection in
                 guard let self else { return }
                 CalibrationStore.save(selection, to: self.userDefaults)
