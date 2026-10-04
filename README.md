@@ -211,6 +211,22 @@ Release history is summarized in [CHANGELOG.md](CHANGELOG.md).
 
 Release packaging and notarization notes live in [docs/distribution.md](docs/distribution.md).
 
+The Mac App Store edition is a separate sandboxed build. After registering the
+`com.pauldavis.liveastrostudio.appstore` bundle identifier and app record in App
+Store Connect, create its upload package with:
+
+```bash
+Scripts/package_app_store.sh \
+  --version 3.6.12 \
+  --identity "3rd Party Mac Developer Application: Your Name (TEAMID)" \
+  --installer-identity "3rd Party Mac Developer Installer: Your Name (TEAMID)"
+```
+
+This command builds and validates the package but does not upload or install it.
+Use TestFlight/internal distribution before submitting the App Store build for
+review. The App Store edition intentionally omits GraXpert and one-click public
+stream/scene automation; the direct GitHub edition retains those features.
+
 Near-term product direction is tracked in [docs/roadmap.md](docs/roadmap.md).
 
 ## License
