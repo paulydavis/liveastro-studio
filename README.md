@@ -225,7 +225,9 @@ Scripts/package_app_store.sh \
 This command builds and validates the package but does not upload or install it.
 Use TestFlight/internal distribution before submitting the App Store build for
 review. The App Store edition intentionally omits GraXpert and one-click public
-stream/scene automation; the direct GitHub edition retains those features.
+stream/scene automation; the direct GitHub edition retains those features. See
+the [Mac App Store submission checklist](docs/app-store/mac-app-store-submission.md)
+for App Store Connect setup, TestFlight acceptance, and upload steps.
 
 Near-term product direction is tracked in [docs/roadmap.md](docs/roadmap.md).
 
