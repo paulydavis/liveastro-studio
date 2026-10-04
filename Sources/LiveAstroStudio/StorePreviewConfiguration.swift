@@ -12,6 +12,11 @@ struct StorePreviewConfiguration: Sendable {
     let distribution: DistributionKind
     var isStorePreview: Bool { distribution == .storePreview }
     var isSandboxedDistribution: Bool { distribution != .direct }
+    var supportsExternalProcessor: Bool { distribution == .direct }
+    var supportsPublicStreamAutomation: Bool { distribution == .direct }
+    var supportsSceneAutomation: Bool { distribution == .direct }
+    var supportsOBSStatus: Bool { true }
+    var supportsOBSLocalRecording: Bool { isSandboxedDistribution }
     let containerRoot: URL
     var relayRoot: URL {
         isSandboxedDistribution ? containerRoot.appendingPathComponent("relay", isDirectory: true)

@@ -33,7 +33,7 @@ LiveAstro reads files from your capture app; it does not take exposures or point
 
 These shortcuts live under **Setup → Capture → Other ways to start**. For a native start onto existing matching files, the confirmation determines whether they are included. **New arrivals only** excludes the captured baseline; files arriving during the question remain eligible. Do not assume every existing file is ignored automatically. External stacker output is a different mode and does not use this raw-sub choice.
 
-In the Store preview, use **Cancel source search** in the Setup footer if camera
+In a sandboxed edition, use **Cancel source search** in the Setup footer if camera
 or folder discovery is taking too long. The controls become available immediately;
 macOS may finish a blocked network read in the background, but its result will not
 start a session. You can then reconnect or choose another source. If camera preparation
@@ -108,7 +108,7 @@ This checks folder watching, display updates, the broadcast window, snapshots, a
 
 ## OBS and Go Live
 
-**Store preview:** Setup → Broadcast offers **Check connection and status** and separate **local recording** controls. Open OBS yourself, enable its WebSocket server under Tools, keep authentication enabled, and enter the host (127.0.0.1 on this Mac), port and password manually. The connection check reads streaming/recording status and disconnects. Its time-stamped result is not ongoing monitoring. Cancel or leave the panel to stop an in-progress check. A failed check does not mean OBS stopped streaming.
+**Sandboxed editions (Store preview and Mac App Store):** Setup → Broadcast offers **Check connection and status** and separate **local recording** controls. Open OBS yourself, enable its WebSocket server under Tools, keep authentication enabled, and enter the host (127.0.0.1 on this Mac), port and password manually. The connection check reads streaming/recording status and disconnects. Its time-stamped result is not ongoing monitoring. Cancel or leave the panel to stop an in-progress check. A failed check does not mean OBS stopped streaming.
 
 To record locally, first check OBS's picture and audio: its current scene is what gets recorded, not automatically the LiveAstro image. Click **Start local recording…**, confirm, and wait until LiveAstro confirms recording. Click **Stop recording** when finished; wait for confirmation and the file path reported by OBS. Open that file from OBS's recording folder to check it. No public stream is started. LiveAstro refuses to take over an already-active recording or start while streaming is active.
 
@@ -116,7 +116,7 @@ Recording is independent of your astronomy session. Changing tabs does not stop 
 
 If the connection fails or OBS's recording changes unexpectedly, LiveAstro gives up control and displays **Check OBS** rather than reconnecting and blindly stopping. Stop recording in OBS, then use **Check that recording is stopped** to clear the warning. This recovery reads status only, on the original endpoint; it cannot take over an active recording. Do not operate recording through another controller at the same time. OBS provides no recording ownership token, so external stop/restart races cannot be ruled out completely.
 
-The preview does not read OBS's settings files, save the entered password, launch OBS, change scenes, or start/stop public streaming. Connection details stay in memory until quit. You can detach the Live display and capture it in OBS, controlling your stream from OBS itself. Remote connections use unencrypted WebSocket; use only a trusted network.
+The sandboxed editions do not read OBS's settings files, save the entered password, launch OBS, change scenes, or start/stop public streaming. Connection details stay in memory until quit. You can detach the Live display and capture it in OBS, controlling your stream from OBS itself. Remote connections use unencrypted WebSocket; use only a trusted network. The direct GitHub edition additionally offers one-click stream and scene controls.
 
 **Direct GitHub edition:** the full OBS controls described below remain available.
 
@@ -226,7 +226,7 @@ Rotates the display so celestial north is up. It requires a star catalog and a s
 
 Tints the whole Mac display red to help preserve dark adaptation—not just the LiveAstro window. It takes effect immediately, without Apply, and clears when you quit. Lower brightness means a dimmer, deeper red. Screenshots remain normal because macOS captures them before the display tint.
 
-Available in both the direct edition and Store preview. Use the moon button or **Display → Night vision → Red screen**. Saved images, replay files and the broadcast image are not tinted; this changes the physical display, not the image data.
+Available in both the direct edition and sandboxed editions. Use the moon button or **Display → Night vision → Red screen**. Saved images, replay files and the broadcast image are not tinted; this changes the physical display, not the image data.
 
 Before observing, check that every connected display—including other apps and the menu bar—is red. Check again after sleep, unlocking, changing display settings or reconnecting a monitor. LiveAstro attempts to reapply the tint, but macOS may show normal colours first, and the login screen is outside LiveAstro's control. This is not a guarantee against every flash of white light; use a physical screen filter if that guarantee is essential.
 
@@ -363,13 +363,13 @@ Useful buttons:
 
 `latest.png` is for quick viewing, OBS/web overlays, and support checks. Use `master.fit` for serious post-processing when a native master is available.
 
-### Post-processing in the Store preview
+### Post-processing in sandboxed editions
 
-The Store preview offers **None** or the built-in **Native NR** denoiser. Native NR
+The sandboxed editions offer **None** or the built-in **Native NR** denoiser. Native NR
 writes a separate `master_processed` FITS file and leaves `master.fit` unchanged.
 It is not a replacement for GraXpert's background-extraction workflow.
 
-Automatic GraXpert processing is not included in the Store preview. You can still
+Automatic GraXpert processing is not included in the sandboxed editions. You can still
 use GraXpert yourself:
 
 1. End the session and wait for finalization. If LiveAstro offers **Finish clean

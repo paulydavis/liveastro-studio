@@ -239,7 +239,7 @@ struct ControlView: View {
             }
             // Go Live / End Broadcast — decoupled from session start.
             HStack {
-                if model.isStorePreview {
+                if !model.supportsPublicStreamAutomation {
                     Text(model.obsLocalRecording?.requiresAttention == true
                          ? "OBS may be recording — controls in Broadcast. End Session does not stop it."
                          : "OBS: connection check and local recording in Broadcast. Use OBS itself to stream.")

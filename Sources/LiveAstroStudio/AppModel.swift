@@ -395,6 +395,9 @@ final class AppModel {
 
     private var pipeline: SessionPipeline?
     let distribution: StorePreviewConfiguration
+    var supportsExternalProcessor: Bool { distribution.supportsExternalProcessor }
+    var supportsPublicStreamAutomation: Bool { distribution.supportsPublicStreamAutomation }
+    var supportsSceneAutomation: Bool { distribution.supportsSceneAutomation }
     let authorizedLocations: AuthorizedLocations
     let locationAvailability: any LocationAvailabilityChecking
     var locationSelectionGeneration: UInt64 = 0
@@ -612,6 +615,10 @@ final class AppModel {
                 CalibrationStore.save(selection, to: self.userDefaults)
             }), makeNativeProcessor: makeNativeProcessor)
         loadSettings()
+        if !configuration.supportsSceneAutomation {
+            broadcast.sceneAutomationOn = false
+            broadcast.obsAutoLaunch = false
+        }
 
         self.nightMode.onFailure = { [weak self] message in
             MainActor.assumeIsolated {

@@ -280,7 +280,7 @@ struct CaptureSettingsView: View {
         }
         Picker("Post-process", selection: $model.processorBackend) {
             Text("None").tag(ProcessorBackend.none)
-            if !model.isStorePreview { Text("GraXpert").tag(ProcessorBackend.graxpert) }
+            if model.supportsExternalProcessor { Text("GraXpert").tag(ProcessorBackend.graxpert) }
             Text("Native NR").tag(ProcessorBackend.nativeDenoise)
         }
         .pickerStyle(.segmented)

@@ -141,8 +141,10 @@ private struct OBSSection: View {
             SecureField("Password (empty if auth off)", text: $model.broadcast.obsPassword)
                 .disabled(connected)
                 .help("Auto-filled from OBS's local settings when left empty; paste manually only for remote OBS.")
-            Toggle("Auto-launch OBS on Go Live", isOn: $model.broadcast.obsAutoLaunch)
-                .help("When OBS is unreachable at Go Live, launch it in the background and retry the connection for up to 20 seconds. Session start and manual Connect never launch OBS.")
+            if model.supportsPublicStreamAutomation {
+                Toggle("Auto-launch OBS on Go Live", isOn: $model.broadcast.obsAutoLaunch)
+                    .help("When OBS is unreachable at Go Live, launch it in the background and retry the connection for up to 20 seconds. Session start and manual Connect never launch OBS.")
+            }
 
             // Scene selection, fed by the controller's live scene list.
             HStack {
@@ -161,19 +163,21 @@ private struct OBSSection: View {
 
             Toggle("Record while streaming", isOn: $model.broadcast.obsRecord)
 
-            // Scene automation: switch to the scope scene on a stall, back to the
-            // stack scene on resume.
-            Toggle("Scene automation (scope on stall)", isOn: $model.broadcast.sceneAutomationOn)
-            Picker("Stack scene", selection: $model.broadcast.stackSceneName) {
-                Text("—").tag("")
-                ForEach(obs.sceneNames, id: \.self) { Text($0).tag($0) }
+            if model.supportsSceneAutomation {
+                // Scene automation: switch to the scope scene on a stall, back to the
+                // stack scene on resume.
+                Toggle("Scene automation (scope on stall)", isOn: $model.broadcast.sceneAutomationOn)
+                Picker("Stack scene", selection: $model.broadcast.stackSceneName) {
+                    Text("—").tag("")
+                    ForEach(obs.sceneNames, id: \.self) { Text($0).tag($0) }
+                }
+                .disabled(!model.broadcast.sceneAutomationOn)
+                Picker("Scope scene", selection: $model.broadcast.scopeSceneName) {
+                    Text("—").tag("")
+                    ForEach(obs.sceneNames, id: \.self) { Text($0).tag($0) }
+                }
+                .disabled(!model.broadcast.sceneAutomationOn)
             }
-            .disabled(!model.broadcast.sceneAutomationOn)
-            Picker("Scope scene", selection: $model.broadcast.scopeSceneName) {
-                Text("—").tag("")
-                ForEach(obs.sceneNames, id: \.self) { Text($0).tag($0) }
-            }
-            .disabled(!model.broadcast.sceneAutomationOn)
         }
     }
 
